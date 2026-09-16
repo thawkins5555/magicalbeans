@@ -677,6 +677,16 @@ own subtabs.
   data it could not place on a port: an empty port map (naming the row
   counts behind it), a walk that did not finish and why, or sensor rows
   that read fine but matched no port at all.
+- **From 5.36.0, the badge also says whether the optic is single-mode
+  or multimode, read straight off the transceiver's own type text —
+  SX/SR/LRM class reads multimode, LX/LH/EX/ZX/BX/LR/ER/ZR class reads
+  single-mode — for every vendor, not only Cisco.** A DOM optic shows
+  `DOM·MM` or `DOM·SM` in place of plain `DOM`, and a laser transceiver
+  with no DOM shows `SFP·MM` or `SFP·SM`; the tooltip spells out which
+  ("multimode (SX/SR class)" or "single-mode (LX/LR class)"). An optic
+  whose text names neither class keeps the plain `DOM`/`SFP` badge, same
+  as before nothing is guessed. The mode survives a cut-short walk the
+  same way the badge itself does.
 - **A device inherits its settings from a "polling profile"** (a group) —
   credentials, poll interval, timeout, retries, which of ping/SNMP are
   enabled, how many ping probes to send and how long to wait for them,
@@ -2011,7 +2021,11 @@ DOM/SFP ones; both CSV exports carry the **Medium** column instead,
 not a count. Nothing new is polled for this:
 every row comes from the same per-port media read behind the DOM/SFP/
 COP badge already on the interface list (see *Drill-down*, below), so
-the report is free. Same two export buttons as Firmware inventory —
+the report is free. **From 5.36.0, Medium** also spells out single-mode
+versus multimode once the transceiver's own type text says which —
+"Laser · SM" or "Laser · MM" in place of plain "Laser" — and both CSV
+exports gain an `optic_mode` column right beside `medium` for the same
+figure on its own. Same two export buttons as Firmware inventory —
 **Export CSV** from the rows on screen, **Download CSV from server**
 for a fresh build — and the same API reach: `GET
 /api/nodes/reports/sfp` and `/sfp/export.csv`.
@@ -4318,7 +4332,14 @@ like any other module.
   exactly one VLAN", which draws as a single, solid strand. If two placed
   devices have no CDP/LLDP adjacency between them at all, the legend says
   so plainly rather than leaving an operator to wonder whether the link is
-  missing by mistake or because nothing has been seen.
+  missing by mistake or because nothing has been seen. **From 5.36.0**,
+  when any link on the map is spanning-tree blocked, the legend also
+  names what a *dotted* line means — deliberately a tighter, dot-like
+  pattern rather than the dashed one, so a blocked port and "no VLAN
+  data" are never mistaken for each other — and, with FiberView ticked
+  and a fiber link on the map, it spells out the colour key too: blue
+  for multimode, dark yellow for single-mode, dotted red for a mismatch
+  between the two.
 - **What CDP and LLDP contribute, and what they cannot.** A link only ever
   draws between two devices (or a device and an unmanaged peer) that Nodes'
   own neighbour walk has actually reported adjacent to each other, folded
@@ -4353,12 +4374,25 @@ like any other module.
   has exactly one such link reported from each side, meaning one cable
   with one port named at each end. Two or more reported from either side
   — a LAG, or a pair of switches cross-connected twice — still draws as
-  separate lines, because nothing says which port faces which and
-  guessing would risk pairing the wrong two. "Present" is the honest
-  limit: the fold sees only the rows this walk returned, so two cables
-  between one pair that each lose a row on opposite sides in the same
-  cycle would fold into one line that is not a cable — a crossed double
-  loss the one-versus-two check cannot tell from one cable.
+  separate lines when nothing else says which port faces which and
+  guessing would risk pairing the wrong two (from 5.36.0, see below, that
+  is now the narrower case where the port name itself does not resolve).
+  "Present" is the honest limit: the fold sees only the rows this walk
+  returned, so two cables between one pair that each lose a row on
+  opposite sides in the same cycle would fold into one line that is not
+  a cable — a crossed double loss the one-versus-two check cannot tell
+  from one cable. **From 5.36.0, a CDP-only cable is instead paired by the
+  far-end port name the neighbour itself sent**, wherever that name
+  resolves to a real interface on the far device — evidence, not a
+  guess, so it is not limited to the "exactly one from each side" case
+  above. This is how two real cables between the same pair — a LAG's two
+  members, or a genuine cross-connect — now draw as two separate,
+  correctly labelled links instead of standing apart as unresolved
+  half-lines: each row resolves its own far-end port and pairs with the
+  matching row from the other side. The "still draws as separate lines"
+  caveat above now applies only when the reported port name resolves to
+  nothing at all on the far device — nothing else has changed about that
+  case.
 - **A link's tooltip names each end's own trunk/access mode, and calls out
   a native-VLAN mismatch by name.** Alongside every VLAN the link
   carries, hovering or clicking shows the mode each device itself reports
@@ -4553,6 +4587,29 @@ like any other module.
   name-only neighbour is judged on the local port alone; a manually
   drawn **Connect** line is never fiber. The demo fleet's switch personas
   report SFP+ optics with DOM, so FiberView lights most of the demo map.
+- **From 5.36.0, FiberView colours a fiber link by single-mode versus
+  multimode, not just "fiber."** Both ends multimode keeps the link
+  blue exactly as before; both ends single-mode draws it dark yellow
+  instead; an SM/MM mismatch between the two ends draws it as a dotted
+  red line — the same optic-mode figure now behind the Nodes badge and
+  the SFP inventory report's Medium column (see Nodes, above). A link
+  is coloured by whichever end's mode is actually known; it only reads
+  as a mismatch when both ends are known and disagree, and stays plain
+  blue when neither end's mode is known.
+- **From 5.36.0, a spanning-tree-blocked link draws dotted, in normal
+  view and FiberView alike**, read off the same BRIDGE-MIB port-state
+  table the poller already polls — nothing new is polled for it. Only
+  the default spanning-tree instance is read, so a port blocked only in
+  a non-default PVST VLAN does not show this way; per-VLAN coverage is
+  a possible future step, not something shipped here. A link that is
+  both a mismatch and blocked draws dotted red — colour still separates
+  it from a plain blocked line.
+- **From 5.36.0, every cable between the same two devices draws as its
+  own line, fanned apart from the others** rather than stacking on
+  identical coordinates. Each line in the fan keeps its own strands,
+  colour, dash pattern and labels, close enough together to read as one
+  bundle but far enough apart that clicking, hovering or tabbing to one
+  reliably lands on that line and not its neighbour.
 
 ---
 

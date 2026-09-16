@@ -5936,6 +5936,160 @@ declared exactly once per themed `:root[data-theme=]` block in
 `prefers-reduced-motion`, and never lets the bold stroke draw thinner
 than the link's own plan width.
 
+### Optic mode, STP-blocked links and parallel fan-out — 5.36.0
+
+**The mode comes off the same transceiver text the media badge already
+reads.** `nodepoll._OPTIC_MM_TEXT` and `_OPTIC_SM_TEXT` are two regexes
+beside the existing `_COPPER_TEXT`, matching the SX/SR/LRM/850nm class
+and the LX/LH/EX/ZX/BX/LR/ER/ZR/1310-1550nm class respectively;
+`_optic_mode(*texts)` checks MM before SM across however many text
+values it is given and returns `"mm"`, `"sm"` or `None` on the first
+hit. `_sfp_slot_media` now returns two more values alongside its
+existing `(media, complete, class_rows, reasons)` tuple: a
+`mode_by_if` dict built during the same cage/occupant walk that already
+proves a port is `"sfp"` versus `"copper"`, and the raw
+`entPhysicalModelName` column it already fetched (`ent_models`), handed
+back so a second pass over DOM-lit ports (`optic_ports`, which
+`_sfp_slot_media` never itself classifies as a container) does not have
+to walk that column again — it scans the port's own mapped entities plus
+up to two hops up the `contained_in` chain and up to four hops down
+through any occupants, over `entPhysicalDescr`/`entPhysicalModelName`,
+for the same MM/SM text. Both paths land in `optic_mode_by_if`, merged
+into `media_rows` as an `"optic_mode"` key alongside `"media"` — `None`
+whenever `media` isn't `"sfp"` or `"optic"`. On a walk cut short,
+`optic_mode` is kept from the stored row exactly the way `media` already
+is (same `if row["optic_mode"] ...` guard, right beside the existing one
+for `media`).
+
+**Storage and the mapper's read of it are one column, one query.**
+`nodesdb.ensure_columns` adds `interfaces.optic_mode TEXT` beside
+`media`; `update_interface_media` now writes both columns in the same
+`UPDATE`. `interface_media_for_devices` is replaced outright by
+`interface_link_facts_for_devices(device_ids)`, which reads `media`,
+`optic_mode` *and* `stp_state` in one chunked query per call (rows where
+any of the three is non-NULL) and returns `{(device_id, if_index):
+{"media", "optic_mode", "stp_state"}}` — one read serves FiberView's
+media/mode colouring and the STP-blocked dotted line both, where 5.34.0
+needed only `media`. `get_mapper_map` calls it once per request, the
+same "one query, not one per link" shape 5.34.0 established.
+
+**`mapper.fiber_mode(a_mode, b_mode)` is the same kind of pure function
+as `link_is_fiber`**: `"mismatch"` when both ends are known and differ,
+else whichever end is known, else `None`. `get_mapper_map` calls it only
+when `link["fiber"]` is already true, and stores `a_optic_mode`,
+`b_optic_mode` and `fiber_mode` on the link alongside the existing
+`a_media`/`b_media`/`fiber`; it also stores `a_stp`, `b_stp` and a
+`blocking` bool (`a_stp == "blocking" or b_stp == "blocking"`) read
+straight from the same `interface_link_facts_for_devices` dict — no
+second BRIDGE-MIB read, `interfaces.stp_state` was already polled by
+`_poll_stp` (5.x) and simply hadn't been surfaced to Mapper before. A
+manual line defaults all six new keys the same way it already defaulted
+`a_media`/`b_media`/`fiber` — `None`/`None`/`False` per pair — keeping
+the "every key a discovered link carries" contract `tests/
+test_mapper_api.py` pins.
+
+**One line per cable: `assemble_links` gains an optional `port_index`
+kwarg**, `(device_id, port_text) -> if_index | None`. For a row that
+already matched a device (`matched_id` set) but not a specific port
+(`matched_if_index` is `None` — the ordinary CDP-only shape), it tries
+`port_index(matched_id, row["port_id"])` then `row["port_descr"]`; a hit
+keys the link on the same `link_identity` frozenset a MAC-matched row
+would use and fills `b_if_index`/`b_port` from the resolved port, so two
+real cables between one device pair each resolve to their own distinct
+frozenset key instead of competing for the single ambiguous
+`("name-match", …)` key `_fold_reciprocal_name_matched` (5.7.0) can only
+safely fold when a pair reports exactly one link from each side. A miss
+falls back to the pre-5.36.0 per-row key untouched. `link_identity`'s
+and `_fold_reciprocal_name_matched`'s docstrings each gained one
+sentence noting this third route to the same frozenset shape, since the
+neighbour naming its own port is evidence a resolver can act on, not the
+guess those two functions exist to refuse.
+
+`web/api.py`'s `_mapper_port_index(service, device_ids)` builds the
+resolver `get_mapper_map` passes in: one
+`nodesdb.interface_port_labels_for_devices(device_ids)` read (the same
+prefetch `_neighbor_local_port_labeler` already makes for a different
+purpose), reduced per device through `nodepoll._canonical_if_name` on
+both `name` and `descr`, into `{device_id: {canonical_text: if_index}}`.
+The returned closure runs the same canonicalisation on whatever port
+text a neighbour row sent before the dict lookup, so "Te1/1/1" and
+"TenGigabitEthernet1/1/1" resolve to the same port. `api.py` imports
+`_canonical_if_name` from `nodepoll` for this — the reverse import never
+happens, so no cycle.
+
+**The dotted line is CSS, ordered after `.unknown` on purpose.**
+`.mp-link.blocking { stroke-dasharray: 2 6; }` sits below `.mp-link.
+unknown { stroke-dasharray: 5 4; }` in `app.css`, so a link that is both
+(no VLAN data *and* STP-blocked, an edge case but not an impossible one)
+reads as dotted, the more specific fact. `.fiber-sm` and `.fiber-
+mismatch` are two more classes on the same `.mp-link.fiber` element,
+each with higher specificity than the plain `.fiber` rule (5.34.0) so
+they win on colour regardless of rule order: `.fiber-sm` swaps the
+stroke and glow colour to the new `--fiber-sm` token; `.fiber-mismatch`
+swaps to `var(--fail)` *and* sets the `2 6` dash, i.e. dotted red. Both
+have `.selected` pairings mirroring `.fiber.selected`'s
+`brightness(1.35)`. `tokens.css` gains `--fiber-sm` in all eight themed
+blocks beside `--fiber` — `#B8860B` everywhere but Contrast's dark
+canvas, which gets the lighter `#E0B030` the same way `--fiber` itself
+is lightened there.
+
+`mapper.js`'s `drawLink` sets these classes from the link's own
+`fiber_mode`/`blocking` fields at draw time, on every drawn element of a
+strands-mode link (each strand `<path>`, the glowing underlay) and on
+the plain/collapsed path — the same "class always present, FiberView
+toggle only changes what CSS does with it" pattern 5.34.0 used for
+`.fiber` itself. `linkTooltip`, `linkAriaLabel` and `linkDetailHtml`
+share two new helpers, `fiberModeText(link, a, b)` and
+`stpBlockingText(link, a, b, esc)`, so the same "Fiber: single-mode (A
+end known)" / "SM on X, MM on Y — mismatched" and "STP: blocking on X
+(port)" lines appear identically in all three surfaces.
+`drawLegend()` appends a sentence for blocking whenever any on-map link
+is blocking, and — only when `view.fiberView` is on and at least one
+link is fiber — a second sentence naming the three FiberView colours;
+the FiberView checkbox's `onchange` now calls `drawLegend()` after
+`applyFiberView()` so ticking it updates the legend text immediately
+rather than waiting for the next full redraw.
+
+**Parallel cables fan apart via `fanOffsets()`, called once per
+`draw()` before the link loop**, filling `view.linkFan: Map<link.id,
+offset_px>`. It groups `view.links` by the unordered pair of node ids
+(`linkNodeA`/`linkNodeB`), and for any group of two or more, sorts by
+link id, measures each link's own drawn width (its `plan.width`, or the
+strand-offset span for a strands-mode link) to find the widest member,
+spaces the group at `max(18, widest + 8)` px, centres the offsets on
+zero, and flips the sign for a link whose own A node has the larger id
+— so both ends' `drawLink` calls, whichever one a given render happens
+to run, shift the cable the same way in world space, matching how
+`drawLink`'s `(nx, ny)` normal itself flips with a link's a/b order. A
+pair with only one link between it gets no entry, so `drawLink`'s
+`view.linkFan.get(link.id) || 0` is a no-op for the overwhelming
+majority of links, applied to `from`/`to` before anything is drawn so
+every strand, label and underlay of a fanned link moves together.
+`redrawDragged` needs no change: it calls the same `drawLink` against
+the same `view.linkFan` map.
+
+**`mapper.link_csv_rows`/`LINK_CSV_HEADER` gain two trailing columns**,
+`"Fiber Mode"` (the link's own `fiber_mode`, blank if unset) and `"STP"`
+(`"blocking on A"`, `"blocking on B"`, both, or blank, built from
+`a_stp`/`b_stp`).
+
+**What each test pins.** `tests/test_sfp_media.py` extends its existing
+regex-vs-text table (§6) with real Cisco part numbers across both mode
+patterns (GLC-SX-MMD/GLC-LH-SMD/GLC-EX-SMD/GLC-ZX-SMD/GLC-BX-U,
+SFP-10G-SR/LR/ER/LRM, SFP-25G-SR-S, QSFP-40G-SR4/100G-LR4, and GLC-T/
+SFP-H10GB-CU1M reading `None`), plus stub-agent cases for a cage/
+occupant-scanned MM module with no DOM and a DOM-lit port with no
+`entPhysicalClass` row at all (the `optic_ports` fallback path).
+`tests/test_mapper_cdp_lldp_fold.py` adds `port_index` cases: the LAG's
+four rows resolving to two links with both if_indexes filled, an
+unresolvable port name falling back to the old per-row key, and an
+LLDP-matched row folding with a port-resolved CDP row for the same
+cable. `tests/test_frontend_contracts.py` section 92 gains the
+`--fiber-sm` per-theme count check (mirroring the existing `--fiber`
+one), the `fiber-sm`/`fiber-mismatch`/`blocking` CSS presence checks,
+and a check that `mapper.js` defines `fanOffsets()` and reads
+`view.linkFan`.
+
 ---
 
 ## Alerts

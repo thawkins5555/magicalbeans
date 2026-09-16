@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.36.0 — Optic single/multimode per port, FiberView by mode, STP-blocked and parallel Mapper links](#5360--optic-singlemultimode-per-port-fiberview-by-mode-stp-blocked-and-parallel-mapper-links)
 - [5.35.0 — Interface stanzas by indent, default gateways from ConfigRX, a single-PSU report, sensor vanish alerts, and SFP badges restored fleet-wide](#5350--interface-stanzas-by-indent-default-gateways-from-configrx-a-single-psu-report-sensor-vanish-alerts-and-sfp-badges-restored-fleet-wide)
 - [5.34.0 — Mapper FiberView: fiber links draw bold and glowing blue](#5340--mapper-fiberview-fiber-links-draw-bold-and-glowing-blue)
 - [5.33.0 — Per-port running config from ConfigRX, Poll Now's three walks, fan alerts, Sensor Snapshot, and Mapper/Dashboard fixes](#5330--per-port-running-config-from-configrx-poll-nows-three-walks-fan-alerts-sensor-snapshot-and-mapperdashboard-fixes)
@@ -168,6 +169,133 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.36.0 — Optic single/multimode per port, FiberView by mode, STP-blocked and parallel Mapper links
+
+Two items from one operator prompt: `PROMPT-LOG.md` carries the request in
+full and the planning answers given for it.
+
+**Every switch now learns whether the optic in a port is single-mode or
+multimode from the transceiver's own type text, DOM or not.** The poller
+already reads this text to prove a cage holds a transceiver at all (the
+ENTITY-MIB description and model-name columns); it now also checks that
+same text for the SX/SR/LRM class (multimode, 850nm) versus the LX/LH/EX/
+ZX/BX/LR/ER/ZR class (single-mode, 1310/1550nm) and keeps whichever it
+finds. This runs on every vendor's switches, not only Cisco's — it is the
+same ENTITY-MIB text path the DOM/SFP/COP badge has always read, just
+carried one step further, so a Cisco optic is not treated any differently
+from anyone else's. A copper or DAC/AOC part never matches either pattern.
+The mode is kept on a walk that gets cut short exactly the way the media
+badge already is, so a slow poll cycle never blanks out what a complete
+one already learned.
+
+**The badge on the interface list now says which one it is.** A DOM
+optic shows `DOM·MM` or `DOM·SM` beside its name instead of plain `DOM`,
+and a laser transceiver with no DOM shows `SFP·MM` or `SFP·SM`; the
+tooltip spells it out ("multimode (SX/SR class)" or "single-mode (LX/LR
+class)"). An optic the switch reports but whose text names neither class
+still shows the plain `DOM`/`SFP` badge exactly as before — nothing is
+guessed.
+
+**SFP inventory and the interface list both carry the new figure.** The
+SFP inventory report's **Medium** column reads "Laser · SM" or "Laser ·
+MM" in place of plain "Laser" once the mode is known, and both its CSV
+exports gain an `optic_mode` column right after `medium`. The
+per-interface CSV export (Nodes → a device → Interfaces → Export CSV)
+gains the same `optic_mode` column after `media`.
+
+**Mapper's FiberView now colours a fiber link by what is actually plugged
+in, not just "fiber = blue."** Both ends multimode keeps the link the
+same bold, glowing blue as before; both ends single-mode draws it dark
+yellow instead; an SM/MM mismatch between the two ends draws it as a
+dotted red line — a real cabling defect (or the wrong optic in one end)
+that used to look identical to a clean fiber run. A link is coloured by
+whichever end's mode is actually known — a link to an unmanaged or
+name-only neighbour still colours correctly off the one end SNMP has
+answered — and only counts as a mismatch when both ends are known and
+disagree; when neither end's mode is known, the link stays plain blue as
+it always has.
+
+**A spanning-tree-blocked port now draws its link as a dotted line, in
+both the normal view and FiberView.** This reads the same BRIDGE-MIB
+port-state table the poller has polled since 5.x (`dot1dStpPortState`,
+default spanning-tree instance) — nothing new is polled for it. A port
+blocked only in a non-default PVST instance (a secondary VLAN on a
+trunk, say) is not covered by this read and will not show — per-VLAN STP
+state is a possible follow-up, not something this release claims. A link
+that is both a single/multimode mismatch and spanning-tree blocked draws
+as a dotted red line; colour still tells the two apart from a plain
+blocked line.
+
+**The dotted blocked-link pattern is deliberately different from the
+existing dashed "no VLAN data" line**, so the two are never mistaken for
+each other — dotted (a tight `2 6` dash, drawn as round dots) for
+blocked, the wider dashed `5 4` pattern for "nothing reported here." The
+legend above the canvas spells out both meanings in words whenever
+either applies to the current map.
+
+**A cable Mapper only ever heard about from CDP is now paired to the
+real port its neighbour actually named, not left as an orphaned
+half-line.** Mapper already folds an LLDP-matched or CDP-and-LLDP cable
+into one line by chassis MAC; a CDP-only pair of classic switches has no
+MAC to pair by, so each end's row used to draw its own line, with two
+cables between the same pair drawing as four unresolved half-lines. The
+far end's own reported port name or description is now looked up
+against that device's real interfaces, and when it resolves, both rows
+fold into one line with both ports correctly labelled — so two real
+cables between one pair now draw as two links, not four. The "still
+draws as separate lines" caveat that applied to a LAG or a cross-
+connected pair now applies only when the reported port name resolves to
+nothing at all; wherever it resolves, the pairing is evidence the
+neighbour itself sent, not a guess.
+
+**Parallel links between the same two devices now fan apart on the
+canvas instead of stacking on identical coordinates.** Each link in a
+group keeps its own strands, colour, dash pattern and port/VLAN labels —
+including the new SM/MM/mismatch and blocked styling above — offset just
+far enough from its neighbours that a click, hover or the keyboard still
+lands on the one line meant.
+
+**The map's CSV export gains Fiber Mode and STP columns** at the end of
+the row, alongside the existing link fields — "sm", "mm", "mismatch" or
+blank for the first, and which end (or both) is blocking for the second.
+
+**The demo fleet's Site-A core map now shows all of this out of the
+box.** Every access switch gets a second, redundant 10G uplink to the
+core switch that spanning tree blocks, so each one now fans two lines to
+the core instead of one: acc-sw-001 plugs multimode optics into both
+ends (blue pair), acc-sw-002 plugs single-mode into both (dark yellow
+pair), and acc-sw-003 mismatches — single-mode reported at the core end
+against its own multimode end — for a dotted red pair, all with the
+second line of each pair drawn dotted for its blocked port.
+
+Files: `demo/personas.py`, `netpath/mapper.py`, `netpath/nodepoll.py`,
+`netpath/nodesdb.py`, `netpath/report.py`, `netpath/reportsched.py`,
+`netpath/web/api.py`, `netpath/web/static/app.css`,
+`netpath/web/static/index.html`, `netpath/web/static/mapper.js`,
+`netpath/web/static/nodes.js`, `netpath/web/static/tokens.css`.
+
+Verification: `tests/test_sfp_media.py` adds the multimode-cage and
+no-class-row-DOM-optic cases alongside the existing table, a cut-short
+walk keeping a stored `optic_mode`, and a unit table of the two mode
+patterns against real Cisco part numbers (GLC-SX-MMD, GLC-LH-SMD,
+SFP-10G-SR/LR/ER/LRM, QSFP-40G-SR4/100G-LR4, GLC-T and a DAC part, which
+read `None`). `tests/test_sfp_report.py` and `tests/test_mapper_links.py`
+are extended for the Medium/`optic_mode` column and the `fiber_mode` rule
+table (mismatch, either end alone, neither known). `tests/test_mapper_
+cdp_lldp_fold.py` adds the port-name-resolved LAG case (two cables from
+four CDP rows, both if_indexes filled), a port name that resolves to
+nothing falling back to the old per-row key, and an LLDP-matched link
+folding with a port-resolved CDP row for the same cable. `tests/
+test_mapper_api.py` extends the map GET and its CSV export for the new
+`a_optic_mode`/`b_optic_mode`/`fiber_mode`/`a_stp`/`b_stp`/`blocking`
+keys, including their defaults on a manual line. `tests/
+test_frontend_contracts.py` pins the new `--fiber-sm` token, the
+`fiber-sm`/`fiber-mismatch`/`blocking` CSS rules, and the `fanOffsets()`/
+`view.linkFan` parallel-link mechanism in `mapper.js`. `tests/ui/walk.mjs`
+adds a Nodes check for the `·MM` badge and a Mapper check that, once
+FiberView is ticked, the canvas holds single-mode, mismatch and blocked
+link classes and draws two lines for the fanned parallel pair.
 
 ### 5.35.0 — Interface stanzas by indent, default gateways from ConfigRX, a single-PSU report, sensor vanish alerts, and SFP badges restored fleet-wide
 

@@ -5,6 +5,36 @@ grouped by the version that carries it. This is a working record for the
 operator — the full story of each change is in `CHANGELOG.md`, and this file
 does not replace it.
 
+## 5.36.0 — Optic single/multimode per port, FiberView by mode, STP-blocked and parallel Mapper links
+
+**Operator prompt, verbatim:**
+> -Cisco switches should all view whether the SFP in a slot is a single mode or multimode SFP even if it's not a DOM SFP based off of the SFP type (SX or LX, LR Etc).  For the Mapper -> FiberView - progress the fiber link status one step further - if a link is using multimode SFP's on each end keep the fiber path blue,  if a switch is using single mode SFP's on each end of a link make that fiberview path a dark yellow.  If there is an SM or MM mismatch between the SFP's on each end that fiber path should be a dotted RED LINE.  
+> -Mapper should be able to determine via LLDP/CDP if multiple links between the same devices exist - if it finds multiple links directly from one device to another it should then add another connection between the two devices.  If a link is spanning tree blocking it should be a dotted line.  This is not fully fleshed out - ask any needed questions.
+
+**Plan.** Two asks, the second one flagged by the operator as not fully
+specified, so planning worked through the open questions before anything
+was built rather than guessing at them. Answers given: the SM/MM figure
+shows on the switch too, not just on the map — a badge suffix
+(`DOM·MM`/`SFP·SM`) plus the SFP inventory report's Medium column and
+CSV; FiberView colours by whichever end's mode is actually known, only
+calling it a mismatch when both ends are known and disagree; the
+spanning-tree-blocked dotted line applies in both the normal view and
+FiberView, and is drawn as a visually distinct dot pattern from the
+existing dashed "no VLAN data" line so the two are never confused;
+parallel cables fan apart into one line per cable rather than collapsing
+into one link or stacking on top of each other; and STP state is read
+from the BRIDGE-MIB poll the fleet already runs — nothing new is polled
+for it. Team split: Thing1 took the poller/database/report/demo-fixture
+side (the optic-mode read itself, its storage, the SFP report and
+interface CSV columns, and the demo fleet's second blocked uplink per
+access switch); Thing2 took Mapper's own side (the pure colour/pairing
+logic in `mapper.py`, the API's link facts and port-name resolver, and
+`mapper.js`/CSS for the colours, dotting and fan-out). Testy ran the
+touched test files as the work landed and the full suite once at the
+end; Javariius reviewed the whole diff before the push to main.
+Stephen_King wrote CHANGELOG/FEATURES/INTERNALS and this entry. Version
+bumped to 5.36.0.
+
 ## 5.35.0 — Interface stanzas by indent, default gateways from ConfigRX, a single-PSU report, sensor vanish alerts, and SFP badges restored fleet-wide
 
 **Operator prompt, verbatim:**
