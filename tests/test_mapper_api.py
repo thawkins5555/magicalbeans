@@ -362,6 +362,13 @@ try:
     # address-matched B-D one, with no media on either end, should not.
     service.nodes_db.update_interface_media(dev_a, [{"if_index": 1, "media": "optic"}])
 
+    check("interface_media_for_devices([]) returns {} for no ids",
+          service.nodes_db.interface_media_for_devices([]) == {}, "")
+    media_direct = service.nodes_db.interface_media_for_devices([dev_a, dev_a, dev_b])
+    check("duplicate ids collapse to one entry per (device_id, if_index), a NULL-media "
+          "interface (B's) is absent, and the seeded row reads back as optic",
+          media_direct == {(dev_a, 1): "optic"}, media_direct)
+
     status, payload = call("GET", f"/api/mapper/maps/{map_id}", token=admin)
     links = payload.get("links", []) if status == 200 else []
     ab_link = next((l for l in links
