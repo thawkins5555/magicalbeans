@@ -50,9 +50,10 @@
   // matches post_mapper_map_frames' own server-side floor.
   const FRAME_MIN = 40;
   const FRAME_HANDLE = 10;   // the resize-handle square, in scene units
-  // How many distinct name/IP strings #mp-find-list offers before it stops
-  // growing — a fleet-sized map's datalist should not become its own scroll.
-  const FIND_LIST_CAP = 300;
+  // #mp-find-list's own dropdown never needs more rows than fit without
+  // scrolling — a fleet-sized map still narrows to a handful of matches
+  // once the operator has typed a few characters.
+  const FIND_SUGGEST_CAP = 12;
 
   // mapperdb.MAP_STYLES, mirrored so the settings dialog's <select> and the
   // canvas's data-map-style attribute never drift from the server's own list.
@@ -552,25 +553,15 @@
   }
 
   /* ---------------------------------------------------------------- find
-     #mp-find/#mp-find-list: a plain text box, not another dialog — the
-     operator is orienting themselves on a map that may hold hundreds of
-     boxes, not picking rows to act on. Suggestions come from the same four
-     fields findNode itself matches against, so what autocompletes is
-     exactly what Enter can find. */
-  function rebuildFindList() {
-    const list = App.el('mp-find-list');
-    if (!list) return;
-    const seen = new Set();
-    const options = [];
-    for (const node of view.nodes) {
-      for (const value of [node.label, node.name, node.resolved_name, node.ip]) {
-        if (!value || seen.has(value)) continue;
-        seen.add(value);
-        if (options.length < FIND_LIST_CAP) options.push(`<option value="${escape(value)}">`);
-      }
-    }
-    list.innerHTML = options.join('');
-  }
+     #mp-find/#mp-find-list: a themed suggestion dropdown, not a dialog —
+     the operator is orienting themselves on a map that may hold hundreds
+     of boxes, not picking rows to act on. Suggestions come from the same
+     four fields findNode itself matches against, so what the dropdown
+     offers is exactly what Enter can find. Open/active state is transient
+     UI state, not view.* — nothing else reads it and nothing persists it. */
+  let findOpen = false;
+  let findItems = [];   // nodes currently listed in the dropdown, ranked
+  let findActive = -1;  // index into findItems, -1 = none highlighted
 
   // Case-insensitive, over label/name/resolved_name/ip: a node ranks by its
   // BEST field (an exact match on any field beats a prefix match on every
@@ -592,6 +583,73 @@
     }
     ranked.sort((a, b) => a.rank - b.rank);
     return ranked.map((r) => r.node);
+  }
+
+  // Data reloading (a poll tick, a manual refresh) while the dropdown is
+  // open must not leave it showing a node that moved, was removed, or a
+  // rank that no longer applies — re-run the same query against the fresh
+  // view.nodes. Closed, there is nothing to refresh.
+  function rebuildFindList() {
+    if (!findOpen) return;
+    const input = App.el('mp-find');
+    showFindSuggestions(input ? input.value : '');
+  }
+
+  function positionFindList(input, list) {
+    const rect = input.getBoundingClientRect();
+    list.style.left = `${rect.left}px`;
+    list.style.top = `${rect.bottom + 2}px`;
+    list.style.width = `${Math.max(rect.width, 220)}px`;
+  }
+
+  function renderFindList() {
+    const list = App.el('mp-find-list');
+    const input = App.el('mp-find');
+    if (!list || !input) return;
+    list.innerHTML = findItems.map((node, i) => {
+      const ip = node.ip ? `<span class="mp-suggest-ip">${escape(node.ip)}</span>` : '';
+      return `<div class="mp-suggest-item${i === findActive ? ' active' : ''}" role="option" ` +
+        `id="mp-find-opt-${i}" aria-selected="${i === findActive}" data-index="${i}">` +
+        `<span class="mp-suggest-name">${escape(node.name || node.ip || '')}</span>${ip}</div>`;
+    }).join('');
+    positionFindList(input, list);
+    list.hidden = false;
+    const active = list.querySelector('.mp-suggest-item.active');
+    if (active) input.setAttribute('aria-activedescendant', active.id);
+    else input.removeAttribute('aria-activedescendant');
+  }
+
+  function showFindSuggestions(text) {
+    const q = String(text || '').trim();
+    findItems = q ? findMatches(q).slice(0, FIND_SUGGEST_CAP) : [];
+    findActive = findItems.length ? 0 : -1;
+    if (!findItems.length) { hideFindSuggestions(); return; }
+    findOpen = true;
+    renderFindList();
+  }
+
+  function hideFindSuggestions() {
+    const list = App.el('mp-find-list');
+    if (list) { list.hidden = true; list.innerHTML = ''; }
+    const input = App.el('mp-find');
+    if (input) input.removeAttribute('aria-activedescendant');
+    findOpen = false;
+    findItems = [];
+    findActive = -1;
+  }
+
+  // Shared by Enter and a click on an option: fills the box with the same
+  // text findNode itself would match on, so repeated Enter afterwards still
+  // cycles multiple hits for that text exactly as it does when nothing was
+  // ever picked from the dropdown.
+  function pickFindSuggestion(index) {
+    const node = findItems[index];
+    if (!node) return;
+    const text = node.name || node.ip || '';
+    const input = App.el('mp-find');
+    if (input) input.value = text;
+    hideFindSuggestions();
+    findNode(text);
   }
 
   // The pan/zoom half of a Find: put the node dead centre at no less than
@@ -627,9 +685,56 @@
   }
 
   function onFindKeydown(event) {
+    if (findOpen && (event.key === 'ArrowDown' || event.key === 'ArrowUp')) {
+      event.preventDefault();
+      if (!findItems.length) return;
+      const delta = event.key === 'ArrowDown' ? 1 : -1;
+      findActive = (findActive + delta + findItems.length) % findItems.length;
+      renderFindList();
+      return;
+    }
+    if (event.key === 'Escape') {
+      if (!findOpen) return;
+      event.preventDefault();
+      hideFindSuggestions();
+      return;
+    }
     if (event.key !== 'Enter') return;
     event.preventDefault();
+    if (findOpen && findActive >= 0) { pickFindSuggestion(findActive); return; }
+    hideFindSuggestions();
     findNode(event.currentTarget.value);
+  }
+
+  function onFindInput(event) {
+    showFindSuggestions(event.target.value);
+  }
+
+  // A click on an option must not blur #mp-find first — mousedown fires
+  // before click and would close the dropdown out from under the click.
+  function onFindListMousedown(event) {
+    event.preventDefault();
+  }
+
+  function onFindListClick(event) {
+    const item = event.target.closest('.mp-suggest-item');
+    if (!item) return;
+    pickFindSuggestion(Number(item.dataset.index));
+  }
+
+  // Never races a click on an option: onFindListMousedown keeps focus on
+  // the input for the whole click, so this only fires for a genuine move
+  // away from the field (Tab, clicking anything the list does not cover).
+  function onFindBlur() {
+    hideFindSuggestions();
+  }
+
+  function onFindOutsideClick(event) {
+    if (!findOpen) return;
+    const input = App.el('mp-find');
+    const list = App.el('mp-find-list');
+    if (event.target === input || (list && list.contains(event.target))) return;
+    hideFindSuggestions();
   }
 
   // Reassigned (not mutated in place) at the top of each openAddDevice()
@@ -1261,6 +1366,21 @@
       }
     });
     g.addEventListener('pointerdown', (event) => onNodePointerDown(event, node));
+    // Opens the same Device Details modal a Nodes row's dblclick does,
+    // without leaving Mapper (App.state.tab stays 'mapper'). Only a real,
+    // still-present device has one to show — an unmanaged LLDP/CDP peer
+    // and a device removed from Nodes both fall through to a no-op, same
+    // as "Open in Nodes" above is only offered for this same case.
+    // Routed through App.whenModuleReady rather than App.pages.nodes
+    // directly: Nodes may never have been the active tab this session, and
+    // a lazy module's App.pages entry is only ever read from app.js itself.
+    g.addEventListener('dblclick', (event) => {
+      if (info.unmanaged || info.gone) return;
+      event.preventDefault();
+      event.stopPropagation();
+      App.whenModuleReady('nodes').then((page) => page.openDeviceDialog(node.device_id))
+        .catch(() => {});
+    });
     layer.appendChild(g);
     return g;
   }
@@ -2801,6 +2921,11 @@
     wireSpaceModifier();
     wireFrameEscape();
     App.el('mp-find').addEventListener('keydown', onFindKeydown);
+    App.el('mp-find').addEventListener('input', onFindInput);
+    App.el('mp-find').addEventListener('blur', onFindBlur);
+    App.el('mp-find-list').addEventListener('mousedown', onFindListMousedown);
+    App.el('mp-find-list').addEventListener('click', onFindListClick);
+    document.addEventListener('mousedown', onFindOutsideClick);
     App.el('mp-add-frame').onclick = () => {
       if (!App.canWrite('mapper') || !view.mapId) return;
       view.framing = !view.framing;

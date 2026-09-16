@@ -3838,32 +3838,34 @@ INDEX86 = read("index.html")
 _MP_BAR86 = INDEX86[INDEX86.index('<div class="bar wrap">'):INDEX86.index('id="mp-add-device"')]
 check('<label>Map <select id="mp-map"></select></label>' in _MP_BAR86
       and '<label>Find <input id="mp-find"' in _MP_BAR86
-      and 'list="mp-find-list"' in _MP_BAR86
-      and '<datalist id="mp-find-list"></datalist>' in _MP_BAR86,
-      "the Find box and its datalist sit in the Mapper action bar, right "
-      "after the Map select and before Add device")
+      and 'autocomplete="off"' in _MP_BAR86
+      and '<div id="mp-find-list" class="mp-suggest" role="listbox" hidden></div>' in _MP_BAR86,
+      "the Find box and its themed suggestion dropdown sit in the Mapper "
+      "action bar, right after the Map select and before Add device")
 check('data-requires-write' not in _MP_BAR86[_MP_BAR86.index('id="mp-find"'):
                                              _MP_BAR86.index('id="mp-find"') + 200],
       "Find is a read control: it selects a node already on the map, it "
       "does not write one")
 check("function rebuildFindList()" in MAPPER86 and "function findMatches(text)" in MAPPER86
-      and "function findNode(text)" in MAPPER86 and "function centerOn(node)" in MAPPER86,
-      "rebuildFindList/findMatches/findNode/centerOn all exist")
-_FIND86 = MAPPER86[MAPPER86.index("  function rebuildFindList()"):
+      and "function findNode(text)" in MAPPER86 and "function centerOn(node)" in MAPPER86
+      and "function showFindSuggestions(text)" in MAPPER86
+      and "function pickFindSuggestion(index)" in MAPPER86,
+      "rebuildFindList/findMatches/findNode/centerOn/showFindSuggestions/"
+      "pickFindSuggestion all exist")
+_FIND86 = MAPPER86[MAPPER86.index("  let findOpen ="):
                    MAPPER86.index("  // Reassigned (not mutated in place)")]
 check("for (const value of [node.label, node.name, node.resolved_name, node.ip])" in _FIND86,
-      "both the datalist and findMatches read the same four fields — label, "
-      "name, resolved_name, ip — so a suggestion is always something Enter "
-      "can actually find")
-check(_FIND86.count("for (const value of [node.label, node.name, node.resolved_name, node.ip])") == 2,
-      "...once to build the datalist, once to rank a match — no third, "
-      "independent field list to drift out of step with either")
-check("options.push(`<option value=\"${escape(value)}`" in _FIND86.replace("\n      ", " ")
-      or "options.push(`<option value=\"${escape(value)}\">`)" in _FIND86,
-      "the datalist's option values are escaped, like every other "
+      "findMatches ranks over the same four fields — label, name, "
+      "resolved_name, ip — that the dropdown is built from")
+check("findItems = q ? findMatches(q).slice(0, FIND_SUGGEST_CAP) : [];" in _FIND86,
+      "the dropdown's own list IS a ranked findMatches() call, capped at "
+      "FIND_SUGGEST_CAP — no separate, independent suggestion source to "
+      "drift out of step with Enter")
+check("const FIND_SUGGEST_CAP = 12;" in MAPPER86,
+      "the dropdown is capped at 12 suggestions")
+check('escape(node.name || node.ip || \'\')' in _FIND86 and 'escape(node.ip)' in _FIND86,
+      "each suggestion's name and ip line are escaped, like every other "
       "interpolated name in this file")
-check("options.length < FIND_LIST_CAP" in _FIND86 and "const FIND_LIST_CAP = 300;" in MAPPER86,
-      "the datalist is capped at 300 distinct suggestions")
 check("field === q ? 0 : field.startsWith(q) ? 1 : field.includes(q) ? 2 : 4" in _FIND86,
       "a node ranks by exact match, then prefix, then plain substring, "
       "case-insensitively")

@@ -13,6 +13,7 @@
     deviceGroups: [],       // organizational folders, unrelated to polling profiles
     selected: null,        // selected device id
     detail: null,           // full device detail payload
+    revealed: null,          // device id highlighted by a revealDevice() link, until it moves on
     // Which of the five nested sub-panes is on screen, and the device the
     // four fetched ones below hold data for. Only the pane on screen is
     // fetched per tick, so the other four go stale on purpose — see
@@ -412,7 +413,8 @@
     App.drawRows(body, rows, drawColumns, (tr, row) => {
       const className = 'clickable'
         + (view.selected === row.id ? ' selected' : '')
-        + (view.devicesChecked.has(row.id) ? ' bulk-checked' : '');
+        + (view.devicesChecked.has(row.id) ? ' bulk-checked' : '')
+        + (view.revealed === row.id ? ' revealed' : '');
       if (tr.className !== className) tr.className = className;
       // The checkbox owns selection; the rest of the row owns the detail
       // pane. stopPropagation keeps ticking a box from also moving the
@@ -629,6 +631,7 @@
   }
 
   function selectDevice(id) {
+    if (view.revealed != null && id !== view.revealed) view.revealed = null;
     view.selected = id;
     // A device is a thing worth linking to: #/nodes/device/1234 in the
     // address bar, replacing rather than pushing so clicking down a list
@@ -677,6 +680,8 @@
       pagesLeft -= 1;
     }
     view.selected = deviceId;
+    view.revealed = deviceId;
+    view.devicesChecked.add(deviceId);
     drawTable();
     const row = App.el('nodes-table')?.querySelector('tr.selected');
     if (row) row.scrollIntoView({ block: 'nearest' });
@@ -735,6 +740,7 @@
       // selected under whatever filters restoreControls put back.
       await revealDevice(deviceId);
     } else if (view.selected !== deviceId) {
+      if (view.revealed != null && deviceId !== view.revealed) view.revealed = null;
       view.selected = deviceId;
       drawTable();
       await loadDetail().catch(() => { /* a link to a deleted device */ });
@@ -7639,6 +7645,13 @@
       // every five seconds is unusable.
       onEnter: () => { view.macSearchPending = true; },
     });
+    // A revealed row's highlight is a "you asked to find this one" cue; it
+    // has nothing to say once the operator starts a different search.
+    App.el('nd-q').oninput = () => {
+      if (view.revealed == null) return;
+      view.revealed = null;
+      drawTable();
+    };
     App.el('nd-manage-devgroups').onclick = manageDeviceGroups;
     App.el('nd-bulk-poll').onclick = bulkPollNow;
     App.el('nd-bulk-identify').onclick = bulkIdentify;
@@ -7787,5 +7800,13 @@
     loadDetailSub(name).catch(() => {});
   }
 
-  App.pages.nodes = { init, refresh, activate, fastTick: drawStatus };
+  /* Mapper's double-click-a-node entry point: the same Device Details modal
+     a Nodes row's dblclick opens, without touching App.state.tab or
+     requiring the Nodes tab to have ever been drawn — deviceDialog fetches
+     by id and only falls back to view.devices for a title. */
+  function openDeviceDialog(deviceId) {
+    deviceDialog(deviceId);
+  }
+
+  App.pages.nodes = { init, refresh, activate, fastTick: drawStatus, openDeviceDialog };
 })();

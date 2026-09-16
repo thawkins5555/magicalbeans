@@ -1195,8 +1195,8 @@
 
   <div class="bar wrap">
     <label>Map <select id="mp-map"></select></label>
-    <label>Find <input id="mp-find" size="18" list="mp-find-list" title="Device name, label or IP on this map" placeholder="name or IP"></label>
-    <datalist id="mp-find-list"></datalist>
+    <label>Find <input id="mp-find" size="18" autocomplete="off" title="Device name, label or IP on this map" placeholder="name or IP"></label>
+    <div id="mp-find-list" class="mp-suggest" role="listbox" hidden></div>
     <button id="mp-add-device" data-requires-write="mapper">Add device</button>
     <button id="mp-add-neighbours" data-requires-write="mapper">Add neighbours</button>
     <button id="mp-remove-node" data-requires-write="mapper">Remove</button>
