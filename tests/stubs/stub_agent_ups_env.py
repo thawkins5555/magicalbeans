@@ -122,6 +122,12 @@ Modes:
              that is NOT an ifIndex column -- alias_rows > 0 (there was
              ENTITY-MIB to map) but port_map ends up empty either way, the
              diagnostic-event case (F3).
+  sfp_media_no_sensor_values
+             `sfp_media`'s SFP_MEDIA_TABLE with no MAU table, and
+             entPhySensorValue refused outright -- a timed-out DOM value
+             walk on a device already latched sensor_capable, the 5.35.0
+             review fix (F2) that must keep a stored 'optic' badge rather
+             than let the empty-sensors cage scan overwrite it.
 
 Three control datagrams, on the same socket as SNMP itself (see
 stub_agent_fdb.py, which established this convention):
@@ -726,6 +732,7 @@ _ENT_PHYSICAL_NAME_COL = "1.3.6.1.2.1.47.1.1.1.1.7"
 DEAD_COLUMNS = {
     "sfp_media_no_class": ("1.3.6.1.2.1.47.1.1.1.1.5",),
     "sfp_media_no_names": (_ENT_PHYSICAL_NAME_COL,),
+    "sfp_media_no_sensor_values": ("1.3.6.1.2.1.99.1.1.1.4",),
 }
 
 # Which entPhysicalEntry columns (and ifMauType) a run was asked for at
@@ -774,6 +781,8 @@ def table_for():
         return {**CISCO_SCALARS, **SFP_MEDIA_TABLE, **SFP_MAU_TABLE}
     if MODE == "sfp_media_no_port_map":
         return {**GENERIC_SCALARS, **PORT_MAP_EMPTY_TABLE}
+    if MODE == "sfp_media_no_sensor_values":
+        return {**GENERIC_SCALARS, **SFP_MEDIA_TABLE}
     return dict(GENERIC_SCALARS)
 
 

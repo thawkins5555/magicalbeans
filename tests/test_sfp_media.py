@@ -270,6 +270,30 @@ try:
 finally:
     stub.kill()
 
+# --- a timed-out DOM value walk must not strip a stored 'optic' badge ----
+# (5.35.0 review fix, F2): entPhySensorValue refused outright, everything
+# else (class/alias/containment) answers -- the case an empty walk (the
+# 'media_keep' block above) does not cover.
+stub, port = spawn_stub("stub_agent_ups_env.py", "sfp_media_no_sensor_values")
+nodepoll_mod.DEFAULT_SNMP_PORT = port
+try:
+    db = new_nodes_db("media_sensor_timeout")
+    did = device_against(db, "sensor-timeout-sw")
+    db.replace_interfaces(did, PORTS)
+    db.update_interface_media(did, [{"if_index": 2, "media": "optic"}])
+    poller = NodePoller(db)
+    device = db.device(did)
+    poller._poll_environment(did, device, db.effective_config(device), set(),
+                             time.time())
+    media = {r["if_index"]: r["media"] for r in db.interfaces(did)}
+    check("a device whose entPhySensorValue walk times out keeps a stored "
+          "'optic' badge, not just 'sfp'/'copper' -- a stale cage scan must "
+          "never rewrite a port this poll had no sensors to re-prove",
+          media.get(2) == "optic", media)
+    db.close()
+finally:
+    stub.kill()
+
 # ==================================== § 1b cage scan decoupled (5.35.0, F)
 
 # --- a device with no DOM sensors at all still gets its cages badged -----
