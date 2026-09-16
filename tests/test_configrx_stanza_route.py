@@ -131,6 +131,10 @@ try:
         "GET", f"/api/nodes/devices/{did}/interfaces/1/config", token=configrx_only)
     check("configrx:read alone (no nodes grant) is refused",
           status == 403, (status, payload))
+    status, payload = call(
+        "GET", "/api/nodes/devices/999999/interfaces/1/config", token=configrx_only)
+    check("configrx:read alone against a nonexistent device id: 403, not 404",
+          status == 403, (status, payload))
 finally:
     server.stop()
     service.shutdown()
