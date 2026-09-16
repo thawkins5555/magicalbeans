@@ -60,7 +60,7 @@ template's (email/SMS/webhook) subject line is reset to its built-in
 default carrying `[SEVERITY]` / `[RECOVER]` (custom, non-built-in
 templates are left alone), and the digest roll-up subject gains a
 worst-severity tag.
-**Outcome:** _pending — to be filled in at push._
+**Outcome.** Shipped as 5.30.0. Full suite 171/175 with only the four known environmental failures (no passphrase, no traceroute, socket family, prune-lock timing); browser walk 83/83 on the rerun with zero console, page or HTTP errors as admin and viewer (the first run of each pass lost the pre-existing interface-dialog Custom-range timing race, D3, which the walk script itself documents). Javariius pass 1 "not ready": a page reload would have wiped the remembered Find box (fixed with a boot-route guard and a walk step that proves a reload keeps it), the stored gateway text was unvalidated (now gated like the alias walk), comment density and four doc sentences; pass 2 four one-line edits, no logic change. New tests: test_default_gateway.py, test_template_subjects.py.
 
 **5.31.0 — Mapper find, select-all, frames**
 Scope: a node search/find box added to the Mapper module; a
