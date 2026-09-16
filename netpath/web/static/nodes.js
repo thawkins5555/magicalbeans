@@ -147,6 +147,22 @@
     listening: 'var(--warn)', learning: 'var(--warn)', broken: 'var(--fail)',
     disabled: 'var(--muted)' };
 
+  // Cisco PVST+/Rapid-PVST per-VLAN detail (5.37.0): a port blocking in only
+  // some of the VLANs it carries names the count, with the blocked ids in
+  // the title; blocked in every VLAN, or no per-VLAN read at all (non-Cisco,
+  // stp_blocking_vlans NULL), keeps the plain word.
+  function stpStateText(r) {
+    const ids = r.stp_blocking_vlans;
+    if (ids && r.stp_vlan_count != null) {
+      const blocked = ids.split(',').filter(Boolean);
+      if (blocked.length < r.stp_vlan_count) {
+        return { text: `blocking · ${blocked.length}/${r.stp_vlan_count} VLANs`,
+          title: `Blocking in VLANs ${blocked.join(', ')}` };
+      }
+    }
+    return { text: r.stp_state, title: null };
+  }
+
   /* The one place display-name precedence lives: 'auto' prefers the SNMP
      hostname (sysName) and falls back to the manually entered name, then
      the IP; 'manual' pins the manually entered name. */
@@ -1517,10 +1533,13 @@
       cell: (r) => (r.poe_power_mw != null ? `${(r.poe_power_mw / 1000).toFixed(1)} W`
         : escape(r.poe_admin ? (r.poe_detect_status || r.poe_admin) : '\u2014')) },
     { key: 'stp_state', label: 'STP', width: 90,
-      cell: (r) => (r.stp_state
-        ? `<span style="color:${STP_STATE_COLOR[r.stp_state] || 'var(--muted)'}">` +
-          `${escape(r.stp_state)}</span>`
-        : '\u2014') },
+      cell: (r) => {
+        if (!r.stp_state) return '\u2014';
+        const { text, title } = stpStateText(r);
+        const titleAttr = title ? ` title="${escape(title)}"` : '';
+        return `<span style="color:${STP_STATE_COLOR[r.stp_state] || 'var(--muted)'}"${titleAttr}>` +
+          `${escape(text)}</span>`;
+      } },
     { key: 'last_seen_ts', label: 'Last seen', width: 100, numeric: true,
       cell: (r) => App.agoCell(r.last_seen_ts) },
   ];

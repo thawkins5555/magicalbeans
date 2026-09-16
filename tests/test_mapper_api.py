@@ -368,7 +368,8 @@ try:
     check("duplicate ids collapse to one entry per (device_id, if_index), a NULL-everything "
           "interface (B's) is absent, and the seeded row reads back as optic",
           media_direct == {(dev_a, 1): {"media": "optic", "optic_mode": None,
-                                        "stp_state": None}}, media_direct)
+                                        "stp_state": None,
+                                        "stp_blocking_vlans": None}}, media_direct)
 
     status, payload = call("GET", f"/api/mapper/maps/{map_id}", token=admin)
     links = payload.get("links", []) if status == 200 else []
@@ -397,7 +398,8 @@ try:
                     if {l.get("a_device_id"), l.get("b_device_id")} == {dev_a, dev_b}), None)
     check("every FiberView/STP key is present on a discovered link",
           ab_link is not None and {"a_optic_mode", "b_optic_mode", "fiber_mode",
-                                   "a_stp", "b_stp", "blocking"} <= set(ab_link),
+                                   "a_stp", "b_stp", "a_stp_vlans", "b_stp_vlans",
+                                   "blocking"} <= set(ab_link),
           ab_link)
     check("fiber_mode reads the one end that is known, not a mismatch",
           ab_link is not None and ab_link.get("a_optic_mode") is None
@@ -407,6 +409,22 @@ try:
           ab_link is not None and ab_link.get("a_stp") is None
           and ab_link.get("b_stp") == "blocking" and ab_link.get("blocking") is True,
           ab_link)
+    check("...with no per-VLAN detail yet, a_stp_vlans/b_stp_vlans are both None",
+          ab_link is not None and ab_link.get("a_stp_vlans") is None
+          and ab_link.get("b_stp_vlans") is None, ab_link)
+
+    # -------------------------------------- 6e. per-VLAN STP detail (5.37.0)
+    service.nodes_db.update_interface_stp(
+        dev_b, [{"if_index": 2, "stp_state": "blocking",
+                 "stp_blocking_vlans": "20,30", "stp_vlan_count": 3}])
+
+    status, payload = call("GET", f"/api/mapper/maps/{map_id}", token=admin)
+    links = payload.get("links", []) if status == 200 else []
+    ab_link = next((l for l in links
+                    if {l.get("a_device_id"), l.get("b_device_id")} == {dev_a, dev_b}), None)
+    check("a blocking end's per-VLAN detail rides along as a_stp_vlans/b_stp_vlans",
+          ab_link is not None and ab_link.get("a_stp_vlans") is None
+          and ab_link.get("b_stp_vlans") == "20,30", ab_link)
 
     # ------------------------------------------------------ 7. export.csv
 
@@ -424,9 +442,9 @@ try:
     b_id_col = mapper_mod.LINK_CSV_HEADER.index("B Device ID")
     ab_row = next((r for r in csv_rows[1:]
                    if {r[a_id_col], r[b_id_col]} == {str(dev_a), str(dev_b)}), None)
-    check("the CSV row for the A-B link names its fiber mode and STP state",
+    check("the CSV row for the A-B link names its fiber mode, STP state and VLAN detail",
           ab_row is not None and ab_row[fiber_col] == "sm"
-          and ab_row[stp_col] == "blocking on B", ab_row)
+          and ab_row[stp_col] == "blocking on B (VLANs 20, 30)", ab_row)
 
     # -------------------------------------------------- 7b. manual links (D2)
     #
@@ -470,7 +488,8 @@ try:
                                   "vlans", "native_vlan", "seen_ts", "plan",
                                   "a_media", "b_media", "fiber",
                                   "a_optic_mode", "b_optic_mode", "fiber_mode",
-                                  "a_stp", "b_stp", "blocking"}
+                                  "a_stp", "b_stp", "a_stp_vlans", "b_stp_vlans",
+                                  "blocking"}
           <= set(manual), manual)
     check("...with FiberView's keys defaulted (no media on a manual line)",
           manual is not None and manual["a_media"] is None
@@ -479,6 +498,7 @@ try:
           manual is not None and manual["a_optic_mode"] is None
           and manual["b_optic_mode"] is None and manual["fiber_mode"] is None
           and manual["a_stp"] is None and manual["b_stp"] is None
+          and manual["a_stp_vlans"] is None and manual["b_stp_vlans"] is None
           and manual["blocking"] is False, manual)
 
     status, payload = call("POST", f"/api/mapper/maps/{map_id}/links",

@@ -4310,6 +4310,18 @@ check("r.searched.map(escape).join(' / ')" in NODES93,
       "every searched candidate name goes through escape() before it's "
       "rendered into the hint")
 
+# ---------------------------------------------------------------------------
+# 94. Per-VLAN STP detail (5.37.0): a Cisco port blocking in only some of
+#     its VLANs names the count on Nodes and the VLAN list on the Mapper.
+NODES94 = read("nodes.js")
+check("blocking · " in NODES94,
+      "the Nodes STP cell names a partially-blocking port's n/count of VLANs")
+check("title:" in NODES94 and "Blocking in VLANs" in NODES94,
+      "the span title lists which VLANs the port is blocking in")
+MAPPER94 = read("mapper.js")
+check("(VLANs " in MAPPER94,
+      "the Mapper's STP tooltip/aria/detail text appends the blocking end's VLAN list")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:
