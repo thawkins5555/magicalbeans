@@ -1928,17 +1928,14 @@ body.kiosk .card.strip > .hint { overflow: visible; white-space: normal; }
 .mp-swatch.selected { outline: 2px solid var(--focus); outline-offset: 1px; }
 .mp-swatch-grid { display: flex; flex-wrap: wrap; gap: var(--space-sm); }
 
-/* Frame tool arm/disarm: the toolbar button reads pressed the way
-   button.primary does elsewhere, and the canvas gets a crosshair while a
-   drag is expected. */
+/* Frame tool arm/disarm: the toolbar button reads pressed like button.primary
+   elsewhere, and the canvas gets a crosshair while a drag is expected. */
 #mp-add-frame.active { background: var(--accent); color: var(--bg); border-color: var(--accent); }
 #mp-canvas.framing #mp-svg { cursor: crosshair; }
 
-/* Frames: a labelled rectangle drawn under every link and node — see
-   mapper.js's file-header comment on why nothing here ever moves a node.
-   Six palette entries share --canvas-vlan-1..6, the same canvas-tuned
-   hues a VLAN strand already draws with, so a frame reads correctly
-   against #mp-canvas in every theme without a palette of its own. */
+/* Frames: a labelled rectangle under every link and node (see mapper.js's
+   file-header comment on why nothing here moves a node). Six palette
+   entries share --canvas-vlan-1..6, the same hues a VLAN strand draws with. */
 .mp-frame-c0 { --mp-frame-color: var(--canvas-vlan-1); }
 .mp-frame-c1 { --mp-frame-color: var(--canvas-vlan-2); }
 .mp-frame-c2 { --mp-frame-color: var(--canvas-vlan-3); }

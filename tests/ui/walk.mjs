@@ -1223,6 +1223,94 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       return `frame ${frameId} drawn, renamed to Core, removed`;
     });
 
+  await check('Mapper: dragging a frame\'s edge and its resize handle each PUT the moved geometry (5.31.1)',
+    async () => {
+      await page.keyboard.press('Escape').catch(() => {});
+      await selectTab(page, 'mapper');
+      await settle(page, 1000);
+      const frameBtn = page.locator('#mp-add-frame');
+      if (await frameBtn.isDisabled()) return 'skipped: Frame is disabled (no write access, or no map selected)';
+      const box = await page.locator('#mp-svg').boundingBox();
+      if (!box) return 'skipped: #mp-svg has no bounding box';
+      const x0 = box.x + 24, y0 = box.y + 24;
+      await frameBtn.click();
+      await page.waitForFunction(() => document.getElementById('mp-add-frame').classList.contains('active'),
+        { timeout: 5000 });
+      await page.mouse.move(x0, y0);
+      await page.mouse.down();
+      const steps = 8;
+      for (let i = 1; i <= steps; i += 1) {
+        await page.mouse.move(x0 + (160 * i) / steps, y0 + (120 * i) / steps);
+      }
+      await page.mouse.up();
+      await page.waitForSelector('#mp-svg .mp-frame', { timeout: 10000 });
+      const frameId = await page.evaluate(() => document.querySelector('#mp-svg .mp-frame').dataset.frameId);
+
+      // The stroke rect's own bounding box edge, not an arbitrary point
+      // inside it: pointer-events is 'stroke' on this rect (28c above), so
+      // only the outline itself is hit-testable, and the fill beneath it
+      // takes no pointer events at all.
+      const strokeBox = await page.evaluate((id) => {
+        const el = document.querySelector(`#mp-svg .mp-frame[data-frame-id="${id}"] .mp-frame-stroke`);
+        if (!el) return null;
+        const r = el.getBoundingClientRect();
+        return { x: r.x + r.width / 2, y: r.y };
+      }, frameId);
+      assert(strokeBox, 'could not find the frame stroke rect');
+
+      const moveRequest = page.waitForRequest((request) =>
+        request.method() === 'PUT'
+        && /\/api\/mapper\/maps\/\d+\/frames\/\d+$/.test(request.url())
+        && (() => {
+          try { const body = request.postDataJSON(); return 'x' in body && 'y' in body; }
+          catch { return false; }
+        })(), { timeout: 20000 });
+      await page.mouse.move(strokeBox.x, strokeBox.y);
+      await page.mouse.down();
+      await page.mouse.move(strokeBox.x + 60, strokeBox.y + 60, { steps: 8 });
+      await page.mouse.up();
+      const moveReq = await moveRequest;
+      const moveResponse = await moveReq.response();
+      assert(moveResponse && moveResponse.status() === 200,
+        `frame move PUT answered ${moveResponse && moveResponse.status()}`);
+
+      const handleBox = await page.evaluate((id) => {
+        const el = document.querySelector(`#mp-svg .mp-frame[data-frame-id="${id}"] .mp-frame-handle`);
+        if (!el) return null;
+        const r = el.getBoundingClientRect();
+        return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+      }, frameId);
+      assert(handleBox, 'could not find the frame resize handle');
+
+      const resizeRequest = page.waitForRequest((request) =>
+        request.method() === 'PUT'
+        && /\/api\/mapper\/maps\/\d+\/frames\/\d+$/.test(request.url())
+        && (() => {
+          try { const body = request.postDataJSON(); return 'width' in body && 'height' in body; }
+          catch { return false; }
+        })(), { timeout: 20000 });
+      await page.mouse.move(handleBox.x, handleBox.y);
+      await page.mouse.down();
+      await page.mouse.move(handleBox.x + 40, handleBox.y + 40, { steps: 8 });
+      await page.mouse.up();
+      const resizeReq = await resizeRequest;
+      const resizeResponse = await resizeReq.response();
+      assert(resizeResponse && resizeResponse.status() === 200,
+        `frame resize PUT answered ${resizeResponse && resizeResponse.status()}`);
+
+      // Cleanup, same confirm idiom as the Frame tool check above.
+      await page.waitForSelector('#mp-detail #mpf-remove', { timeout: 10000 });
+      await page.click('#mp-detail #mpf-remove');
+      await page.waitForSelector('#modal:not([hidden]) .modal-buttons button.danger', { timeout: 10000 });
+      const removed = page.waitForResponse((response) =>
+        /\/api\/mapper\/maps\/\d+\/frames\/\d+$/.test(response.url())
+        && response.request().method() === 'DELETE', { timeout: 10000 });
+      await page.click('#modal:not([hidden]) .modal-buttons button.danger');
+      const removeResponse = await removed;
+      assert(removeResponse.ok(), `frame remove answered ${removeResponse.status()}`);
+      return `frame ${frameId} dragged (PUT x/y) and resized (PUT width/height), removed`;
+    });
+
   await check('Wireless: opening an AP draws (or explains an empty) history chart (G3)',
     async () => {
       await page.keyboard.press('Escape').catch(() => {});

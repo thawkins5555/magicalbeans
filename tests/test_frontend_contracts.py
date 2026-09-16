@@ -4015,8 +4015,9 @@ check("if (event.key !== 'Escape' || App.state.tab !== 'mapper' || !view.framing
 
 # 88d. Selecting, editing and removing a frame.
 check("function selectFrame(frame) {" in MAPPER88,
-      "selectFrame is the one function that selects a frame and clears "
-      "whatever node/link selection there was")
+      "selectFrame is the keyboard-only path (a frame's own Enter/Space) "
+      "that selects a frame and clears whatever node/link selection there "
+      "was, via a full requestDraw()")
 _SELECT_FRAME88 = MAPPER88[MAPPER88.index("function selectFrame(frame) {"):
                            MAPPER88.index("function selectFrame(frame) {") + 250]
 check("view.selectedFrameId = frame.id;" in _SELECT_FRAME88
@@ -4024,10 +4025,40 @@ check("view.selectedFrameId = frame.id;" in _SELECT_FRAME88
       and "view.selectedLinkId = null;" in _SELECT_FRAME88,
       "...it sets selectedFrameId and clears both the node selection and "
       "selectedLinkId")
-check("selectFrame(frame);" in MAPPER88[MAPPER88.index("function onFramePointerDown"):
-                                        MAPPER88.index("function onFramePointerDown") + 400],
-      "onFramePointerDown's select half calls selectFrame rather than "
-      "repeating its three assignments inline")
+
+# 88d-bis (5.31.1 fix): a requestDraw()'d select here detaches the very <g>
+# the pointer just captured, so the drag's own move/up listeners never fire
+# and no PUT is ever queued. selectFrameInPlace toggles .selected in place.
+check("function selectFrameInPlace(frame) {" in MAPPER88,
+      "selectFrameInPlace is the frame analogue of applySelectionClasses: "
+      "an in-place selection with no redraw, for onFramePointerDown's own "
+      "press")
+_SELECT_FRAME_IP88 = MAPPER88[MAPPER88.index("function selectFrameInPlace(frame) {"):
+                              MAPPER88.index("function selectFrameInPlace(frame) {") + 600]
+check("view.selectedFrameId = frame.id;" in _SELECT_FRAME_IP88
+      and "view.selection = new Set();" in _SELECT_FRAME_IP88
+      and "view.selectedLinkId = null;" in _SELECT_FRAME_IP88,
+      "...it sets the same three fields selectFrame does")
+check("el.classList.toggle('selected', id === frame.id);" in _SELECT_FRAME_IP88,
+      "...but toggles .selected on the frame <g>s already in the DOM "
+      "rather than rebuilding them")
+check("if (!view.frameEls.size) { requestDraw(); return; }" in _SELECT_FRAME_IP88,
+      "...with a requestDraw() fallback only for a press that somehow "
+      "lands before the first paint (no frame elements to toggle yet)")
+check("requestDraw();\n    drawDetail();" not in _SELECT_FRAME_IP88,
+      "...and the ordinary path never falls through to a requestDraw() + "
+      "drawDetail() pair the way selectFrame's does")
+_ON_FRAME_PD88 = MAPPER88[MAPPER88.index("function onFramePointerDown"):
+                          MAPPER88.index("function onFramePointerDown") + 400]
+check("selectFrameInPlace(frame);" in _ON_FRAME_PD88,
+      "onFramePointerDown's select half calls selectFrameInPlace, not "
+      "selectFrame, so the press that arms a drag never triggers a "
+      "requestDraw()'d redraw underneath it")
+check("selectFrame(frame);" not in _ON_FRAME_PD88,
+      "...and no longer calls the requestDraw()-based selectFrame at all")
+check("if (!App.canWrite('mapper')) return;" in _ON_FRAME_PD88,
+      "a reader may select a frame (selectFrameInPlace above already ran) "
+      "but the drag itself never arms below this guard")
 check("view.selectedFrameId = null;" in MAPPER88[MAPPER88.index("function setSelection("):
                                                  MAPPER88.index("function setSelection(") + 200]
       and "view.selectedFrameId = null;" in MAPPER88[MAPPER88.index("function selectLink("):
@@ -4046,6 +4077,11 @@ check("if ((event.key === 'Delete' || event.key === 'Backspace') && view.selecte
 check("function removeFrame(id)" in MAPPER88 and "App.confirmDestructive('Remove frame'," in MAPPER88,
       "removeFrame confirms the same way removeSelected does for nodes, "
       "shared by the pane's own Remove button and the keyboard shortcut")
+# 5.31.1 fix: the pane's Remove button was gated on canWrite, but the two
+# keyboard paths above were not — a reader got a confirm then a 403 toast.
+check("function removeFrame(id) {\n    if (!App.canWrite('mapper')) return;" in MAPPER88,
+      "removeFrame checks canWrite as its very first line, closing both "
+      "keyboard paths a reader could otherwise reach it through")
 
 # 88e. Moving/resizing: a debounced, per-frame write with the same
 #      debounce/retry constants flushPositionWrites already uses.
@@ -4076,7 +4112,12 @@ check("for (const frame of view.frames) {" in _CONTENT_BOUNDS88
       "contentBounds folds every frame's live rect into the same min/max "
       "it already computes for nodes, so Fit and the PNG export enclose "
       "a frame that sticks out past every node on the map")
-check("!view.nodes.length && !view.frames.length" in MAPPER88,
+# Scoped to draw() (not contentBounds, which shares this exact substring in
+# its own null-bounds guard): the empty-canvas branch must check frames too
+# (5.31.1 fix), or a frames-only, no-devices map draws as empty.
+_DRAW88F = MAPPER88[MAPPER88.index("  function draw() {"):
+                    MAPPER88.index("  function emptyCanvas(svg, canvas, message)")]
+check("if (!view.nodes.length && !view.frames.length) {" in _DRAW88F,
       "an all-frames, no-devices map still has content to fit, rather than "
       "reading as empty")
 

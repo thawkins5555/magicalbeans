@@ -848,6 +848,7 @@
   // button in the detail pane and Delete/Backspace on the canvas (with a
   // frame selected) both call this one function.
   function removeFrame(id) {
+    if (!App.canWrite('mapper')) return;
     const frame = view.frameMap.get(id);
     if (!frame) return;
     App.confirmDestructive('Remove frame',
@@ -1526,7 +1527,7 @@
     if (!view.mapId) {
       return emptyCanvas(svg, canvas, 'No map selected. Use Maps to create or pick one.');
     }
-    if (!view.nodes.length) {
+    if (!view.nodes.length && !view.frames.length) {
       return emptyCanvas(svg, canvas,
         `${view.map ? view.map.name : 'This map'} has no devices yet. Use Add device or Add neighbours.`);
     }
@@ -1654,14 +1655,27 @@
     drawDetail();
   }
 
-  // The select-only half of onFramePointerDown, shared with a frame's own
-  // Enter/Space keydown (below) so a keyboard selection and a pointer
-  // selection can never drift apart.
+  // Keyboard path only (Enter/Space below); not a drag, so a full redraw is fine.
   function selectFrame(frame) {
     view.selectedFrameId = frame.id;
     view.selection = new Set();
     view.selectedLinkId = null;
     requestDraw();
+    drawDetail();
+  }
+
+  // The frame analogue of applySelectionClasses: toggles .selected in place,
+  // not requestDraw() (which would detach the <g> just captured below).
+  function selectFrameInPlace(frame) {
+    view.selectedFrameId = frame.id;
+    view.selection = new Set();
+    view.selectedLinkId = null;
+    if (!view.frameEls.size) { requestDraw(); return; }
+    for (const [id, el] of view.frameEls) el.classList.toggle('selected', id === frame.id);
+    for (const [, el] of view.nodeEls) el.classList.remove('selected');
+    for (const [, holder] of view.linkEls) {
+      for (const path of holder.querySelectorAll('.mp-link')) path.classList.remove('selected');
+    }
     drawDetail();
   }
 
@@ -2136,7 +2150,7 @@
     event.preventDefault();
     event.stopPropagation();
     focusCanvas();
-    selectFrame(frame);
+    selectFrameInPlace(frame);
     if (!App.canWrite('mapper')) return;   // selection only: nothing to drag
     const target = event.currentTarget;
     target.setPointerCapture(event.pointerId);
