@@ -676,12 +676,21 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       // to close before clicking through to a new one, or the close and the
       // reopen race and the reopen can lose.
       await page.waitForSelector('#modal[hidden]', { state: 'attached', timeout: 5000 }).catch(() => {});
+      // Closed does not mean quiet: E3's redraws (timers, in-flight
+      // fetches against the same device) can still be landing. Let them
+      // settle the same way every tab switch below does, or the reopen
+      // still races them.
+      await settle(page, 500);
       await selectTab(page, 'nodes');
       await settle(page, 800);
       await page.click('#nodes-table tbody tr:first-child').catch(() => {});
       // The interface list arrives with the device detail fetch, which a
-      // freshly seeded fleet answers slowly; wait for rows, not a fixed nap.
-      const hasRow = await page.waitForSelector('#nd-if-table tbody tr', { timeout: 20000 })
+      // freshly seeded fleet answers slowly — and while it is still empty,
+      // drawIfaceTable paints a placeholder <tr><td class="empty">…</td></tr>
+      // with no onclick, which still matches a bare "tbody tr" selector.
+      // Wait for a real, clickable row (tr.clickable — see drawIfaceTable),
+      // not just any row, or the click below can land on that placeholder.
+      const hasRow = await page.waitForSelector('#nd-if-table tbody tr.clickable', { timeout: 20000 })
         .then(() => true).catch(() => false);
       if (!hasRow) return 'skipped: the selected device has no interfaces to open';
       // The interface list can still be mid-poll-refresh right after that
@@ -691,43 +700,69 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       await page.waitForResponse((res) => new URL(res.url()).pathname.endsWith('/interfaces')
         && res.request().method() === 'GET', { timeout: 5000 }).catch(() => {});
       await sleep(500);
-      await page.click('#nd-if-table tbody tr:first-child');
-      await page.waitForSelector('#modal:not([hidden]) #ifd-range', { timeout: 20000 });
+      // The click above can still land on a row about to be replaced by the
+      // settled-but-not-yet-painted /interfaces response; re-query the row
+      // (still restricted to a real, clickable one) and retry the open once
+      // before giving up, rather than a single 20s wait that either lands
+      // or loses the whole check.
+      // The chart only asks for /series once the poller has stored an
+      // if_in_bps/if_out_bps sample for this port (refreshChart); on a
+      // freshly seeded fleet under load that can take a while, so wait for
+      // it here rather than asserting a fetch the dialog would never make.
+      const sampled = await page.evaluate(async () => {
+        const id = (window.location.hash.match(/#\/nodes\/device\/(\d+)/) || [])[1];
+        const cell = document.querySelector('#nd-if-table tbody tr.clickable:first-child td');
+        const ifIndex = cell ? cell.textContent.trim() : '';
+        if (!id || !/^\d+$/.test(ifIndex)) return false;
+        for (let i = 0; i < 30; i += 1) {
+          const r = await fetch(`/api/nodes/devices/${id}/metrics`, { credentials: 'same-origin' });
+          const list = r.ok ? ((await r.json()).metrics || []) : [];
+          if (list.some((m) => m.key === `if_in_bps.${ifIndex}` || m.key === `if_out_bps.${ifIndex}`)) return true;
+          await new Promise((done) => setTimeout(done, 2000));
+        }
+        return false;
+      });
+      if (!sampled) return 'skipped: no bandwidth samples stored yet for the first interface';
+      let opened = false;
+      for (let attempt = 0; attempt < 2 && !opened; attempt += 1) {
+        await page.click('#nd-if-table tbody tr.clickable:first-child');
+        opened = await page.waitForSelector('#modal:not([hidden]) #ifd-range', { timeout: 10000 })
+          .then(() => true).catch(() => false);
+      }
+      assert(opened, 'the interface dialog never opened after two attempts');
       await sleep(600);
 
-      const seriesRequests = [];
-      const onRequest = (request) => {
+      await page.selectOption('#modal:not([hidden]) #ifd-range', 'custom');
+      await page.waitForSelector('#modal:not([hidden]) #rd-start', { timeout: 10000 });
+      const values = await page.evaluate(() => {
+        const pad = (n) => String(n).padStart(2, '0');
+        const iso = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}` +
+          `T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+        return { start: iso(new Date(Date.now() - 3 * 3600000)),
+                 end: iso(new Date(Date.now() - 3600000)) };
+      });
+      await page.fill('#modal:not([hidden]) #rd-start', values.start);
+      await page.fill('#modal:not([hidden]) #rd-end', values.end);
+      // Registered right before Apply, so it can only match the reopened
+      // dialog's own pinned-window fetch, not the first open's "Last hour"
+      // one — and awaited (not a fixed sleep after the fact), since under
+      // load the chart's own fetch can lag well behind the title update.
+      const seriesWithWindow = page.waitForRequest((request) => {
+        if (request.method() !== 'GET') return false;
         const url = new URL(request.url());
-        if (url.pathname.endsWith('/series')) seriesRequests.push(url.search);
-      };
-      page.on('request', onRequest);
-      try {
-        await page.selectOption('#modal:not([hidden]) #ifd-range', 'custom');
-        await page.waitForSelector('#modal:not([hidden]) #rd-start', { timeout: 10000 });
-        const values = await page.evaluate(() => {
-          const pad = (n) => String(n).padStart(2, '0');
-          const iso = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}` +
-            `T${pad(d.getHours())}:${pad(d.getMinutes())}`;
-          return { start: iso(new Date(Date.now() - 3 * 3600000)),
-                   end: iso(new Date(Date.now() - 3600000)) };
-        });
-        await page.fill('#modal:not([hidden]) #rd-start', values.start);
-        await page.fill('#modal:not([hidden]) #rd-end', values.end);
-        seriesRequests.length = 0;
-        await page.click('#modal:not([hidden]) .modal-buttons button.primary');
-        // Custom… closes and reopens this same dialog (App.modal is one
-        // shared box) rather than floating a second one over it, so this
-        // waits for the REOPENED #ifd-range to exist before reading it.
-        await page.waitForSelector('#modal:not([hidden]) #ifd-range', { timeout: 20000 });
-        await page.waitForFunction(() => {
-          const title = document.getElementById('ifd-bw-title');
-          return title && !/LAST HOUR/.test(title.textContent);
-        }, null, { timeout: 10000 });
-        await sleep(600);
-      } finally {
-        page.off('request', onRequest);
-      }
-      const withWindow = seriesRequests.find((s) => s.includes('t0=') && s.includes('t1='));
+        return url.pathname.endsWith('/series')
+          && url.searchParams.has('t0') && url.searchParams.has('t1');
+      }, { timeout: 20000 });
+      await page.click('#modal:not([hidden]) .modal-buttons button.primary');
+      // Custom… closes and reopens this same dialog (App.modal is one
+      // shared box) rather than floating a second one over it, so this
+      // waits for the REOPENED #ifd-range to exist before reading it.
+      await page.waitForSelector('#modal:not([hidden]) #ifd-range', { timeout: 20000 });
+      await page.waitForFunction(() => {
+        const title = document.getElementById('ifd-bw-title');
+        return title && !/LAST HOUR/.test(title.textContent);
+      }, null, { timeout: 10000 });
+      const withWindow = await seriesWithWindow.then(() => true).catch(() => false);
       assert(withWindow, 'no /series request carried t0 and t1 after Apply');
       const title = await page.evaluate(
         () => (document.getElementById('ifd-bw-title') || {}).textContent || '');
@@ -2299,7 +2334,12 @@ async function checkMisc(page, watcher) {
     // #nodes-table (selected-row styling), detaching this handle. A
     // selector re-queries the live row at click time instead.
     await page.dblclick('#nodes-table tbody tr');
-    await page.waitForTimeout(1500);
+    // The dialog's own /interfaces fetch (see deviceDialog's Promise.all)
+    // can still be in flight when a fixed nap ends; wait for its table to
+    // actually carry a row before reading counts off it.
+    await page.waitForSelector('#modal:not([hidden]) #ndd-if-table tbody tr',
+                                { timeout: 20000 });
+    await page.waitForTimeout(500);
     const pane = await count('#nd-if-table');
     const dialog = await count('#ndd-if-table');
     await page.keyboard.press('Escape');
