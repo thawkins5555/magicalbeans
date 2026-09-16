@@ -1286,10 +1286,8 @@ class NodesDatabase(SqliteStore):
             # deliberately absent from _OVERRIDE_COLUMNS.
             "poe_capable": "INTEGER",
             "stp_capable": "INTEGER",
-            # The per-VLAN STP probe's own latch (nodepoll._cisco_vlan_stp):
-            # unlike stp_capable, a 0 here is re-tried hourly rather than
-            # forever, since a VTP domain can grow a VLAN after the first
-            # miss — see nodepoll._SENSOR_REPROBE_S/self._stp_vlan_read.
+            # nodepoll._cisco_vlan_stp's own latch; unlike stp_capable a
+            # miss is re-tried hourly, not forever (self._stp_vlan_read).
             "stp_vlan_capable": "INTEGER",
             "ups_capable": "INTEGER",
             "sensor_capable": "INTEGER",
@@ -1352,13 +1350,9 @@ class NodesDatabase(SqliteStore):
             "stp_state": "TEXT", "poe_power_mw": "INTEGER",
             "media": "TEXT", "optic_mode": "TEXT",
         })
-        # Per-VLAN STP detail (5.37.0): the VLAN ids (ascending, comma-
-        # joined) a port is blocking in and how many VLAN contexts answered
-        # it at all. "" means blocked nowhere; NULL means no per-VLAN read
-        # has ever completed for this port (classic IOS's default STP
-        # context is VLAN 1, which this estate prunes off every trunk, so
-        # stp_state alone can miss a blocked redundant uplink entirely —
-        # see nodepoll._cisco_vlan_stp).
+        # Per-VLAN STP detail (5.37.0, see nodepoll._cisco_vlan_stp): the
+        # blocking VLAN ids, comma-joined ascending ("" = none), and how
+        # many VLAN contexts answered; NULL = no per-VLAN read yet.
         self.ensure_columns("interfaces", {
             "stp_blocking_vlans": "TEXT", "stp_vlan_count": "INTEGER",
         })
@@ -4345,10 +4339,7 @@ class NodesDatabase(SqliteStore):
             self._conn.commit()
 
     def set_stp_vlan_capable(self, device_id: int, capable: bool | None) -> None:
-        """set_stp_capable's own counterpart for the per-VLAN STP pass
-        (nodepoll._cisco_vlan_stp) — a separate latch because a classic
-        IOS device can answer dot1dStp globally but not per-VLAN, or vice
-        versa on a v1-only box."""
+        """set_stp_capable's own counterpart for nodepoll._cisco_vlan_stp."""
         with self._lock:
             self._conn.execute(
                 "UPDATE devices SET stp_vlan_capable = ? WHERE id = ?",
@@ -4591,12 +4582,9 @@ class NodesDatabase(SqliteStore):
 
     def update_interface_stp(self, device_id: int, rows: list[dict]) -> None:
         """update_interface_poe's own counterpart for per-port STP state.
-
-        stp_blocking_vlans/stp_vlan_count are COALESCEd rather than
-        overwritten: a row from the global-only read (no per-VLAN pass, or
-        one cut short) carries neither key, and must leave whatever
-        per-VLAN detail is already stored alone rather than blank it.
-        """
+        stp_blocking_vlans/stp_vlan_count COALESCE rather than overwrite: a
+        global-only or cut-short row carries neither key, and must leave
+        stored per-VLAN detail alone."""
         if not rows:
             return
         params = [(row.get("stp_state"), row.get("stp_blocking_vlans"),
