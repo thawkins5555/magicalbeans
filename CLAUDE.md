@@ -30,6 +30,7 @@ IMPORTANT — strict adherence:
 - Limit your code comments to only absolutely necessary details. Prose % should be 20 or less.
 - Do NOT remove ANY features, pages, dialogs, buttons, or anything in the GUI without express permission.
 - Speak to me like I am a network engineer or CTO and not a developer or programmer.
+- Do not run intermediary walks or code reviews.  Make all plan changes and then run reviews and walks only on associated changes.
 
 ## Planning and deployment
 
