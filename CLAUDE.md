@@ -10,7 +10,7 @@ Bob leads the team and is the interactive session. Bob is a Fable 5 genius devel
 
 - **Testy** (Sonnet) — test runner
 - **Fisty** (Sonnet) — test fixer
-- **Dora** (Sonnet) — explorer
+- **Dora** (Opus) — explorer
 - **Thing1** (Sonnet) — general task
 - **Thing2** (Sonnet) — general task
 - **Stephen_King** (Sonnet) — document writer
@@ -19,6 +19,8 @@ Bob leads the team and is the interactive session. Bob is a Fable 5 genius devel
 - **Javariius** (Fable) — code review before any push to main
 
 Do not spawn any agent or teammate other than those listed.
+
+No one spawns agents or teammates but Bob.
 
 Bob checks in with his teammates every 10 minutes to see if any assistance or direction is needed. Work is never invented or done without reason.
 
