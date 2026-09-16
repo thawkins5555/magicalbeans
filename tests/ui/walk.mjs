@@ -1150,23 +1150,45 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       if (!stp.present) return 'skipped: acc-sw-005 is not in this fleet';
       assert(stp.classified,
         `acc-sw-005 had no per-VLAN STP read after ${stp.waited_s}s, poll-now included`);
-      await row.click();
-      const hasRow = await page.waitForSelector('#nd-if-table tbody tr', { timeout: 20000 })
-        .then(() => true).catch(() => false);
-      if (!hasRow) return 'skipped: acc-sw-005 lists no interfaces';
-      await page.waitForResponse((res) => new URL(res.url()).pathname.endsWith('/interfaces')
-        && res.request().method() === 'GET', { timeout: 5000 }).catch(() => {});
-      await sleep(500);
 
-      const cell = await page.evaluate(() => {
-        const cells = [...document.querySelectorAll('#nd-if-table td')];
-        const match = cells.find((c) => c.textContent.includes('blocking · '));
-        return match ? { text: match.textContent, title: match.title } : null;
-      });
-      assert(cell, 'expected a "blocking · " cell in #nd-if-table for acc-sw-005');
-      assert(cell.title.startsWith('Blocking in VLANs'),
-        `expected the cell's title to start with "Blocking in VLANs", got "${cell.title}"`);
-      return cell.text;
+      // stp_state carries no `on: true` in nodes.js's IFACE_COLUMNS
+      // (~1535), so it's hidden from #nd-if-table unless the Nodes setting
+      // table_columns_ifaces names it. Add it to the default visible set
+      // for this check, then put the operator's own choice back.
+      const originalCsv = await page.evaluate(() =>
+        (App.state.nodesSettings || {}).table_columns_ifaces || '');
+      // IFACE_COLUMNS' on:true keys, in catalogue order (nodes.js
+      // ~1490-1545) -- listed explicitly since IFACE_COLUMNS itself is
+      // private to nodes.js's closure and not reachable from here.
+      const defaultIfaceColumns = ['if_index', 'priority', 'descr',
+        'admin_status', 'oper_status', 'speed_bps', 'in_bps', 'out_bps'];
+      const withStp = [...defaultIfaceColumns, 'stp_state'].join(',');
+      const setIfaceColumns = (csv) => page.evaluate(async (v) => {
+        await App.post('/api/settings', { scope: 'nodes', values: { table_columns_ifaces: v } });
+        await App.loadState();
+      }, csv);
+      await setIfaceColumns(withStp);
+      try {
+        await row.click();
+        const hasRow = await page.waitForSelector('#nd-if-table tbody tr', { timeout: 20000 })
+          .then(() => true).catch(() => false);
+        if (!hasRow) return 'skipped: acc-sw-005 lists no interfaces';
+        await page.waitForResponse((res) => new URL(res.url()).pathname.endsWith('/interfaces')
+          && res.request().method() === 'GET', { timeout: 5000 }).catch(() => {});
+        await sleep(500);
+
+        const cell = await page.evaluate(() => {
+          const cells = [...document.querySelectorAll('#nd-if-table td')];
+          const match = cells.find((c) => c.textContent.includes('blocking · '));
+          return match ? { text: match.textContent, title: match.title } : null;
+        });
+        assert(cell, 'expected a "blocking · " cell in #nd-if-table for acc-sw-005');
+        assert(cell.title.startsWith('Blocking in VLANs'),
+          `expected the cell's title to start with "Blocking in VLANs", got "${cell.title}"`);
+        return cell.text;
+      } finally {
+        await setIfaceColumns(originalCsv);
+      }
     });
 
   await check('the Device Details dialog shows STACK POWER for a Cisco access switch (stack power)',
