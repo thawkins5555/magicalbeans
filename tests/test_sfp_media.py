@@ -46,7 +46,9 @@ PORTS = [{"if_index": 1, "descr": "GigabitEthernet1/0/1"},
          {"if_index": 14, "descr": "GigabitEthernet1/0/14"},
          {"if_index": 15, "descr": "GigabitEthernet1/0/15"},
          {"if_index": 16, "descr": "GigabitEthernet1/0/16"},
-         {"if_index": 17, "descr": "GigabitEthernet1/0/17"}]
+         {"if_index": 17, "descr": "GigabitEthernet1/0/17"},
+         {"if_index": 18, "descr": "GigabitEthernet1/0/18"},
+         {"if_index": 19, "descr": "GigabitEthernet1/0/19"}]
 
 IF_MAU_TYPE = "1.3.6.1.2.1.26.2.1.1.3"
 
@@ -187,6 +189,14 @@ try:
     check("copper ports never carry an optic_mode",
           optic_mode.get(8) is None and optic_mode.get(9) is None
           and optic_mode.get(10) is None, optic_mode)
+    check("a DOM-lit port whose parent chain carries a chassis model name "
+          "(N9K-C93180YC-EX) reads 'mm' off its transceiver child "
+          "(SFP-10G-SR), not 'sm' off the chassis -- the fallback scan's "
+          "transceiver gate (F1, 5.36.1)",
+          media.get(18) == "optic" and optic_mode.get(18) == "mm", optic_mode)
+    check("the same chassis ancestor with no transceiver text anywhere "
+          "reads None, not the chassis model name (F1, 5.36.1)",
+          media.get(19) == "optic" and optic_mode.get(19) is None, optic_mode)
 
     metrics = {m["key"]: m["last_value"] for m in db.metrics(did)}
     check("a copper module's temperature sensor is still recorded -- "
@@ -311,6 +321,34 @@ try:
           "'optic' badge, not just 'sfp'/'copper' -- a stale cage scan must "
           "never rewrite a port this poll had no sensors to re-prove",
           media.get(2) == "optic", media)
+    db.close()
+finally:
+    stub.kill()
+
+# --- a timed-out module-text walk must not null a DOM-proven port's mode -
+# (5.36.1 review fix, F2): entPhysicalDescr refused outright starves both
+# the cage/occupant scan and the optic_ports fallback scan of text on the
+# same cadence, while the DOM sensor itself still proves if 17 'optic'.
+stub, port = spawn_stub("stub_agent_ups_env.py", "sfp_media_no_descr")
+nodepoll_mod.DEFAULT_SNMP_PORT = port
+try:
+    db = new_nodes_db("media_mode_timeout")
+    did = device_against(db, "mode-timeout-sw")
+    db.replace_interfaces(did, PORTS)
+    db.update_interface_media(did, [{"if_index": 17, "media": "optic",
+                                     "optic_mode": "mm"}])
+    poller = NodePoller(db)
+    device = db.device(did)
+    poller._poll_environment(did, device, db.effective_config(device), set(),
+                             time.time())
+    media = {r["if_index"]: r["media"] for r in db.interfaces(did)}
+    optic_mode = {r["if_index"]: r["optic_mode"] for r in db.interfaces(did)}
+    check("if 17 stays 'optic' off its own DOM sensor even with no module "
+          "text to read this cycle",
+          media.get(17) == "optic", media)
+    check("...and keeps its stored optic_mode rather than going NULL until "
+          "the next full walk",
+          optic_mode.get(17) == "mm", optic_mode)
     db.close()
 finally:
     stub.kill()
@@ -542,6 +580,9 @@ OPTIC_MODE_TABLE = [
     ("GLC-ZX-SMD", "sm"), ("GLC-BX-U", "sm"), ("SFP-10G-SR", "mm"),
     ("SFP-10G-LR", "sm"), ("SFP-10G-ER", "sm"), ("SFP-10G-LRM", "mm"),
     ("SFP-25G-SR-S", "mm"), ("QSFP-40G-SR4", "mm"), ("QSFP-100G-LR4", "sm"),
+    ("SFP-10G-BX10-U", "sm"), ("SFP-10G-BX10-D", "sm"),
+    ("SFP-10G-BX40-U", "sm"), ("SFP-10G-BX40-D", "sm"),
+    ("SFP-10G-SRL", "mm"), ("SFP-LX10", "sm"), ("QSFP-100G-ER4L-S", "sm"),
     ("GLC-T", None), ("SFP-H10GB-CU1M", None),
 ]
 for text, expected in OPTIC_MODE_TABLE:

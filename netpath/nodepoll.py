@@ -169,12 +169,13 @@ _COPPER_TEXT = re.compile(
 # ZR class, 1310/1550nm) proof out of the same transceiver text. Copper/DAC/
 # AOC text never matches either.
 _OPTIC_MM_TEXT = re.compile(
-    r"\b(?:sx|sr|sr4|csr4|esr4|lrm|mm[df]?)\b|base-?(?:sx|sr|lrm)"
+    r"\b(?:sx|sr|sr4|csr4|esr4|lrm|srl|mm[df]?)\b|base-?(?:sx|sr|lrm)"
     r"|glc-sx|-sr(?:4|-s|-x)?\b|850\s?nm", re.I)
 _OPTIC_SM_TEXT = re.compile(
-    r"\b(?:lx|lh|ex|zx|bx[ud]?|lr|er|zr|lr4|er4|zr4|psm4|cwdm4?|dwdm|sm[df]?)\b"
+    r"\b(?:lx|lx10|lh|ex|zx|bx\d*[ud]?|lr|er|er4l|zr|lr4|er4|zr4|psm4|cwdm4?"
+    r"|dwdm|sm[df]?)\b"
     r"|base-?(?:lx|lh|ex|zx|bx|lr|er|zr)|glc-(?:lh|ex|zx|bx)"
-    r"|-(?:lr|er|zr|lx|zx|ex)(?:4|-s|-x)?\b|1310\s?nm|1550\s?nm", re.I)
+    r"|-(?:lr|er|er4l|zr|lx|zx|ex)(?:4|-s|-x)?\b|1310\s?nm|1550\s?nm", re.I)
 
 
 def _optic_mode(*texts) -> str | None:
@@ -6735,21 +6736,28 @@ class NodePoller(Worker):
             for entity, parent in contained_in.items():
                 children.setdefault(parent, []).append(entity)
             for if_index in missing_mode:
+                # Own text first, then the cage's contents, then its
+                # ancestors -- and only a text naming a transceiver may vote
+                # at all, so a chassis/linecard/service-module model name up
+                # the containment chain (e.g. "N9K-C93180YC-EX") can never
+                # be mistaken for the DOM-lit port's own optic (F1, 5.36.1).
                 texts = []
                 for entity in sorted(entities_by_if.get(if_index, ())):
                     texts += [by_descr.get(entity), ent_models.get(entity)]
-                    hop, seen = contained_in.get(entity, 0), 0
-                    while hop and seen < 2:
-                        texts += [by_descr.get(hop), ent_models.get(hop)]
-                        hop = contained_in.get(hop, 0)
-                        seen += 1
                     queue, depth = list(children.get(entity, ())), 0
                     while queue and depth < 4:
                         for child in queue:
                             texts += [by_descr.get(child), ent_models.get(child)]
                         queue = [c for parent in queue for c in children.get(parent, ())]
                         depth += 1
-                found_mode = _optic_mode(*texts)
+                    hop, seen = contained_in.get(entity, 0), 0
+                    while hop and seen < 2:
+                        texts += [by_descr.get(hop), ent_models.get(hop)]
+                        hop = contained_in.get(hop, 0)
+                        seen += 1
+                transceiver_texts = [t for t in texts
+                                     if t and _TRANSCEIVER_TEXT.search(str(t))]
+                found_mode = _optic_mode(*transceiver_texts)
                 if found_mode:
                     optic_mode_by_if[if_index] = found_mode
         if not slots_complete or not sensor_complete:
@@ -6772,6 +6780,14 @@ class NodePoller(Worker):
                         optic_mode_by_if[if_index] = stored_mode
                     else:
                         optic_mode_by_if.pop(if_index, None)
+                elif if_index in optic_ports and if_index not in optic_mode_by_if:
+                    # A DOM-proven port (media already 'optic' this cycle)
+                    # whose ENTITY walk was cut short before its mode text
+                    # was reached keeps its stored mode rather than going
+                    # NULL until the next full walk (F2, 5.36.1).
+                    stored_mode = row["optic_mode"] if "optic_mode" in row.keys() else None
+                    if stored_mode:
+                        optic_mode_by_if[if_index] = stored_mode
         media_rows = [{"if_index": if_index, "media": media,
                        "optic_mode": (optic_mode_by_if.get(if_index)
                                       if media in ("sfp", "optic") else None)}

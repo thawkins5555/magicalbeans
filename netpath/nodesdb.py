@@ -2268,10 +2268,7 @@ class NodesDatabase(SqliteStore):
         return self.interface_port_labels_for_devices([device_id])
 
     def interface_link_facts_for_devices(self, device_ids) -> dict[tuple[int, int], dict]:
-        """(device_id, if_index) -> {"media", "optic_mode", "stp_state"} for
-        every interface of the named devices with at least one of the three
-        non-NULL -- MAPPER's FiberView badge, SM/MM colour and STP-blocked
-        dotted line."""
+        """(device_id, if_index) -> {"media", "optic_mode", "stp_state"} for every interface of the named devices with at least one of the three non-NULL."""
         ids = list(dict.fromkeys(int(d) for d in device_ids))
         if not ids:
             return {}
@@ -4415,10 +4412,7 @@ class NodesDatabase(SqliteStore):
                 raise
 
     def update_interface_media(self, device_id: int, rows: list[dict]) -> None:
-        """Per-port media kind ('optic', 'sfp', 'sfp_empty' or None) and
-        optic mode ('sm'/'mm' or None), batched the way update_interface_poe
-        batches its own poll. A row for a port this device no longer has
-        updates nothing, same as there."""
+        """Per-port media kind ('optic', 'sfp', 'sfp_empty' or None) and optic mode ('sm'/'mm' or None), batched the way update_interface_poe batches its own poll."""
         if not rows:
             return
         params = [(row.get("media"), row.get("optic_mode"), device_id, row["if_index"])
