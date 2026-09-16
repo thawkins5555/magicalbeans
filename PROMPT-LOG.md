@@ -5,6 +5,95 @@ grouped by the version that carries it. This is a working record for the
 operator — the full story of each change is in `CHANGELOG.md`, and this file
 does not replace it.
 
+## 5.33.0 — Per-port running config, Poll Now's three walks, fan alerts, Sensor Snapshot, Mapper/Dashboard fixes
+
+**Operator prompt — ten items, one message, given while the operator was
+not present to answer planning questions:**
+
+1. Interface Detail popup for a port: "the system should check if there
+   is an existing ConfigRX Backup of that device (If there are multiple
+   use the most recent.)... the 'Running Configuration' tile... should be
+   populated with the running config only for that specific port."
+2. "Manually pressing the 'Poll Now' button should also learn the MAC
+   addresses, read the ARP Cache, and Walk the VLAN membership for that
+   device."
+3. "Double clicking a device on MAPPER should stay on the Mapper module
+   but open that devices... Device Details popup Dialog."
+4. "Dashboard graphs are not scaling Y correctly - please double check
+   the scaling and logic on this."
+5. "'Most Interface Events' Dashboard tile is not populating with any
+   entries even though I know interfaces have been flapping etc."
+6. "The highlight feature upon clicking a device name link is not
+   suffucient... lets highlight the select[ed] device with yellow and
+   also select the checkbox for that device to make it more obvious."
+7. Device Details, near Re-identify: "a 'Sensor Snapshot' button... take
+   a capture of the current state of the power supplies and stack power
+   cables and fans and commit this as 'normal status.'"
+8. "If there is not currently alerts for fan modules in devices please
+   add them."
+9. "When searching for a device in MAPPER the auto fill suggestions
+   popup should match the theme... it looks similar to a browser
+   autofill which could be confusing."
+10. "Mapper labels are STILL overlapping eachother if devices are moved
+    too close together."
+
+**Planning decisions made without the operator (nobody to ask — Bob
+proceeded on judgment, to be confirmed or corrected at review):**
+- Item 5's root cause: the tile was built to read `device_events` for
+  `interface_down`/`interface_up`/`interface_flapping` kinds that
+  `device_events` has never carried — a port's own transitions live in
+  a separate `interface_events` log keyed to the interface, not the
+  device. Decision: give the tile its own query against the real table,
+  rather than writing new kinds into `device_events` to match the old
+  query.
+- Item 4's root cause turned out to be three separate bugs, not one:
+  a percent tile with no Y max auto-scaling instead of pinning to 100, a
+  multi-series chart letting an invisible min/max band inflate its own
+  axis, and a value above the axis ceiling drawing past the top of the
+  chart instead of clamping to it. Decision: fix all three rather than
+  the one that happened to reproduce first.
+- Item 2: submit the three walks directly rather than clearing the
+  scheduler's own next-due timestamps for them, because a device the
+  scheduler has never walked has no timestamp yet and would be staggered
+  over a random delay instead of started now — direct submission is what
+  makes "immediately" actually mean immediately.
+- Item 7: baseline semantics are exact-value equality, not "quiet unless
+  it gets worse by some margin" — a later reading identical to the
+  accepted baseline stays quiet, any different reading (worse or better)
+  is judged exactly as if no baseline existed. Chosen for being the
+  simplest rule that matches "commit this as normal status" literally.
+- Item 9: a themed custom dropdown (arrow keys, Enter, Escape, click)
+  rather than any way of restyling the browser's own `<datalist>`,
+  which cannot be themed at all — it is drawn by the browser chrome, not
+  the page.
+- Item 10: each label's box is one block — its name line plus its
+  sub-line together — so a collision push moves both lines down as a
+  unit; pushing only the name line would just relocate the overlap to
+  the sub-line instead of fixing it.
+- Item 1: a device's operator-set port alias is deliberately never a
+  candidate for matching a config's own interface name against — it is
+  free text an operator typed, not a form any vendor's config would
+  print on an `interface` line, and matching against it risked a false
+  stanza.
+- Item 1: Juniper support is limited to the brace-delimited pretty-print
+  form (`show configuration`'s `interfaces { ge-0/0/0 { ... } } }`
+  layout) — Junos' single-line `set` form is not handled, since it is a
+  materially different text shape and the operator did not ask for it
+  specifically.
+
+**Team split:** Dora mapped the affected code first (the interface config
+route's neighbours, the poll/walk scheduler, the alert engine's threshold
+path, `drawSeriesChart`, and mapper.js's node/label drawing) so both
+builders started from the same understanding of what was already there.
+Thing1 built six items: the Dashboard scaling fixes (4), the interface-
+events tile fix (5), the yellow reveal highlight and checkbox (6), the
+Mapper double-click dialog (3), the themed Find dropdown (9), and label
+placement (10). Thing2 built three items: the per-port running config
+from ConfigRX (1), Poll Now's three walks (2), and fan alerts together
+with Sensor Snapshot (8, 7 — the same baseline mechanism covers both).
+
+**Outcome.** (Bob fills in test and review results before release.)
+
 ## 5.30.0 / 5.31.0 / 5.32.0 — Device link + Address tab fixes, Mapper search/select-all/frames, Cisco Stack Power (planned)
 
 **Operator prompt:**

@@ -5423,11 +5423,15 @@ highlighted item calls `pickFindSuggestion(index)`, which fills the input
 with that node's own name/IP and calls `findNode(text)` — so a suggestion
 picked from the list is indistinguishable, from that point on, from the
 same text typed and entered by hand, and repeated Enter still cycles
-multiple hits for it. Escape and a blur close it; a `mousedown` on the
+multiple hits for it. Escape and a blur close it; a `pointerdown` on the
 list calls `preventDefault()` so the input never blurs out from under a
-click before the click's own handler runs — `onFindListClick` reads
+click before the click's own handler runs — pointer events rather than
+mouse ones for the same reason every other drag and click surface in the
+product already picks pointer events over mouse-specific ones (see *Touch,
+pen and keyboard*, above): a touch or pen tap on a suggestion must close
+this the same way a mouse click does. `onFindListClick` reads
 `event.target.closest('.mp-suggest-item')` and picks it the same way
-Enter does. A `mousedown` anywhere else in the document
+Enter does. A `pointerdown` anywhere else in the document
 (`onFindOutsideClick`) closes it, skipping the input and the list itself.
 `rebuildFindList()` — called after every data reload, a poll tick
 included — now just re-runs `showFindSuggestions` against the current
