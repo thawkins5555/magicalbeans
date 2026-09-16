@@ -1378,9 +1378,10 @@ reading the device has right now as normal for it — useful the moment a
 switch is discovered with, say, only one power supply and one stack
 cable fitted, which would otherwise alert as missing hardware forever.
 A later reading that still matches the accepted baseline stays quiet;
-one that gets worse still alerts, exactly as if no baseline had been
-taken. Taking a snapshot also clears whatever is currently open on those
-same alerts for the device, with a note on each saying so. The dialog
+a reading that changes from the baseline still alerts, exactly as if no
+baseline had been taken. Taking a snapshot also clears whatever is
+currently open on those same alerts for the device, with a note on each
+saying so. The dialog
 shows a line — "Baseline taken ⟨when⟩ · N sensors" — once a snapshot
 exists. Temperature is not covered by a snapshot: it is judged against a
 limit or a vendor status enum, not a fixed pass/fail reading, and already
@@ -1506,11 +1507,14 @@ rather than waiting for each one's interval, and reports how many it queued
 and how many were already running. The detail pane's button only ever polls
 the one device open in it.
 
-**From 5.33.0, Poll now also learns MAC addresses, reads the ARP cache and
-walks VLAN membership for that device immediately**, rather than waiting
-for each table's own interval to come round — the same three background
-walks the poller already runs on their own schedule, just run now instead
-of on a stagger. A device already failing or with SNMP switched off is
+**From 5.33.0, clicking the Poll now button also learns MAC addresses,
+reads the ARP cache and walks VLAN membership for that device
+immediately**, rather than waiting for each table's own interval to come
+round — the same three background walks the poller already runs on
+their own schedule, just run now instead of on a stagger. This is the
+button only: a device's first poll after a bulk import, and the poll a
+power-fault trap forces on its own device, do not trigger the three
+walks. A device already failing or with SNMP switched off is
 skipped, exactly as the scheduled walks skip it, and a walk turned off for
 the device (its interval set to 0) is not started. A walk already running
 for the device is never started a second time. Neighbour discovery (LLDP/
@@ -1703,16 +1707,23 @@ saying a config is a whole-device thing. It reads the ConfigRX backup only
 out of the stored text, matching Cisco IOS/IOS-XE/NX-OS/IOS-XR, Arista,
 Aruba/HP ProCurve and Aruba CX's indented style, plus Juniper's
 brace-delimited `interfaces { ge-0/0/0 { ... } } ` form. Matching the
-port's SNMP name against the config's own interface name accepts an exact
-match or a short/long-form pair sharing the same trailing digits — `Gi1/0/1`
-finds `GigabitEthernet1/0/1`, `Po1` finds `Port-channel1` — but never a
-different port with the same prefix (`Gi1/0/1` does not match a stanza for
-`Gi1/0/10`). A device with no backup, or a backup with no line naming this
-port, says so in place of the config text rather than leaving the tile
-blank. The tile is only fetched for an account that can read ConfigRX — a
-Nodes-only viewer keeps the earlier static hint instead of a request that
-would be refused — and beneath a permission that stops there, the text
-comes back redacted the same way ConfigRX's own backup view already is.
+port's SNMP name against the config's own interface name checks every
+interface header in the file for an exact match first, and only falls
+back to a short/long-form pair sharing the same trailing digits —
+`Gi1/0/1` finds `GigabitEthernet1/0/1`, `Po1` finds `Port-channel1` — when
+none match exactly, so a short name whose letters also happen to prefix a
+different, longer interface name earlier in the file (`Tw1/0/1` against
+`TwentyFiveGigE1/0/1`) always resolves to that name's own exact header
+(`TwoGigabitEthernet1/0/1`) instead. `Gi1/0/1` still never matches a
+stanza for `Gi1/0/10`. A device with no ConfigRX backup at all says "No
+ConfigRX backup for this device yet."; a backup with no line naming this
+port says so instead — either way the **ConfigRX** button stays offered,
+never a blank tile. The tile is only fetched for an account that can read
+ConfigRX — a Nodes-only viewer keeps the dialog's static hint ("The
+port's own stanza appears here when ConfigRX holds a backup of this
+device.") instead of a request that would be refused — and beneath a
+permission that stops there, the text comes back redacted the same way
+ConfigRX's own backup view already is.
 
 **Priority port, from 5.23.0.** A checkbox in the port dialog's own
 header — a ★ appears beside the dialog title and in the interface list's

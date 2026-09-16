@@ -4119,16 +4119,33 @@ a time, looking for a named block directly inside `interfaces { ... }`
 whose name matches a candidate, then collects lines until that block's
 own braces balance. It does not attempt Junos' single-line `set` output.
 
-**Name matching (`_names_match`).** Case-insensitive exact equality
-always matches — the only rule that applies to a vendor with no
-short/long split at all, such as ProCurve's `1/A1`. Otherwise
-`_split_prefix` splits each name into its leading run of letters/hyphens
-(`Gi`, `GigabitEthernet`, `Port-channel`) and everything after; a match
-needs the trailing parts to be identical strings (so `Gi1/0/1` never
-matches a config's `Gi1/0/10` — same prefix, longer trailing digits) and
-one prefix to be a case-insensitive prefix of the other (`Gi` of
-`GigabitEthernet`, `Po` of `Port-channel`). A name with no leading letter
-at all has an empty prefix and so can only ever match by exact equality.
+**Name matching, two passes over every header (`_exact_match`,
+`_prefix_match`).** `interface_stanza` first collects every `interface
+...` header line in the file, then makes two passes over that list: the
+first checks `_exact_match` (case-insensitive string equality) against
+every header before looking at any prefix rule at all, and only if
+nothing in the whole file matches exactly does a second pass fall back to
+`_prefix_match` — `_split_prefix` splits each name into its leading run
+of letters/hyphens (`Gi`, `GigabitEthernet`, `Port-channel`, `Tw`,
+`TwentyFiveGigE`) and everything after; a match needs the trailing parts
+to be identical strings (so `Gi1/0/1` never matches a config's `Gi1/0/10`
+— same prefix, longer trailing digits) and one prefix to be a
+case-insensitive prefix of the other (`Gi` of `GigabitEthernet`, `Po` of
+`Port-channel`). Splitting the search into two whole passes, rather than
+one pass trying exact-then-prefix per header, is what makes the exact
+match win regardless of where in the file it sits: `Tw` is also a
+prefix of `TwentyFiveGigE`, so a single combined pass matching header by
+header in file order would let an earlier `TwentyFiveGigE1/0/1` stanza
+answer for `Tw1/0/1` even when the file has its own, later
+`TwoGigabitEthernet1/0/1` header — the exact match a caller actually
+meant. `_names_match` (exact-or-prefix, one call) still exists for
+`_juniper_block`'s single candidate-against-block-name check, which has
+no multi-header ambiguity to resolve this way. A name with no leading
+letter at all (ProCurve's `1/A1`) has an empty prefix and so can only
+ever match by exact equality. `tests/test_configrx_stanza.py` covers
+`Tw1/0/1`/`TwentyFiveGigE1/0/1`/`TwoGigabitEthernet1/0/1` and the
+equivalent `Fo1/0/1`/`FourHundredGigE1/0/1`/`FortyGigabitEthernet1/0/1`
+case.
 
 **Route (`api.get_nodes_device_interface_config`, `GET
 /api/nodes/devices/<id>/interfaces/<if_index>/config`).** Reads
@@ -4147,26 +4164,44 @@ gates ConfigRX read**
 (`server.ROUTES`); the handler additionally checks Nodes read by hand,
 since the route table can only carry one module per route and this page
 is reached from Nodes as much as from ConfigRX — the same shape
-`_dash_can` uses for `get_dashboard_offenders`'s own second gate. Both
-grants are required; either alone is refused (`tests/
-test_configrx_stanza_route.py` covers both one-sided cases plus the
-happy path, no-stanza and no-backup shapes end to end against a real
-`Service`/`WebServer`).
+`_dash_can` uses for `get_dashboard_offenders`'s own second gate. The
+handler checks that Nodes-read grant *before* looking the device up, so a
+caller with no Nodes read gets a 403 even for a device id that does not
+exist — a permission refusal must not first confirm or deny that a
+device id is real. Both grants are required; either alone is refused
+(`tests/test_configrx_stanza_route.py` covers both one-sided cases, the
+403-before-404 ordering, plus the happy path, no-stanza and no-backup
+shapes end to end against a real `Service`/`WebServer`).
 
 **Front end (`nodes.js` interface dialog).** The RUNNING CONFIGURATION
-tile keeps its earlier static ConfigRX hint by default, and only fires
+tile keeps its static hint — "The port's own stanza appears here when
+ConfigRX holds a backup of this device." — by default, and only fires
 the fetch above when `App.canRead('configrx')` — a Nodes-only viewer is
 never sent a request the server would 403. `backup_id == null` (no
-backup at all) leaves the static hint in place; a backup with no
-matching stanza (`text: null`) swaps in a one-line "no stanza for this
-interface" message instead; a matched stanza renders in a `<pre>`, with
-the backup's own timestamp and a link back to ConfigRX above it.
+backup at all) swaps in "No ConfigRX backup for this device yet." in
+place of the static hint, keeping the **ConfigRX** button; a backup with
+no matching stanza (`text: null`) instead shows "From backup ⟨when⟩" with
+a one-line "No stanza for this interface in the latest backup" message
+below it; a matched stanza renders in a `<pre>` under that same "From
+backup ⟨when⟩" line, with the link back to ConfigRX above it in all
+three backup-found cases.
 
 ### `nodepoll.NodePoller.poll_now` / `_walk_now`: MAC, VLAN and ARP walks on a manual poll — 5.33.0
 
 `poll_now`'s existing job — invalidate cached engines, submit the base
-counters/status poll — is unchanged; it now also calls the new
-`_walk_now(device_id)` before returning. `_walk_now` loops the same three
+counters/status poll — is unchanged; it gains a `walks: bool = False`
+parameter and, only when the caller passes `walks=True`, also calls the
+new `_walk_now(device_id)` before returning. Only the two Poll Now
+button routes pass it: `api.post_nodes_device_poll` (single device) and
+`api.post_nodes_devices_bulk_poll` (a ticked selection) both call
+`poll_now(device_id, walks=True)`. Every other caller keeps the old,
+walk-free behaviour by passing nothing: `post_nodes_devices_bulk_import`'s
+own first poll of each newly added device, and `snmptrapd`'s forced
+re-read after a Stack Power/PSU fault trap (wired through
+`service.py`'s `poll_now=lambda device_id: self.node_poller.poll_now
+(device_id)`), both still call `poll_now(device_id)` with `walks` at its
+default — an automatic poll never starts an unasked-for MAC/VLAN/ARP
+walk, only a click on the button does. `_walk_now` loops the same three
 `(interval config key, in-flight set, next-due stamps, walk function)`
 tuples the scheduler's own `_maybe_walk_mac_table`/`_maybe_walk_vlans`/
 `_maybe_walk_arp_table` already own (`mac_table_interval_s`/
@@ -4195,10 +4230,13 @@ very next pass.
 
 `tests/test_poll_now_walks.py` drives this against a real `NodePoller`
 with a stubbed `_mac_executor` and stubbed walk functions (which still
-exercise the in-flight set's own `finally`-clearing round trip): all
-three walks fire when enabled, none fire when every interval is 0, none
-fire for a device already down, and an already-in-flight walk (one of
-the three sets pre-seeded) is not started a second time.
+exercise the in-flight set's own `finally`-clearing round trip), calling
+`poll_now(device_id, walks=True)` throughout: all three walks fire when
+enabled, none fire when every interval is 0, none fire for a device
+already down, an already-in-flight walk (one of the three sets
+pre-seeded) is not started a second time, and a plain `poll_now(device_id)`
+call with `walks` left at its default starts none of the three — the
+shape every non-button caller (bulk import, the trap re-read) uses.
 
 ### Cisco fan state: `FAN_TABLES` (`nodeoids.py`, `nodepoll.py`, `web/api.py`, `alertrules.py`, `alertsdb.py`) — 5.33.0
 
@@ -4250,9 +4288,7 @@ transaction, the same shape `replace_interface_thresholds` already uses
 for one `(device, source)`; `sensor_baselines(device_id)` reads them back
 as `{metric_key: value}`; `sensor_baseline_meta(device_id)` returns
 `{"count", "ts"}` (the newest `ts` across every baselined key, `None`
-when there are none) for the dialog's "Baseline taken …" line;
-`delete_sensor_baselines` clears a device's baselines outright (currently
-unused by any route, present for symmetry / a future reset control).
+when there are none) for the dialog's "Baseline taken …" line.
 `sensor_baselines` is added to `NodesDatabase._PURGE_TABLES`
 (`device_id = ?`), so deleting a device drops its baselines with
 everything else, the same list `interface_thresholds`/`interface_flags`
@@ -4275,9 +4311,9 @@ if this rule is currently open for the entity, resolves it on the way
 past (loading `open_dedup_keys()` at most once per pass, the same lazy
 load `open_keys` already uses elsewhere in this method) and counts it
 under `self.counters["resolved"]`. A value that does not exactly equal
-the baseline — including one that is *worse* — falls through to the
-method's ordinary breach/clear logic exactly as if there were no baseline
-at all, so a fault that gets worse than what was accepted always still
+the baseline falls through to the method's ordinary breach/clear logic
+exactly as if there were no baseline at all — so any reading that
+changes from the accepted baseline, worse or otherwise, always still
 alerts.
 
 **Routes.** `POST /api/nodes/devices/<id>/sensor-snapshot` (Nodes write,
@@ -4296,7 +4332,12 @@ the evaluator above treats as resolved. `GET
 dialog line. `_BASELINE_RULE_KEYS` maps each covered metric root to the
 rule key(s) it can resolve (`psu_state` → `psu_warning`/`psu_failed`,
 `stack_power_port` → `stack_power_cable_down`, `fan_state` →
-`fan_warning`/`fan_failed`).
+`fan_warning`/`fan_failed`). The POST also writes an audit row,
+`_audit(service, params, "device.sensor_snapshot", target=f"device:
+{device['ip']}", detail=f"count={len(rows)}")` — the device's IP as the
+audit target and the number of readings just baselined as the detail, so
+who accepted a device's current state as normal, and how many sensors
+that covered, is on the audit trail alongside every other Nodes write.
 
 **Front end.** The Sensor Snapshot button sits in the vendor section's
 write-gated bar, beside Re-identify, disabling itself for the round trip
@@ -4306,8 +4347,8 @@ painted from the POST's own response and refreshed from the GET route on
 open. `tests/test_sensor_snapshot.py` drives the whole path against a
 real `Service`/`WebServer`: opening `psu_failed`/`fan_failed` before any
 snapshot, the snapshot resolving both with a note, a later tick at the
-same reading staying quiet, a worse reading re-opening it, and the
-write/read permission split.
+same reading staying quiet, a changed (worse) reading re-opening it, and
+the write/read permission split.
 
 ### Dashboard's "Most interface events" tile: `nodesdb.count_interface_events_by_device` (`nodesdb.py`, `web/api.py`) — 5.33.0
 
@@ -4319,7 +4360,11 @@ those three kinds; a port's own transitions are written to
 `interface_events` (keyed on `interface_id`, kind `link_up`/`link_down`)
 by `record_interface_event`, entirely separate from the device-level
 event log. The list was therefore reliably empty from the day it
-shipped. `count_interface_events_by_device(since, limit=None)` is a new
+shipped. That `kinds=` parameter is gone from `count_events_by_device`
+now — this tile was its only caller, and with the tile reading its own
+dedicated query instead, `kinds=` had no caller left at all;
+`count_events_by_device(since, limit=None)` now filters on `e.ts >= ?`
+alone. `count_interface_events_by_device(since, limit=None)` is a new
 query, `count_events_by_device`'s own shape (`device_id`, `name`, `ip`,
 `sys_name`, `display_name_source`, `n`, ordered `n DESC, name`) but
 `SELECT ... FROM interface_events e JOIN interfaces i ON i.id =
@@ -5468,6 +5513,17 @@ lower than the box's default position. Only the label's own `y` moves; the
 box itself, and every link attachment point, are untouched, so a
 collision fix never moves what a link or the per-frame drag path — both
 unchanged by this — actually points at.
+
+`measureLabel` reads its font off `labelFontCache`/`subFontCache`
+(`fontFor('--ui')`/`fontFor('--mono')`), each computed once and cached —
+but `draw()` now refreshes both caches at the top of every full redraw,
+before `placeLabels` runs, rather than only the first time either is
+needed. Without that refresh, a theme switch that changes the label font
+or its size would leave every collision measurement keyed to whatever
+font was cached when the page loaded, so boxes could still overlap (or
+be pushed further than needed) after switching themes until a full page
+reload rebuilt the cache from scratch; now the very next redraw picks up
+the new theme's font.
 
 ### Double-click opens Device Details without leaving Mapper (`mapper.js`, `nodes.js`) — 5.33.0
 
@@ -10932,7 +10988,11 @@ change selects a different device without going through `revealDevice`,
 or the Find box's own `input` handler fires; it is deliberately not
 cleared by drawing the table again for the same reveal, or by the
 five-second refresh tick, since neither of those is the operator moving
-on.
+on. `tests/test_frontend_contracts.py` §91 pins both halves of this so
+neither can silently drift: `--reveal` must be declared exactly once in
+every `:root[data-theme="…"]` block of `tokens.css` (one match, not zero
+or two, per theme), and `app.css` must still carry the
+`table.grid tr.revealed td` rule that reads it.
 
 ### Lazy module loading (`app.js`, `index.html`) — 4.49.0
 

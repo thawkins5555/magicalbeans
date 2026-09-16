@@ -182,39 +182,53 @@ ProCurve, Aruba CX) by walking lines under an `interface ...` header until
 the next non-indented, non-`!` line, and Juniper's pretty-printed brace
 form (`interfaces { ge-0/0/0 { ... } }`) by matching braces — Junos'
 single-line `set` output is not handled. Matching a port's SNMP name
-against the config's own interface name accepts an exact match, or a
-shared numeric/slash tail with one name's letters a prefix of the
-other's (`Gi1/0/1` against `GigabitEthernet1/0/1`, `Po1` against
-`Port-channel1`) — `Gi1/0/1` never matches a stanza for `Gi1/0/10`. A
-device's operator-set port alias is never one of the candidates: it is a
+against the config's own interface name checks every `interface ...`
+header in the file for an exact, case-insensitive match first, and only
+when none of them match falls back to the short/long prefix rule
+(`Gi1/0/1` against `GigabitEthernet1/0/1`, `Po1` against
+`Port-channel1`) — `Gi1/0/1` never matches a stanza for `Gi1/0/10`, and
+the exact-match pass means a short name that happens to also prefix a
+different, longer interface name (`Tw1/0/1` against
+`TwentyFiveGigE1/0/1`) can never win over that name's own, later,
+exactly-named header (`TwoGigabitEthernet1/0/1`). A device's
+operator-set port alias is never one of the candidates: it is a
 free-text label, not a form any vendor's config would ever print on an
 `interface` line, so matching against it risked a false stanza. The tile
-reads the device's most recent backup only; a device with no backup, or a
-port with no stanza in that backup, says so in place of the config text
-rather than showing nothing. `GET
-/api/nodes/devices/<id>/interfaces/<if_index>/config` is gated on both
-ConfigRX read (a stored configuration is what it hands back, redacted the
-same way `GET .../configrx/backup` already is for a caller without
-ConfigRX write) and Nodes read (this is still a per-device page) — a
-viewer with only one of the two is refused, and the dialog itself never
-even asks unless the signed-in account can read ConfigRX, so a Nodes-only
-viewer keeps today's static hint instead of a request that would fail.
+reads the device's most recent backup only; a device with no backup says
+"No ConfigRX backup for this device yet.", and a backup with no stanza
+for this port says "No stanza for this interface in the latest backup" —
+either way the **ConfigRX** button stays offered, never a blank tile.
+`GET /api/nodes/devices/<id>/interfaces/<if_index>/config` is gated on
+both ConfigRX read (a stored configuration is what it hands back,
+redacted the same way `GET .../configrx/backup` already is for a caller
+without ConfigRX write) and Nodes read (this is still a per-device page)
+— a viewer with only one of the two is refused, and the dialog itself
+never even asks unless the signed-in account can read ConfigRX, so a
+Nodes-only viewer keeps the dialog's static hint ("The port's own stanza
+appears here when ConfigRX holds a backup of this device.") instead of a
+request that would fail.
 
-**Poll Now also learns MAC addresses, reads the ARP cache and walks VLAN
-membership for that device**, immediately rather than waiting for each
-table's own interval to come round. `NodePoller._walk_now` reuses the
-scheduler's own `_maybe_walk_mac_table`/`_maybe_walk_vlans`/
-`_maybe_walk_arp_table` in-flight guards and executor, so a walk already
-running for the device is never started a second time; it submits each
-walk directly rather than clearing the scheduler's own next-due stamp,
-because clearing that stamp for a device the scheduler has never walked
-before would hit the "first seen" branch and stagger the walk over a
-random fraction of its interval instead of starting it now — direct
-submission is what makes a manual poll actually prompt. The same guards
-that already skip a down or SNMP-disabled device, and a device with a
-walk turned off (interval 0), apply here unchanged; the LLDP/neighbour
-walk is untouched, since nothing about a manual poll asked for
-neighbours.
+**The Poll Now button also learns MAC addresses, reads the ARP cache and
+walks VLAN membership for that device**, immediately rather than waiting
+for each table's own interval to come round. `NodePoller.poll_now` takes
+a new `walks` flag (default off); only the two routes behind the Poll Now
+button — the single-device poll and the bulk "Poll now" action on a
+selection — set it, so it is only ever an operator's own click that
+starts the three walks early. Bulk import's own first poll of a newly
+added device and the trap daemon's forced re-read after a power-fault
+trap both call `poll_now` unchanged, without the flag, and so still poll
+without walking. `NodePoller._walk_now` reuses the scheduler's own
+`_maybe_walk_mac_table`/`_maybe_walk_vlans`/`_maybe_walk_arp_table`
+in-flight guards and executor, so a walk already running for the device
+is never started a second time; it submits each walk directly rather
+than clearing the scheduler's own next-due stamp, because clearing that
+stamp for a device the scheduler has never walked before would hit the
+"first seen" branch and stagger the walk over a random fraction of its
+interval instead of starting it now — direct submission is what makes a
+manual poll actually prompt. The same guards that already skip a down or
+SNMP-disabled device, and a device with a walk turned off (interval 0),
+apply here unchanged; the LLDP/neighbour walk is untouched, since nothing
+about a manual poll asked for neighbours.
 
 **Double-clicking a device on Mapper now opens that device's own Device
 Details dialog without leaving the Mapper tab.** It reuses the exact
@@ -242,8 +256,9 @@ dialog, beside Re-identify.** It accepts every power supply, stack power
 and fan reading the device has right now as that device's normal state,
 so a switch that has always had one power supply and one stack cable
 stops alerting about the ones it doesn't have. A later reading that is
-still exactly the accepted baseline stays quiet; the moment it reads
-worse, the alert opens exactly as it would with no baseline at all. Taking
+still exactly the accepted baseline stays quiet; a reading that changes
+from the baseline still alerts, exactly as it would with no baseline at
+all. Taking
 a snapshot also resolves whichever of those same alerts are open for the
 device right now, on the reasoning that the value that just became the
 baseline is, by construction, whatever that alert's current reading
@@ -300,7 +315,11 @@ node's name is measured the way the browser will actually render it (a
 detached canvas context, not a reflow-triggering `getBBox()`), and a name
 that would overlap another name or another box is pushed straight down,
 in whole line steps, until it clears both — the box itself never moves,
-only where its name is drawn.
+only where its name is drawn. The measured font is re-read at the start
+of every full redraw, so switching themes mid-session (a different
+label font or size) is picked up on the very next draw rather than
+leaving collision spacing stuck on whatever theme was active when the
+page loaded.
 
 Files: `configrx_stanza.py` (new), `nodeoids.py`, `nodepoll.py`,
 `nodesdb.py`, `alertengine.py`, `alertrules.py`, `alertsdb.py`,
@@ -309,22 +328,32 @@ Files: `configrx_stanza.py` (new), `nodeoids.py`, `nodepoll.py`,
 `web/static/app.css`, `web/static/tokens.css`, `web/static/index.html`.
 
 Verification: `tests/test_configrx_stanza.py` is new — the stanza
-extractor's vendor block shapes, the short/long name table, and the
-Juniper brace matcher. `tests/test_configrx_stanza_route.py` is new — the
-config route end to end: a matched stanza, no stanza, no backup at all,
-and the dual configrx-read/nodes-read gate. `tests/test_poll_now_walks.py`
-is new — Poll Now submitting all three walks, a device with every walk
-turned off getting none of them, a down device skipped, and an in-flight
-walk not doubled. `tests/test_sensor_snapshot.py` is new — the snapshot
-route storing a baseline per sensor, resolving what is open, the
-equality-only quiet rule against a worse reading, and its write/read
-permission split. `tests/test_dashboard_offenders.py` is new — the
-interface-events query and the tile it feeds. `tests/
-test_alert_sensor_rules.py` is extended for the fifth sensor family and
-the Sensor Snapshot baseline path across all three covered families.
-`tests/test_frontend_contracts.py` is updated for the Find dropdown
-markup in place of the datalist, the Sensor Snapshot button, and the fan
-row's per-sensor hint text.
+extractor's vendor block shapes, the short/long name table, the Juniper
+brace matcher, and the two-pass exact-before-prefix search (`Tw1/0/1`
+resolving to `TwoGigabitEthernet1/0/1` rather than an earlier
+`TwentyFiveGigE1/0/1` prefix hit, and the equivalent `Fo1/0/1` case).
+`tests/test_configrx_stanza_route.py` is new — the config route end to
+end: a matched stanza, an existing port with no stanza in the backup, a
+port with no interface row at all, no backup at all, and the dual
+configrx-read/nodes-read gate, including that a missing Nodes-read grant
+403s ahead of any device lookup. `tests/test_poll_now_walks.py` is new —
+Poll Now submitting all three walks when called with `walks=True`, a
+device with every walk turned off getting none of them, a down device
+skipped, an in-flight walk not doubled, and a plain `poll_now()` call
+(the shape bulk import and the trap re-read use) starting no walks at
+all. `tests/test_sensor_snapshot.py` is new — the snapshot route storing
+a baseline per sensor, resolving what is open, the equality-only quiet
+rule against a changed reading, and its write/read permission split.
+`tests/test_dashboard_offenders.py` is new — the interface-events query
+and the tile it feeds. `tests/test_alert_sensor_rules.py` is extended
+for the fifth sensor family and the Sensor Snapshot baseline path across
+all three covered families. `tests/test_frontend_contracts.py` is
+updated for the Find dropdown markup in place of the datalist, the
+Sensor Snapshot button, the fan row's per-sensor hint text, and a new
+check that `--reveal` is declared exactly once per themed `tokens.css`
+block with `app.css`'s `tr.revealed` rule still reading it. `tests/
+test_bulk_contracts.py` drops its now-unneeded entry for
+`count_events_by_device`'s removed `kinds=` parameter.
 
 ### 5.32.0 — Cisco Stack Power: cable-down and fault-trap alerts on Device Details
 
