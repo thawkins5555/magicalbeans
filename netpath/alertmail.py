@@ -199,9 +199,7 @@ def duration_text(seconds) -> str:
 
 
 def severity_tag(severity: int) -> str:
-    """A bracketed, upper-case tag for the front of a subject line —
-    "[CRITICAL]" — so severity is legible in a notification preview
-    without opening the message."""
+    """Bracketed, upper-case severity for a subject line, e.g. "[CRITICAL]"."""
     return "[{}]".format(
         (SEVERITY_NAMES[severity] if 0 <= severity <= 7 else str(severity)).upper())
 

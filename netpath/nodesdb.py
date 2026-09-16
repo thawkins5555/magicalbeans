@@ -1331,10 +1331,8 @@ class NodesDatabase(SqliteStore):
             "media": "TEXT",
         })
 
-        # The device's own default-route next hop(s), comma-joined when more
-        # than one answers (ECMP or a tos-scoped pair) — see nodepoll.
-        # _refresh_addresses. "" once a read answers with no default route,
-        # NULL until the first successful read.
+        # The device's own default-route next hop(s) — see
+        # nodepoll._refresh_default_gateway and set_default_gateway below.
         self.ensure_columns("devices", {"default_gateway": "TEXT"})
 
         # A sweep's reached addresses (JSON) and, if folded into another
@@ -3222,6 +3220,15 @@ class NodesDatabase(SqliteStore):
                 "SELECT * FROM interfaces WHERE device_id = ? ORDER BY if_index",
                 (device_id,)).fetchall()
 
+    def interface_labels(self, device_id: int) -> dict[int, sqlite3.Row]:
+        """{if_index: row} with just descr/name, for _interface_label callers
+        that don't need the rest of the interfaces columns."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT if_index, descr, name FROM interfaces WHERE device_id = ?",
+                (device_id,)).fetchall()
+        return {r["if_index"]: r for r in rows}
+
     def interface_exists(self, device_id: int, if_index: int) -> bool:
         with self._lock:
             return self._conn.execute(
@@ -4273,9 +4280,9 @@ class NodesDatabase(SqliteStore):
             self._conn.commit()
 
     def set_default_gateway(self, device_id: int, text: str) -> None:
-        """The comma-joined next hop(s) _refresh_addresses read, or "" for
-        an answered read with no default route. A poll that could not read
-        either OID leaves the stored value alone rather than calling this."""
+        """The comma-joined next hop(s) _refresh_default_gateway read, or ""
+        for an answered read with no default route; NULL means never read
+        (a poll that couldn't read either OID leaves the column alone)."""
         with self._lock:
             self._conn.execute(
                 "UPDATE devices SET default_gateway = ? WHERE id = ?",

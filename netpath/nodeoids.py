@@ -177,14 +177,10 @@ IP_ADDR_TABLE = "1.3.6.1.2.1.4.20.1.1"
 IP_ADDR_IFINDEX = "1.3.6.1.2.1.4.20.1.2"
 IP_ADDR_NETMASK = "1.3.6.1.2.1.4.20.1.3"
 
-# ipCidrRouteNextHop under dest 0.0.0.0, mask 0.0.0.0 — the default route(s)
-# a device holds. Walk suffix is tos.nexthop, value the next hop itself, so
-# a box with several default routes (ECMP, or a tos-scoped pair) answers
-# more than one row from one cheap walk of a subtree only a handful of
-# routes wide.
+# ipCidrRouteNextHop under dest/mask 0.0.0.0 — the default route(s); more
+# than one row for ECMP or a tos-scoped pair.
 IP_CIDR_ROUTE_NEXTHOP_DEFAULT = "1.3.6.1.2.1.4.24.4.1.4.0.0.0.0.0.0.0.0"
-# RFC1213's older ipRouteNextHop.0.0.0.0, a GET fallback for a box that only
-# ever populated the table above's ipRouteTable predecessor.
+# RFC1213's older ipRouteNextHop.0.0.0.0 GET, for a box that never filled the table above.
 IP_ROUTE_NEXTHOP_DEFAULT = "1.3.6.1.2.1.4.21.1.7.0.0.0.0"
 
 # ------------------------------------------------------------ ARP tables

@@ -4270,6 +4270,21 @@ class NodePoller(Worker):
                                         details=details, complete=True)
         self._refresh_default_gateway(device, config)
 
+    @staticmethod
+    def _gateway_candidate(value) -> str:
+        """A next-hop value as stored, or "" for anything that is not a
+        real, non-default IP address — the same alias_candidate gate
+        _refresh_addresses uses, plus an ipaddress parse so a misbehaving
+        agent's OctetString or integer answer can't land in the column."""
+        text = nodesdb.alias_candidate(value)
+        if not text:
+            return ""
+        try:
+            ipaddress.ip_address(text)
+        except ValueError:
+            return ""
+        return text
+
     def _refresh_default_gateway(self, device, config: dict) -> None:
         """The device's own default-route next hop(s): ipCidrRouteNextHop
         under dest/mask 0.0.0.0, falling back to the older ipRouteNextHop.0.0.0.0
@@ -4284,7 +4299,8 @@ class NodePoller(Worker):
             route_rows = {}
             walked = False
         if walked and route_rows:
-            hops = {str(v) for v in route_rows.values() if v and str(v) != "0.0.0.0"}
+            hops = {self._gateway_candidate(v) for v in route_rows.values()}
+            hops.discard("")
             self.db.set_default_gateway(device_id, ", ".join(sorted(hops)))
             return
         try:
@@ -4293,8 +4309,8 @@ class NodePoller(Worker):
             return
         vb = next((v for v in response.varbinds
                   if v["oid"] == nodeoids.IP_ROUTE_NEXTHOP_DEFAULT), None)
-        value = str(vb["value"]) if vb and vb["value"] else ""
-        self.db.set_default_gateway(device_id, "" if value == "0.0.0.0" else value)
+        value = self._gateway_candidate(vb["value"]) if vb and vb["value"] else ""
+        self.db.set_default_gateway(device_id, value)
 
     def _poll_vendor_health(self, device, config: dict, identity: dict,
                             already=()) -> list[tuple]:

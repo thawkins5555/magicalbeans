@@ -4841,7 +4841,7 @@ def _device_addresses_json(row, aliases, names=None) -> list[dict]:
 
 def get_nodes_device_addresses(service, params, body, device_id) -> dict:
     row = _require(service.nodes_db.device(device_id), "device")
-    names = {r["if_index"]: r for r in service.nodes_db.interfaces(device_id)}
+    names = service.nodes_db.interface_labels(device_id)
     return {"addresses": _device_addresses_json(
         row, service.nodes_db.device_addresses(device_id), names)}
 
@@ -4972,7 +4972,7 @@ def get_nodes_device(service, params, body, device_id) -> dict:
     # ADDRESSES subtab is one short list the detail pane already has a
     # round trip for, and a second request per device selection to carry
     # three rows is a request nobody needs.
-    names = {r["if_index"]: r for r in service.nodes_db.interfaces(device_id)}
+    names = service.nodes_db.interface_labels(device_id)
     device["addresses"] = _device_addresses_json(
         row, service.nodes_db.device_addresses(device_id), names)
     device.update(_identification_json(service, row))

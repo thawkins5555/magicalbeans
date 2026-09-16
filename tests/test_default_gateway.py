@@ -104,7 +104,24 @@ poller._refresh_default_gateway(device(6), CONFIG)
 check("an answered-but-empty GET stores the empty string too",
       poller.db.stored.get(6) == "", poller.db.stored)
 
-print("7. _device_json carries default_gateway")
+print("7. walk answers one legit hop and one junk value")
+poller = new_poller()
+poller._walk_column = lambda *a, **kw: {"0.10.0.0.1": "10.0.0.1", "0.10.0.0.2": 12345}
+poller._snmp_get = lambda *a, **kw: (_ for _ in ()).throw(AssertionError("GET not needed"))
+poller._refresh_default_gateway(device(7), CONFIG)
+check("the junk value (an integer, not an IpAddress) is dropped",
+      poller.db.stored.get(7) == "10.0.0.1", poller.db.stored)
+
+print("8. GET answers with a junk value")
+poller = new_poller()
+poller._walk_column = lambda *a, **kw: {}
+poller._snmp_get = get_response(
+    [{"oid": nodeoids.IP_ROUTE_NEXTHOP_DEFAULT, "type": "OctetString", "value": "not-an-ip"}])
+poller._refresh_default_gateway(device(8), CONFIG)
+check("a GET answer that fails validation stores the empty string",
+      poller.db.stored.get(8) == "", poller.db.stored)
+
+print("9. _device_json carries default_gateway")
 db = NodesDatabase(f"{TMPDIR}/nodes.db")
 did = db.add_device("10.40.0.1", "core-a")
 row = db.device(did)

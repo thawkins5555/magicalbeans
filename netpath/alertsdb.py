@@ -1195,6 +1195,8 @@ class AlertsDatabase(SqliteStore):
     # Set by prune() when its budget ran out before the backlog did, the same
     # flag netpath.db and netpath.flowdb raise for the same reason.
     last_prune_incomplete = False
+    # Marker for the one-time built-in subject reset (see _migrate).
+    _TEMPLATE_SUBJECTS_RESET_5_30 = "template_subjects_reset_5_30"
 
     def _after_open(self) -> None:
         self._seed_templates()
@@ -1221,14 +1223,12 @@ class AlertsDatabase(SqliteStore):
             self._conn.execute(
                 "UPDATE rules SET for_seconds = 60 WHERE key = 'packet_loss_high'")
         self._migrate_templates()
-        # 5.30.0, once: every built-in subject goes back to the shipped
-        # wording (which leads with the severity tag), edited or not. Bodies
-        # and non-builtin templates are untouched.
-        if not self._private_setting("template_subjects_reset_5_30"):
+        # One-time: built-in subjects go back to the shipped wording, edited or not.
+        if not self._private_setting(self._TEMPLATE_SUBJECTS_RESET_5_30):
             self._conn.execute(
                 "UPDATE templates SET subject = builtin_subject, updated_ts = ?"
                 " WHERE is_builtin = 1 AND subject <> builtin_subject", (time.time(),))
-            self._set_private_setting("template_subjects_reset_5_30", True, commit=False)
+            self._set_private_setting(self._TEMPLATE_SUBJECTS_RESET_5_30, True, commit=False)
         self.ensure_columns("sms_credential", {
             "account_sid": "TEXT NOT NULL DEFAULT ''",
             "auth_mode": "TEXT NOT NULL DEFAULT 'auth_token'",
