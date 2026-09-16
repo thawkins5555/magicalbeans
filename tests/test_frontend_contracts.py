@@ -3656,6 +3656,31 @@ check("r.alias, r.kind, r.medium, r.media, r.oper_status" in NODES80,
 check("row.id = `${row.device_id}:${row.if_index}`;" in NODES80,
       "runSfpReport keys each report row by device and if_index, not device alone")
 
+# --- 81b. SINGLE PSU report, modelled on the SFP report (5.35.0) -----------
+NODES_PSU = read("nodes.js")
+INDEX_PSU = read("index.html")
+check('data-subtab="psu"' in INDEX_PSU, "the Reports nested nav carries the SINGLE PSU subtab")
+check('id="nd-rep-sub-psu"' in INDEX_PSU, "the PSU report has its own subpage")
+for needle in ("'/api/nodes/reports/psu'", "'/api/nodes/reports/psu/export.csv'",
+              "function runPsuReport(", "function drawPsuReportTable(",
+              "function exportPsuReportCsv("):
+    check(needle in NODES_PSU, "nodes.js carries the PSU report route / handler %s" % needle)
+_SERVER_PSU = open(os.path.join(REPO_ROOT, "netpath", "web", "server.py"),
+                   encoding="utf-8").read()
+for needle in (r'r"^/api/nodes/reports/psu$"', r'r"^/api/nodes/reports/psu/export\.csv$"'):
+    check(needle in _SERVER_PSU, "server.py routes the PSU report literal %s" % needle)
+check("row.id = `${row.device_id}:${row.member}`;" in NODES_PSU,
+      "runPsuReport keys each report row by device and member, not device alone")
+check("['device_id', 'name', 'ip', 'member', 'psu_total', 'psu_present',\n"
+      "    'psu_down', 'supplies', 'stack_power', 'covered', 'last_ts', 'device']"
+      in NODES_PSU,
+      "the client PSU_CSV_HEADER mirrors report.PSU_CSV_HEADER's order")
+_REPORT_PSU = open(os.path.join(REPO_ROOT, "netpath", "report.py"), encoding="utf-8").read()
+check('PSU_CSV_HEADER = ["device_id", "name", "ip", "member", "psu_total", "psu_present",\n'
+      '                  "psu_down", "supplies", "stack_power", "covered", "last_ts", "device"]'
+      in _REPORT_PSU,
+      "report.py's own PSU_CSV_HEADER is what nodes.js's copy is pinned against")
+
 # --- 82. Duplicate evidence is scoped to a device's own interfaces ---------
 # Only addresses a device reports on its own interfaces count toward
 # duplicate detection; the discovery-addresses walk and the trap/merge
@@ -3809,10 +3834,16 @@ check("const gateway = App.el('nd-addr-gateway');" in NODES
       and "view.detail.default_gateway" in NODES,
       "drawAddressesTable fills #nd-addr-gateway from "
       "view.detail.default_gateway")
-check("gw ? `Default gateway: ${gw}`" in NODES
-      and "'Default gateway: not published by this device.'" in NODES,
-      "the gateway line names the address when the device published one, "
-      "or says plainly that it did not")
+check("!gw ? 'Default gateway: not published by this device.'" in NODES,
+      "the gateway line says plainly when the device published nothing")
+check("`Default gateway: ${escape(gw)} (from ConfigRX backup)`" in NODES,
+      "a gateway sourced from a ConfigRX backup (SNMP left the column "
+      "empty) names where it came from, and the address goes through escape()")
+check("`Default gateway: ${escape(gw)}`" in NODES,
+      "a gateway SNMP itself published is shown plain, still through escape()")
+check("default_gateway_source" in NODES,
+      "drawAddressesTable reads the source api.py's device detail tags "
+      "the gateway with")
 check("const iface = r.interface ? escape(r.interface)" in NODES,
       "drawAddressesTable's Interface cell prefers the device's own "
       "r.interface name")
@@ -4253,6 +4284,19 @@ check("stroke-width: var(--mp-fiber-w, 5px);" in APP_CSS92,
       "a fiber link's bold stroke width comes from JS's own --mp-fiber-w, not a CSS calc()")
 check(".mp-link.fiber.selected" in APP_CSS92,
       "a selected fiber link keeps brightness(1.35) alongside its glow")
+
+# ---------------------------------------------------------------------------
+# 93. Interface dialog RUNNING CONFIGURATION tile: an unmatched search names
+#     what it searched and how large the backup's own haystack was (5.35.0).
+NODES93 = read("nodes.js")
+check("'This port has no stored interface row.'" in NODES93,
+      "no candidate names at all (no stored ifName/ifDescr) gets its own hint")
+check("interface stanzas in this backup." in NODES93,
+      "a backup with headers but no matching stanza names the search and "
+      "the haystack size")
+check("r.searched.map(escape).join(' / ')" in NODES93,
+      "every searched candidate name goes through escape() before it's "
+      "rendered into the hint")
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))

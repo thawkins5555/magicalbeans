@@ -109,7 +109,16 @@ try:
     status, payload = call(
         "GET", f"/api/nodes/devices/{did_nobackup}/interfaces/1/config", token=admin)
     check("a device with no stored backup at all: everything null",
-          status == 200 and payload == {"backup_id": None, "ts": None, "text": None},
+          status == 200 and payload == {"backup_id": None, "ts": None, "text": None,
+                                        "searched": [], "headers": 0},
+          (status, payload))
+
+    status, payload = call(
+        "GET", f"/api/nodes/devices/{did}/interfaces/3/config", token=admin)
+    check("searched carries the candidate names in order name then descr, "
+          "headers counts every 'interface' header in the backup",
+          status == 200 and payload["searched"] == ["Gi1/0/3", "GigabitEthernet1/0/3"]
+          and payload["headers"] == 2,
           (status, payload))
 
     # -------------------------------------------------------------- gates

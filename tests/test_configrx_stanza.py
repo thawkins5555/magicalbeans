@@ -140,6 +140,51 @@ check("Fo1/0/1 finds the exact FortyGigabitEthernet1/0/1 header, not the "
       fo_result is not None and fo_result.startswith("interface FortyGigabitEthernet1/0/1"),
       fo_result)
 
+# --------------------------------------------- indented headers (pager residue)
+indented_text = (
+    "hostname sw1\n"
+    "!\n"
+    "  interface GigabitEthernet1/0/1\n"
+    "   description uplink\n"
+    "   switchport mode trunk\n"
+    "  !\n"
+    "end\n"
+)
+indented_stanza = configrx_stanza.interface_stanza(indented_text, ["Gi1/0/1"])
+check("an indented header (pager residue ahead of the line) is still found",
+      indented_stanza == "  interface GigabitEthernet1/0/1\n   description uplink\n"
+      "   switchport mode trunk",
+      indented_stanza)
+
+# ----------------------------- column-0 exact beats a nested IOS-XR header
+xr_text = (
+    "router ospf 1\n"
+    " interface GigabitEthernet1/0/1\n"
+    "  cost 10\n"
+    "!\n"
+    "interface GigabitEthernet1/0/1\n"
+    " description real stanza\n"
+    "!\n"
+)
+xr_stanza = configrx_stanza.interface_stanza(xr_text, ["Gi1/0/1"])
+check("a column-0 exact header wins over an earlier indented one nested "
+      "under router ospf",
+      xr_stanza == "interface GigabitEthernet1/0/1\n description real stanza",
+      xr_stanza)
+
+# ------------------------------------------------------------------- CRLF
+crlf_text = "hostname sw1\r\n!\r\ninterface GigabitEthernet1/0/1\r\n description x\r\n!\r\n"
+crlf_stanza = configrx_stanza.interface_stanza(crlf_text, ["Gi1/0/1"])
+check("CRLF line endings still match", crlf_stanza is not None
+      and "description x" in crlf_stanza, crlf_stanza)
+
+# ------------------------------------------------------- count_interface_headers
+check("count_interface_headers counts column-0 and indented headers",
+      configrx_stanza.count_interface_headers(xr_text) == 2,
+      configrx_stanza.count_interface_headers(xr_text))
+check("...zero for text with none", configrx_stanza.count_interface_headers("hostname x\n") == 0)
+check("...zero for empty text", configrx_stanza.count_interface_headers("") == 0)
+
 print()
 print("FAILURES:", FAILS if FAILS else "none")
 raise SystemExit(1 if FAILS else 0)

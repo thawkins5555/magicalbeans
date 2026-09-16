@@ -182,6 +182,9 @@ IP_ADDR_NETMASK = "1.3.6.1.2.1.4.20.1.3"
 IP_CIDR_ROUTE_NEXTHOP_DEFAULT = "1.3.6.1.2.1.4.24.4.1.4.0.0.0.0.0.0.0.0"
 # RFC1213's older ipRouteNextHop.0.0.0.0 GET, for a box that never filled the table above.
 IP_ROUTE_NEXTHOP_DEFAULT = "1.3.6.1.2.1.4.21.1.7.0.0.0.0"
+# inetCidrRouteNextHop, IPv4 dest 0.0.0.0/0 -- ipCidrRouteTable's successor,
+# the one newer IOS/IOS-XE actually populates (see nodepoll._refresh_default_gateway).
+INET_CIDR_ROUTE_NEXTHOP_DEFAULT_V4 = "1.3.6.1.2.1.4.24.7.1.7.1.4.0.0.0.0.0"
 
 # ------------------------------------------------------------ ARP tables
 #

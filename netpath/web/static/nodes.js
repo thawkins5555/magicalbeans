@@ -107,6 +107,8 @@
     repFirmwareSort: App.recallSort('nodes-rep-fw', { key: 'sw_version', descending: false }),
     repSfp: null,
     repSfpSort: App.recallSort('nodes-rep-sfp', { key: 'name', descending: false }),
+    repPsu: null,
+    repPsuSort: App.recallSort('nodes-rep-psu', { key: 'name', descending: false }),
   };
 
   const escape = App.escapeHtml;
@@ -3010,9 +3012,13 @@
           const header = r.backup_id == null
             ? 'No ConfigRX backup for this device yet.'
             : `From backup ${escape(App.when(r.ts))}`;
+          const noStanzaHint = !r.searched || !r.searched.length
+            ? 'This port has no stored interface row.'
+            : `No stanza for ${r.searched.map(escape).join(' / ')} among ` +
+              `${r.headers} interface stanzas in this backup.`;
           const content = r.backup_id == null ? '' : (r.text
             ? `<pre class="detail" style="max-height:220px">${escape(r.text)}</pre>`
-            : '<p class="hint">No stanza for this interface in the latest backup.</p>');
+            : `<p class="hint">${noStanzaHint}</p>`);
           configBody.innerHTML = `<p class="hint">${header} — ` +
             '<button type="button" class="linkish inline" id="ifd-configrx">ConfigRX</button></p>' +
             content;
@@ -3285,8 +3291,10 @@
     const gateway = App.el('nd-addr-gateway');
     if (gateway) {
       const gw = (view.detail && view.detail.default_gateway) || '';
-      App.setText(gateway, gw ? `Default gateway: ${gw}`
-                              : 'Default gateway: not published by this device.');
+      const gwSource = (view.detail && view.detail.default_gateway_source) || '';
+      App.setText(gateway, !gw ? 'Default gateway: not published by this device.'
+                  : gwSource === 'configrx' ? `Default gateway: ${escape(gw)} (from ConfigRX backup)`
+                  : `Default gateway: ${escape(gw)}`);
     }
     const rows = (view.detail && view.detail.addresses) || [];
     table.innerHTML = '<caption class="sr-only">Addresses this device answers on</caption>' +
@@ -4049,7 +4057,7 @@
 
   function fillReportDevGroupSelects() {
     for (const id of ['nd-rep-avail-devgroup', 'nd-rep-topn-devgroup',
-                      'nd-rep-fw-devgroup', 'nd-rep-sfp-devgroup']) {
+                      'nd-rep-fw-devgroup', 'nd-rep-sfp-devgroup', 'nd-rep-psu-devgroup']) {
       const select = App.el(id);
       const current = select.value;
       select.innerHTML = reportDevGroupOptionsHtml();
@@ -4543,6 +4551,106 @@
     App.exportCsv('/api/nodes/reports/sfp/export.csv', params);
   }
 
+  // ------------------------------------------------------ single PSU
+  const PSU_COLUMNS = [
+    { key: 'name', label: 'Device', width: 210,
+      value: (r) => r.device || r.name || r.ip || `#${r.device_id}`,
+      cell: (r) => App.deviceNameLink(r.name || r.ip || `#${r.device_id}`,
+                                      { id: r.device_id }) },
+    { key: 'ip', label: 'IP', width: 120, cell: (r) => escape(r.ip || '') },
+    { key: 'member', label: 'Member', width: 80,
+      cell: (r) => escape(r.member || '—') },
+    { key: 'supplies', label: 'Supplies', width: 260, cell: (r) => escape(r.supplies || '') },
+    { key: 'stack_power', label: 'StackPower', width: 100,
+      cell: (r) => escape(r.stack_power || '') },
+    { key: 'last_ts', label: 'Last seen', width: 100, numeric: true,
+      value: (r) => r.last_ts || 0, cell: (r) => App.agoCell(r.last_ts) },
+  ];
+
+  function onPsuSort(key, descending) {
+    view.repPsuSort = { key, descending };
+    drawPsuReportTable();
+  }
+
+  function drawPsuReportTable() {
+    const report = view.repPsu;
+    const rows = report ? report.rows : [];
+    const table = App.grid(App.el('nd-rep-psu-table'), {
+      name: 'nodes-rep-psu', caption: 'Single PSU report',
+      columns: PSU_COLUMNS, sort: view.repPsuSort, onSort: onPsuSort });
+    const body = document.createElement('tbody');
+    const sorted = App.sortRows(rows, view.repPsuSort.key,
+      view.repPsuSort.descending, PSU_COLUMNS);
+    App.drawRows(body, sorted, PSU_COLUMNS, (tr, r) => {
+      if (!r._known) { tr.className = ''; tr.onclick = null; return; }
+      tr.className = 'clickable';
+      tr.title = 'Open this device on the Devices subtab';
+      tr.onclick = () => {
+        App.rememberSub('nodes', 'devices');
+        selectSub('devices');
+        selectDevice(r.device_id);
+      };
+    }, report ? 'No single-supply switches matched this report.' : 'Click Run report.');
+    table.appendChild(body);
+    App.wireRowKeyboard(body);
+  }
+
+  function runPsuReport() {
+    const button = App.el('nd-rep-psu-run');
+    return App.runJob(button, {
+      queued: 'Running…',
+      done: (result) => (result ? `${result.row_count} switch(es)` : 'No matching devices'),
+    }, (async () => {
+      const device_ids = await reportDeviceIds('nd-rep-psu-devgroup');
+      if (device_ids && !device_ids.length) {
+        view.repPsu = null;
+        drawPsuReportTable();
+        App.setText(App.el('nd-rep-psu-summary'), 'No devices in that group.');
+        return null;
+      }
+      const params = {};
+      if (device_ids) params.device_ids = device_ids.join(',');
+      const result = await App.get('/api/nodes/reports/psu', params);
+      const { byId } = await App.deviceIndex();
+      for (const row of result.rows) {
+        row.id = `${row.device_id}:${row.member}`;
+        row._known = byId.has(row.device_id);
+      }
+      view.repPsu = result;
+      drawPsuReportTable();
+      App.setText(App.el('nd-rep-psu-summary'),
+        `${result.row_count} switch(es) on one supply across ${result.device_count} ` +
+        `device(s) · ${result.covered_count} covered by StackPower`);
+      return result;
+    })());
+  }
+
+  const PSU_CSV_HEADER = ['device_id', 'name', 'ip', 'member', 'psu_total', 'psu_present',
+    'psu_down', 'supplies', 'stack_power', 'covered', 'last_ts', 'device'];
+
+  function exportPsuReportCsv() {
+    const report = view.repPsu;
+    if (!report || !report.rows.length) {
+      App.toast('Run the report first.', 'warn');
+      return;
+    }
+    const rows = report.rows.map((r) => [r.device_id, r.name, r.ip, r.member, r.psu_total,
+      r.psu_present, r.psu_down, r.supplies, r.stack_power, r.covered, r.last_ts, r.device]);
+    saveReportCsv(`psu-${App.isoLocal(report.generated_ts).slice(0, 10)}.csv`,
+      PSU_CSV_HEADER, rows);
+  }
+
+  async function exportPsuReportCsvFromServer() {
+    const device_ids = await reportDeviceIds('nd-rep-psu-devgroup');
+    if (device_ids && !device_ids.length) {
+      App.toast('No devices in that group.', 'warn');
+      return;
+    }
+    const params = {};
+    if (device_ids) params.device_ids = device_ids.join(',');
+    App.exportCsv('/api/nodes/reports/psu/export.csv', params);
+  }
+
   function selectReportsSub(name) {
     App.selectSub('nodes', name, { host: 'nodes-sub-reports', prefix: 'nd-rep-sub-' });
     if (name === 'scheduled') loadReportSchedules().catch(() => {});
@@ -4557,7 +4665,8 @@
      App.grid's column picker/sort machinery for it. */
 
   const SCHED_KIND_LABEL = { availability: 'Availability', top_metrics: 'Top-N by metric',
-                             firmware: 'Firmware inventory', sfp: 'SFP inventory' };
+                             firmware: 'Firmware inventory', sfp: 'SFP inventory',
+                             psu: 'Single PSU' };
   const SCHED_WEEKDAY_LABEL = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday',
                                'Saturday', 'Sunday'];
 
@@ -4600,6 +4709,9 @@
         `<label class="check"><input type="checkbox" id="nd-sched-sfp-empty"` +
         `${params.include_empty ? ' checked' : ''}> Include empty cages</label>`;
     }
+    if (kind === 'psu') {
+      return `<label>Device group <select id="nd-sched-devgroup">${reportDevGroupOptionsHtml()}</select></label>`;
+    }
     return period +
       `<label>Device group <select id="nd-sched-devgroup">${reportDevGroupOptionsHtml()}</select></label>`;
   }
@@ -4613,6 +4725,12 @@
     if (kind === 'firmware') return {};
     if (kind === 'sfp') {
       const params = { include_empty: App.el('nd-sched-sfp-empty').checked };
+      const group = App.el('nd-sched-devgroup').value;
+      if (group) params.device_group_id = Number(group);
+      return params;
+    }
+    if (kind === 'psu') {
+      const params = {};
       const group = App.el('nd-sched-devgroup').value;
       if (group) params.device_group_id = Number(group);
       return params;
@@ -4633,6 +4751,7 @@
         <option value="top_metrics">Top-N by metric</option>
         <option value="firmware">Firmware inventory</option>
         <option value="sfp">SFP inventory</option>
+        <option value="psu">Single PSU</option>
       </select></label>
       <div id="nd-sched-params">${schedParamsHtml(kind, existing && existing.params)}</div>
       <label>Cadence <select id="nd-sched-cadence">
@@ -7796,11 +7915,17 @@
     App.el('nd-rep-sfp-export-server').onclick = () => {
       exportSfpReportCsvFromServer().catch(() => {});
     };
+    App.el('nd-rep-psu-run').onclick = () => { runPsuReport()?.catch(() => {}); };
+    App.el('nd-rep-psu-export-csv').onclick = exportPsuReportCsv;
+    App.el('nd-rep-psu-export-server').onclick = () => {
+      exportPsuReportCsvFromServer().catch(() => {});
+    };
     App.el('nd-sched-new').onclick = () => scheduleDialog(null);
     drawAvailReportTable();
     drawTopnReportTable();
     drawFirmwareReportTable();
     drawSfpReportTable();
+    drawPsuReportTable();
     drawScheduleTable();
 
     // The timeline is drawn into a viewBox sized from its box, so a

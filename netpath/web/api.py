@@ -4940,6 +4940,20 @@ def get_nodes_device(service, params, body, device_id) -> dict:
     row = _require(service.nodes_db.device(device_id), "device")
     reveal = _may_read_secrets(service, params, "nodes")
     device = _device_json(row, reveal)
+    # ConfigRX fallback for a Layer-2 switch whose route tables never
+    # answer over SNMP (nodepoll._refresh_default_gateway leaves the column
+    # empty): its `ip default-gateway`/default static route, parsed off its
+    # latest backup (configrx._config_gateway). SNMP always wins when set.
+    if device["default_gateway"]:
+        device["default_gateway_source"] = "snmp"
+    else:
+        rx_config = service.configrx_db.device_config(device_id)
+        fallback = ((rx_config["config_gateway"] or "")
+                    if rx_config is not None and "config_gateway" in rx_config.keys()
+                    else "")
+        device["default_gateway_source"] = "configrx" if fallback else ""
+        if fallback:
+            device["default_gateway"] = fallback
     # effective_config resolves the profile's own community into the
     # device's, so it carries one too and follows the same rule.
     device["effective_config"] = _effective_config_json(service, row, reveal)
@@ -5736,7 +5750,7 @@ def get_nodes_device_interface_config(service, params, body, device_id, if_index
     _require(service.nodes_db.device(device_id), "device")
     backups = service.configrx_db.backups_for(device_id, limit=1)
     if not backups:
-        return {"backup_id": None, "ts": None, "text": None}
+        return {"backup_id": None, "ts": None, "text": None, "searched": [], "headers": 0}
     backup = backups[0]
     content = service.configrx_db.backup_content(backup["id"]) or ""
     if not _may_read_secrets(service, params, "configrx"):
@@ -5744,8 +5758,11 @@ def get_nodes_device_interface_config(service, params, body, device_id, if_index
     iface = service.nodes_db.interface_row(device_id, if_index)
     names = [iface["name"] if iface else None,
             iface["descr"] if iface else None]
-    text = configrx_stanza.interface_stanza(content, [n for n in names if n])
-    return {"backup_id": backup["id"], "ts": backup["ts"], "text": text}
+    searched = [n for n in names if n]
+    text = configrx_stanza.interface_stanza(content, searched)
+    headers = configrx_stanza.count_interface_headers(content)
+    return {"backup_id": backup["id"], "ts": backup["ts"], "text": text,
+            "searched": searched, "headers": headers}
 
 
 # Bumped by every handler below that edits the MIB corpus in a way
@@ -6749,9 +6766,29 @@ def get_nodes_reports_sfp_export(service, params, body) -> dict:
     return _csv_response("sfp", reportmod.SFP_CSV_HEADER, csv_rows)
 
 
+def _psu_report(service, params):
+    return reportmod.single_psu_report(
+        service.nodes_db, _id_list(params.get("device_ids")),
+        hostnames=service.app_db.hostnames)
+
+
+def get_nodes_reports_psu(service, params, body) -> dict:
+    """Stack members (or standalone switches) running on a single power
+    supply. `device_ids` narrows to a group."""
+    return _psu_report(service, params).to_dict()
+
+
+def get_nodes_reports_psu_export(service, params, body) -> dict:
+    report = _psu_report(service, params)
+    csv_rows = [[r.device_id, r.name, r.ip, r.member, r.psu_total, r.psu_present,
+                r.psu_down, r.supplies, r.stack_power, r.covered, r.last_ts, r.device]
+                for r in report.rows]
+    return _csv_response("psu", reportmod.PSU_CSV_HEADER, csv_rows)
+
+
 # --------------------------------------------------- scheduled reports (F)
 
-_REPORT_SCHEDULE_KINDS = ("availability", "top_metrics", "firmware", "sfp")
+_REPORT_SCHEDULE_KINDS = ("availability", "top_metrics", "firmware", "sfp", "psu")
 _REPORT_SCHEDULE_CADENCES = ("daily", "weekly", "monthly")
 _REPORT_SCHEDULE_RECIPIENTS_MAX = 20
 
@@ -6779,7 +6816,7 @@ def _clean_report_schedule_params(kind: str, params) -> dict:
     """Params per kind, the shape reportsched.py's own renderers read back:
     availability {period_days, device_group_id?}, top_metrics {period_days,
     metric_key, top_n}, firmware {} (nothing of its own to configure), sfp
-    {include_empty, device_group_id?}."""
+    {include_empty, device_group_id?}, psu {device_group_id?}."""
     if not isinstance(params, dict):
         raise ValueError("params must be an object")
     if kind == "availability":
@@ -6814,6 +6851,15 @@ def _clean_report_schedule_params(kind: str, params) -> dict:
         return {"period_days": period_days, "metric_key": metric_key, "top_n": top_n}
     if kind == "sfp":
         cleaned = {"include_empty": _truthy(params.get("include_empty"))}
+        group_id = params.get("device_group_id")
+        if group_id not in (None, ""):
+            try:
+                cleaned["device_group_id"] = int(group_id)
+            except (TypeError, ValueError):
+                raise ValueError("device_group_id must be an integer")
+        return cleaned
+    if kind == "psu":
+        cleaned = {}
         group_id = params.get("device_group_id")
         if group_id not in (None, ""):
             try:

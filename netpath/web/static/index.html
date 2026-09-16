@@ -346,6 +346,7 @@
       <button class="subtab" data-subtab="topmetrics">TOP-N BY METRIC</button>
       <button class="subtab" data-subtab="firmware">FIRMWARE INVENTORY</button>
       <button class="subtab" data-subtab="sfp">SFP INVENTORY</button>
+      <button class="subtab" data-subtab="psu">SINGLE PSU</button>
       <button class="subtab" data-subtab="scheduled">SCHEDULED</button>
     </nav>
 
@@ -437,10 +438,27 @@
       <div class="table-wrap"><table id="nd-rep-sfp-table"></table></div>
     </div>
 
+    <div id="nd-rep-sub-psu" class="subpage">
+      <div class="bar wrap">
+        <span class="section">SINGLE PSU</span>
+        <span class="hint">Switches running on one power supply. A stack member whose second supply is down but whose StackPower cable is up to a neighbour is left out.</span>
+      </div>
+      <div class="bar wrap">
+        <label>Group <select id="nd-rep-psu-devgroup"></select></label>
+        <button id="nd-rep-psu-run" class="primary">Run report</button>
+        <button id="nd-rep-psu-export-csv">Export CSV</button>
+        <button id="nd-rep-psu-export-server">Download CSV from server</button>
+      </div>
+      <div class="bar wrap">
+        <span id="nd-rep-psu-summary" class="hint"></span>
+      </div>
+      <div class="table-wrap"><table id="nd-rep-psu-table"></table></div>
+    </div>
+
     <div id="nd-rep-sub-scheduled" class="subpage">
       <div class="bar wrap">
         <span class="section">SCHEDULED</span>
-        <span class="hint">Run one of the three reports above automatically and email it, summary in the body, full data as a CSV attachment.</span>
+        <span class="hint">Run one of the reports above automatically and email it, summary in the body, full data as a CSV attachment.</span>
       </div>
       <div class="bar wrap" id="nd-sched-mail-hint" hidden>
         <span class="hint">Alerts email is not configured, so a scheduled report will run but not send.

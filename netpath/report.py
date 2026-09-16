@@ -622,6 +622,154 @@ def sfp_inventory(nodesdb, device_ids: list[int] | None = None,
         rows=rows)
 
 
+_PSU_MEMBER_RE = re.compile(r"^Switch\s+(\d+)", re.IGNORECASE)
+
+# The report's own words for a psu_state reading -- shorter than
+# api.py's _PSU_STATE_WORDS (its dialog spells out "failed / no input"),
+# since this text is read in a table cell/CSV column, not a live sensor list.
+_PSU_STATE_WORDS = {0: "ok", 1: "degraded", 2: "failed", 3: "not present"}
+
+_STACK_POWER_ROOTS = ("stack_power_port", "stack_power_port_switch",
+                      "stack_power_port_admin", "stack_power_port_neighbour")
+
+
+def _psu_member(label: str) -> str:
+    """The leading 'Switch N' off a psu_state label, or '' for a standalone
+    switch -- what a StackPower port's own stack_power_port_switch.<idx>
+    value is matched against."""
+    m = _PSU_MEMBER_RE.match(label or "")
+    return m.group(1) if m else ""
+
+
+def _metric_idx(key: str) -> str | None:
+    return key.rsplit(".", 1)[1] if "." in key else None
+
+
+@dataclass
+class PsuRow:
+    device_id: int
+    name: str
+    ip: str
+    device: str
+    member: str
+    psu_total: int
+    psu_present: int
+    psu_down: int
+    supplies: str
+    stack_power: str
+    covered: bool
+    last_ts: float | None
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+PSU_CSV_HEADER = ["device_id", "name", "ip", "member", "psu_total", "psu_present",
+                  "psu_down", "supplies", "stack_power", "covered", "last_ts", "device"]
+
+
+@dataclass
+class PsuReport:
+    generated_ts: float
+    device_count: int
+    row_count: int
+    covered_count: int
+    rows: list[PsuRow]
+
+    def to_dict(self) -> dict:
+        return {"generated_ts": self.generated_ts, "device_count": self.device_count,
+                "row_count": self.row_count, "covered_count": self.covered_count,
+                "rows": [r.to_dict() for r in self.rows]}
+
+
+def single_psu_report(nodesdb, device_ids: list[int] | None = None,
+                      dns_names: dict | None = None, hostnames=None) -> PsuReport:
+    """Stack members (or standalone switches, member "") running on a
+    single power supply. Judged per member: a member whose dead supply has
+    failed StackPower over to a neighbour is left off the list and counted
+    in `covered_count` instead. `device_ids`/`dns_names`/`hostnames` behave
+    as in firmware_inventory/sfp_inventory."""
+    metric_rows = nodesdb.metrics_for_families(
+        ["psu_state", *_STACK_POWER_ROOTS])
+    wanted = set(device_ids) if device_ids is not None else None
+
+    psus: dict[tuple[int, str], dict] = {}
+    stack_ports: dict[tuple[int, str], dict] = {}
+    for row in metric_rows:
+        device_id = row["device_id"]
+        if wanted is not None and device_id not in wanted:
+            continue
+        value = row["last_value"]
+        root = row["key"].split(".", 1)[0]
+        if root == "psu_state":
+            if value is None:
+                continue
+            member = _psu_member(row["label"])
+            acc = psus.setdefault((device_id, member), {
+                "total": 0, "present": 0, "down": 0, "supplies": [], "last_ts": None})
+            state = int(value)
+            acc["total"] += 1
+            acc["present"] += state in (0, 1)
+            acc["down"] += state in (2, 3)
+            acc["supplies"].append(f"{row['label']} {_PSU_STATE_WORDS.get(state, '')}".strip())
+            ts = row["last_ts"]
+            if ts is not None and (acc["last_ts"] is None or ts > acc["last_ts"]):
+                acc["last_ts"] = ts
+            continue
+        idx = _metric_idx(row["key"])
+        if idx is None or root not in _STACK_POWER_ROOTS:
+            continue
+        port = stack_ports.setdefault((device_id, idx), {})
+        port[root] = None if value is None else int(value)
+
+    member_ports: dict[tuple[int, str], list[dict]] = {}
+    for (device_id, _idx), port in stack_ports.items():
+        switch = port.get("stack_power_port_switch")
+        member_ports.setdefault(
+            (device_id, "" if switch is None else str(switch)), []).append(port)
+
+    devices_seen = {device_id for device_id, _member in psus}
+    device_rows = nodesdb.devices_by_ids(sorted(devices_seen)) if devices_seen else []
+    if dns_names is None and hostnames is not None:
+        dns_names = hostnames([row["ip"] for row in device_rows])
+    devices_by_id = {row["id"]: row for row in device_rows}
+
+    rows: list[PsuRow] = []
+    covered_count = 0
+    for (device_id, member), acc in psus.items():
+        if acc["present"] != 1:
+            continue
+        ports = member_ports.get((device_id, member), [])
+        covered = any(
+            p.get("stack_power_port") == 0 and p.get("stack_power_port_admin") != 2
+            and (p.get("stack_power_port_neighbour") or 0) > 0 for p in ports)
+        if acc["down"] >= 1 and covered:
+            covered_count += 1
+            continue
+        up_to_neighbour = sum(
+            1 for p in ports if p.get("stack_power_port") == 0
+            and (p.get("stack_power_port_neighbour") or 0) > 0)
+        if up_to_neighbour:
+            stack_power = f"{up_to_neighbour} up"
+        elif any(p.get("stack_power_port") == 2 for p in ports):
+            stack_power = "cable down"
+        else:
+            stack_power = "none"
+        device_row = devices_by_id.get(device_id)
+        ip = device_row["ip"] if device_row else ""
+        label = device_label(device_row, dns_names or {})[0] if device_row else ""
+        device = label if label == ip else f"{label} ({ip})"
+        rows.append(PsuRow(
+            device_id=device_id, name=label, ip=ip, device=device, member=member,
+            psu_total=acc["total"], psu_present=acc["present"], psu_down=acc["down"],
+            supplies=" · ".join(acc["supplies"]), stack_power=stack_power,
+            covered=False, last_ts=acc["last_ts"]))
+    rows.sort(key=lambda r: (r.name.lower(), r.member))
+    return PsuReport(
+        generated_ts=time.time(), device_count=len(devices_seen),
+        row_count=len(rows), covered_count=covered_count, rows=rows)
+
+
 def top_metric_ranking(nodesdb, key: str, t0: float, t1: float, *,
                        n: int = 20, rank_by: str = "peak",
                        ascending: bool = False, like: bool = False,

@@ -816,6 +816,18 @@ class SqliteStore:
         """
         return 0
 
+    def _trim_id_ceiling(self) -> int | None:
+        """The highest id trim_to_size's first stage may ever delete, or
+        None for no ceiling.
+
+        A subclass overrides this to protect ids past some high-water mark
+        of its own — flowdb caps it at the minute rollup's watermark, so a
+        stalled compaction pass cannot lose a block of raw flows the rollup
+        has not summarised yet, the same protection prune()'s row-cap stage
+        already applies.
+        """
+        return None
+
     def trim_to_size(self, max_bytes: int, budget_s: float | None = None) -> int:
         """Delete the oldest rows until the store fits under the cap.
 
@@ -845,8 +857,15 @@ class SqliteStore:
                 span = high - low + 1
                 want = min(deletable, max(1, int(
                     span * (1.0 - max_bytes / float(size)) * 1.1)))
-                batch_removed, _ = self._delete_batches(low, low + want, deadline)
-                removed += batch_removed
+                cut = low + want
+                ceiling = self._trim_id_ceiling()
+                if ceiling is not None and ceiling < cut:
+                    cut = max(low, ceiling)
+                if cut > low:
+                    batch_removed, _ = self._delete_batches(low, cut, deadline)
+                    removed += batch_removed
+                else:
+                    deletable = 0   # capped at the ceiling, nothing left this pass
             self._reclaim_until(deadline)
             if not deletable or time.monotonic() >= deadline:
                 break

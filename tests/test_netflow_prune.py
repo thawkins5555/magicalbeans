@@ -373,6 +373,39 @@ def test_7_a_wrong_clock_does_not_widen_the_sweep() -> None:
     skewed.close()
 
 
+def test_8_size_cap_respects_the_minute_watermark() -> None:
+    print("8: the size cap does not delete a raw flow the minute rollup "
+          "has not summarised yet")
+    db = store("size_cap_watermark.db")
+    now = time.time()
+    start = flowdb._align_down(now - 3 * 3600, 60)
+    n = 20_000
+    db.insert_flows([flow(i, start + i * 0.5) for i in range(n)])
+    before = db.size_bytes()
+
+    # Only the older third of the range has been compacted; everything
+    # from the watermark on is a block the minute rollup has not reached.
+    watermark_ts = start + (n // 3) * 0.5
+    watermark_bucket = flowdb._align_down(watermark_ts, 60)
+    db._set_private_setting(flowdb._FLOOR % 60, start)
+    db._set_private_setting(flowdb._WATERMARK % 60, watermark_bucket)
+
+    db.trim_to_size(int(before * 0.1), budget_s=60.0)
+
+    unsummarised_left = db._conn.execute(
+        "SELECT COUNT(*) AS n FROM flows WHERE ts_end >= ?",
+        (watermark_bucket,)).fetchone()["n"]
+    unsummarised_total = db._conn.execute(
+        "SELECT COUNT(*) AS n FROM flows WHERE ts_end >= ? AND ts_end < ?",
+        (watermark_bucket, flow(n - 1, start + (n - 1) * 0.5).ts_end + 1)).fetchone()["n"]
+    check(unsummarised_left == unsummarised_total and unsummarised_left > 0,
+          f"every flow at or after the watermark survives the size cap "
+          f"({unsummarised_left} of {unsummarised_total})")
+    check(db.cap_held_back > 0,
+          f"and the trim counts what it held back ({db.cap_held_back})")
+    db.close()
+
+
 TESTS = [
     test_1_age_and_row_cap,
     test_2_rollups_outlive_the_raw_flows,
@@ -381,6 +414,7 @@ TESTS = [
     test_5_delete_everything_clears_the_charts,
     test_6_the_size_cap_takes_raw_first,
     test_7_a_wrong_clock_does_not_widen_the_sweep,
+    test_8_size_cap_respects_the_minute_watermark,
 ]
 
 

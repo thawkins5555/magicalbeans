@@ -275,6 +275,37 @@ def _flatten_vendor_idx(suffix: str) -> str:
     return str(packed)
 
 
+_DOTTED_IPV4_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
+
+
+def _inet_address_text(value) -> str:
+    """An InetAddress (RFC 4001) IPv4 value as dotted text, or "" for
+    anything not a plain 4-byte address -- inetCidrRouteNextHop is this
+    type, and snmppoll already turns a non-printable OCTET STRING into
+    space-separated hex ("0A 00 00 01") rather than raw bytes by the time it
+    reaches here. Dotted text and real bytes are accepted too, for whatever
+    already-decoded shape a caller has. IPv6 (16 bytes) and anything else
+    return "" -- only IPv4 next hops are stored. See fortipoll._format_ip
+    for the same hex-pair decoding against a different InetAddress column.
+    """
+    if isinstance(value, (bytes, bytearray)):
+        raw = bytes(value)
+    else:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        if _DOTTED_IPV4_RE.match(text):
+            return text
+        groups = text.replace(":", " ").split()
+        try:
+            raw = bytes(int(g, 16) for g in groups if len(g) <= 2)
+        except ValueError:
+            return ""
+        if len(raw) != len(groups):
+            return ""
+    return ".".join(str(b) for b in raw) if len(raw) == 4 else ""
+
+
 def report_reason(response) -> tuple[str, str]:
     """(usmStats name, plain explanation) for a Report-PDU, or ("", "")
     when it names nothing this table knows."""
@@ -1688,6 +1719,11 @@ class NodePoller(Worker):
         self._vendor_sensor_read: dict[int, float] = {}
         # (device_id, PsuTable.state) -> static PSU columns, _SENSOR_REFRESH_S TTL.
         self._vendor_psu_static: dict[tuple, dict] = {}
+        # (device_id, PsuTable.state) -> the indices the last COMPLETE walk
+        # of that column returned, so a FRU tray/supply pulled between polls
+        # is noticed even though the walk simply stops mentioning it rather
+        # than reporting it gone. See _mark_vendor_rows_absent.
+        self._vendor_psu_seen: dict[tuple[int, str], set[str]] = {}
         # device_id -> last CISCO-STACKWISE-MIB walk time / capable flag (1/0/absent=unknown).
         self._stack_power_read: dict[int, float] = {}
         self._stack_power_capable: dict[int, int] = {}
@@ -2720,6 +2756,9 @@ class NodePoller(Worker):
         for cache_key in [k for k in list(self._vendor_psu_static)
                           if k[0] not in keep]:
             self._vendor_psu_static.pop(cache_key, None)
+        for cache_key in [k for k in list(self._vendor_psu_seen)
+                          if k[0] not in keep]:
+            self._vendor_psu_seen.pop(cache_key, None)
         # Sets rather than dicts, so not in the loop above: the "logged
         # once" memory for a device that answers no ARP table, the stagger,
         # and the four per-device verdicts whose whole purpose is to make
@@ -4325,9 +4364,13 @@ class NodePoller(Worker):
 
     def _refresh_default_gateway(self, device, config: dict) -> None:
         """The device's own default-route next hop(s): ipCidrRouteNextHop
-        under dest/mask 0.0.0.0, falling back to the older ipRouteNextHop.0.0.0.0
-        GET for a box that never filled the newer table. Left alone (not
-        stored as "") when neither read answers at all."""
+        under dest/mask 0.0.0.0, then inetCidrRouteNextHop (IPv4) under the
+        same default route -- ipCidrRouteTable is deprecated and empty on
+        IOS 15.x/IOS-XE, which is what publishes the newer table instead --
+        falling back to the older ipRouteNextHop.0.0.0.0 GET for a box that
+        never filled either table. The first of the three that answers a
+        real next hop wins. Left alone (not stored as "") when none of the
+        three answers at all."""
         device_id = device["id"]
         try:
             route_rows = self._walk_column(device, config,
@@ -4339,8 +4382,23 @@ class NodePoller(Worker):
         if walked and route_rows:
             hops = {self._gateway_candidate(v) for v in route_rows.values()}
             hops.discard("")
-            self.db.set_default_gateway(device_id, ", ".join(sorted(hops)))
-            return
+            if hops:
+                self.db.set_default_gateway(device_id, ", ".join(sorted(hops)))
+                return
+        try:
+            inet_rows = self._walk_column(
+                device, config, nodeoids.INET_CIDR_ROUTE_NEXTHOP_DEFAULT_V4)
+            inet_walked = True
+        except SnmpError:
+            inet_rows = {}
+            inet_walked = False
+        if inet_walked and inet_rows:
+            hops = {self._gateway_candidate(_inet_address_text(v))
+                    for v in inet_rows.values()}
+            hops.discard("")
+            if hops:
+                self.db.set_default_gateway(device_id, ", ".join(sorted(hops)))
+                return
         try:
             response = self._snmp_get(device, config, [nodeoids.IP_ROUTE_NEXTHOP_DEFAULT])
         except SnmpError:
@@ -6631,11 +6689,14 @@ class NodePoller(Worker):
     # that publish per-sensor limits.
 
     def _forget_vendor_psu_static(self, device_id: int) -> None:
-        """Drops this device's _vendor_psu_static entries (tuple-keyed, so
-        a plain .pop() cannot)."""
+        """Drops this device's _vendor_psu_static/_vendor_psu_seen entries
+        (tuple-keyed, so a plain .pop() cannot)."""
         for cache_key in [k for k in list(self._vendor_psu_static)
                           if k[0] == device_id]:
             self._vendor_psu_static.pop(cache_key, None)
+        for cache_key in [k for k in list(self._vendor_psu_seen)
+                          if k[0] == device_id]:
+            self._vendor_psu_seen.pop(cache_key, None)
 
     def _poll_vendor_sensors(self, device_id: int, device, config: dict,
                              now: float) -> None:
@@ -6694,7 +6755,16 @@ class NodePoller(Worker):
                 self.db.set_vendor_sensor_capable(device_id, False)
             return
 
-        existing = {row["key"] for row in self.db.metrics(device_id)}
+        metrics_rows = self.db.metrics(device_id)
+        existing = {row["key"] for row in metrics_rows}
+        # key -> stored label, for _mark_vendor_rows_absent's ABSENT row on
+        # an idx that vanishes from a complete walk entirely. Defensive for
+        # a metrics() stand-in with no label column, the same "in .keys()"
+        # idiom device[...] reads elsewhere in this file use.
+        existing_labels = {}
+        for row in metrics_rows:
+            row_keys = row.keys() if hasattr(row, "keys") else row
+            existing_labels[row["key"]] = row["label"] if "label" in row_keys else row["key"]
         samples = []
         answered = False
 
@@ -6718,7 +6788,7 @@ class NodePoller(Worker):
                     device_id, device, config, sensor_table, rows, now)
 
         for table in psu_tables or ():
-            rows = self._vendor_psu_rows(device, config, table, now)
+            rows, complete = self._vendor_psu_rows(device, config, table, now)
             if rows:
                 answered = True
             for idx, row in rows.items():
@@ -6732,12 +6802,17 @@ class NodePoller(Worker):
                     continue
                 samples.append((key, row["label"], "state", "gauge", now,
                                 float(row["state"])))
+            self._mark_vendor_rows_absent(device_id, table.state, "psu_state",
+                                          rows, complete, existing,
+                                          existing_labels, samples, now)
 
         if fan_tables:
             primary, fallback = fan_tables
-            fan_rows = self._vendor_psu_rows(device, config, primary, now)
+            fan_rows, fan_complete = self._vendor_psu_rows(device, config, primary, now)
+            fan_table = primary
             if not fan_rows:
-                fan_rows = self._vendor_psu_rows(device, config, fallback, now)
+                fan_rows, fan_complete = self._vendor_psu_rows(device, config, fallback, now)
+                fan_table = fallback
             if fan_rows:
                 answered = True
             for idx, row in fan_rows.items():
@@ -6753,6 +6828,12 @@ class NodePoller(Worker):
                     continue
                 samples.append((key, row["label"], "state", "gauge", now,
                                 float(row["state"])))
+            # Only the table THIS poll actually used: the fallback pattern
+            # means a device that switches which of the two answers must
+            # never read as the other one's whole fan tray vanishing.
+            self._mark_vendor_rows_absent(device_id, fan_table.state, "fan_state",
+                                          fan_rows, fan_complete, existing,
+                                          existing_labels, samples, now)
 
         if not capable and answered:
             self.db.set_vendor_sensor_capable(device_id, True)
@@ -6826,12 +6907,15 @@ class NodePoller(Worker):
                 row["state"] = state
         return rows
 
-    def _vendor_psu_rows(self, device, config: dict, table, now: float) -> dict:
-        """idx -> {"label", "state" (0/1/2, or None to skip/clear)} for one
+    def _vendor_psu_rows(self, device, config: dict, table, now: float) -> tuple:
+        """({idx -> {"label", "state" (0/1/2, or None to skip/clear)}},
+        whether the state column's own walk reached the end) for one
         nodeoids.PsuTable. See _poll_vendor_sensors for what a None state
-        means to the caller. The state column is walked every call; the
-        class/skip/name columns are cached for _SENSOR_REFRESH_S, but only
-        once every one of them answered (a timed-out walk is not a fact).
+        means to the caller, and _mark_vendor_rows_absent for what the
+        completeness flag is for. The state column is walked every call;
+        the class/skip/name columns are cached for _SENSOR_REFRESH_S, but
+        only once every one of them answered (a timed-out walk is not a
+        fact).
         """
         device_id = device["id"]
         cache_key = (device_id, table.state)
@@ -6855,8 +6939,8 @@ class NodePoller(Worker):
                 self._vendor_psu_static[cache_key] = {
                     "class_map": class_map, "skip_map": skip_map, "names": names, "ts": now}
         rows: dict[str, dict] = {}
-        states = {_flatten_vendor_idx(k): v for k, v in
-                  self._walk_column(device, config, table.state).items()}
+        raw_states, complete = self._walk_column_status(device, config, table.state)
+        states = {_flatten_vendor_idx(k): v for k, v in raw_states.items()}
         for idx, raw in states.items():
             if table.class_col:
                 try:
@@ -6884,7 +6968,38 @@ class NodePoller(Worker):
                 continue
             rows[idx] = {"label": label,
                         "state": _vendor_state_value(raw, scalar_map, table.state_default)}
-        return rows
+        return rows, complete
+
+    def _mark_vendor_rows_absent(self, device_id: int, table_state: str, family: str,
+                                 rows: dict, complete: bool, existing: set,
+                                 labels: dict, samples: list, now: float) -> None:
+        """Appends `(<family>.<idx>, label, "state", "gauge", now,
+        _PSU_STATE_ABSENT)` to `samples` for every idx a PREVIOUS complete
+        walk of `table_state` produced that THIS one did not — the FRU
+        fan tray or power supply that vanishes from the walk entirely
+        rather than reporting notPresent in it, so a stale reading (and an
+        open alert built on it) never goes stale forever.
+
+        Only when `key in existing` (a bay this device has reported a
+        reading for before) and only for a COMPLETE walk: a walk cut short
+        (timeout, row cap) is not evidence anything is gone, so it leaves
+        the remembered set untouched rather than treating everything it
+        did not reach as pulled. The remembered set is per (device_id,
+        table_state) — Cisco's fan primary/fallback tables, or ENVMON vs.
+        the FRU PSU table, are two different OIDs and two different keys
+        here, so a device switching which one answers never marks the
+        other's indices absent.
+        """
+        seen_key = (device_id, table_state)
+        if not complete:
+            return
+        previous = self._vendor_psu_seen.get(seen_key, set())
+        for idx in sorted(previous - set(rows)):
+            key = f"{family}.{idx}"
+            if key in existing:
+                samples.append((key, labels.get(key, key), "state", "gauge",
+                                now, self._PSU_STATE_ABSENT))
+        self._vendor_psu_seen[seen_key] = set(rows)
 
     def _poll_stack_power(self, device_id: int, device, config: dict,
                           now: float) -> None:

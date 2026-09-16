@@ -7,8 +7,9 @@ present) once it has, so an open psu_failed alert on a pulled supply stays
 open instead of clearing, and the per-poll PSU cadence (state column every
 call, static name/class columns cached).
 
-No real SNMP session: _walk_column is replaced on the NodePoller instance
-directly, the way tests/test_swversion_entity_walk.py does. self.db is the
+No real SNMP session: _walk_column_detail is replaced on the NodePoller
+instance directly (both _walk_column and _walk_column_status funnel
+through it, the tests/test_poller_behaviour.py convention). self.db is the
 same small in-memory fake test_sensor_tables.py uses, recording what was
 written -- polling-and-stored-rows coverage only.
 """
@@ -78,8 +79,11 @@ VMWARE_OID = "1.3.6.1.4.1.6876.4.1"
 
 
 def table_walker(columns: dict):
+    """Stubs _walk_column_detail, which _walk_column/_walk_column_status
+    both funnel through (the tests/test_poller_behaviour.py convention),
+    so both wrappers see the same fake table. Every OID answers complete."""
     def fake(device, config, oid, raise_on_timeout=False, deadline=None):
-        return dict(columns.get(oid, {}))
+        return dict(columns.get(oid, {})), True, ""
     return fake
 
 
@@ -87,7 +91,7 @@ def table_walker(columns: dict):
 
 envmon, fru = nodeoids.PSU_TABLES[9]
 poller = new_poller()
-poller._walk_column = table_walker({
+poller._walk_column_detail = table_walker({
     envmon.state: {"1": 1, "2": 2, "3": 3, "4": 4, "5": 5},
     envmon.name: {"1": "PSU1", "2": "PSU2", "3": "PSU3", "4": "PSU4", "5": "PSU5"},
 })
@@ -105,7 +109,7 @@ check("vendor_sensor_capable latches true", poller.db.capable_calls == [(1, True
 
 # --------------------------------------- Cisco FRU: class-filtered chassis PSU
 poller_fru = new_poller()
-poller_fru._walk_column = table_walker({
+poller_fru._walk_column_detail = table_walker({
     fru.state: {"10": 2, "11": 9, "12": 8, "20": 2, "13": 1, "14": 3},
         # on, onButFanFail, failed, on, offEnvOther, offAdmin
     fru.name: {"10": "PSU-0", "11": "PSU-1", "12": "PSU-2", "20": "Fan Tray",
@@ -129,7 +133,7 @@ check("...a non-PSU FRU row (entPhysicalClass != powerSupply) is not "
 # ---------------------------------------- pulled-supply clears an open alert
 poller_clear = new_poller()
 poller_clear.db.seed_existing(3, "psu_state.1")   # was written a previous poll
-poller_clear._walk_column = table_walker({
+poller_clear._walk_column_detail = table_walker({
     envmon.state: {"1": 5},   # now notPresent
     envmon.name: {"1": "PSU1"},
 })
@@ -144,7 +148,7 @@ check("a supply that was present and now reads notPresent writes an "
 # ------------------------------------------------------- Juniper class filter
 jn = nodeoids.PSU_TABLES[2636]
 poller_jn = new_poller()
-poller_jn._walk_column = table_walker({
+poller_jn._walk_column_detail = table_walker({
     jn.state: {"1": 6, "2": 8, "3": 2},        # online, offline, empty
     jn.name: {"1": "PEM 0", "2": "PEM 1", "3": "PEM 2"},
     jn.class_col: {"1": 7, "2": 18, "3": 7},   # powerEntryModule/powerSupplyModule
@@ -160,7 +164,7 @@ check("...empty(2) is skipped, no key written for a bay never seen before",
 # --------------------------------------------------------- Ubiquiti skip_when
 ub = nodeoids.PSU_TABLES[41112]
 poller_ub = new_poller()
-poller_ub._walk_column = table_walker({
+poller_ub._walk_column_detail = table_walker({
     ub.state: {"1": 1, "2": 1},                        # both read "up"
     ub.skip_when_col: {"1": 1, "2": 3},                 # 2 is standby
 })
@@ -176,7 +180,7 @@ check("...a supply flagged standby in the sibling column is skipped "
 # ------------------------------------------------------- MikroTik extra_scalars
 mk = nodeoids.PSU_TABLES[14988]
 poller_mk = new_poller()
-poller_mk._walk_column = table_walker({
+poller_mk._walk_column_detail = table_walker({
     mk.state: {"0": 1},                              # primary ok
     mk.extra_scalars[0][0]: {"0": 0},                 # backup absent reads false(0)
 })
@@ -188,7 +192,7 @@ check("MikroTik: the primary is ok and a backup reading false writes nothing "
       samples_mk.get("psu_state.0") == 0.0 and "psu_state.2" not in samples_mk,
       samples_mk)
 poller_mk2 = new_poller()
-poller_mk2._walk_column = table_walker({
+poller_mk2._walk_column_detail = table_walker({
     mk.state: {"0": 1},
     mk.extra_scalars[0][0]: {"0": 1},                 # backup present and ok
 })
@@ -199,7 +203,7 @@ check("...and a backup reading true is its own ok row",
 # --------------------------------------------------------------- VMware class
 vm = nodeoids.PSU_TABLES[6876]
 poller_vm = new_poller()
-poller_vm._walk_column = table_walker({
+poller_vm._walk_column_detail = table_walker({
     vm.state: {"1": 2, "2": 4, "3": 2},         # normal, failed, normal
     vm.name: {"1": "PS1", "2": "PS2", "3": "Fan1"},
     vm.class_col: {"1": 3, "2": 3, "3": 4},     # 3 = powerSupply, 4 = fan
@@ -215,7 +219,7 @@ check("...a fan row under the same shared table is not treated as a PSU",
 
 # --------------------------------------------------- capability latch: nothing
 poller_none = new_poller()
-poller_none._walk_column = table_walker({})
+poller_none._walk_column_detail = table_walker({})
 dev_none = device(CISCO_OID)
 poller_none._poll_vendor_sensors(8, dev_none, CONFIG, 1_700_000_000.0)
 check("a device answering neither table is latched incapable, once",
@@ -231,7 +235,7 @@ def recording_walker(columns: dict, calls: list):
 temp_table = nodeoids.SENSOR_TABLES[9]
 walked = []
 poller_cad = new_poller()
-poller_cad._walk_column = recording_walker({
+poller_cad._walk_column_detail = recording_walker({
     envmon.state: {"1": 1}, envmon.name: {"1": "PSU1"},
     temp_table.value: {"1": 42}, temp_table.state: {"1": 1},
 }, walked)
@@ -253,7 +257,7 @@ check("cadence: second call does NOT re-walk the PSU name column (cache hit)",
 # a latched-incapable device waits the hourly reprobe, PSU state included
 walked_nc = []
 poller_nc = new_poller()
-poller_nc._walk_column = recording_walker({}, walked_nc)
+poller_nc._walk_column_detail = recording_walker({}, walked_nc)
 dev_nc = device(CISCO_OID, vendor_sensor_capable=None, id=10)
 poller_nc._poll_vendor_sensors(10, dev_nc, CONFIG, 1_700_000_000.0)
 walked_nc.clear()
@@ -266,7 +270,7 @@ check("cadence: a latched-incapable device walks nothing on the second call, 60s
 walked_c = []
 cols_c = {envmon.state: {"1": 1}, envmon.name: {}}   # name walk timed out
 poller_c = new_poller()
-poller_c._walk_column = recording_walker(cols_c, walked_c)
+poller_c._walk_column_detail = recording_walker(cols_c, walked_c)
 dev_c = device(CISCO_OID, vendor_sensor_capable=True, id=11)
 poller_c._poll_vendor_sensors(11, dev_c, CONFIG, 1_700_000_000.0)
 check("cache: an empty static walk is not cached",

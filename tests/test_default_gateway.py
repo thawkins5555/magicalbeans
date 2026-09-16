@@ -1,7 +1,9 @@
 """nodepoll._refresh_default_gateway: ipCidrRouteNextHop under dest/mask
-0.0.0.0 read first, ipRouteNextHop.0.0.0.0 GET as a fallback for a box that
-only fills the older table, and nodesdb.set_default_gateway/_device_json
-carrying the result through to the API.
+0.0.0.0 read first, then inetCidrRouteNextHop (IPv4) under the same default
+route -- the table newer IOS/IOS-XE actually populates -- then
+ipRouteNextHop.0.0.0.0 GET as the last fallback for a box that fills none of
+the walked tables. The first of the three to answer a real next hop wins;
+the empty string is stored only once every one of them has answered nothing.
 
 No real SNMP session: _walk_column and _snmp_get are replaced on the
 NodePoller instance directly, the way tests/test_psu_state.py does.
@@ -54,6 +56,19 @@ def get_response(varbinds):
     return lambda *a, **kw: types.SimpleNamespace(varbinds=varbinds)
 
 
+def walk_by_oid(answers: dict):
+    """base OID -> a rows dict, or an SnmpError instance to raise for that
+    OID -- the per-column stub _vendor_psu_rows' own tests use, needed here
+    now that ipCidr and inetCidr are two separate walks of the same
+    _walk_column method."""
+    def fake(device, config, oid, raise_on_timeout=False, deadline=None):
+        entry = answers.get(oid, {})
+        if isinstance(entry, Exception):
+            raise entry
+        return dict(entry)
+    return fake
+
+
 print("1. two next hops from the walk")
 poller = new_poller()
 poller._walk_column = lambda *a, **kw: {"0.10.0.0.1": "10.0.0.1", "0.10.0.0.2": "10.0.0.2"}
@@ -78,12 +93,13 @@ poller._refresh_default_gateway(device(3), CONFIG)
 check("the stored value is left alone, not overwritten with empty",
       3 not in poller.db.stored, poller.db.stored)
 
-print("4. walk answers only 0.0.0.0")
+print("4. every leg answers only 0.0.0.0")
 poller = new_poller()
 poller._walk_column = lambda *a, **kw: {"0.10.0.0.1": "0.0.0.0"}
-poller._snmp_get = lambda *a, **kw: (_ for _ in ()).throw(AssertionError("GET not needed"))
+poller._snmp_get = get_response(
+    [{"oid": nodeoids.IP_ROUTE_NEXTHOP_DEFAULT, "type": "IpAddress", "value": "0.0.0.0"}])
 poller._refresh_default_gateway(device(4), CONFIG)
-check("an answered read with no default route stores the empty string",
+check("no leg answering a real route stores the empty string",
       poller.db.stored.get(4) == "", poller.db.stored)
 
 print("5. GET also answers 0.0.0.0")
@@ -120,6 +136,34 @@ poller._snmp_get = get_response(
 poller._refresh_default_gateway(device(8), CONFIG)
 check("a GET answer that fails validation stores the empty string",
       poller.db.stored.get(8) == "", poller.db.stored)
+
+print("10. ipCidr empty, only inetCidr answers (hex-pair InetAddress octets)")
+poller = new_poller()
+poller._walk_column = walk_by_oid({
+    nodeoids.INET_CIDR_ROUTE_NEXTHOP_DEFAULT_V4: {"0.10.0.0.1": "0A 09 09 01"},
+})
+poller._snmp_get = lambda *a, **kw: (_ for _ in ()).throw(AssertionError("GET not needed"))
+poller._refresh_default_gateway(device(10), CONFIG)
+check("inetCidr's hex-pair InetAddress octets decode to a dotted next hop",
+      poller.db.stored.get(10) == "10.9.9.1", poller.db.stored)
+
+print("11. ipCidr and inetCidr both empty, only RFC1213 GET answers")
+poller = new_poller()
+poller._walk_column = walk_by_oid({})
+poller._snmp_get = get_response(
+    [{"oid": nodeoids.IP_ROUTE_NEXTHOP_DEFAULT, "type": "IpAddress", "value": "10.5.5.1"}])
+poller._refresh_default_gateway(device(11), CONFIG)
+check("RFC1213 GET is reached, and stored, only once both walks answer nothing",
+      poller.db.stored.get(11) == "10.5.5.1", poller.db.stored)
+
+print("12. none of the three legs answers a real route")
+poller = new_poller()
+poller._walk_column = walk_by_oid({})
+poller._snmp_get = get_response(
+    [{"oid": nodeoids.IP_ROUTE_NEXTHOP_DEFAULT, "type": "noSuchInstance", "value": None}])
+poller._refresh_default_gateway(device(12), CONFIG)
+check("nothing anywhere stores the empty string, not silence",
+      poller.db.stored.get(12) == "", poller.db.stored)
 
 print("9. _device_json carries default_gateway")
 db = NodesDatabase(f"{TMPDIR}/nodes.db")

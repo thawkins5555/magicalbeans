@@ -398,6 +398,11 @@ ROUTES = [
      api.get_nodes_reports_sfp, ("nodes", R)),
     ("GET", r"^/api/nodes/reports/sfp/export\.csv$",
      api.get_nodes_reports_sfp_export, ("nodes", R)),
+    # Single-PSU switches, and the same report as a file.
+    ("GET", r"^/api/nodes/reports/psu$",
+     api.get_nodes_reports_psu, ("nodes", R)),
+    ("GET", r"^/api/nodes/reports/psu/export\.csv$",
+     api.get_nodes_reports_psu_export, ("nodes", R)),
     # Scheduled emailed reports (netpath/reportsched.py): run automatically or on demand.
     ("GET", r"^/api/nodes/reports/schedules$", api.get_nodes_report_schedules, ("nodes", R)),
     ("POST", r"^/api/nodes/reports/schedules$", api.post_nodes_report_schedule, ("nodes", W)),

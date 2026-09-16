@@ -19,7 +19,7 @@ from . import report as reportmod
 from .eventlog import SYSTEM
 
 CADENCES = ("daily", "weekly", "monthly")
-KINDS = ("availability", "top_metrics", "firmware", "sfp")
+KINDS = ("availability", "top_metrics", "firmware", "sfp", "psu")
 
 # Body text formats a period as whole days; 20 rows is what an inbox reads
 # in one screen without an attachment.
@@ -239,11 +239,35 @@ def _render_sfp(service, params: dict, now: float):
     return subject, body, csvout.csv_text(reportmod.SFP_CSV_HEADER, csv_rows)
 
 
+def _render_psu(service, params: dict, now: float):
+    device_ids = _device_ids_for_group(service.nodes_db, params.get("device_group_id"))
+    report = reportmod.single_psu_report(
+        service.nodes_db, device_ids=device_ids, hostnames=service.app_db.hostnames)
+    subject = f"Single power supply — {report.row_count} switch(es)"
+    lines = [subject,
+            f"Generated {time.strftime('%Y-%m-%d %H:%M', time.localtime(now))}",
+            f"{report.device_count} device(s) with power sensors, "
+            f"{report.covered_count} covered by StackPower", ""]
+    for r in report.rows[:_BODY_ROW_CAP]:
+        member = f" member {r.member}" if r.member else ""
+        lines.append(f"  {r.name[:28]:<28}{member:<12} {r.supplies}")
+    if len(report.rows) > _BODY_ROW_CAP:
+        lines.append(f"  ... and {len(report.rows) - _BODY_ROW_CAP} more "
+                    "(see the attached CSV)")
+    body = "\n".join(lines) + "\n"
+
+    csv_rows = [[r.device_id, r.name, r.ip, r.member, r.psu_total, r.psu_present,
+                r.psu_down, r.supplies, r.stack_power, r.covered, r.last_ts, r.device]
+                for r in report.rows]
+    return subject, body, csvout.csv_text(reportmod.PSU_CSV_HEADER, csv_rows)
+
+
 _RENDERERS = {
     "availability": _render_availability,
     "top_metrics": _render_top_metrics,
     "firmware": _render_firmware,
     "sfp": _render_sfp,
+    "psu": _render_psu,
 }
 
 

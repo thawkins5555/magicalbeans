@@ -915,6 +915,32 @@ class FlowDatabase(SqliteStore):
             self._reclaim_until(deadline)
         return removed
 
+    def _trim_id_ceiling(self) -> int | None:
+        """Caps the size cap's first stage at the minute rollup's watermark
+        -- same query and same protection prune()'s row-cap stage applies
+        at ~839-850, so a stalled compaction pass cannot lose a block of
+        raw flows the minute rollup has not summarised yet. Sets
+        cap_held_back and logs, mirroring prune()'s own counter, whenever
+        that protection actually holds something back."""
+        _minute_floor, minute_watermark = self.rollup_bounds(60)
+        if minute_watermark is None:
+            return None
+        with self._lock:
+            ceiling_row = self._conn.execute(
+                "SELECT MIN(id) AS id FROM flows WHERE ts_end >= ? AND ts_end < ?",
+                (minute_watermark, time.time() + 3600)).fetchone()
+            high = self._conn.execute("SELECT MAX(id) AS id FROM flows").fetchone()["id"]
+        ceiling = ceiling_row["id"]
+        if ceiling is None or high is None:
+            return ceiling
+        held = max(0, high - ceiling + 1)
+        self.cap_held_back = held
+        if held:
+            log.warning("netpath.flowdb: size cap held back %d flow(s) not yet"
+                        " summarised by the minute rollup (watermark behind)",
+                        held)
+        return ceiling
+
     def recent_endpoints(self, limit: int = 300, since_s: float = 3600) -> list[str]:
         """Busiest source and destination addresses seen recently.
 

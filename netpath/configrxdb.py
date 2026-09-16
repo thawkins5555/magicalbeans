@@ -248,7 +248,8 @@ class ConfigRxDatabase(SqliteStore):
     def _migrate(self) -> None:
         self.ensure_columns("device_config", {
             "store_secrets": "INTEGER NOT NULL DEFAULT 0",
-            "enable_secret_enc": "BLOB"})
+            "enable_secret_enc": "BLOB",
+            "config_gateway": "TEXT"})
         self.ensure_columns("backups", {"redacted": "INTEGER NOT NULL DEFAULT 0"})
         self._enable_search_fts()
 
@@ -365,6 +366,19 @@ class ConfigRxDatabase(SqliteStore):
 
     def clear_enable_secret(self, device_id: int) -> None:
         self.set_enable_secret(device_id, None)
+
+    def set_config_gateway(self, device_id: int, text: str) -> None:
+        """The default gateway parsed out of this device's latest capture
+        (configrx._config_gateway), stored on every backup so a device
+        backed up once still has one. "" clears it (no such line found).
+        The device_detail API fallback (api.py) reads this only when SNMP's
+        own default_gateway column is empty."""
+        with self._lock:
+            self._ensure_row(device_id)
+            self._conn.execute(
+                "UPDATE device_config SET config_gateway = ? WHERE device_id = ?",
+                (text, device_id))
+            self._conn.commit()
 
     def forget_device(self, device_id: int) -> None:
         """Called when a device is removed from Nodes, so ConfigRX does not
