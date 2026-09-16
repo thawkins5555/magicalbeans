@@ -1468,6 +1468,31 @@ async function checkRouting(page, base, dir, tag) {
     return `${state.hash} -> ${state.name}`;
   });
 
+  // 5.30.0 review: a reload used to replay the device route through
+  // revealDevice, which clears the Find box the same way the hashchange
+  // case (checkMisc, above) needs it to. A reload must not.
+  await check('a reload keeps the remembered Find term', async () => {
+    await selectTab(page, 'nodes');
+    await settle(page, 900);
+    await page.waitForSelector('#nd-q', { timeout: 20000 });
+    await page.fill('#nd-q', 'core');
+    await page.keyboard.press('Enter');
+    await settle(page, 900);
+    await page.waitForSelector('#nodes-table tbody tr', { timeout: 20000 });
+    await page.click('#nodes-table tbody tr:first-child');
+    await sleep(900);
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await ready(page);
+    await page.waitForSelector('#nodes-table tbody tr', { timeout: 20000 });
+    const q = await page.inputValue('#nd-q');
+    assert(q === 'core', `#nd-q reads "${q}" after the reload, not "core"`);
+    // Leave the Find box the way every other check here found it.
+    await page.fill('#nd-q', '');
+    await page.keyboard.press('Enter');
+    await settle(page, 700);
+    return q;
+  });
+
   /* A device selection routed to #/nodes/device/<id> and survived a
      reload, but switching to a top-level subtab left the URL unchanged, so
      the URL described a screen that was not on screen and Back restored a

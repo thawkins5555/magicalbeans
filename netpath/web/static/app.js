@@ -499,7 +499,7 @@ const App = (() => {
   function activateTab(name, options = {}) {
     ensureModuleReady(name).then((page) => {
       if (state.tab !== name) return;
-      if (options.route) { deliverRoute(options.route); return; }
+      if (options.route) { deliverRoute(options.route, { initial: !!options.initial }); return; }
       if (page && page.activate) page.activate();
       refreshNow(name);
     }).catch((error) => {
@@ -2803,12 +2803,8 @@ const App = (() => {
       `<th scope="col">By severity</th></tr></thead><tbody>${rows}</tbody>`;
   }
 
-  /* Empty a set of filter fields and settle the store on the emptied
-     values — the Clear button's own logic (below), pulled out so a route
-     handler can run the same reset (nodes.js's revealDevice, 5.30.0)
-     without wiring a fake click. `refresh`, not a boolean: the button
-     always refreshes itself, a caller stepping through several clears in
-     turn wants to refresh only once, at the end, itself. */
+  /* Shared with route handlers (nodes.js revealDevice) so they can reset
+     filters without a fake click. `opts.refresh`: call once, at the end. */
   function clearFilters(tab, ids, opts = {}) {
     for (const id of ids) {
       const field = document.getElementById(id);
@@ -2816,10 +2812,7 @@ const App = (() => {
       if (field.type === 'checkbox') field.checked = false;
       else field.value = '';
     }
-    // Assigning .value from script fires no event, so without this the
-    // store would keep every filter Clear has just removed and a
-    // reload would come back filtered by them.
-    syncControls(tab, ids);
+    syncControls(tab, ids); // writes the emptied values back into the store
     if (opts.onClear) opts.onClear();
     if (opts.refresh) opts.refresh();
   }
@@ -5521,7 +5514,7 @@ const App = (() => {
     // ready — a second hash change can land here while the first one's
     // module is still in flight — so this goes through the same
     // ensureModuleReady gate selectTab uses, not straight to deliverRoute.
-    if (changed) selectTab(route.tab, { fromRoute: true, route });
+    if (changed) selectTab(route.tab, { fromRoute: true, route, initial });
     else activateTab(route.tab, { route });
     return true;
   }
@@ -5551,12 +5544,16 @@ const App = (() => {
 
   /* Hands the route to the module. The selection half runs after the
      module's first refresh, or nodes.js's own "select the first device if
-     none is selected" would overwrite the device the link named. */
-  function deliverRoute(route) {
+     none is selected" would overwrite the device the link named.
+     `deliverOpts.initial` marks the boot-time replay of a remembered route
+     (vs. a hashchange from a link elsewhere) so a module can tell the two
+     apart — nodes.js uses it to leave remembered filters alone. */
+  function deliverRoute(route, deliverOpts = {}) {
     applySubtabFromRoute(route);
     const page = pages[route.tab];
     if (!page || !page.activate) return;
-    const opts = { route, parts: route.parts, query: route.query };
+    const opts = { route, parts: route.parts, query: route.query,
+                   initial: !!deliverOpts.initial };
     if (!page.refresh) {
       page.activate(opts);
       return;
@@ -6135,7 +6132,7 @@ const App = (() => {
           page.__ready = true;
         }
         selectTab(landing, bootRoute.tab === landing
-          ? { fromRoute: true, route: bootRoute } : {});
+          ? { fromRoute: true, route: bootRoute, initial: true } : {});
         paintedEarly = true;
       } catch (error) {
         brokenPages.add(landing);

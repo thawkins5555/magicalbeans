@@ -3803,6 +3803,27 @@ check('`<span title="ifIndex ${escape(String(r.if_index))}">#${' in NODES,
       "...falling back to #<if_index> with an \"ifIndex <n>\" title when no "
       "interface name is known")
 
+# ---------------------------------------------------------------------------
+# 85. A reload on Devices kept resetting the remembered Find/filter bar
+#     (5.30.0 review): the boot-time replay of #/nodes/device/<id> now
+#     carries opts.initial, so activate() takes the plain select branch
+#     instead of revealDevice, which would otherwise clear what
+#     restoreControls had just put back.
+check('if (options.route) { deliverRoute(options.route, { initial: !!options.initial }); return; }'
+      in APP,
+      "activateTab forwards options.initial into deliverRoute")
+check("function deliverRoute(route, deliverOpts = {}) {" in APP
+      and "initial: !!deliverOpts.initial" in APP,
+      "deliverRoute accepts an initial flag and passes it on to "
+      "page.activate()'s opts")
+check("selectTab(route.tab, { fromRoute: true, route, initial });" in APP,
+      "applyRoute threads its own initial argument into selectTab")
+check("{ fromRoute: true, route: bootRoute, initial: true }" in APP,
+      "the boot-time early paint marks the replayed route as initial")
+check("if (!filtered && !opts.initial) {" in NODES,
+      "activate() skips revealDevice (and so keeps every remembered "
+      "filter) on the boot-time replay of a device route")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

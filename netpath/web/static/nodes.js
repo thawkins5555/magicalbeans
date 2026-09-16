@@ -650,22 +650,17 @@
     });
   }
 
-  /* A device-name link elsewhere (Alerts, IPAM, ...) names this tab's
-     #/nodes/device/<id> with no query of its own, and the row it means may
-     not be on screen — a Find term or a filter left over from whatever the
-     operator was last doing here, or the fleet simply spans more than one
-     page. Clears the bar a step at a time, cheapest first, stopping the
-     moment the row turns up, so an ordinary link (Find alone accounts for
-     most misses) costs one extra fetch, not six. Bounded to ten pages past
-     that: further than that, "not found" is a more honest answer than a
-     silent long fetch loop. Always runs to completion (no "already
-     selected" shortcut) — the same device linked twice with a stray Find
-     term typed in between still has that term to clear. */
+  /* A hashchange-driven device link whose row may be hidden by a leftover
+     Find term/filter or a later page. Clears the bar cheapest-first,
+     stopping once the row turns up; gives up after 10 extra pages. */
   async function revealDevice(deviceId) {
     const hasRow = () => view.devices.some((d) => d.id === deviceId);
     App.clearFilters('nodes', ['nd-q']);
     view.macSearchPending = false;
     view.pageOffset = 0;
+    // Set before any refresh below: each one's own loadDetail() fetches by
+    // id, so this is what stops it fetching the previous device instead.
+    view.selected = deviceId;
     await App.refreshNow('nodes');
     if (!hasRow()) {
       App.clearFilters('nodes', ['nd-filter-group', 'nd-filter-devgroup',
@@ -735,9 +730,11 @@
     if (parts[0] !== 'device' || parts[1] === undefined) return;
     const deviceId = Number(parts[1]);
     if (!Number.isFinite(deviceId)) return;
-    if (!filtered) {
+    if (!filtered && !opts.initial) {
       // No q/name/filter of its own: a plain device link, which is exactly
       // when the row it names might not be showing (see revealDevice).
+      // A boot-time replay (opts.initial) skips this: the row was already
+      // selected under whatever filters restoreControls put back.
       await revealDevice(deviceId);
     } else if (view.selected !== deviceId) {
       view.selected = deviceId;
