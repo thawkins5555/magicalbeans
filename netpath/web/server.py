@@ -326,21 +326,13 @@ ROUTES = [
     ("GET", r"^/api/nodes/devices/(\d+)/hardware$", api.get_nodes_device_hardware, ("nodes", R)),
     ("GET", r"^/api/nodes/devices/(\d+)/dom$", api.get_nodes_device_dom_all, ("nodes", R)),
     ("GET", r"^/api/nodes/devices/(\d+)/sensors$", api.get_nodes_device_sensors, ("nodes", R)),
-    # Sensor Snapshot: accepts every current psu_state/stack_power_port/
-    # fan_state reading as this device's baseline and resolves what it can
-    # -- a write, the same gate as poll/identify; reading the stored
-    # baseline back for the dialog's "Baseline taken ..." line is not.
+    # Sensor Snapshot: a write, gated like poll/identify; the GET below is not.
     ("POST", r"^/api/nodes/devices/(\d+)/sensor-snapshot$",
      api.post_nodes_device_sensor_snapshot, ("nodes", W)),
     ("GET", r"^/api/nodes/devices/(\d+)/sensor-snapshot$",
      api.get_nodes_device_sensor_snapshot, ("nodes", R)),
     ("GET", r"^/api/nodes/devices/(\d+)/stack-power$", api.get_nodes_device_stack_power, ("nodes", R)),
     ("GET", r"^/api/nodes/devices/(\d+)/interfaces/(\d+)/mac-table$", api.get_nodes_device_mac_table, ("nodes", R)),
-    # This port's stanza out of the device's latest ConfigRX backup, for the
-    # Interface Detail dialog's RUNNING CONFIGURATION tile. Gated configrx
-    # here (a stored configuration is what it hands over, same as
-    # get_configrx_backup above); the handler itself checks nodes read too,
-    # since this is also a per-device page a nodes-only viewer should see.
     ("GET", r"^/api/nodes/devices/(\d+)/interfaces/(\d+)/config$",
      api.get_nodes_device_interface_config, ("configrx", R)),
     ("GET", r"^/api/nodes/devices/(\d+)/oids$", api.get_nodes_device_oids, ("nodes", R)),

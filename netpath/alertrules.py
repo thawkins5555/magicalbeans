@@ -622,12 +622,7 @@ PUBLISHED_HYSTERESIS = {"sfp_rx_dbm": 1.0, "sfp_tx_dbm": 1.0, "temp_sensor_c": 2
 SENSOR_FAMILIES = frozenset({"temp_sensor_c", "temp_sensor_state", "psu_state",
                              "stack_power_port", "fan_state"})
 
-# The families a Sensor Snapshot baseline can cover (api.post_nodes_device_
-# sensor_snapshot / nodesdb.sensor_baselines) -- the state-enum families
-# whose "already known bad, and accepted" hardware a snapshot is for. Not
-# temp_sensor_c/temp_sensor_state: a temperature is judged against a limit,
-# not a fixed enum, and has its own published-threshold and hysteresis
-# handling already.
+# The state-enum families a Sensor Snapshot baseline covers (not temperature).
 BASELINE_FAMILIES = frozenset({"psu_state", "stack_power_port", "fan_state"})
 
 # A rule that is only the fallback for a device with no per-sensor

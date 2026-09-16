@@ -1292,9 +1292,7 @@ class AlertEngine(Worker):
         # Loaded on first use and only when a breach has no new sample behind
         # it, so a tick with nothing breaching costs nothing extra.
         open_keys: set | None = None
-        # Sensor Snapshot baselines (nodesdb.sensor_baselines), loaded at
-        # most once per device and only for a device this pass actually
-        # judges a BASELINE_FAMILIES rule against.
+        # Sensor Snapshot baselines, loaded at most once per device.
         baselines_by_device: dict[int, dict] = {}
         for device_id in device_ids:
             device = devices.get(device_id)
@@ -1437,14 +1435,8 @@ class AlertEngine(Worker):
                              and now - sample_ts > stale_after)
                     if stale:
                         value, sample_ts = None, None
-                    # Sensor Snapshot: a psu_state/stack_power_port/fan_state
-                    # reading that still equals the baseline an operator
-                    # already accepted for THIS metric key never breaches --
-                    # a value that gets WORSE than the baseline still does,
-                    # the same as any key with no baseline at all. Anything
-                    # already open for this target is resolved on the way
-                    # past, the same way the no-published-limit branch above
-                    # does when a rule stops applying to a target.
+                    # Sensor Snapshot: a reading still equal to the accepted
+                    # baseline never breaches; anything else does.
                     if metric is not None and value is not None \
                             and rule["source_kind"] in BASELINE_FAMILIES:
                         device_baselines = baselines_by_device.get(device_id)
