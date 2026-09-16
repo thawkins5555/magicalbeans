@@ -39,7 +39,7 @@ CSS glow/pulse. Testy ran the affected test files plus the full suite
 once, and a Mapper-only browser walk. Javariius reviewed the whole diff
 before push.
 
-**Outcome.** Shipped as 5.34.0. [test and review results: Bob fills in]
+**Outcome.** Shipped as 5.34.0. Dora mapped the link pipeline; Thing2 built the verdict and API fields, Thing1 the checkbox and styling. Full suite once: 168 of 173 passed, four the known environmental failures plus tests/test_alerts_ui.py, whose pin counted every animation rule in app.css and tripped on the new fiber pulse — Fisty narrowed it to the alert pulse. Browser walk 88 of 88 with no console, page or HTTP errors, plus an ad-hoc Playwright check of the checkbox, its persistence across reload and the new link keys (28 of 29 demo links report fiber). Javariius first pass "not ready": a selected fiber link lost its selection cue to the glow rule, and a multi-VLAN trunk in strands mode collapsed into one ribbon with a filter per strand — fixed with a combined-filter rule and a single glowing underlay beneath the strands; second pass "ready to push". No walk after review.
 
 ## 5.33.0 — Per-port running config, Poll Now's three walks, fan alerts, Sensor Snapshot, Mapper/Dashboard fixes
 

@@ -196,10 +196,6 @@ actually answered, so a link to an unmanaged or name-only neighbour is
 judged on the local port alone. A manually drawn line (**Connect**) is
 never fiber, since it carries no port media of its own.
 
-**One known gap:** the demo fleet answers no ENTITY-MIB, so FiberView has
-nothing to show on `demo/fleet.py` — it needs real switches with
-transceivers reporting media to Nodes.
-
 Files: `netpath/mapper.py`, `netpath/nodesdb.py`, `netpath/web/api.py`,
 `netpath/web/static/mapper.js`, `netpath/web/static/app.css`,
 `netpath/web/static/tokens.css`, `netpath/web/static/index.html`.

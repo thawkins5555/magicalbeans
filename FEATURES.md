@@ -4478,9 +4478,8 @@ like any other module.
   data, or nothing known at all is not fiber. A link is judged on
   whichever end has actually answered, so a link to an unmanaged or
   name-only neighbour is judged on the local port alone; a manually
-  drawn **Connect** line is never fiber. The demo fleet answers no
-  ENTITY-MIB, so FiberView has nothing to show there — it needs real
-  switches whose transceivers report media to Nodes.
+  drawn **Connect** line is never fiber. The demo fleet's switch personas
+  report SFP+ optics with DOM, so FiberView lights most of the demo map.
 
 ---
 
