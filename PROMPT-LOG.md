@@ -92,6 +92,29 @@ placement (10). Thing2 built three items: the per-port running config
 from ConfigRX (1), Poll Now's three walks (2), and fan alerts together
 with Sensor Snapshot (8, 7 — the same baseline mechanism covers both).
 
+**Javariius's review, four must-fix items, all taken before push:**
+`poll_now` was starting the MAC/VLAN/ARP walks on every call that reached
+it, not only a Poll Now click — bulk import's own first poll of a new
+device and the trap daemon's forced re-read after a power-fault trap were
+walking devices nobody asked to have walked. Fixed with a `walks` flag on
+`poll_now`, off by default, set only by the single-device and bulk Poll
+Now routes. `configrx_stanza`'s interface-name match checked each config
+header in file order and took the first prefix hit it found, so a short
+name (`Tw1/0/1`) could resolve to an unrelated interface with a similar
+prefix (`TwentyFiveGigE1/0/1`) appearing earlier in the file, even when
+the device's own, correctly-named interface (`TwoGigabitEthernet1/0/1`)
+was sitting further down. Fixed as two full passes over every header —
+exact, case-insensitive equality first across the whole file, the
+short/long prefix rule only once that whole first pass has come up
+empty — so an exact name always wins regardless of where it sits.
+Comment prose was over the 20% cap in the new modules. And the Interface
+Detail dialog's ConfigRX hint text no longer matched what the dialog
+actually shows once the other fixes landed — a viewer with ConfigRX read
+and a device with no backup was left reading old placeholder wording
+that no longer described the screen in front of them. Reworded to say
+plainly what each state of the tile now is. Fixed by Thing2 and Thing1
+before push.
+
 **Outcome.** (Bob fills in test and review results before release.)
 
 ## 5.30.0 / 5.31.0 / 5.32.0 — Device link + Address tab fixes, Mapper search/select-all/frames, Cisco Stack Power (planned)
