@@ -213,10 +213,14 @@ covers every VLAN in one CIST instance, so the original default-context
 read was never missing anything there. Each pass is bounded to 48 VLANs
 and 15 seconds, the same envelope the MAC-table walk already runs
 under, and it runs on every poll, exactly like the rest of STP state
-today — nothing about the cadence changed. A pass that runs out of VLANs
-or time before finishing leaves the stored per-VLAN detail alone rather
-than overwrite it with a partial view; only the plain, cheap global read
-still updates on a cut-short pass. Whether a device answers a per-VLAN
+today — nothing about the cadence changed. A switch carrying more than
+48 VLANs is judged on its lowest-numbered 48, and the VLAN count beside
+the cell says so. A pass that runs out of time before finishing writes
+nothing for that poll — neither the detail nor the summary — so a
+blocked uplink never flickers to forwarding because one VLAN walk was
+slow; the stored state stands until the next complete pass. A port that
+is disabled or broken in every VLAN keeps that word rather than reading
+forwarding. Whether a device answers a per-VLAN
 context at all is probed once and remembered (`stp_vlan_capable`), the
 same idiom the media/sensor probes use, with a device that has never
 answered re-tried once an hour rather than given up on for good.

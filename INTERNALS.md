@@ -6143,9 +6143,21 @@ nowhere); `stp_vlan_count` is that port's `"vlans"` tally. **The
 cut-short rule**: this merge, and the two new columns, are only written
 when `vlan_answered and vlan_complete`; a pass that answered something
 but finished incomplete instead logs one diagnostic per hour (the `_log_
-media_diag` pattern, `nodepoll.py:6017`, cause `stp_vlan_cut_short`) and
-writes nothing for the per-VLAN columns, leaving the stored detail from
-the prior complete pass untouched.
+media_diag` pattern, cause `stp_vlan_cut_short`) and skips
+`update_interface_stp` for that poll entirely, so the summary and the
+detail can never disagree and the stored row from the prior complete
+pass stands. A VLAN list sliced to `_MAX_VLAN_CONTEXTS` still counts as
+complete: the pass judged the first 48 VLANs and `stp_vlan_count` says
+how many it saw. `complete` is False only for the deadline break or a
+column walk that `_walk_column_status` reported unfinished. Per port
+the states seen across contexts collapse as blocking if any VLAN is
+blocking(2), else forwarding if any is forwarding(5), else the single
+other state seen (disabled/broken/listening/learning), else the global
+read's own value; a port the global read listed but no VLAN context
+mentioned keeps the global value. The per-VLAN pass runs before the
+`stp_capable` verdict is latched to 0 on a Cisco v1/v2c device, and
+before the empty-`dot1dStpPortState` early return, so a switch whose
+VLAN 1 carries no ports at all still gets its detail.
 
 **Storage**: `nodesdb.ensure_columns` adds `devices.stp_vlan_capable
 INTEGER` beside `stp_capable`, and `interfaces.stp_blocking_vlans TEXT`/
