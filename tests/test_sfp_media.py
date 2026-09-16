@@ -388,6 +388,8 @@ device = db.device(did)
 poller._poll_environment(did, device, db.effective_config(device), set(), t0)
 check("first probe of a plain host walks the ENTITY-MIB columns",
       walked != [], walked)
+check("plain host latches cage-incapable",
+      poller._cage_capable.get(did) is False, poller._cage_capable)
 
 walked.clear()
 device = db.device(did)
