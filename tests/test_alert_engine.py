@@ -1838,4 +1838,49 @@ finally:
     nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
 
 
+# =================================================================== C4
+print("\nC4 — spanning tree: unblocking resolves the blocking alert, and "
+      "STP transitions are not counted as link flapping")
+
+nodes, alerts, snmp, syslog, ipam, engine = build()
+try:
+    engine._tick()
+    did = add_device(nodes, "10.14.0.1", "acc-sw-stp")
+    nodes.replace_interfaces(did, [
+        {"if_index": 1, "descr": "Gi1/0/1", "alias": "uplink b",
+         "admin_status": "up", "oper_status": "up"},
+    ])
+    iid = nodes.interfaces(did)[0]["id"]
+
+    nodes.record_interface_event(iid, "stp_blocking", "Gi1/0/1: forwarding -> blocking")
+    engine._tick()
+    assert len(open_rows(alerts, "stp_blocking", f"{did}:1")) == 1
+    ok("a port entering blocking opens the spanning-tree alert")
+
+    nodes.record_interface_event(iid, "stp_unblocked", "Gi1/0/1: blocking -> forwarding")
+    engine._tick()
+    assert open_rows(alerts, "stp_blocking", f"{did}:1") == [], \
+        open_rows(alerts, "stp_blocking", f"{did}:1")
+    ok("...and unblocking RESOLVES it, rather than leaving it open for an "
+       "operator to close by hand -- which would make the dedup key swallow "
+       "every later blocking of the same port")
+
+    nodes.record_interface_event(iid, "stp_blocking", "Gi1/0/1: forwarding -> blocking")
+    engine._tick()
+    assert len(open_rows(alerts, "stp_blocking", f"{did}:1")) == 1
+    ok("so the SECOND time the same port blocks, it alerts again")
+
+    # Three STP rows inside the flap window, the link never down: spanning
+    # tree re-converging is not a port flapping.
+    nodes.record_interface_event(iid, "stp_unblocked", "Gi1/0/1: blocking -> forwarding")
+    nodes.record_interface_event(iid, "stp_blocking", "Gi1/0/1: forwarding -> blocking")
+    engine._tick()
+    assert open_rows(alerts, "interface_flapping", f"{did}:1") == [], \
+        open_rows(alerts, "interface_flapping", f"{did}:1")
+    ok("...and none of those transitions raises Interface flapping, which "
+       "counts link_up/link_down and nothing else")
+finally:
+    nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+
 print(f"\nALL {len(PASSED)} ALERT-ENGINE ASSERTIONS PASSED")

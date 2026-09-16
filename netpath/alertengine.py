@@ -991,9 +991,12 @@ class AlertEngine(Worker):
                 ts=row["ts"], message=row["detail"] or f"{label}: {row['kind']}",
                 device_name=device["name"] or "", device_ip=device["ip"],
                 extra={"priority": is_priority}))
-            if row["kind"] == "link_up":
-                cleared_rule = self._rule_by_key(
-                    CLEARS.get(("interface_event", "link_up"), ""))
+            # Any interface event CLEARS names, not link_up alone: 5.38.0's
+            # stp_unblocked closes the blocking alert the same way, and the
+            # device and wireless drains already read the map generically.
+            clears_key = ("interface_event", row["kind"])
+            if clears_key in CLEARS:
+                cleared_rule = self._rule_by_key(CLEARS[clears_key])
                 if cleared_rule:
                     # Closes the paired rule and its CLEARS_COMPANIONS too, so priority_interface_down clears alongside interface_down.
                     for rule_key in (cleared_rule["key"],

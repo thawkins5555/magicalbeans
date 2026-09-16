@@ -159,12 +159,12 @@ _SFP_METRICS = {
 _MEDIA_MODE = {
     "sx": "mm", "fx": "mm", "sr": "mm", "srl": "mm", "sr4": "mm",
     "csr4": "mm", "esr4": "mm", "lrm": "mm", "lx4": "mm", "sw": "mm",
-    "mm": "mm", "mmf": "mm",
+    "mm": "mm", "mmf": "mm", "mmd": "mm",
     "lx": "sm", "lx10": "sm", "lh": "sm", "fb": "sm", "ex": "sm",
     "zx": "sm", "lr": "sm", "lr4": "sm", "lr10": "sm", "er": "sm",
     "er4": "sm", "er4l": "sm", "zr": "sm", "zr4": "sm", "lw": "sm",
     "psm4": "sm", "cwdm": "sm", "cwdm4": "sm", "dwdm": "sm",
-    "sm": "sm", "smf": "sm",
+    "sm": "sm", "smf": "sm", "smd": "sm",
 }
 # BiDi is single-mode and carries its own reach/direction suffix (BX10-U,
 # BX20-D, BX40), so it is a pattern rather than a table key.
@@ -212,7 +212,8 @@ _COPPER_TEXT = re.compile(
 # Multimode (850 nm) and single-mode (1270-1610 nm) proof out of the same
 # transceiver text, built from _MEDIA_MODE. Copper/DAC/AOC text matches
 # neither; the wavelength arm catches a module that quotes no PMD at all.
-_OPTIC_MM_TEXT = re.compile(_media_pattern("mm") + r"|850\s?nm", re.I)
+_OPTIC_MM_TEXT = re.compile(
+    _media_pattern("mm") + r"|\b(?:850|1300)\s?nm\b", re.I)
 _OPTIC_SM_TEXT = re.compile(
     _media_pattern("sm") + rf"|\b{_BIDI_CODE}\b|base-?{_BIDI_CODE}\b"
     rf"|-{_BIDI_CODE}\b|\b1[2-6]\d{{2}}\s?nm\b", re.I)
@@ -2199,13 +2200,11 @@ class NodePoller(Worker):
     def _pool_capacity(self) -> int:
         """Worker threads that could be running a poll right now.
 
-        The live pool plus every pool _apply_pool_size swapped out and left
-        to drain: shutdown(wait=False) does not cancel, so a shrink from 128
-        workers to 80 leaves up to 128 old-pool polls still in flight.
-        Counting only the live pool reported them against the new size --
-        "120 busy and 142 queued of 80 worker(s)". A pool whose threads have
-        all exited is dropped here, which is the only place that list is
-        pruned.
+        The live pool plus every pool left draining: shutdown(wait=False)
+        does not cancel, so a shrink from 128 to 80 leaves up to 128
+        old-pool polls in flight, and counting only the live pool reported
+        them as "120 busy ... of 80 worker(s)". A drained pool is dropped
+        here, the only place that list is pruned.
         """
         with self._lock:
             draining = list(self._draining)

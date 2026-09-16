@@ -719,12 +719,9 @@ _BUILTIN_RULES = [
     ("interface_up", "Interface recovered", "interface_event", "link_up", 6, "device_up", None, None, 1),
     ("interface_flapping", "Interface flapping", "interface_event", "flapping", 3, "event_notice", None, None, 1),
     ("priority_interface_down", "Priority interface down", "interface_event", "link_down", 2, "event_notice", None, None, 1),  # gated to flagged ports by alertrules.PRIORITY_ONLY_RULES
-    # Spanning tree moving a port into or out of blocking is a topology
-    # change: the redundant path an operator is relying on has just been
-    # taken away or handed back, and nothing else in the product says so.
-    # A port's link going up or down while blocked stays interface_down/
-    # interface_up -- the poller names the blocking in that event's detail
-    # rather than opening a rule nobody asked to tune.
+    # A topology change: the redundant path has been taken away or handed
+    # back. A blocked port's link going up or down stays interface_down/up,
+    # with the blocking named in that event's detail.
     ("stp_blocking", "Spanning tree blocking a port", "interface_event", "stp_blocking", 4, "event_notice", None, None, 1),
     ("stp_unblocked", "Spanning tree port unblocked", "interface_event", "stp_unblocked", 6, "device_up", None, None, 1),
     ("cpu_high", "CPU utilization high", "threshold", "cpu_pct", 4, "threshold_breach", 90.0, 80.0, 2),

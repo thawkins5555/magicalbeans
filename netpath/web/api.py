@@ -2232,7 +2232,8 @@ _SCOPE_SETTINGS_RANGES = {
     # -1 deletes every ap_samples/radio_samples row on the next sweep
     # (prune_history reads it as "everything is older than this"); 0
     # writes a row every poll instead of every history_sample_s.
-    "wireless": {"history_days": (1, 3650), "history_sample_s": (60, 86400)},
+    "wireless": {"history_days": (1, 3650), "history_sample_s": (60, 86400),
+                 "ap_web_port": (1, 65535)},
 }
 
 

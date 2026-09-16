@@ -4580,11 +4580,9 @@ class NodesDatabase(SqliteStore):
                 " WHERE priority = 1").fetchall()
         return {(row["device_id"], row["if_index"]) for row in rows}
 
-    # The port states this application treats as "not forwarding this
-    # link" -- dot1dStpPortState's blocking(2), and RSTP's discarding, which
-    # some agents report in its place. listening/learning are transient
-    # stages of coming up, not a blocked link, and disabled/broken are the
-    # port being off rather than spanning tree holding it down.
+    # Spanning tree holding a link down: dot1dStpPortState blocking(2) and
+    # RSTP's discarding. listening/learning are a port coming up, and
+    # disabled/broken are the port being off.
     STP_BLOCKED_STATES = ("blocking", "discarding")
 
     def update_interface_stp(self, device_id: int, rows: list[dict]) -> None:
@@ -4593,9 +4591,8 @@ class NodesDatabase(SqliteStore):
         global-only or cut-short row carries neither key, and must leave
         stored per-VLAN detail alone.
 
-        A port that changes into or out of a blocked state also records an
-        interface event, the same channel link_up/link_down use, so the
-        alert rules can see a topology change without polling this table.
+        A port changing into or out of a blocked state also records an
+        interface event, the channel link_up/link_down already use.
         """
         if not rows:
             return
@@ -4614,8 +4611,7 @@ class NodesDatabase(SqliteStore):
             except sqlite3.DatabaseError:
                 self._conn.rollback()
                 raise
-        # After the commit, not inside it: an event is a second write, and
-        # the state is the thing that must land.
+        # After the commit: the state is the thing that must land.
         for row in rows:
             was = prior.get(row["if_index"])
             if was is None:
@@ -5087,13 +5083,20 @@ class NodesDatabase(SqliteStore):
             return self._conn.execute(
                 "SELECT * FROM interfaces WHERE id = ?", (interface_id,)).fetchone()
 
+    # What counts as a transition to the flapping rule, this method's only
+    # caller. Not every row: the table also carries stp_blocking/
+    # stp_unblocked, and a re-converging uplink is not a flapping port.
+    FLAP_EVENT_KINDS = ("link_up", "link_down")
+
     def recent_interface_events_for(self, interface_id: int, since_s: float = 900,
                                     limit: int = 50) -> list[sqlite3.Row]:
         cutoff = time.time() - since_s
+        marks = ",".join("?" * len(self.FLAP_EVENT_KINDS))
         with self._lock:
             return self._conn.execute(
                 "SELECT * FROM interface_events WHERE interface_id = ? AND ts >= ?"
-                " ORDER BY ts DESC LIMIT ?", (interface_id, cutoff, limit)).fetchall()
+                f" AND kind IN ({marks}) ORDER BY ts DESC LIMIT ?",
+                (interface_id, cutoff, *self.FLAP_EVENT_KINDS, limit)).fetchall()
 
     def interface_id_for(self, device_id: int, if_index: int) -> int | None:
         with self._lock:

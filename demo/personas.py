@@ -1315,9 +1315,13 @@ def _build_cisco_access(wrap32: bool, ports: int, vlan: str | None) -> dict:
         access - 2: (names[access - 3], "100Base-FX SFP", "GLC-FE-100FX"),
     }))
     entries.update(entity_sensors({access: [DOM_SENSORS[0]]}))
-    # Every fixed copper port answers arc 30 too, as a real Catalyst does.
-    entries.update(if_mau_type({**{i: 30 for i in range(1, access - 1)},
-                               access - 1: 30, access: 54, access + 1: 36}))
+    # Every fixed copper port answers arc 30 too, as a real Catalyst does --
+    # except the FX cage's, which answers 100BaseFX(12): a copper MAU arc
+    # outranks module text, so arc 30 there would badge the port copper and
+    # the FX fixture would prove nothing.
+    entries.update(if_mau_type({**{i: 30 for i in range(1, access - 2)},
+                               access - 2: 12, access - 1: 30,
+                               access: 54, access + 1: 36}))
     entries.update(host_resources(1, [("Physical memory", 1024, 524288, 0.61)]))
     entries.update(arc_objects(9, {
         # CISCO-PROCESS-MIB cpmCPUTotal5minRev, one of the two objects an
