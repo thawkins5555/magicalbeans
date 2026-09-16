@@ -176,6 +176,10 @@ class DeviceState:
         # scalars count down), or the room sensor is pinned hot.
         self.on_battery = bool(knobs.get("on_battery", False))
         self.temp_hot = bool(knobs.get("temp_hot", False))
+        # stack_cable_down SPECIALS knob: one power stack cable's link goes
+        # down(2) on both ends -- see _build_cisco_access's CISCO-STACKWISE-MIB
+        # entries.
+        self.stack_cable_down = bool(knobs.get("stack_cable_down", False))
         self.v3 = knobs.get("v3")                       # None|"noauth"|"sha"
         self.v3_user = knobs.get("v3_user", "poller")
         self.v3_password = knobs.get("v3_password", "")
@@ -303,6 +307,7 @@ class DeviceState:
                 "flapping": sorted(self.flapping), "v3": self.v3,
                 "community": self.community,
                 "on_battery": self.on_battery, "temp_hot": self.temp_hot,
+                "stack_cable_down": self.stack_cable_down,
                 "dark_after_s": self.dark_after_s, "dark_for_s": self.dark_for_s,
                 "reboot_every_s": self.reboot_every_s,
                 "uptime_s": int(time.time() - self.boot(time.time())),
@@ -1286,6 +1291,39 @@ def _build_cisco_access(wrap32: bool, ports: int, vlan: str | None) -> dict:
         cisco_extension=True))
     entries.update(dot1d_stp(priority=32768, root_cost=4, root_port=uplink_if))
     entries.update(dot1d_stp_ports({port: 5 for port in port_to_if}))  # forwarding
+    # CISCO-STACKWISE-MIB (5.32.0): a 3-member ring power stack, redundant
+    # mode, 30 A cables. entPhysicalIndex 1001/2001/3001 sit well outside
+    # this persona's own (~50-port) entPhysicalIndex range, so they can
+    # never collide with the entity_sensors/sfp_cages entries above.
+    stack_switches = {1001: 1, 2001: 2, 3001: 3}
+    ring = [1001, 2001, 3001]
+    # PORT-1 faces the previous switch in the ring, PORT-2 the next one --
+    # switch 2's PORT-2 and switch 3's PORT-1 are therefore the same cable,
+    # the one the stack_cable_down knob (SPECIALS index 30) takes down.
+    neighbor_of = {}
+    for i, ent in enumerate(ring):
+        neighbor_of[(ent, 1)] = stack_switches[ring[i - 1]]
+        neighbor_of[(ent, 2)] = stack_switches[ring[(i + 1) % len(ring)]]
+    down_ports = {(2001, 2), (3001, 1)}
+    for ent, switch_num in stack_switches.items():
+        entries[f"{fgoids.CSW_SWITCH_NUM_CURRENT}.{ent}"] = (T_GAUGE32, switch_num)
+        entries[f"{fgoids.CSW_SWITCH_POWER_BUDGET}.{ent}"] = (T_GAUGE32, 1100)
+        entries[f"{fgoids.CSW_SWITCH_POWER_COMMITED}.{ent}"] = (T_GAUGE32, 280 + switch_num * 30)
+        entries[f"{fgoids.CSW_SWITCH_POWER_ALLOCATED}.{ent}"] = (T_GAUGE32, 300 + switch_num * 30)
+        for port in (1, 2):
+            entries[f"{fgoids.CSW_STACK_POWER_PORT_OPER_STATUS}.{ent}.{port}"] = (T_INTEGER, 1)
+            entries[f"{fgoids.CSW_STACK_POWER_PORT_NEIGHBOR_SWITCH}.{ent}.{port}"] = (
+                T_GAUGE32, neighbor_of[(ent, port)])
+            entries[f"{fgoids.CSW_STACK_POWER_PORT_LINK_STATUS}.{ent}.{port}"] = (
+                T_INTEGER, (lambda st, now, key=(ent, port):
+                           2 if key in down_ports and st.stack_cable_down else 1))
+            entries[f"{fgoids.CSW_STACK_POWER_PORT_LIMIT_A}.{ent}.{port}"] = (T_GAUGE32, 30)
+            entries[f"{fgoids.CSW_STACK_POWER_PORT_NAME}.{ent}.{port}"] = (
+                T_OCTET_STRING, f"PORT-{port}")
+    entries[f"{fgoids.CSW_STACK_POWER_MODE}.1"] = (T_INTEGER, 2)          # redundant
+    entries[f"{fgoids.CSW_STACK_POWER_NUM_MEMBERS}.1"] = (T_GAUGE32, 3)
+    entries[f"{fgoids.CSW_STACK_POWER_TYPE}.1"] = (T_INTEGER, 1)          # ring
+    entries[f"{fgoids.CSW_STACK_POWER_NAME}.1"] = (T_OCTET_STRING, "Power Stack 1")
     return entries
 
 
@@ -2306,6 +2344,12 @@ SPECIALS: dict[int, dict] = {
                  "site) — a fixed count, not a proportional one"},
     28: {"persona": "mikrotik", "profile": "v2c-public", "knob": ""},
     29: {"persona": "mikrotik", "profile": "v2c-public", "knob": ""},
+    30: {"persona": "cisco_access", "profile": "v2c-public",
+         "knob": "stack_cable_down",
+         "note": "the CISCO-STACKWISE-MIB power stack's ring cable between "
+                 "switch 2 and switch 3 is down; nodepoll._poll_stack_power "
+                 "turns it into a real stack_power_port metric and "
+                 "alertsdb's stack_power_cable_down rule fires off it"},
 }
 
 # The last index SPECIALS occupies; the weighted mix starts one past it.
@@ -2463,6 +2507,8 @@ def fleet_plan(count: int) -> list[dict]:
                 knobs["on_battery"] = True
             elif knob == "temp_hot":
                 knobs["temp_hot"] = True
+            elif knob == "stack_cable_down":
+                knobs["stack_cable_down"] = True
 
         if version == 3:
             knobs.setdefault("v3", "sha" if profile == "v3-sha" else "noauth")

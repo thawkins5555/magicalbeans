@@ -326,6 +326,7 @@ ROUTES = [
     ("GET", r"^/api/nodes/devices/(\d+)/hardware$", api.get_nodes_device_hardware, ("nodes", R)),
     ("GET", r"^/api/nodes/devices/(\d+)/dom$", api.get_nodes_device_dom_all, ("nodes", R)),
     ("GET", r"^/api/nodes/devices/(\d+)/sensors$", api.get_nodes_device_sensors, ("nodes", R)),
+    ("GET", r"^/api/nodes/devices/(\d+)/stack-power$", api.get_nodes_device_stack_power, ("nodes", R)),
     ("GET", r"^/api/nodes/devices/(\d+)/interfaces/(\d+)/mac-table$", api.get_nodes_device_mac_table, ("nodes", R)),
     ("GET", r"^/api/nodes/devices/(\d+)/oids$", api.get_nodes_device_oids, ("nodes", R)),
     # A whole-device walk is a live SNMP job, not a read of stored data, so

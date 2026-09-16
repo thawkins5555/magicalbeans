@@ -675,8 +675,8 @@ _RULE_EDITABLE = ("name", "severity", "enabled", "device_filter", "threshold",
                   "auto_resolve_after_s", "notify", "notify_sms")
 _RULE_CUSTOM_EDITABLE = _RULE_EDITABLE + ("kind", "source_kind")
 
-# 62 built-in rules: 10 device_event + 4 interface_event + 29 threshold +
-# 3 trap + 1 syslog + 1 ipam + 4 wireless_event + 1 dhcp_threshold +
+# 70 built-in rules: 10 device_event + 4 interface_event + 36 threshold +
+# 4 trap + 1 syslog + 1 ipam + 4 wireless_event + 1 dhcp_threshold +
 # 3 netpath_threshold + 1 netpath_event + 5 system. Each `template` name is a
 # templates.key —
 # most non-primary rules reuse a generic template rather than a bespoke
@@ -855,6 +855,12 @@ _BUILTIN_RULES = [
     ("temp_sensor_state_critical", "Sensor reports temperature critical", "threshold", "temp_sensor_state", 2, "threshold_breach", 2.0, 2.0, 1),
     ("psu_warning", "Power supply degraded", "threshold", "psu_state", 4, "threshold_breach", 1.0, 1.0, 1),
     ("psu_failed", "Power supply failed or lost input", "threshold", "psu_state", 2, "threshold_breach", 2.0, 2.0, 1),
+    # 5.32.0: CISCO-STACKWISE-MIB. stack_power_port is 0 ok (up, or
+    # deliberately admin-disabled) / 2 cable down -- same shape as psu_state
+    # bar the "not present" state, since a stack power port that stops
+    # answering is a vanished walk row, not a removed bay (nodepoll
+    # deliberately writes nothing for it; see _poll_stack_power).
+    ("stack_power_cable_down", "Stack Power cable down", "threshold", "stack_power_port", 2, "threshold_breach", 2.0, 2.0, 1),
     # RH above ~80% starts to risk condensation on anything metal in the
     # room — unambiguous on its own: nothing but a dedicated environmental
     # monitor answers a humidity sensor at all, so this one metric key
@@ -868,6 +874,11 @@ _BUILTIN_RULES = [
     ("trap_critical", "Critical SNMP trap received", "trap", "", 2, "trap_forwarded", None, None, 1),
     ("trap_cold_start", "Device cold start trap", "trap", "coldStart", 4, "trap_forwarded", None, None, 1),
     ("trap_link_down_unmanaged", "Link-down trap from an unmanaged device", "trap", "linkDown", 3, "trap_forwarded", None, None, 1),
+    # 5.32.0: any of the fault notifications CISCO-STACKWISE-MIB defines
+    # (trapdecode.KIND_BY_OID "stackPower", ...500.0.0.9-18) -- the plain
+    # link/oper-status-changed pair (...500.0.0.7/8, kind "stackPowerStatus")
+    # is informational by the MIB's own text and has no rule of its own.
+    ("stack_power_trap", "Stack Power fault trap", "trap", "stackPower", 4, "trap_forwarded", None, None, 1),
     ("syslog_critical", "Critical syslog message", "syslog", "", 2, "trap_forwarded", None, None, 1),
     ("ipam_new_conflict", "New IPAM address conflict", "ipam", "", 4, "trap_forwarded", None, None, 1),
     ("wireless_ap_removed", "Access point removed from its controller", "wireless_event", "ap_removed", 3, "event_notice", None, None, 1),

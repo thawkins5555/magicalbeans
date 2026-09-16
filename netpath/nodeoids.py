@@ -1358,3 +1358,30 @@ PSU_TABLES = {
     ),
 }
 
+# ---------------------------------------------------------------------------
+# Cisco Stack Power (5.32.0) -- CISCO-STACKWISE-MIB, ciscoMgmt 500, arc 9
+# only. Resolved from the MIB text the same way SENSOR_TABLES/PSU_TABLES
+# above were; nodepoll._poll_stack_power is the only reader, so this is a
+# flat OID list rather than another declarative table -- the port/stack/
+# switch tables have three different index shapes and none of them fit
+# SensorTable or PsuTable's single-index, single-state-column shape.
+
+# cswStackPowerPortInfoTable, INDEX entPhysicalIndex.cswStackPowerPortIndex.
+CSW_STACK_POWER_PORT_OPER_STATUS = "1.3.6.1.4.1.9.9.500.1.3.2.1.2"
+CSW_STACK_POWER_PORT_NEIGHBOR_SWITCH = "1.3.6.1.4.1.9.9.500.1.3.2.1.4"
+CSW_STACK_POWER_PORT_LINK_STATUS = "1.3.6.1.4.1.9.9.500.1.3.2.1.5"
+CSW_STACK_POWER_PORT_LIMIT_A = "1.3.6.1.4.1.9.9.500.1.3.2.1.6"
+CSW_STACK_POWER_PORT_NAME = "1.3.6.1.4.1.9.9.500.1.3.2.1.7"
+
+# cswStackPowerInfoTable, INDEX cswStackPowerStackNumber.
+CSW_STACK_POWER_MODE = "1.3.6.1.4.1.9.9.500.1.3.1.1.2"
+CSW_STACK_POWER_NUM_MEMBERS = "1.3.6.1.4.1.9.9.500.1.3.1.1.5"
+CSW_STACK_POWER_TYPE = "1.3.6.1.4.1.9.9.500.1.3.1.1.6"
+CSW_STACK_POWER_NAME = "1.3.6.1.4.1.9.9.500.1.3.1.1.7"
+
+# cswSwitchInfoTable, INDEX entPhysicalIndex.
+CSW_SWITCH_NUM_CURRENT = "1.3.6.1.4.1.9.9.500.1.2.1.1.1"
+CSW_SWITCH_POWER_BUDGET = "1.3.6.1.4.1.9.9.500.1.2.1.1.9"
+CSW_SWITCH_POWER_COMMITED = "1.3.6.1.4.1.9.9.500.1.2.1.1.10"
+CSW_SWITCH_POWER_ALLOCATED = "1.3.6.1.4.1.9.9.500.1.2.1.1.14"
+

@@ -8,6 +8,7 @@ Metric keys and threshold rows are written by hand, exactly as
 tests/test_alert_per_port.py does, so nothing here depends on the poller.
 """
 import os
+import sqlite3
 import time
 
 import _paths  # noqa: F401  (puts the repo root and tests/ on sys.path)
@@ -62,6 +63,16 @@ def sample(nodes, did, key, label, unit, ts, value):
     nodes.record_metric_sample(did, key, label, unit, "gauge", ts, value)
 
 
+def go_down(nodes, device_id):
+    """Same outage helper tests/test_alert_per_port.py uses: a status update
+    the engine's own outage detector would make, plus the event it reads."""
+    conn = sqlite3.connect(nodes.path)
+    conn.execute("UPDATE devices SET status = 'down' WHERE id = ?", (device_id,))
+    conn.commit()
+    conn.close()
+    nodes.record_device_event(device_id, "down", "stopped responding")
+
+
 def publish(nodes, did, idx, warn, alarm):
     nodes.replace_interface_thresholds(did, "CISCO-ENTITY-SENSOR-MIB", [
         {"if_index": idx, "metric_root": "temp_sensor_c", "low_alarm": None,
@@ -73,14 +84,17 @@ def publish(nodes, did, idx, warn, alarm):
 check("the two published temperature rules read the high bands",
       PUBLISHED_THRESHOLD_RULES["temp_sensor_high"] == ("temp_sensor_c", "high_warn")
       and PUBLISHED_THRESHOLD_RULES["temp_sensor_critical"] == ("temp_sensor_c", "high_alarm"))
-check("the three sensor families are declared",
-      SENSOR_FAMILIES == {"temp_sensor_c", "temp_sensor_state", "psu_state"})
+check("the four sensor families are declared",
+      SENSOR_FAMILIES == {"temp_sensor_c", "temp_sensor_state", "psu_state",
+                          "stack_power_port"})
 check("both chassis rules fall back to the sensor families",
       set(FALLBACK_OF) == {"temp_chassis_high", "temp_chassis_critical"})
 check("each pair rolls warning under critical and critical under device_down",
       ROLLED_UP_BY["temp_sensor_high"] == "temp_sensor_critical"
       and ROLLED_UP_BY["psu_warning"] == "psu_failed"
       and ROLLED_UP_BY["psu_failed"] == "device_down")
+check("stack_power_cable_down rolls up under device_down directly",
+      ROLLED_UP_BY["stack_power_cable_down"] == "device_down")
 check("a sensor entity resolves to its device for muting",
       device_id_for("sensor", "7:3") == 7)
 
@@ -171,6 +185,46 @@ for i in range(3):
     engine._tick()
 check("a state-only device is also covered, so the chassis rule stays quiet",
       open_rows(alerts, "temp_chassis_critical") == [])
+nodes.close(); alerts.close()
+for store in stores:
+    store.close()
+
+# --------------------------------------------- S4 stack power cable down
+nodes, alerts, engine, stores = build(rollup_enabled=True)
+did = nodes.add_device("10.30.0.4", name="stack-sw", group_id=nodes.ensure_default_group())
+engine._tick()
+base = time.time()
+sample(nodes, did, "stack_power_port.1001002",
+      "Switch 1 stack power PORT-2 -> switch 2", "state", base, 2.0)
+engine._tick()
+rows = open_rows(alerts, "stack_power_cable_down")
+check("a stack power port reading 2 opens stack_power_cable_down",
+      len(rows) == 1 and rows[0]["entity_kind"] == "sensor"
+      and rows[0]["entity_id"] == f"{did}:1001002", [dict(r) for r in rows])
+check("...named after the port, not a generic sensor index",
+      rows and "PORT-2" in rows[0]["entity_label"], rows and rows[0]["entity_label"])
+sample(nodes, did, "stack_power_port.1001002",
+      "Switch 1 stack power PORT-2 -> switch 2", "state", base + 1, 0.0)
+engine._tick()
+check("...and 0 clears it", open_rows(alerts, "stack_power_cable_down") == [])
+
+
+# device_down first, THEN a fresh breach -- the order _rollup_parent (not
+# the open-on-absorb sweep, which only covers "device"/"interface" entity
+# children -- see alertengine._absorb_one) actually covers for a `sensor`
+# family child: it is suppressed before ever opening, same as psu_failed.
+did2 = nodes.add_device("10.30.0.5", name="stack-sw-down", group_id=nodes.ensure_default_group())
+engine._tick()
+go_down(nodes, did2)
+engine._tick()
+check("the device is down", len(open_rows(alerts, "device_down")) == 1)
+sample(nodes, did2, "stack_power_port.1001002",
+      "Switch 1 stack power PORT-2 -> switch 2", "state", base + 2, 2.0)
+engine._tick()
+check("a fresh cable-down breach while the device is already down is "
+      "suppressed under the outage rather than opening its own alert",
+      open_rows(alerts, "stack_power_cable_down") == [],
+      [dict(r) for r in open_rows(alerts, "stack_power_cable_down")])
 nodes.close(); alerts.close()
 for store in stores:
     store.close()

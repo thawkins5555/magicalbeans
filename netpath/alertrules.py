@@ -567,6 +567,11 @@ ROLLED_UP_BY = {
     "temp_sensor_state_critical": "device_down",
     "psu_warning": "psu_failed",
     "psu_failed": "device_down",
+    # 5.32.0: Stack Power cable ports are also `sensor` entities (see
+    # SENSOR_FAMILIES below); a stack still routes power over its ring the
+    # other way, so a downed cable rolls up under the device rather than
+    # under psu_failed, which is about a supply, not a link.
+    "stack_power_cable_down": "device_down",
 }
 
 
@@ -615,7 +620,8 @@ PUBLISHED_HYSTERESIS = {"sfp_rx_dbm": 1.0, "sfp_tx_dbm": 1.0, "temp_sensor_c": 2
 # Metric families whose per-index children are sensors, not ports: the
 # engine names them from the metric's own label and keys the alert
 # "<device_id>:<sensor index>" under entity kind `sensor`.
-SENSOR_FAMILIES = frozenset({"temp_sensor_c", "temp_sensor_state", "psu_state"})
+SENSOR_FAMILIES = frozenset({"temp_sensor_c", "temp_sensor_state", "psu_state",
+                             "stack_power_port"})
 
 # A rule that is only the fallback for a device with no per-sensor
 # coverage: rule key -> the families whose presence (a published

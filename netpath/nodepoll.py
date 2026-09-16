@@ -1688,6 +1688,11 @@ class NodePoller(Worker):
         self._vendor_sensor_read: dict[int, float] = {}
         # (device_id, PsuTable.state) -> static PSU columns, _SENSOR_REFRESH_S TTL.
         self._vendor_psu_static: dict[tuple, dict] = {}
+        # device_id -> when CISCO-STACKWISE-MIB was last walked / whether it
+        # answered (1/0/absent=unknown). _poll_stack_power's own latch, kept
+        # apart from vendor_sensor_capable -- see that method's docstring.
+        self._stack_power_read: dict[int, float] = {}
+        self._stack_power_capable: dict[int, int] = {}
         # device_id -> when the vendor table's own published thresholds
         # were last walked. See _SENSOR_THRESHOLD_REFRESH_S.
         self._vendor_sensor_threshold_read: dict[int, float] = {}
@@ -2151,6 +2156,7 @@ class NodePoller(Worker):
         self._vendor_sensor_threshold_read.pop(device_id, None)
         self._mau_read.pop(device_id, None)
         self._forget_vendor_psu_static(device_id)
+        self._stack_power_read.pop(device_id, None)
         # And "start from nothing": an explicit retry is the one place a
         # per-device cache is discarded on request. The operator is asking
         # for the attempt the scheduler would make with no history — the
@@ -2673,6 +2679,7 @@ class NodePoller(Worker):
                       self._sensor_read, self._sensor_threshold_read,
                       self._vendor_sensor_read, self._vendor_sensor_threshold_read,
                       self._mau_read, self._mau_capable,
+                      self._stack_power_read, self._stack_power_capable,
                       self._sensor_diag_ts, self._snmp_backoff,
                       self._snmp_failing_count, self._get_batch,
                       self._poll_cost):
@@ -4723,6 +4730,7 @@ class NodePoller(Worker):
         self._vendor_sensor_read.pop(device_id, None)
         self._vendor_sensor_threshold_read.pop(device_id, None)
         self._forget_vendor_psu_static(device_id)
+        self._stack_power_read.pop(device_id, None)
         job.start()
         return job.status()
 
@@ -6618,6 +6626,17 @@ class NodePoller(Worker):
         """
         if not config.get("snmp_enabled", True):
             return
+        keys = device.keys() if hasattr(device, "keys") else device
+        raw_oid = device["sys_object_id"] if "sys_object_id" in keys else ""
+        arc = nodeoids.enterprise_arc(raw_oid or "")
+        # CISCO-STACKWISE-MIB stack power (5.32.0): its own probe-once-
+        # remember latch (_poll_stack_power/_stack_power_capable), entirely
+        # independent of vendor_sensor_capable below -- a Cisco device can
+        # answer PSU or temperature and have no power stack cabling at all,
+        # or the reverse.
+        if arc == 9:
+            self._poll_stack_power(device_id, device, config, now)
+
         capable = device["vendor_sensor_capable"]
         window = self._SENSOR_REPROBE_S if capable == 0 else self._SENSOR_REFRESH_S
         due_sensors = now - self._vendor_sensor_read.get(device_id, 0.0) >= window
@@ -6627,9 +6646,6 @@ class NodePoller(Worker):
         if due_sensors:
             self._vendor_sensor_read[device_id] = now
 
-        keys = device.keys() if hasattr(device, "keys") else device
-        raw_oid = device["sys_object_id"] if "sys_object_id" in keys else ""
-        arc = nodeoids.enterprise_arc(raw_oid or "")
         sensor_table = None
         if due_sensors:
             sensor_table = nodeoids.SENSOR_TABLES.get(arc)
@@ -6815,6 +6831,112 @@ class NodePoller(Worker):
             rows[idx] = {"label": label,
                         "state": _vendor_state_value(raw, scalar_map, table.state_default)}
         return rows
+
+    def _poll_stack_power(self, device_id: int, device, config: dict,
+                          now: float) -> None:
+        """CISCO-STACKWISE-MIB (nodeoids.CSW_*) stack power cabling —
+        stack_power_port(_admin|_limit_a).<idx> (idx =
+        _flatten_vendor_idx("<entPhysicalIndex>.<cswStackPowerPortIndex>")),
+        stack_power_stack_*.<stack number> and stack_power_*_w.<entPhysicalIndex>.
+        Called from _poll_vendor_sensors for arc 9 (Cisco) only.
+
+        Its own probe-once-remember latch (_stack_power_capable/_read),
+        deliberately separate from vendor_sensor_capable: whether a Cisco
+        device has stack power cabling at all has nothing to do with
+        whether it answers ENVMON/FRU PSU state. A device that has
+        answered before is walked every poll; one that has not is retried
+        at most once an hour (_SENSOR_REPROBE_S), same as PSU.
+        """
+        capable = self._stack_power_capable.get(device_id)
+        if capable != 1 and (now - self._stack_power_read.get(device_id, 0.0)
+                             < self._SENSOR_REPROBE_S):
+            return
+        self._stack_power_read[device_id] = now
+
+        oper = self._walk_column(device, config, nodeoids.CSW_STACK_POWER_PORT_OPER_STATUS)
+        neighbor = self._walk_column(device, config, nodeoids.CSW_STACK_POWER_PORT_NEIGHBOR_SWITCH)
+        link = self._walk_column(device, config, nodeoids.CSW_STACK_POWER_PORT_LINK_STATUS)
+        limit = self._walk_column(device, config, nodeoids.CSW_STACK_POWER_PORT_LIMIT_A)
+        port_name = self._walk_column(device, config, nodeoids.CSW_STACK_POWER_PORT_NAME)
+
+        switch_num = self._walk_column(device, config, nodeoids.CSW_SWITCH_NUM_CURRENT)
+        budget = self._walk_column(device, config, nodeoids.CSW_SWITCH_POWER_BUDGET)
+        committed = self._walk_column(device, config, nodeoids.CSW_SWITCH_POWER_COMMITED)
+        allocated = self._walk_column(device, config, nodeoids.CSW_SWITCH_POWER_ALLOCATED)
+
+        mode = self._walk_column(device, config, nodeoids.CSW_STACK_POWER_MODE)
+        members = self._walk_column(device, config, nodeoids.CSW_STACK_POWER_NUM_MEMBERS)
+        topology = self._walk_column(device, config, nodeoids.CSW_STACK_POWER_TYPE)
+        stack_name = self._walk_column(device, config, nodeoids.CSW_STACK_POWER_NAME)
+
+        answered = bool(oper or switch_num or mode)
+        if answered:
+            self._stack_power_capable[device_id] = 1
+        elif capable is None:
+            self._stack_power_capable[device_id] = 0
+        if not answered:
+            return
+
+        samples = []
+        switch_by_ent = {suffix: _vendor_numeric(raw, False)
+                         for suffix, raw in switch_num.items()}
+
+        for suffix, admin_raw in oper.items():
+            parts = suffix.split(".")
+            if len(parts) != 2:
+                continue
+            ent, port = parts
+            admin = _vendor_numeric(admin_raw, False)
+            if admin is None:
+                continue
+            link_val = _vendor_numeric(link.get(suffix), False)
+            if admin == 2:
+                state = 0.0                  # administratively off, not a fault
+            elif link_val == 2:
+                state = 2.0                  # enabled, cable down
+            elif link_val == 1:
+                state = 0.0                  # enabled, up
+            else:
+                continue                     # link never answered -- no fact yet
+            switch = switch_by_ent.get(ent)
+            switch_text = str(int(switch)) if switch is not None else ent
+            name = str(port_name.get(suffix) or "").strip() or f"port {port}"
+            label = f"Switch {switch_text} stack power {name}"
+            nbr = _vendor_numeric(neighbor.get(suffix), False)
+            if nbr:                          # 0/unset -- no neighbour to name
+                label += f" -> switch {int(nbr)}"
+            idx = _flatten_vendor_idx(suffix)
+            samples.append((f"stack_power_port.{idx}", label, "state", "gauge", now, state))
+            samples.append((f"stack_power_port_admin.{idx}", label, "state",
+                            "gauge", now, admin))
+            lim = _vendor_numeric(limit.get(suffix), False)
+            if lim is not None:
+                samples.append((f"stack_power_port_limit_a.{idx}", label, "A",
+                                "gauge", now, lim))
+
+        for suffix, raw in switch_num.items():
+            switch = _vendor_numeric(raw, False)
+            if switch is None:
+                continue
+            label = f"Switch {int(switch)}"
+            for oid_map, root, unit in ((budget, "stack_power_budget_w", "W"),
+                                        (committed, "stack_power_committed_w", "W"),
+                                        (allocated, "stack_power_allocated_w", "W")):
+                value = _vendor_numeric(oid_map.get(suffix), False)
+                if value is not None:
+                    samples.append((f"{root}.{suffix}", label, unit, "gauge", now, value))
+
+        for suffix in set(topology) | set(mode) | set(members):
+            label = str(stack_name.get(suffix) or "").strip() or f"power stack {suffix}"
+            for oid_map, root, unit in ((topology, "stack_power_stack_type", "state"),
+                                        (mode, "stack_power_stack_mode", "state"),
+                                        (members, "stack_power_stack_members", "count")):
+                value = _vendor_numeric(oid_map.get(suffix), False)
+                if value is not None:
+                    samples.append((f"{root}.{suffix}", label, unit, "gauge", now, value))
+
+        if samples:
+            self.db.record_metric_samples(device_id, samples)
 
     def _vendor_threshold_source(self, table) -> str:
         """A stable, human-legible source name for

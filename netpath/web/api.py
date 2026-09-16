@@ -5503,10 +5503,11 @@ def get_nodes_device_hardware(service, params, body, device_id) -> dict:
 
 
 _SENSOR_FAMILY_KINDS = {"temp_sensor_c": "temperature", "temp_sensor_state": "temperature",
-                        "psu_state": "psu"}
+                        "psu_state": "psu", "stack_power_port": "stack_power"}
 _PSU_STATE_WORDS = {0: "ok", 1: "degraded", 2: "failed / no input",
                     3: "not present (removed or no input)"}
 _TEMP_STATE_WORDS = {0: "normal", 1: "warning", 2: "critical", 3: "shutdown"}
+_STACK_POWER_STATE_WORDS = {0: "ok", 2: "cable down"}
 
 
 def get_nodes_device_sensors(service, params, body, device_id) -> dict:
@@ -5535,7 +5536,9 @@ def get_nodes_device_sensors(service, params, body, device_id) -> dict:
                 entry["high_warn"], entry["high_alarm"] = limit["high_warn"], limit["high_alarm"]
                 entry["limit_source"] = limit["source"]
         else:
-            words = _PSU_STATE_WORDS if root == "psu_state" else _TEMP_STATE_WORDS
+            words = (_PSU_STATE_WORDS if root == "psu_state" else
+                     _STACK_POWER_STATE_WORDS if root == "stack_power_port" else
+                     _TEMP_STATE_WORDS)
             entry["state"] = None if value is None else int(value)
             entry["state_text"] = words.get(entry["state"], str(value) if value is not None else "")
     sensors = sorted(by_key.values(), key=lambda e: (e["kind"], e["index"]))
@@ -5544,6 +5547,110 @@ def get_nodes_device_sensors(service, params, body, device_id) -> dict:
                                                              or e["high_alarm"] is not None
                                                              or e["state"] is not None)
                            for e in sensors)}
+
+
+_STACK_POWER_PORT_LABEL_RE = re.compile(
+    r"^Switch (?P<switch>\S+) stack power (?P<name>.+?)"
+    r"(?: -> switch (?P<neighbour>\d+))?$")
+_STACK_POWER_SWITCH_LABEL_RE = re.compile(r"^Switch (?P<switch>\S+)$")
+_STACK_POWER_MODE_WORDS = {1: "power sharing", 2: "redundant",
+                           3: "power sharing (strict)", 4: "redundant (strict)"}
+_STACK_POWER_TOPOLOGY_WORDS = {1: "ring", 2: "star"}
+
+
+def _stack_power_numkey(value):
+    """Numeric-first sort key: a stack/switch/port number in this feature
+    is always the raw digits nodepoll wrote, but falls back gracefully if a
+    label ever fails to parse."""
+    try:
+        return (0, int(value))
+    except (TypeError, ValueError):
+        return (1, str(value))
+
+
+def get_nodes_device_stack_power(service, params, body, device_id) -> dict:
+    """CISCO-STACKWISE-MIB rows nodepoll._poll_stack_power stored -- stored
+    data only, no SNMP. There is no separate switch-number/port-name/
+    neighbour column to join against, only the metric label each of those
+    values was folded into ("Switch N stack power <name>[ -> switch M]",
+    "Switch N"), so those three are recovered by parsing it back out.
+    """
+    _require(service.nodes_db.device(device_id), "device")
+    rows = {str(row["key"]): row for row in service.nodes_db.metrics(int(device_id))}
+    present = any(key.startswith("stack_power_") for key in rows)
+
+    stacks = []
+    for key, row in rows.items():
+        if not key.startswith("stack_power_stack_type."):
+            continue
+        n = key.split(".", 1)[1]
+        mode_row = rows.get(f"stack_power_stack_mode.{n}")
+        members_row = rows.get(f"stack_power_stack_members.{n}")
+        mode = int(mode_row["last_value"]) if mode_row and mode_row["last_value"] is not None else None
+        topology = int(row["last_value"]) if row["last_value"] is not None else None
+        stacks.append({
+            "number": int(n) if n.isdigit() else n,
+            "name": row["label"] or f"power stack {n}",
+            "mode": mode, "mode_text": _STACK_POWER_MODE_WORDS.get(mode, ""),
+            "topology": _STACK_POWER_TOPOLOGY_WORDS.get(topology, ""),
+            "members": (int(members_row["last_value"])
+                       if members_row and members_row["last_value"] is not None else None),
+        })
+    stacks.sort(key=lambda s: _stack_power_numkey(s["number"]))
+
+    switches = []
+    for key, row in rows.items():
+        if not key.startswith("stack_power_budget_w."):
+            continue
+        ent = key.split(".", 1)[1]
+        m = _STACK_POWER_SWITCH_LABEL_RE.match(row["label"] or "")
+        switch = m.group("switch") if m else ent
+        committed_row = rows.get(f"stack_power_committed_w.{ent}")
+        allocated_row = rows.get(f"stack_power_allocated_w.{ent}")
+        switches.append({
+            "switch": int(switch) if switch.isdigit() else switch,
+            "budget_w": row["last_value"],
+            "committed_w": committed_row["last_value"] if committed_row else None,
+            "allocated_w": allocated_row["last_value"] if allocated_row else None,
+        })
+    switches.sort(key=lambda s: _stack_power_numkey(s["switch"]))
+
+    ports = []
+    for key, row in rows.items():
+        if not key.startswith("stack_power_port."):
+            continue
+        idx = key.split(".", 1)[1]
+        m = _STACK_POWER_PORT_LABEL_RE.match(row["label"] or "")
+        switch = m.group("switch") if m else None
+        name = m.group("name") if m else (row["label"] or "")
+        neighbour = int(m.group("neighbour")) if m and m.group("neighbour") else 0
+        admin_row = rows.get(f"stack_power_port_admin.{idx}")
+        limit_row = rows.get(f"stack_power_port_limit_a.{idx}")
+        admin = (int(admin_row["last_value"])
+                if admin_row and admin_row["last_value"] is not None else None)
+        state = int(row["last_value"]) if row["last_value"] is not None else None
+        if admin == 2:
+            state_text = "disabled"
+        elif state == 2:
+            state_text = "cable down"
+        else:
+            state_text = "ok" if state == 0 else ""
+        ports.append({
+            "switch": int(switch) if switch and switch.isdigit() else switch,
+            "name": name, "neighbour_switch": neighbour,
+            "admin_text": {1: "enabled", 2: "disabled"}.get(admin, ""),
+            # No raw link column is stored separately from `state` -- see
+            # nodepoll._poll_stack_power's docstring for why state alone
+            # (0 up-or-disabled, 2 down) is the only fact a disabled port
+            # ever publishes here.
+            "link_text": "down" if state == 2 else "up",
+            "state": state, "state_text": state_text,
+            "limit_a": limit_row["last_value"] if limit_row else None,
+            "last_ts": row["last_ts"],
+        })
+    ports.sort(key=lambda p: (_stack_power_numkey(p["switch"]), p["name"]))
+
+    return {"present": present, "stacks": stacks, "switches": switches, "ports": ports}
 
 
 def get_nodes_device_dom_all(service, params, body, device_id) -> dict:

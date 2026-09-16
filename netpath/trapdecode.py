@@ -961,6 +961,21 @@ WELL_KNOWN = {
     "1.3.6.1.4.1.9.9.13.1.5.1.2": "ciscoEnvMonSupplyStatusDescr",
     "1.3.6.1.4.1.9.9.13.1.5.1.3": "ciscoEnvMonSupplyState",
     "1.3.6.1.4.1.9.9.117.1.1.2.1.2": "cefcFRUPowerOperStatus",
+    # CISCO-STACKWISE-MIB notifications (5.32.0), ciscoMgmt.500.0.0.N --
+    # names taken verbatim from the MIB, including its own misspelt
+    # cscwStackPowerBudgetWarrning.
+    "1.3.6.1.4.1.9.9.500.0.0.7":  "cswStackPowerPortLinkStatusChanged",
+    "1.3.6.1.4.1.9.9.500.0.0.8":  "cswStackPowerPortOperStatusChanged",
+    "1.3.6.1.4.1.9.9.500.0.0.9":  "cswStackPowerVersionMismatch",
+    "1.3.6.1.4.1.9.9.500.0.0.10": "cswStackPowerInvalidTopology",
+    "1.3.6.1.4.1.9.9.500.0.0.11": "cscwStackPowerBudgetWarrning",
+    "1.3.6.1.4.1.9.9.500.0.0.12": "cswStackPowerInvalidInputCurrent",
+    "1.3.6.1.4.1.9.9.500.0.0.13": "cswStackPowerInvalidOutputCurrent",
+    "1.3.6.1.4.1.9.9.500.0.0.14": "cswStackPowerUnderBudget",
+    "1.3.6.1.4.1.9.9.500.0.0.15": "cswStackPowerUnbalancedPowerSupplies",
+    "1.3.6.1.4.1.9.9.500.0.0.16": "cswStackPowerInsufficientPower",
+    "1.3.6.1.4.1.9.9.500.0.0.17": "cswStackPowerPriorityConflict",
+    "1.3.6.1.4.1.9.9.500.0.0.18": "cswStackPowerUnderVoltage",
     "1.3.6.1.4.1.232":         "hpCompaq",
     "1.3.6.1.4.1.311":         "microsoft",
     "1.3.6.1.4.1.318":         "apc",
@@ -1037,6 +1052,22 @@ KIND_BY_OID = {
     "1.3.6.1.2.1.15.7.1":  "bgpEstablished",
     "1.3.6.1.2.1.15.7.2":  "bgpBackwardTransition",
     "1.3.6.1.2.1.33.2.1":  "upsOnBattery",
+    # CISCO-STACKWISE-MIB (5.32.0): the link/oper-status-changed pair is
+    # informational by the MIB's own text, so it gets a different kind from
+    # the nine genuine fault notifications -- see alertsdb.stack_power_trap,
+    # which matches "stackPower" and not "stackPowerStatus".
+    "1.3.6.1.4.1.9.9.500.0.0.7":  "stackPowerStatus",
+    "1.3.6.1.4.1.9.9.500.0.0.8":  "stackPowerStatus",
+    "1.3.6.1.4.1.9.9.500.0.0.9":  "stackPower",
+    "1.3.6.1.4.1.9.9.500.0.0.10": "stackPower",
+    "1.3.6.1.4.1.9.9.500.0.0.11": "stackPower",
+    "1.3.6.1.4.1.9.9.500.0.0.12": "stackPower",
+    "1.3.6.1.4.1.9.9.500.0.0.13": "stackPower",
+    "1.3.6.1.4.1.9.9.500.0.0.14": "stackPower",
+    "1.3.6.1.4.1.9.9.500.0.0.15": "stackPower",
+    "1.3.6.1.4.1.9.9.500.0.0.16": "stackPower",
+    "1.3.6.1.4.1.9.9.500.0.0.17": "stackPower",
+    "1.3.6.1.4.1.9.9.500.0.0.18": "stackPower",
 }
 
 # Every kind the filter dropdown offers, in the order it offers them.
@@ -1067,6 +1098,20 @@ DEFAULT_SEVERITY_RULES = [
     ("1.3.6.1.4.1.9.9.117.2.0.2", 2),  # cefcPowerStatusChange                -> critical
     ("1.3.6.1.4.1.9.9.117.2.0.4", 3),  # cefcFRURemoved                       -> error
     ("1.3.6.1.4.1.9.9.117.2.0.3", 5),  # cefcFRUInserted                      -> notice
+    # CISCO-STACKWISE-MIB (5.32.0) -- severities as specified for the
+    # release, not derived from the MIB text.
+    ("1.3.6.1.4.1.9.9.500.0.0.7",  5),  # cswStackPowerPortLinkStatusChanged -> notice
+    ("1.3.6.1.4.1.9.9.500.0.0.8",  5),  # cswStackPowerPortOperStatusChanged -> notice
+    ("1.3.6.1.4.1.9.9.500.0.0.9",  4),  # cswStackPowerVersionMismatch       -> warning
+    ("1.3.6.1.4.1.9.9.500.0.0.10", 3),  # cswStackPowerInvalidTopology       -> error
+    ("1.3.6.1.4.1.9.9.500.0.0.11", 4),  # cscwStackPowerBudgetWarrning       -> warning
+    ("1.3.6.1.4.1.9.9.500.0.0.12", 2),  # cswStackPowerInvalidInputCurrent   -> critical
+    ("1.3.6.1.4.1.9.9.500.0.0.13", 2),  # cswStackPowerInvalidOutputCurrent  -> critical
+    ("1.3.6.1.4.1.9.9.500.0.0.14", 3),  # cswStackPowerUnderBudget           -> error
+    ("1.3.6.1.4.1.9.9.500.0.0.15", 4),  # cswStackPowerUnbalancedPowerSupplies -> warning
+    ("1.3.6.1.4.1.9.9.500.0.0.16", 2),  # cswStackPowerInsufficientPower     -> critical
+    ("1.3.6.1.4.1.9.9.500.0.0.17", 4),  # cswStackPowerPriorityConflict      -> warning
+    ("1.3.6.1.4.1.9.9.500.0.0.18", 2),  # cswStackPowerUnderVoltage          -> critical
 ]
 
 # The shortest OID that can be a table column here (1.3.6.1.2.1.x.y.1.z is
