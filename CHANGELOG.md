@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.30.0 — Device links reveal the row, named interfaces and a default gateway on Addresses, tagged digests](#5300--device-links-reveal-the-row-named-interfaces-and-a-default-gateway-on-addresses-tagged-digests)
 - [5.29.0 — Discovery addresses removed: interfaces and ARP only](#5290--discovery-addresses-removed-interfaces-and-arp-only)
 - [5.28.0 — Discovery duplicates: an override, and folded rows no longer hidden](#5280--discovery-duplicates-an-override-and-folded-rows-no-longer-hidden)
 - [5.27.0 — Duplicate devices only share a configured address, not a discovered one](#5270--duplicate-devices-only-share-a-configured-address-not-a-discovered-one)
@@ -162,6 +163,64 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.30.0 — Device links reveal the row, named interfaces and a default gateway on Addresses, tagged digests
+
+Six items from the operator, split across three releases by risk and
+independence: `PROMPT-LOG.md` carries the full request. This entry covers
+the three that shipped as 5.30.0 — a device link that reveals its row, named
+interfaces and a default gateway on Addresses, and tagged alert digests.
+The other three (Mapper search/select-all/frames, Cisco Stack Power) are
+5.31.0 and 5.32.0, still open.
+
+**A device-name link now finds the row, wherever it points from.** Click a
+device name on Alerts, IPAM, Events, Wireless, Mapper's upstream picker,
+ConfigRX or a Nodes report, and Nodes → Devices no longer just opens Device
+Details for it — it clears the Find box, returns the grid to page one and,
+if the row is still hidden, clears the Profile, Group, Status, Only-offline,
+Only-in-maintenance and Only-with-overrides filters too. If the fleet still
+runs past one page, the grid pages forward — up to ten pages — until the row
+turns up. The row is then highlighted and scrolled into view, same as
+before. A link that carries its own search term (the fallback used when a
+device can't be linked by id) is unaffected and still just fills the Find
+box as it always has. `App.clearFilters` is a new shared helper behind both
+this and the Devices grid's own Clear button, so the two behave identically.
+
+**Addresses subtab: named interfaces, and the default gateway.** The
+Interface column used to show the bare SNMP ifIndex number; it now shows
+that interface's own name (its description if the device gave one, its
+short name otherwise — e.g. `Vlan10`, `GigabitEthernet1/0/1`), falling back
+to `#<n>` only if the interface itself is no longer on file. A new "Default
+gateway:" line above the address table shows the device's own default-route
+next hop, read on the same hourly walk as the address table itself; it
+reads "not published by this device" when the device answers but reports no
+default route.
+
+**Alert digests now say how bad, at a glance.** The roll-up digest — the
+one email/webhook/text sent when several alerts open in a short window
+instead of one notice per alert — used to carry a plain "SappiWhere: N
+alerts opened in the last M minutes" subject. It now leads with the worst
+severity in the batch, the same `[SEVERITY]` tag a single alert's subject
+already carried: `[CRITICAL] SappiWhere: 7 alerts opened in the last 5
+minutes`. The Settings **Send test email** button is unchanged.
+
+**Upgrade note:** once, on the first start after upgrading to 5.30.0, every
+*built-in* notification template's subject line is reset to this release's
+shipped wording — including one an operator had deliberately edited. Only
+the subject; the body, and any custom (non-built-in) template, are left
+exactly as they were. This runs once per database, marked by the
+`template_subjects_reset_5_30` setting, and never runs again after that
+first start.
+
+Files: `alertmail.py`, `alertengine.py`, `alertsdb.py`, `nodeoids.py`,
+`nodepoll.py`, `nodesdb.py`, `web/api.py`, `web/static/app.js`,
+`web/static/nodes.js`, `web/static/index.html`.
+
+Verification: `tests/ui/walk.mjs` — a new check drives a device-name link
+from the Alerts table with a stale Find term left in the Nodes grid and
+confirms Find is cleared, the row is selected, and Device Details opens; the
+existing Addresses-subtab check is extended to confirm the "Default
+gateway:" line is present.
 
 ### 5.29.0 — Discovery addresses removed: interfaces and ARP only
 

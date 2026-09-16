@@ -3364,6 +3364,71 @@ renders it, since a button spec knows nothing about permissions, and then
 `applyPermissions()` is re-run so a revoked grant settles on the open
 dialog instead of leaving an irreversible control enabled.
 
+### Interface names and the default gateway on Addresses (`nodeoids.py`, `nodepoll.py`, `nodesdb.py`, `web/api.py`, `web/static/nodes.js`) — 5.30.0
+
+**Naming the interface.** `_device_addresses_json(row, aliases, names=None)`
+(`api.py`) gained a third, optional argument: `names`, `{if_index:
+interfaces row}`. `_interface_label(names, if_index)` looks the address's
+`if_index` up in it and returns the interface's `descr` if it has one, else
+its `name`, else `""` — the same descr-then-name precedence the interface
+table's own display already uses elsewhere. Each alias row's JSON gains an
+`interface` key built this way; the synthetic primary-address row (which
+has no `if_index` of its own) always carries `interface: ""`. `names` is
+optional and only built by a caller that already has a reason to pay for
+`nodes_db.interfaces(device_id)` — both `get_nodes_device_addresses`
+(the Addresses subtab's own endpoint) and `get_nodes_device` (which embeds
+`addresses` in the device detail payload) now build it and pass it through;
+nothing else calls `_device_addresses_json` without it, since the resulting
+`interface: ""` degrades to exactly the old ifIndex-only column via the
+front end's own fallback below. `nodes.js`'s `drawAddressesTable` prefers
+`r.interface` (HTML-escaped) and falls back to `#<if_index>` (with a
+`title="ifIndex <n>"` tooltip) only when the interface itself is gone from
+the interfaces table, or an em dash when there is no `if_index` at all.
+
+**Reading the default gateway.** Two new OIDs in `nodeoids.py`:
+`IP_CIDR_ROUTE_NEXTHOP_DEFAULT` (`ipCidrRouteNextHop` under dest/mask
+`0.0.0.0`, `1.3.6.1.2.1.4.24.4.1.4.0.0.0.0.0.0.0.0`) and
+`IP_ROUTE_NEXTHOP_DEFAULT` (the older RFC1213 `ipRouteNextHop.0.0.0.0`,
+`1.3.6.1.2.1.4.21.1.7.0.0.0.0`), a GET fallback for a device that never
+populated the newer table. `nodepoll.NodePoller._refresh_default_gateway`
+is called from the end of `_refresh_addresses` — the same hourly
+`ipAddrTable` walk, on the same `_ADDRESS_REFRESH_S` (3600 s) cadence, not
+a separate timer:
+
+1. Walk `IP_CIDR_ROUTE_NEXTHOP_DEFAULT`. A device with a default route
+   answers one row per (tos, next-hop) pair — the walk suffix is
+   `tos.nexthop`, the value the next hop itself — so ECMP or a
+   tos-scoped pair yields more than one row from one cheap walk of a
+   subtree only a handful of routes wide.
+2. If the walk answered (no `SnmpError`) with at least one row, every
+   distinct non-`"0.0.0.0"` value is comma-joined, sorted, and written
+   with `nodesdb.set_default_gateway(device_id, text)`. This is the only
+   path taken on a device that answers the newer table at all, even if
+   after filtering there turns out to be nothing to report — the
+   fallback below is only for a device whose walk failed outright or
+   came back with no rows to filter.
+3. Otherwise (the walk raised `SnmpError`, or answered with zero rows) a
+   single GET of `IP_ROUTE_NEXTHOP_DEFAULT` is tried. If that GET itself
+   raises `SnmpError`, `_refresh_default_gateway` returns without calling
+   `set_default_gateway` at all — the previously stored value, if any, is
+   left alone rather than being blanked by one bad poll. If the GET
+   answers, the value is stored as-is, or `""` when it too reads
+   `"0.0.0.0"`.
+
+`devices.default_gateway` (`nodesdb._migrate`, `ensure_columns`, `TEXT`) is
+`NULL` until the first successful read of either kind, and `""` once a
+read has answered with no default route to report — the Addresses subtab
+tells those apart: `_device_json` exposes it as `default_gateway`
+(`row["default_gateway"] or ""`, guarded by a `"default_gateway" in
+row.keys()` check for a row shape from before the column existed), and
+`nodes.js`'s `drawAddressesTable` renders `"Default gateway: <value>"` when
+it is non-empty and `"Default gateway: not published by this device."`
+otherwise — that second line covers both the never-read `NULL` and the
+answered-with-nothing `""` case alike, since neither is actionable
+differently from an operator's chair. `index.html` adds the `#nd-addr-gateway`
+paragraph above the address table and updates the subtab's own hint text to
+mention the default route alongside the hourly address read.
+
 ### MIB parser (`mibparse.py`)
 
 Not a MIB compiler, the same framing `trapdecode.py`'s own OID name table
@@ -6215,6 +6280,25 @@ is asked in `_sweep_notify_rollup` (the one path that can hand a batch to
 itself. It is unrelated to `min_severity`, which is a filter on syslog
 ingest.
 
+**5.30.0: `alertmail.severity_tag(severity)` is the `[SEVERITY]` formatter,
+pulled out of `build_context()` so `alertengine.py` can call it too.** It is
+the same one-liner `build_context()` used to inline for the
+`severity_tag` token — `SEVERITY_NAMES[severity]` (or the bare number,
+out of range) upper-cased and bracketed — now a standalone function
+`build_context()` calls to fill that token, unchanged in what it returns.
+`_send_digest` (email), `_webhook_digest` and `_sms_digest`
+(`alertengine.py`) each now compute `alertmail.severity_tag(min(row
+["severity"] for row, _rule, _occ in <the batch>))` and lead their subject
+(or, for `_sms_digest`, the `sms_text()` tag argument, previously always
+`""`) with it — `min()` because on this scale, syslog-derived, 0 is
+`emergency` and 7 is `debug`, so numerically lowest is worst. Previously
+all three digest kinds carried a plain `"SappiWhere: N alerts opened in
+the last M minutes"` (or, for SMS, the same without a tag). A per-alert
+notification already got its own severity tag from `build_context()`
+before this release — this only extends the tag to the digest path, which
+batches several alerts of possibly differing severities under one subject
+and had never carried one.
+
 `_notify()` computes `{{device_ip}}` by looking up the device fresh at
 send time (`_device_ip_for()`, parsing `alerts.entity_id` back into a
 device id) rather than trusting anything carried on the `Occurrence` —
@@ -6249,6 +6333,28 @@ wording) and rewrites the live `subject`/`body` only where they still match,
 character for character, `_PREVIOUS_BUILTIN_TEMPLATES` — anything else is an
 operator's edit and is left alone. It runs before `_seed_templates`, so a fresh
 database matches nothing and is simply seeded.
+
+**5.30.0: a one-time, unconditional subject reset, deliberately looser than
+the discipline above.** Every built-in subject shipped before 5.30.0 was
+missing the `[SEVERITY]` lead `severity_tag()` (below) now gives it — not
+just the handful of exact previous wordings `_PREVIOUS_BUILTIN_TEMPLATES`
+enumerates, but potentially anything an operator had typed into a built-in
+template's subject field over any number of past releases. `alertsdb._migrate`
+runs one statement, gated on the `template_subjects_reset_5_30` private
+setting (`_private_setting`/`_set_private_setting`, the same marker
+mechanism `_ADDRESSES_INTERFACE_ONLY_5_29` uses in `nodesdb.py`): `UPDATE
+templates SET subject = builtin_subject, ... WHERE is_builtin = 1 AND
+subject <> builtin_subject`. Unlike `_migrate_templates`'s character-exact
+match, this touches **every** built-in whose subject differs from
+`builtin_subject` at all — an operator's own deliberate rewording included
+— because the only way to guarantee every built-in subject leads with a
+severity tag is to stop trying to distinguish "an old shipped wording" from
+"an edit" for this one field. Bodies, and every non-built-in (custom)
+template, are never touched by this statement. It runs once per database,
+immediately after `_migrate_templates()` in `_migrate()` (so
+`builtin_subject` is already this release's text by the time it runs), and
+never again — a template subject an operator edits after the reset stays
+exactly as edited.
 
 A resolution email (`_notify_clear()`, kind `"clear"` — the
 `notifications.kind` enum value the schema already reserved for this)
@@ -10056,6 +10162,56 @@ name links through `?q=` would have raised "…looks like an attempt at a MAC
 address" under a search that had just worked. Both keys write into the same
 `nd-q` field; only `q` sets the flag.
 
+**5.30.0: a plain `#/nodes/device/<id>` link reveals its row, not just its
+pane.** `App.deviceNameLink`'s `opts.id` branch (above) routes straight to
+`#/nodes/device/<id>` with no query of its own — no `?q=`/`?name=`/filter —
+so `activate()`'s existing `filtered` flag (set only by those query keys)
+stays `false` for it, and that is exactly the signal `nodes.js`'s route
+handler now uses: `if (!filtered) { await revealDevice(deviceId); }`, in
+place of the old plain `view.selected = deviceId; drawTable();`. A link
+that does carry a query — the `?name=` fallback above, or a MAC link from
+IPAM's conflicts — still takes the old branch unchanged, since a search
+term of its own means the operator (or the page) already chose what the
+grid should show.
+
+`revealDevice(deviceId)` (`nodes.js`) clears the filter bar a step at a
+time, cheapest first, refetching after each step and stopping the moment
+the row is in `view.devices`:
+
+1. Clear the Find box (`nd-q`) alone, reset to page one, refetch — the
+   overwhelmingly common case, since a stale Find term is what usually
+   hides a linked device.
+2. Still missing → also clear Profile, Group, Status, Only-offline,
+   Only-in-maintenance and Only-with-overrides (`nd-filter-group`,
+   `nd-filter-devgroup`, `nd-filter-status`, `nd-filter-offline`,
+   `nd-filter-maintenance`, `nd-filter-overrides`), reset to page one,
+   refetch again.
+3. Still missing → page forward (`view.pageOffset += view.pageLimit`),
+   refetching each time, up to ten pages past the current one. Past that
+   `revealDevice` stops paging rather than walking a large fleet's entire
+   page set silently — an ordinary link (step 1 alone covers most misses)
+   costs one extra fetch, not an open-ended loop.
+
+It always runs to completion rather than short-circuiting on "the device is
+already selected" — the same device linked twice with a stray Find term
+typed in between must still have that term cleared the second time. Once
+the row is found (or the bound is hit) it sets `view.selected`, redraws the
+table, scrolls the selected `<tr>` into view (`scrollIntoView({block:
+'nearest'})`) and calls `loadDetail()`, the same call the old direct-select
+branch made — a link to a since-deleted device still fails the same silent
+way (`.catch(() => {})`) it always did.
+
+**`App.clearFilters(tab, ids, opts)`** is the Clear-button logic
+(`App.filterBar`, below) pulled out of its `onclick` closure so
+`revealDevice` can run the identical reset — empty each field (uncheck a
+checkbox), `syncControls` so the view store forgets the values too (a
+script-assigned `.value` fires no `change` event, so without this the next
+refetch would still be filtered by whatever was just "cleared" on screen),
+then `opts.onClear`/`opts.refresh` if given. The Clear button itself now
+calls it with `refresh: go`; `revealDevice` calls it twice with no
+`refresh`, since it drives its own `App.refreshNow('nodes')` between steps
+instead.
+
 ### Lazy module loading (`app.js`, `index.html`) — 4.49.0
 
 Before this release, `index.html` carried thirteen `<script defer>` tags —
@@ -10555,12 +10711,15 @@ could have asked `App` for. The pieces and where they came from:
   `returnToLive` reverses it.
 - **`App.filterBar(tab, {text, selects, apply, clear, clears, onEnter,
   onClear})`.** Wires Enter on text fields, change on selects, the Search
-  button and the Clear button. Clear empties each field (unchecks a
-  checkbox), calls `syncControls` so the view store forgets the values —
-  assigning `.value` fires no event, and without this a reload came back
-  filtered by fields that looked empty — then refreshes. Nodes passes
-  `onEnter` to set `macSearchPending`, because a MAC lookup may open a
-  dialog and must run on a deliberate search only.
+  button and the Clear button. The Clear button's own reset — empty each
+  field (uncheck a checkbox), `syncControls` so the view store forgets the
+  values (assigning `.value` fires no event, and without this a reload came
+  back filtered by fields that looked empty), then refresh — is
+  `App.clearFilters`, from 5.30.0 (see **Cross-tab device links**, above):
+  pulling it out of the button's own closure let `nodes.js`'s
+  `revealDevice` run the identical reset without wiring a fake click. Nodes
+  passes `onEnter` to set `macSearchPending`, because a MAC lookup may open
+  a dialog and must run on a deliberate search only.
 - **Empty and busy.** `App.emptyText(svg, w, h, text)` for charts;
   `.detail:empty::before { content: attr(data-empty) }` for detail panes,
   so the placeholder lives in the HTML beside the pane and needs no script;
