@@ -6740,7 +6740,7 @@ class NodePoller(Worker):
                 # ancestors -- and only a text naming a transceiver may vote
                 # at all, so a chassis/linecard/service-module model name up
                 # the containment chain (e.g. "N9K-C93180YC-EX") can never
-                # be mistaken for the DOM-lit port's own optic (F1, 5.36.1).
+                # be mistaken for the DOM-lit port's own optic (F1, 5.36.0).
                 texts = []
                 for entity in sorted(entities_by_if.get(if_index, ())):
                     texts += [by_descr.get(entity), ent_models.get(entity)]
@@ -6784,7 +6784,7 @@ class NodePoller(Worker):
                     # A DOM-proven port (media already 'optic' this cycle)
                     # whose ENTITY walk was cut short before its mode text
                     # was reached keeps its stored mode rather than going
-                    # NULL until the next full walk (F2, 5.36.1).
+                    # NULL until the next full walk (F2, 5.36.0).
                     stored_mode = row["optic_mode"] if "optic_mode" in row.keys() else None
                     if stored_mode:
                         optic_mode_by_if[if_index] = stored_mode

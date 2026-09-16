@@ -192,10 +192,10 @@ try:
     check("a DOM-lit port whose parent chain carries a chassis model name "
           "(N9K-C93180YC-EX) reads 'mm' off its transceiver child "
           "(SFP-10G-SR), not 'sm' off the chassis -- the fallback scan's "
-          "transceiver gate (F1, 5.36.1)",
+          "transceiver gate (F1, 5.36.0)",
           media.get(18) == "optic" and optic_mode.get(18) == "mm", optic_mode)
     check("the same chassis ancestor with no transceiver text anywhere "
-          "reads None, not the chassis model name (F1, 5.36.1)",
+          "reads None, not the chassis model name (F1, 5.36.0)",
           media.get(19) == "optic" and optic_mode.get(19) is None, optic_mode)
 
     metrics = {m["key"]: m["last_value"] for m in db.metrics(did)}
@@ -326,7 +326,7 @@ finally:
     stub.kill()
 
 # --- a timed-out module-text walk must not null a DOM-proven port's mode -
-# (5.36.1 review fix, F2): entPhysicalDescr refused outright starves both
+# (5.36.0 review fix, F2): entPhysicalDescr refused outright starves both
 # the cage/occupant scan and the optic_ports fallback scan of text on the
 # same cadence, while the DOM sensor itself still proves if 17 'optic'.
 stub, port = spawn_stub("stub_agent_ups_env.py", "sfp_media_no_descr")

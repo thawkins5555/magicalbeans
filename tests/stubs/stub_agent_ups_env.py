@@ -94,7 +94,7 @@ Modes:
              occupied MM cage (GLC-SX-MMD) with no DOM, and if 17 a DOM-lit
              port with no entPhysicalClass row at all, proving the
              optic_ports fallback scan finds SM/MM too. Plus, for the
-             fallback scan's transceiver gate (5.36.1, F1): if 18, a
+             fallback scan's transceiver gate (5.36.0, F1): if 18, a
              DOM-lit port whose own text is generic, ancestor a Nexus
              chassis ("N9K-C93180YC-EX") and descendant a real transceiver
              ("SFP-10G-SR") -- must read 'mm' off the descendant, never
@@ -141,7 +141,7 @@ Modes:
              `sfp_media`'s SFP_MEDIA_TABLE with no MAU table, and
              entPhysicalDescr refused outright -- a timed-out text walk
              that starves both the cage/occupant scan and the optic_ports
-             fallback scan of module text on the same cadence, the 5.36.1
+             fallback scan of module text on the same cadence, the 5.36.0
              review fix (F2) that must keep a DOM-proven port's stored
              optic_mode rather than null it out.
 
@@ -738,7 +738,7 @@ SFP_MEDIA_TABLE = {
     # --- if 18: a DOM-lit port, own text generic, no entPhysicalClass row.
     # Ancestor (one containment hop up) is a Nexus chassis model name
     # ("N9K-C93180YC-EX") that must never vote; a descendant (one hop down)
-    # is the real transceiver ("SFP-10G-SR") that must (F1, 5.36.1)
+    # is the real transceiver ("SFP-10G-SR") that must (F1, 5.36.0)
     "1.3.6.1.2.1.47.1.1.1.1.2.218": ("str", "GigabitEthernet1/0/18"),
     "1.3.6.1.2.1.47.1.1.1.1.4.218": ("int", 618),               # contained in the chassis
     "1.3.6.1.2.1.47.1.3.2.1.2.218.1": ("str", "1.3.6.1.2.1.2.2.1.1.18"),
@@ -754,7 +754,7 @@ SFP_MEDIA_TABLE = {
     "1.3.6.1.2.1.99.1.1.1.5.418": ("int", 1),
 
     # --- if 19: the same chassis ancestor, no transceiver text anywhere
-    # -- optic_mode must read None, not the chassis model name (F1, 5.36.1)
+    # -- optic_mode must read None, not the chassis model name (F1, 5.36.0)
     "1.3.6.1.2.1.47.1.1.1.1.2.219": ("str", "GigabitEthernet1/0/19"),
     "1.3.6.1.2.1.47.1.1.1.1.4.219": ("int", 619),
     "1.3.6.1.2.1.47.1.3.2.1.2.219.1": ("str", "1.3.6.1.2.1.2.2.1.1.19"),
