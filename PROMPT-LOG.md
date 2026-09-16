@@ -115,7 +115,25 @@ that no longer described the screen in front of them. Reworded to say
 plainly what each state of the tile now is. Fixed by Thing2 and Thing1
 before push.
 
-**Outcome.** (Bob fills in test and review results before release.)
+**Outcome.** All ten items shipped in 5.33.0. Dora mapped the ten areas
+first; Thing1 built the Mapper, Dashboard and reveal-highlight items and
+Thing2 the per-port config, Poll Now walks, fan alerts and Sensor Snapshot.
+Testy's first full pass found one real regression — the new Find dropdown
+registered two mouse-event listeners where the input contract allows only
+pointer events — which Fisty closed by switching both to `pointerdown`; the
+browser walk then passed 88 of 88 with no console, page or HTTP errors as
+admin or viewer. Javariius's first pass returned "not ready" with the four
+must-fix items above plus should-fix items (an audit row for the snapshot
+route, the nodes-read check ahead of the device lookup so a ConfigRX-only
+account gets 403 rather than a 404 that enumerates ids, an unused delete
+helper and an orphaned query parameter removed, a route test that now
+exercises a real port with no stanza); all were taken. The second pass
+returned "ready to push" once one doc claim was backed by the test it
+named (Bob added the 403-before-lookup check). The final full suite on the
+fixed code passed 169 of 173 with only the four environmental failures this
+container always shows (SMS passphrase, traceroute, the prune-lock timing
+check and the SNMP socket family in the web-gates test). No walk was run
+after the review, per the standing rule.
 
 ## 5.30.0 / 5.31.0 / 5.32.0 — Device link + Address tab fixes, Mapper search/select-all/frames, Cisco Stack Power (planned)
 
