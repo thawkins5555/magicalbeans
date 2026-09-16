@@ -5549,9 +5549,6 @@ def get_nodes_device_sensors(service, params, body, device_id) -> dict:
                            for e in sensors)}
 
 
-_STACK_POWER_PORT_LABEL_RE = re.compile(
-    r"^Switch (?P<switch>\S+) stack power (?P<name>.+?)"
-    r"(?: -> switch (?P<neighbour>\d+))?$")
 _STACK_POWER_SWITCH_LABEL_RE = re.compile(r"^Switch (?P<switch>\S+)$")
 _STACK_POWER_MODE_WORDS = {1: "power sharing", 2: "redundant",
                            3: "power sharing (strict)", 4: "redundant (strict)"}
@@ -5570,10 +5567,13 @@ def _stack_power_numkey(value):
 
 def get_nodes_device_stack_power(service, params, body, device_id) -> dict:
     """CISCO-STACKWISE-MIB rows nodepoll._poll_stack_power stored -- stored
-    data only, no SNMP. There is no separate switch-number/port-name/
-    neighbour column to join against, only the metric label each of those
-    values was folded into ("Switch N stack power <name>[ -> switch M]",
-    "Switch N"), so those three are recovered by parsing it back out.
+    data only, no SNMP. A port's name, switch number and neighbour switch
+    are each their own fact (stack_power_port_admin's label, and the
+    stack_power_port_switch/_neighbour metrics) rather than parsed out of
+    stack_power_port.<idx>'s friendly label, which stays free to read
+    however reads best in an alert. Only the switch-info rows below still
+    read their switch number off a label ("Switch N") -- that one is not a
+    compound value, so there is nothing to parse apart.
     """
     _require(service.nodes_db.device(device_id), "device")
     rows = {str(row["key"]): row for row in service.nodes_db.metrics(int(device_id))}
@@ -5620,12 +5620,17 @@ def get_nodes_device_stack_power(service, params, body, device_id) -> dict:
         if not key.startswith("stack_power_port."):
             continue
         idx = key.split(".", 1)[1]
-        m = _STACK_POWER_PORT_LABEL_RE.match(row["label"] or "")
-        switch = m.group("switch") if m else None
-        name = m.group("name") if m else (row["label"] or "")
-        neighbour = int(m.group("neighbour")) if m and m.group("neighbour") else 0
         admin_row = rows.get(f"stack_power_port_admin.{idx}")
+        switch_row = rows.get(f"stack_power_port_switch.{idx}")
+        neighbour_row = rows.get(f"stack_power_port_neighbour.{idx}")
         limit_row = rows.get(f"stack_power_port_limit_a.{idx}")
+        # admin_row's label is the raw cswStackPowerPortName (nodepoll's own
+        # doing) -- the friendly `row["label"]` stays reserved for the alert.
+        name = (admin_row["label"] if admin_row else None) or (row["label"] or "")
+        switch = (int(switch_row["last_value"])
+                 if switch_row and switch_row["last_value"] is not None else None)
+        neighbour = (int(neighbour_row["last_value"])
+                    if neighbour_row and neighbour_row["last_value"] is not None else 0)
         admin = (int(admin_row["last_value"])
                 if admin_row and admin_row["last_value"] is not None else None)
         state = int(row["last_value"]) if row["last_value"] is not None else None
@@ -5636,8 +5641,7 @@ def get_nodes_device_stack_power(service, params, body, device_id) -> dict:
         else:
             state_text = "ok" if state == 0 else ""
         ports.append({
-            "switch": int(switch) if switch and switch.isdigit() else switch,
-            "name": name, "neighbour_switch": neighbour,
+            "switch": switch, "name": name, "neighbour_switch": neighbour,
             "admin_text": {1: "enabled", 2: "disabled"}.get(admin, ""),
             # No raw link column is stored separately from `state` -- see
             # nodepoll._poll_stack_power's docstring for why state alone

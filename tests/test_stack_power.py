@@ -134,6 +134,15 @@ check("...neighbour 0 (none) is omitted from the label",
 check("admin metric passes the raw OperStatus through",
       samples.get("stack_power_port_admin.1001001") == 1.0
       and samples.get("stack_power_port_admin.1001002") == 1.0, samples)
+check("...labelled with the raw PortName, not the friendly composed label",
+      labels.get("stack_power_port_admin.1001001") == "PORT-1"
+      and labels.get("stack_power_port_admin.1001002") == "PORT-2", labels)
+check("switch metric is the port's own switch number",
+      samples.get("stack_power_port_switch.1001001") == 1.0
+      and samples.get("stack_power_port_switch.1001002") == 1.0, samples)
+check("neighbour metric is the neighbour switch number, 0 when none",
+      samples.get("stack_power_port_neighbour.1001001") == 3.0
+      and samples.get("stack_power_port_neighbour.1001002") == 0.0, samples)
 check("limit metric is the published over-current threshold",
       samples.get("stack_power_port_limit_a.1001001") == 30.0, samples)
 check("stack info: type/mode/members, named after the stack",
@@ -243,7 +252,7 @@ check("one switch assembled with its three power numbers",
       and resp["switches"][0]["committed_w"] == 300.0
       and resp["switches"][0]["allocated_w"] == 320.0, resp["switches"])
 ports_by_name = {p["name"]: p for p in resp["ports"]}
-check("two ports, switch/name/neighbour recovered from the stored label",
+check("two ports, switch/name/neighbour read off their own stored metrics",
       ports_by_name.get("PORT-1", {}).get("switch") == 1
       and ports_by_name.get("PORT-1", {}).get("neighbour_switch") == 3
       and ports_by_name.get("PORT-2", {}).get("neighbour_switch") == 0,

@@ -6835,10 +6835,15 @@ class NodePoller(Worker):
     def _poll_stack_power(self, device_id: int, device, config: dict,
                           now: float) -> None:
         """CISCO-STACKWISE-MIB (nodeoids.CSW_*) stack power cabling —
-        stack_power_port(_admin|_limit_a).<idx> (idx =
+        stack_power_port(_admin|_switch|_neighbour|_limit_a).<idx> (idx =
         _flatten_vendor_idx("<entPhysicalIndex>.<cswStackPowerPortIndex>")),
         stack_power_stack_*.<stack number> and stack_power_*_w.<entPhysicalIndex>.
         Called from _poll_vendor_sensors for arc 9 (Cisco) only.
+
+        _admin/_switch/_neighbour/_limit_a are display/lookup facts, not
+        alerts of their own: _admin's label is the raw cswStackPowerPortName,
+        so the API reads a port's name off it rather than parsing the
+        friendly label stack_power_port.<idx> carries for the alert.
 
         Its own probe-once-remember latch (_stack_power_capable/_read),
         deliberately separate from vendor_sensor_capable: whether a Cisco
@@ -6907,8 +6912,17 @@ class NodePoller(Worker):
                 label += f" -> switch {int(nbr)}"
             idx = _flatten_vendor_idx(suffix)
             samples.append((f"stack_power_port.{idx}", label, "state", "gauge", now, state))
-            samples.append((f"stack_power_port_admin.{idx}", label, "state",
+            # admin's label is the raw PortName, not the friendly label above:
+            # get_nodes_device_stack_power reads a port's name off it and its
+            # switch/neighbour off the two metrics below, rather than parsing
+            # the friendly label back apart.
+            samples.append((f"stack_power_port_admin.{idx}", name, "state",
                             "gauge", now, admin))
+            if switch is not None:
+                samples.append((f"stack_power_port_switch.{idx}", name, "state",
+                                "gauge", now, float(switch)))
+            samples.append((f"stack_power_port_neighbour.{idx}", name, "state",
+                            "gauge", now, float(nbr or 0)))
             lim = _vendor_numeric(limit.get(suffix), False)
             if lim is not None:
                 samples.append((f"stack_power_port_limit_a.{idx}", label, "A",
