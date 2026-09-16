@@ -1140,8 +1140,9 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       await selectTab(page, 'nodes');
       await settle(page, 800);
       await page.click('#page-nodes > .subtabs > .subtab[data-subtab="devices"]').catch(() => {});
-      // acc-sw-004's second uplink blocks only in VLAN 30 of its 5-VLAN
-      // trunk -- see demo/personas.py's _access_uplink2_vlan_state.
+      // acc-sw-004's second uplink blocks only in VLAN 30, while the VTP
+      // table answers all 10 plant VLANs ("blocking · 1/10 VLANs") -- see
+      // demo/personas.py's _access_uplink2_vlan_state.
       const row = page.locator('#nodes-table tbody tr', { hasText: 'acc-sw-004' }).first();
       const found = await row.count() > 0;
       if (!found) return 'skipped: acc-sw-004 is not in this fleet';

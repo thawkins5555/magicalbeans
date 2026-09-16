@@ -1290,10 +1290,6 @@
     if (link.a_optic_mode && link.b_optic_mode) return `Fiber: ${full(link.fiber_mode)} both ends`;
     return `Fiber: ${full(link.fiber_mode)} (${link.a_optic_mode ? 'A' : 'B'} end known)`;
   }
-  // A blocking end's own per-VLAN detail (Cisco PVST+/Rapid-PVST, read in
-  // each VLAN's community@vlan context), when the poller has it -- absent
-  // for a manual line, an unmanaged peer, or a device the per-VLAN walk
-  // doesn't cover, which all report None.
   function stpVlanSuffix(vlans) {
     return vlans ? ` (VLANs ${vlans.split(',').join(', ')})` : '';
   }

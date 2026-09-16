@@ -4318,6 +4318,8 @@ check("blocking · " in NODES94,
       "the Nodes STP cell names a partially-blocking port's n/count of VLANs")
 check("title:" in NODES94 and "Blocking in VLANs" in NODES94,
       "the span title lists which VLANs the port is blocking in")
+check("r.stp_state === 'blocking' &&" in NODES94,
+      "partial-VLAN STP text only renders when stp_state is actually blocking")
 MAPPER94 = read("mapper.js")
 check("(VLANs " in MAPPER94,
       "the Mapper's STP tooltip/aria/detail text appends the blocking end's VLAN list")

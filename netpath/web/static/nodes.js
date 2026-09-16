@@ -153,9 +153,9 @@
   // stp_blocking_vlans NULL), keeps the plain word.
   function stpStateText(r) {
     const ids = r.stp_blocking_vlans;
-    if (ids && r.stp_vlan_count != null) {
+    if (r.stp_state === 'blocking' && ids && r.stp_vlan_count != null) {
       const blocked = ids.split(',').filter(Boolean);
-      if (blocked.length < r.stp_vlan_count) {
+      if (blocked.length > 0 && blocked.length < r.stp_vlan_count) {
         return { text: `blocking · ${blocked.length}/${r.stp_vlan_count} VLANs`,
           title: `Blocking in VLANs ${blocked.join(', ')}` };
       }
