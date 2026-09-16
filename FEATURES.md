@@ -4275,19 +4275,23 @@ like any other module.
   to move it, the handle to resize it. The detail pane offers a
   60-character label, six colours — the same six a VLAN strand on this map
   already draws with — and **Remove**; Delete/Backspace on the canvas
-  removes a selected frame the same way it removes a selected device, and
-  it is reachable by keyboard the same way too (Tab lands on it, Enter or
-  Space selects it). A frame is decoration only: moving or resizing one
-  never moves a device it encloses, and the inside of a frame passes
-  clicks straight through, so a rubber-band selection or a pan started
-  over a frame's interior works exactly as it did before frames existed.
-  Frames draw under every link and node so nothing they enclose is ever
-  hidden behind one, are included in **Fit** and the PNG export, and are
-  left out of the CSV export, which lists links rather than drawing
-  decoration. A position edit (a drag or a resize) saves debounced, the
-  same way a node move already does; renaming or recolouring a frame is
-  audited, moving one is not, the same split already drawn between a
-  node's position and its name.
+  removes a selected frame, and it is reachable by keyboard too (Tab lands
+  on it, Enter or Space selects it). A frame is decoration only: moving or
+  resizing one never moves a device it encloses, and the inside of a frame
+  passes clicks straight through, so a rubber-band selection or a pan
+  started over a frame's interior works exactly as it did before frames
+  existed. Frames draw under every link and node so nothing they enclose
+  is ever hidden behind one, are included in **Fit** and the PNG export,
+  and are left out of the CSV export, which lists links rather than
+  drawing decoration. A map with frames but no devices draws them too —
+  the "no devices yet" placeholder only shows when a map has neither — so
+  the Frame tool keeps working on a devices-less map. A read-only account
+  can select a frame the same way a write account does, but cannot drag,
+  resize or remove it (Delete/Backspace included), matching every other
+  disabled Mapper control. A position edit (a drag or a resize) saves
+  debounced, the same way a node move already does; renaming or
+  recolouring a frame is audited, moving one is not, the same split
+  already drawn between a node's position and its name.
 
 ---
 

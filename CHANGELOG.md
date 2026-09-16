@@ -197,15 +197,20 @@ draw one. A frame is selected by its dashed border, its label or its
 bottom-right resize handle; dragging the border moves it, the handle
 resizes it, and the detail pane offers a 60-character label, six colours
 (the same six the map's VLAN strands already draw with) and **Remove**.
-Delete/Backspace on the canvas removes a selected frame the same way it
-removes a selected node. A frame is decoration only — moving or resizing
-one never moves a device, by the operator's own instruction — and the
-inside of a frame passes clicks straight through to whatever is under it,
-so a rubber-band selection or a pan started over a frame's interior still
-works exactly as it did before frames existed. Frames draw under every
-link and node, so nothing they enclose is ever obscured; they are included
-in **Fit** and the PNG export, and left out of the CSV export, which lists
-links, not drawing decoration. Position edits (a drag or a resize) save
+Delete/Backspace on the canvas removes a selected frame. A frame is
+decoration only — moving or resizing one never moves a device, by the
+operator's own instruction — and the inside of a frame passes clicks
+straight through to whatever is under it, so a rubber-band selection or a
+pan started over a frame's interior still works exactly as it did before
+frames existed. Frames draw under every link and node, so nothing they
+enclose is ever obscured; they are included in **Fit** and the PNG
+export, and left out of the CSV export, which lists links, not drawing
+decoration. A map with frames but no devices now draws them too — the
+"no devices yet" placeholder only shows when a map has neither — so the
+Frame tool keeps working on a devices-less map. A read-only account can
+select a frame the same way a write account does, but cannot drag,
+resize or remove it (Delete/Backspace included), matching every other
+disabled Mapper control. Position edits (a drag or a resize) save
 debounced and retry on failure the same way a node move already does;
 renaming or recolouring a frame is audited, moving one is not — the same
 split already drawn between a node's position and its name. A frame is

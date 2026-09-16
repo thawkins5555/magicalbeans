@@ -5117,7 +5117,21 @@ the selected map disappears out from under an armed tool.
 selection's own shape: `onFramePointerDown` (border, label or handle)
 selects the frame and clears any node/link selection, `setSelection`/
 `selectLink` clear it back, and `renderDetail`'s frame branch runs before
-the link/node branches. The detail pane (`frameDetailHtml`) is a label
+the link/node branches. `onFramePointerDown`'s own press calls
+`selectFrameInPlace`, not `selectFrame` — it toggles `.selected` on the
+frame/node/link elements already in the DOM, the frame analogue of
+`applySelectionClasses` above, rather than requesting a full redraw:
+`requestDraw()` lands a frame later, after `draw()` has already thrown
+away and rebuilt every `<g>`, which would detach the very element the
+pointer has just captured. `selectFrame` itself is kept only for the
+keyboard path below, where there is no pointer capture to lose and a full
+redraw is fine. A read-only account still reaches `selectFrameInPlace`
+through the same press — a frame can be selected with read-only Mapper
+access — but `onFramePointerDown` returns immediately after, before
+capturing the pointer, so no drag or resize follows, and `removeFrame`
+itself checks `App.canWrite('mapper')` first, so Delete/Backspace is a
+no-op too; all three match the pane's own disabled controls rather than
+adding a separate gate. The detail pane (`frameDetailHtml`) is a label
 input plus Save, six colour swatches, an Added timestamp and Remove, every
 control gated `data-requires-write="mapper"` and `disabled` rather than
 hidden, the same as a node's own rename field. Delete/Backspace on the
@@ -5126,10 +5140,9 @@ Remove button does, which confirms through `App.confirmDestructive`
 exactly as `removeSelected` already does for nodes. **A frame also picks
 up the same keyboard reach a device already has**: its `<g>` carries
 `tabindex="0"`, `role="button"` and an `aria-label`, and its own keydown
-handler routes Enter/Space to the same `selectFrame` helper
-`onFramePointerDown` now shares, and Delete/Backspace to `removeFrame`.
-A move or resize queues its own debounced write — `queueFrameWrite`/
-`flushFrameWrite`, one `setTimeout` per frame id in
+handler routes Enter/Space to `selectFrame`, and Delete/Backspace to
+`removeFrame`. A move or resize queues its own debounced write —
+`queueFrameWrite`/`flushFrameWrite`, one `setTimeout` per frame id in
 `view.frameWriteTimers`/`frameWriteRetryTimers` rather than one shared
 timer for every node, because a frame write is its own `PUT` (there is no
 batched `updates` route for frames the way there is for node positions),
@@ -5144,15 +5157,20 @@ every frame's live rect into the same min/max it already computed for
 nodes**, through `liveFrameRect`, and returns a bounds object for an
 all-frames, no-devices map rather than reading it as empty. The CSV
 export is untouched — it lists links, not drawing decoration, so a frame
-is deliberately absent from it.
+is deliberately absent from it. `draw()`'s own empty-canvas gate matches:
+it now falls through to `showCanvas()` when `view.frames.length` is
+non-zero even with `view.nodes.length` at zero, so a devices-less map
+with frames draws them instead of the "no devices yet" placeholder, and
+the Frame tool keeps working on such a map.
 
-`tests/test_frontend_contracts.py` §88 (with sub-checks 88a-88f) pins the
+`tests/test_frontend_contracts.py` §88 (with sub-checks 88a-88g) pins the
 three routes, the fill/stroke pointer-events split, the fixed
 fill/stroke/label/handle child order, the six `--canvas-vlan-N` swatch
 classes, the rubber-band reuse and its `FRAME_MIN` floor, `disarmFraming`,
-the selection/detail-pane wiring, the per-frame debounce/retry, and
-`contentBounds`' frame folding — the same one-line-grep-per-invariant
-idiom every other MAPPER contract section in this file already uses.
+the selection/detail-pane wiring, the per-frame debounce/retry,
+`contentBounds`' frame folding, and (88g) the keyboard reach below — the
+same one-line-grep-per-invariant idiom every other MAPPER contract
+section in this file already uses.
 `tests/ui/walk.mjs` exercises all three 5.31.0 items end to end: a Find
 that selects a device by name, Add device's select-all ticking every
 listed row, and a frame drawn, renamed and removed in one pass.
