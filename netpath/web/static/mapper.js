@@ -1374,6 +1374,23 @@
     stroke.addEventListener('pointerdown', (event) => onFramePointerDown(event, frame, 'move'));
     label.addEventListener('pointerdown', (event) => onFramePointerDown(event, frame, 'move'));
     handle.addEventListener('pointerdown', (event) => onFramePointerDown(event, frame, 'resize'));
+    // The same Tab reach a node gets: tabindex/role/aria-label via
+    // setAttribute (never innerHTML, so the label needs no escape() here
+    // either), Enter/Space selects through the same path a pointer press
+    // does, and Delete/Backspace removes — nodes have no keyboard delete of
+    // their own to match, so none is added here beyond what was asked.
+    g.tabIndex = 0;
+    g.setAttribute('role', 'button');
+    g.setAttribute('aria-label', frame.label ? `Frame ${frame.label}` : 'Frame');
+    g.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        selectFrame(frame);
+      } else if (event.key === 'Delete' || event.key === 'Backspace') {
+        event.preventDefault();
+        removeFrame(frame.id);
+      }
+    });
     updateFrameElement(g, frame);
     layer.appendChild(g);
     return g;
@@ -1633,6 +1650,17 @@
     // Each link opens on its capped VLAN list; "Show all" is a decision
     // about the link being read, not a mode the pane stays in.
     view.detailShowAllVlans = false;
+    requestDraw();
+    drawDetail();
+  }
+
+  // The select-only half of onFramePointerDown, shared with a frame's own
+  // Enter/Space keydown (below) so a keyboard selection and a pointer
+  // selection can never drift apart.
+  function selectFrame(frame) {
+    view.selectedFrameId = frame.id;
+    view.selection = new Set();
+    view.selectedLinkId = null;
     requestDraw();
     drawDetail();
   }
@@ -2108,11 +2136,7 @@
     event.preventDefault();
     event.stopPropagation();
     focusCanvas();
-    view.selectedFrameId = frame.id;
-    view.selection = new Set();
-    view.selectedLinkId = null;
-    requestDraw();
-    drawDetail();
+    selectFrame(frame);
     if (!App.canWrite('mapper')) return;   // selection only: nothing to drag
     const target = event.currentTarget;
     target.setPointerCapture(event.pointerId);

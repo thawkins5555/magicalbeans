@@ -4014,12 +4014,20 @@ check("if (event.key !== 'Escape' || App.state.tab !== 'mapper' || !view.framing
       "the Mapper tab")
 
 # 88d. Selecting, editing and removing a frame.
-check("view.selectedFrameId = frame.id;" in MAPPER88
-      and "view.selection = new Set();" in MAPPER88[MAPPER88.index("function onFramePointerDown"):]
-      and "view.selectedLinkId = null;" in MAPPER88[MAPPER88.index("function onFramePointerDown"):
-                                                     MAPPER88.index("function onFramePointerDown") + 600],
-      "onFramePointerDown selects the frame and clears whatever node/link "
-      "selection there was")
+check("function selectFrame(frame) {" in MAPPER88,
+      "selectFrame is the one function that selects a frame and clears "
+      "whatever node/link selection there was")
+_SELECT_FRAME88 = MAPPER88[MAPPER88.index("function selectFrame(frame) {"):
+                           MAPPER88.index("function selectFrame(frame) {") + 250]
+check("view.selectedFrameId = frame.id;" in _SELECT_FRAME88
+      and "view.selection = new Set();" in _SELECT_FRAME88
+      and "view.selectedLinkId = null;" in _SELECT_FRAME88,
+      "...it sets selectedFrameId and clears both the node selection and "
+      "selectedLinkId")
+check("selectFrame(frame);" in MAPPER88[MAPPER88.index("function onFramePointerDown"):
+                                        MAPPER88.index("function onFramePointerDown") + 400],
+      "onFramePointerDown's select half calls selectFrame rather than "
+      "repeating its three assignments inline")
 check("view.selectedFrameId = null;" in MAPPER88[MAPPER88.index("function setSelection("):
                                                  MAPPER88.index("function setSelection(") + 200]
       and "view.selectedFrameId = null;" in MAPPER88[MAPPER88.index("function selectLink("):
@@ -4071,6 +4079,34 @@ check("for (const frame of view.frames) {" in _CONTENT_BOUNDS88
 check("!view.nodes.length && !view.frames.length" in MAPPER88,
       "an all-frames, no-devices map still has content to fit, rather than "
       "reading as empty")
+
+# 88g. A frame gets the same Tab reach a node already has (5.31.0
+#      follow-up): tabindex/role/aria-label set the same way a node's own
+#      <g> sets them, Enter/Space selects through selectFrame (no drag),
+#      Delete/Backspace removes. Nodes have no keyboard delete of their
+#      own, so none was added here either — only what nodes already do.
+_DRAW_FRAME88G = MAPPER88[MAPPER88.index("  function drawFrame(layer, frame)"):
+                          MAPPER88.index("  // `bounds`/size come from draw()")]
+check("g.tabIndex = 0;" in _DRAW_FRAME88G and "g.setAttribute('role', 'button');" in _DRAW_FRAME88G,
+      "a frame's <g> is a Tab stop with role=button, the same two lines a "
+      "node's own <g> carries")
+check("g.setAttribute('aria-label', frame.label ? `Frame ${frame.label}` : 'Frame');"
+      in _DRAW_FRAME88G,
+      "the aria-label is set via setAttribute (never innerHTML), reading "
+      "'Frame <label>' or bare 'Frame' when nothing was typed")
+_FRAME_KEYDOWN88G = _DRAW_FRAME88G[_DRAW_FRAME88G.index("g.addEventListener('keydown'"):]
+check("selectFrame(frame);" in _FRAME_KEYDOWN88G,
+      "Enter/Space on a focused frame selects it through selectFrame — the "
+      "same select-only path onFramePointerDown's own press uses, no drag "
+      "started from a keydown")
+check("removeFrame(frame.id);" in _FRAME_KEYDOWN88G,
+      "Delete/Backspace on a focused frame removes it through removeFrame, "
+      "the same confirm idiom the pane's own Remove button and the "
+      "canvas-level shortcut (88d) already use")
+check("ArrowLeft" not in _DRAW_FRAME88G and "ArrowRight" not in _DRAW_FRAME88G
+      and "ArrowUp" not in _DRAW_FRAME88G and "ArrowDown" not in _DRAW_FRAME88G,
+      "no arrow-key nudging: a node's own keydown handler does not nudge "
+      "either, so a frame does not gain a capability nodes lack")
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))
