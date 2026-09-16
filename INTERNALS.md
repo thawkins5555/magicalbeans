@@ -5748,6 +5748,154 @@ coverage at all is evaluated exactly as before, per-device override
 included — the fallback is additive, not a replacement for the
 existing rule.
 
+### Cisco Stack Power (`nodeoids.py`, `nodepoll.py`, `web/api.py`, `alertrules.py`, `alertsdb.py`, `trapdecode.py`, `snmptrapd.py`, `demo/personas.py`) — 5.32.0
+
+**OIDs.** `nodeoids.py` resolves thirteen CISCO-STACKWISE-MIB objects
+(`ciscoMgmt.500`, enterprise arc 9 only) across three tables with three
+different index shapes, so — unlike `SENSOR_TABLES`/`PSU_TABLES` — they
+are a flat `CSW_*` OID list rather than another declarative table:
+`cswStackPowerPortInfoTable` (index
+`entPhysicalIndex.cswStackPowerPortIndex`: `OperStatus`,
+`NeighborSwitch`, `LinkStatus`, the over-current `LimitA`, `PortName`),
+`cswStackPowerInfoTable` (index
+`cswStackPowerStackNumber`: `Mode`, `NumMembers`, `Type`, `Name`) and
+`cswSwitchInfoTable` (index `entPhysicalIndex`: the switch's own
+`NumCurrent`, `PowerBudget`, `PowerCommitted`, `PowerAllocated`).
+
+**Cadence and latch.** `NodePoller._poll_stack_power` is called from
+`_poll_vendor_sensors` for `enterprise_arc(sys_object_id) == 9` only,
+ahead of (not gated by) that method's own `due_sensors`/PSU computation —
+a Cisco device with PSU or temperature sensors but no power stack, or the
+reverse, must not have one coverage held back by the other's cadence. Its
+own latch, `_stack_power_capable`/`_stack_power_read`, is deliberately
+separate from `vendor_sensor_capable`: `_poll_stack_power` walks all
+thirteen columns, and once any of `cswStackPowerPortOperStatus`,
+`cswSwitchInfoNumCurrent` or `cswStackPowerInfoMode` answers at all, the
+device is latched `capable = 1` and walked on every subsequent poll; a
+device that answers none of them is latched `0` and retried at most once
+an hour (`_SENSOR_REPROBE_S`, the same hourly reprobe PSU uses). A retry,
+a device delete, or a `poll_now` call pops the device out of
+`_stack_power_read` alongside the other per-device sensor caches, so the
+next poll walks fresh rather than waiting out the reprobe window. A port
+index is packed `entPhysicalIndex * 1000 + cswStackPowerPortIndex`
+(`_flatten_vendor_idx`, the same base-1000 packing every compound vendor
+index in this file uses), so port 1 on entity 1001 and port 2 on entity
+2001 can never collide.
+
+**Metric keys.** Per port: `stack_power_port.<idx>` — state 0 when the
+link is up, or when the port is administratively disabled (deliberately
+off is not a fault), state 2 when the port is enabled but the link itself
+reads down, the cable fault the whole feature exists to catch, and no
+write at all while the link has never answered, so a port with no fact
+yet never gets a state; `stack_power_port_admin.<idx>` — the raw
+`OperStatus` (1 enabled, 2 disabled), labelled with the port's own
+`cswStackPowerPortName` rather than the friendly label below, so the API
+can read a port's name back off a metric rather than parsing one apart;
+`stack_power_port_switch.<idx>` and `stack_power_port_neighbour.<idx>` —
+the port's own switch number and the switch on the other end of its
+cable (0 when the walk names none), each fact on its own metric for the
+same reason; `stack_power_port_limit_a.<idx>` — the over-current limit in
+amperes. `stack_power_port.<idx>`'s own label is left free for what
+reads best in an alert — `"Switch <n> stack power <name>[ -> switch
+<m>]"` — since nothing parses it back apart any more. Per stack member
+switch, keyed by `entPhysicalIndex` and labelled `"Switch <n>"`:
+`stack_power_budget_w`, `stack_power_committed_w`,
+`stack_power_allocated_w`. Per power stack, keyed by
+`cswStackPowerStackNumber` and labelled with the stack's own name:
+`stack_power_stack_type` (1 ring, 2 star), `stack_power_stack_mode` (1-4,
+power sharing / redundant, each with a strict variant), and
+`stack_power_stack_members`. A port that vanishes from a later walk (a
+member leaving the stack) gets no new sample that poll and keeps
+whatever state it last reported — nothing here ever deletes a metric key.
+
+**API assembly** (`web/api.get_nodes_device_stack_power`, `GET
+/api/nodes/devices/<id>/stack-power`) reads every `stack_power_*` row
+`nodes_db.metrics()` has for the device — stored data only, never a live
+SNMP walk — and assembles three lists: `stacks` (from the
+`stack_power_stack_*` triple, one row per stack number), `switches`
+(from the `stack_power_*_w` triple, one row per `entPhysicalIndex`, its
+switch number recovered from its own `"Switch <n>"` label — the one
+value here still read off a label, since it is not a compound one) and
+`ports` (one row per `stack_power_port.<idx>`, its name/switch/neighbour
+read off `stack_power_port_admin`/`_switch`/`_neighbour` rather than
+parsed from `stack_power_port`'s own friendly label). `present` is true
+the moment any `stack_power_*` key exists for the device, which is what
+the STACK POWER section and its Cisco-only, no-power-stack hint line key
+off. `_stack_power_numkey` sorts a stack/switch/port number as an
+integer first, falling back to a string sort only if a number ever fails
+to parse. `tests/test_stack_power.py` covers the walk, the vanished-port
+case, the capability latch, and this assembly end to end, with a small
+in-memory fake store the way `tests/test_psu_state.py` already does for
+PSU.
+
+**Rules.** `alertrules.SENSOR_FAMILIES` gains `stack_power_port`, so the
+engine's child-entity loop treats it as entity kind `sensor` with entity
+id `<device_id>:<idx>`, labelled from the metric's own stored label —
+exactly the PSU/temperature treatment, described above.
+`alertsdb._BUILTIN_RULES` gains **Stack Power cable down**
+(`stack_power_cable_down`, threshold, source `stack_power_port`, >= 2.0,
+critical) and **Stack Power fault trap** (`stack_power_trap`, trap,
+source `stackPower`, warning); `alertrules.ROLLED_UP_BY` maps
+`stack_power_cable_down` to `device_down` — a cable-down alert rolls up
+directly under a device outage, the same as `psu_failed`, since a stack
+still carries power the other way around its ring or star while one
+cable is down. Both rules reach an upgraded install the way every
+built-in rule does: `AlertsDatabase._seed_rules` runs `INSERT OR IGNORE`
+against `_BUILTIN_RULES` on every open, so a database that predates this
+release gains both rows, by key, the next time it opens — no migration
+flag needed. A trap rule's `source_kind` is matched against the
+occurrence's own `trap_kind` (`trapdecode.KIND_BY_OID`) by exact string
+equality, and `KIND_BY_OID` classes the version-mismatch notification
+(`...500.0.0.9`) as kind `"stackPower"`, the same as the nine genuine
+fault OIDs (`...500.0.0.10`-`18`) — so **Stack Power fault trap** fires
+on all ten of them. Only the immediate re-read (below) treats version
+mismatch differently.
+
+**Trap handling.** `trapdecode.WELL_KNOWN` names all twelve
+`ciscoMgmt.500.0.0.N` (`N` 7-18) STACKWISE notifications verbatim from
+the MIB, misspelling included
+(`cscwStackPowerBudgetWarrning`). `KIND_BY_OID` classes the link/oper
+status-changed pair (`.7`/`.8`) `"stackPowerStatus"` — informational by
+the MIB's own text — and the other ten `"stackPower"`.
+`DEFAULT_SEVERITY_RULES` rates the status pair Notice(5), version
+mismatch Warning(4), invalid topology and under-budget Error(3), invalid
+input/output current, insufficient power and under-voltage Critical(2),
+and the rest Warning(4) — severities specified for this release, not
+derived from the MIB's own text. `snmptrapd.POWER_TRAP_OIDS` — the set
+`TrapCollector._power_trap_reread` checks before calling `poll_now` on
+the sending device, at most once per `POWER_TRAP_REREAD_S` (60 s) per
+device, the same hook the six PSU/ENVMON traps already use — grows by
+eleven: the status pair plus every genuine fault OID, deliberately
+leaving out version mismatch, the same "not urgent enough for an
+on-demand walk" call the MIB's own text makes for it. `tests/
+test_trap_psu.py` covers the twelve OIDs' names, kinds and severities,
+and both the re-read and the one deliberate exclusion from it.
+
+**Demo knob.** `demo/personas._build_cisco_access` wires a three-switch
+power stack (ring topology, redundant mode, 30 A cables) onto
+`entPhysicalIndex` 1001/2001/3001 — chosen well outside this persona's
+own (roughly fifty-port) entity range so they can never collide with its
+`entity_sensors`/SFP-cage entries. Each switch's `PORT-1` faces the
+previous switch in the ring and `PORT-2` the next one, so switch 2's
+`PORT-2` and switch 3's `PORT-1` are the same cable. SPECIALS index 30
+(`stack_cable_down`, `cisco_access` persona) takes that one cable's link
+down on both ends, so a fleet build carries one device that opens and
+clears **Stack Power cable down** on its own.
+
+**A known, unchanged limit.** A sensor-family alert — PSU, temperature
+sensor, and now Stack Power cable down — that is already open when its
+own device goes down is not absorbed retroactively the moment
+`device_down` opens: `_absorb_one`'s prefix match (`alertengine.py`)
+only widens to cover a device's already-open *interface* children
+(`f"{child_rule['key']}:interface:{device_id}:"`); a sensor child, keyed
+`<rule>:sensor:<device_id>:<idx>`, matches neither that prefix nor the
+exact dedup-key lookup, so it is left open at that moment. It is
+suppressed only the next time its own occurrence is re-evaluated and
+`_rollup_parent` finds `device_down` already open for that device — in
+practice, whenever the sensor family's own metric or trap next recurs.
+This is pre-existing PSU/temperature behaviour, not changed by adding
+Stack Power to the same family.
+
 ### Alert mutes (`alertsdb.py`, `alertengine._muted`)
 
 `alert_mutes(entity_kind, entity_id, until_ts, created_ts, created_by,
@@ -8021,6 +8169,11 @@ notifications Critical(2), `cefcFRURemoved` Error(3) and
 received" rule fires on the four Critical ones without an admin having
 to write a rule by hand.
 
+**Twelve CISCO-STACKWISE-MIB OIDs, from 5.32.0**, added to `WELL_KNOWN`,
+`KIND_BY_OID` and `DEFAULT_SEVERITY_RULES` the same way — see Cisco Stack
+Power, above, for the full OID-by-OID breakdown; none of them carries a
+varbind worth a name of its own.
+
 The encoder half (`build_v1_trap`, `build_v2c_trap`,
 `build_inform_response`) is small and total, used by `post_snmp_test` and
 by the inform-acknowledgement path. `build_inform_response()` splices the
@@ -8071,9 +8224,12 @@ optional `poll_now` callable; `web/service.py` wires it to
 construction order (the collector is built before `NodePoller`) does
 not matter. `_power_trap_reread`, called from `_handle_datagram` right
 after the trap is decoded, checks the decoded trap's OID against
-`POWER_TRAP_OIDS` (exactly the six Cisco ENVMON/FRU power traps
-`trapdecode.WELL_KNOWN` now names — a fan or temperature notification
-on the same arc does not qualify), resolves the sending source to a
+`POWER_TRAP_OIDS` (the six Cisco ENVMON/FRU power traps
+`trapdecode.WELL_KNOWN` names, plus — from 5.32.0 — eleven of the twelve
+CISCO-STACKWISE-MIB notifications; see Cisco Stack Power, above, for
+which one is deliberately left out and why — a fan or temperature
+notification on the same arc does not qualify either way), resolves the
+sending source to a
 device with `nodes_db.device_id_for_address`, and calls
 `poll_now(device_id)` unless one fired for that device within
 `POWER_TRAP_REREAD_S` — `poll_now` is the operator's retry-from-nothing

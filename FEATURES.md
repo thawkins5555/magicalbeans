@@ -1316,6 +1316,23 @@ answered no sensors at all is asked again once an hour rather than written
 off for the life of the service, and **Re-identify** and **Poll now** both
 ask again immediately.
 
+**From 5.32.0, a Cisco switch's Stack Power cabling gets its own STACK
+POWER section**, placed right after TEMPERATURE ALERTS and shown only for
+a device the poller has already identified as Cisco — no extra probe just
+to decide whether to show it. It lists the power stack(s) the switch
+belongs to (name, whether it runs power sharing or redundant, each with a
+"strict" variant, and whether the stack cables in a ring or a star, plus
+member count), a table of each member switch's power budget, committed
+and allocated watts, and a table of every Stack Power port — which
+switch, its name, the switch on the other end of that cable, whether it
+is administratively enabled, its link state, the over-current limit in
+amperes the device itself publishes for that port, and a plain-English
+status that calls out a downed cable by the rule that alerts on it. A
+Cisco switch with no power stack at all shows one line saying so instead
+of an empty section; every other vendor shows no section. The existing
+per-sensor table also marks a Stack Power port `(stack power)`, the same
+way it already marks a power-supply row `(power supply)`.
+
 **The per-port bandwidth chart holds still under live polling.** Selecting a
 device polls it every few seconds, and a chart drawn from every one of those
 samples turned to hash the moment that started: the rate of a 3-second
@@ -2367,6 +2384,23 @@ alerts and optionally emailing about them.
   cadence. Upgrading writes the new state once onto every bay that was
   removed before this release, so expect one alert per such bay on the
   first poll; resolve them by hand.
+- **From 5.32.0, a Cisco stack's power cabling alerts too.** **Stack Power
+  cable down** (critical) fires per port the moment a cable's link reads
+  down while the port is still enabled — a deliberately disabled port
+  never alerts — and rolls up under a device outage the same way **Power
+  supply failed** does. **Stack Power fault trap** (warning) fires on any
+  of the CISCO-STACKWISE-MIB notifications the SNMP Trap Log classes as a
+  genuine fault: invalid topology, a budget warning, invalid input or
+  output current, under budget, unbalanced supplies, insufficient power,
+  a priority conflict, under voltage, or a version mismatch between stack
+  members. All twelve Stack Power notifications are named and given a
+  default severity in the SNMP Trap Log; the plain link/oper
+  status-changed pair (informational, not a fault) and every fault trap
+  except the version-mismatch one trigger the same immediate re-read the
+  PSU traps do, at most once a minute per device. The over-current limit
+  the MIB publishes per port has no live reading to alert on — it is
+  shown, not alerted on, in the Device Details STACK POWER section (see
+  Nodes → Devices, above).
 - **Three of those 35 are new in 4.39.0**, and each one reports a failure
   that previously had nobody to report it. `snmp_failing_ping_ok` fires
   when a device answers ping while its SNMP agent has stopped answering —

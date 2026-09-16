@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.32.0 — Cisco Stack Power: cable-down and fault-trap alerts on Device Details](#5320--cisco-stack-power-cable-down-and-fault-trap-alerts-on-device-details)
 - [5.31.0 — Mapper: find a device, select-all in the picker dialogs, and frames](#5310--mapper-find-a-device-select-all-in-the-picker-dialogs-and-frames)
 - [5.30.0 — Device links reveal the row, named interfaces and a default gateway on Addresses, tagged digests](#5300--device-links-reveal-the-row-named-interfaces-and-a-default-gateway-on-addresses-tagged-digests)
 - [5.29.0 — Discovery addresses removed: interfaces and ARP only](#5290--discovery-addresses-removed-interfaces-and-arp-only)
@@ -164,6 +165,100 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.32.0 — Cisco Stack Power: cable-down and fault-trap alerts on Device Details
+
+Cisco Stack Power is the last of six requests from one operator prompt,
+split across three releases by risk and independence; `PROMPT-LOG.md`
+carries the full request and both earlier releases' scope. This entry
+closes it out: a Stack Power switch's power stack, its members'
+budgets and its inter-switch cabling now show on Device Details, and two
+new rules alert on a cable going down or on a Stack Power fault trap — cable
+down plus power traps, the operator's own planning answer. The one
+threshold the MIB publishes — a port's over-current limit — is read off the
+device and displayed; there is no live current reading to alert on, so
+over-current itself is trap-driven, same as every other fault here.
+
+**Device Details gains a STACK POWER section, Cisco devices only.** It
+sits right after TEMPERATURE ALERTS: the power stack(s) on the switch (name,
+mode — power sharing or redundant, each with a strict variant — ring or
+star topology, member count), a table of each member switch's power budget,
+committed and allocated watts, and a per-port table (switch, port name,
+neighbour switch, admin enabled/disabled, link, the device's own
+over-current limit in amperes, status, last poll). A Cisco switch with no
+power stack cabling at all shows one hint line rather than an empty
+section; a non-Cisco device shows no section, the gate being the vendor
+already detected off `sysObjectID`, not a fresh probe. The existing
+per-sensor table also tags a cable port `(stack power)`, alongside its
+existing `(power supply)` tag for a PSU row.
+
+**The poller reads CISCO-STACKWISE-MIB on Cisco gear only** (enterprise
+arc 9), every poll once a switch has answered it at all; a switch that
+has never answered is retried at most once an hour, the same probe-once-
+remember shape PSU state already uses, and kept as its own latch so a
+Cisco device with PSU/temperature sensors but no power stack, or the
+reverse, is not held back by the other's coverage. A port reads state 0
+when its link is up, or when it is administratively disabled — deliberately
+off is not a fault — and state 2 when it is enabled but the link itself is
+down: the cable fault the whole feature exists to catch. A port that
+disappears from a later walk (a member leaving the stack) keeps whatever
+state it last reported rather than being cleared or marked unknown.
+
+**Two new rules: "Stack Power cable down" (critical, per port) and "Stack
+Power fault trap" (warning).** Cable down reads the same port state the
+poller just described and rolls up directly under a device outage, the
+same as a failed power supply — a stack still carries power the other way
+around its ring or star while one cable is down, so this is about the
+cable, not the switch. Fault trap fires on any STACKWISE notification the
+SNMP Trap Log now classes as a genuine fault (invalid topology, a budget
+warning, invalid input or output current, under budget, unbalanced
+supplies, insufficient power, a priority conflict, under voltage, or a
+software version mismatch between stack members) — the plain link/oper
+status-changed pair is left out of this rule, the same "informational, not
+a fault" read the MIB's own text gives it. Both rules reach an upgraded
+install exactly the way the PSU rules did: they are seeded in by key the
+next time the alerts database opens, so an existing install gains them
+without a migration step. Every one of the twelve Stack Power
+notifications is named and given a severity in the SNMP Trap Log; the two
+status-changed traps and every fault trap **except** the version-mismatch
+one — the MIB's own call on what is worth an on-demand walk — trigger an
+immediate re-read of the sending device (a 60-second debounce per
+device), the same hook the PSU traps already use, so a cable-down alert
+opens, or clears on recovery, within one poll instead of trailing the
+walk's own cadence.
+
+**Demo:** the `cisco_access` persona now carries a three-switch power stack
+wired in a ring, redundant mode, 30 A cables; SPECIALS knob 30
+(`stack_cable_down`) takes one of those cables down on both ends, for a
+fleet device to watch the alert open and clear on.
+
+One more fix travels in this release, unrelated to Stack Power: **the
+Mapper's Frame tool now draws on a wholly empty map.** Arming Frame used
+to fall through to the "no devices yet" placeholder the moment a map had
+neither nodes nor frames on it, which meant a brand-new map could never
+get its first frame drawn — the tool needed the real canvas to draw on,
+and the placeholder was standing in its way. Arming or disarming the tool
+now redraws immediately, so the canvas and the placeholder swap in step
+with it.
+
+Files: `nodeoids.py`, `nodepoll.py`, `alertrules.py`, `alertsdb.py`,
+`trapdecode.py`, `snmptrapd.py`, `web/api.py`, `web/server.py`,
+`web/static/nodes.js`, `web/static/mapper.js`, `demo/personas.py`.
+
+Verification: `tests/test_stack_power.py` is new — the poller's walk into
+`stack_power_port(_admin|_switch|_neighbour|_limit_a).<idx>`,
+`stack_power_stack_*.<n>` and `stack_power_*_w.<ent>`, the API assembling
+them back into the dialog's shape, and the built-in rule seeding, both
+fresh and on an install that predates it. `tests/test_trap_psu.py` is
+extended for the twelve trap OIDs' names/severities/kinds and the
+re-read hook, including the one deliberate exclusion from it.
+`tests/test_alert_sensor_rules.py` is extended for the new sensor family
+and rollup entry, and the outage-ordering case — device already down
+when the cable drops versus the cable already down when the device goes.
+`tests/test_frontend_contracts.py` gained a section pinning the STACK POWER
+markup, the Cisco-only gate, and its hint/error text; `tests/ui/walk.mjs`
+gained a Device Details check against the fleet's own Cisco access-switch
+persona, plus two checks for the Frame-tool fix.
 
 ### 5.31.0 — Mapper: find a device, select-all in the picker dialogs, and frames
 
