@@ -43,6 +43,27 @@ Modes:
                 what is stored" case.
   pvst_no_vtp   Same bridge/scalar tables as `pvst`, no vtpVlanState table
                 at all -- the "no VTP means no per-VLAN capability" latch.
+  pvst-empty1   Bridge scalars and dot1dBasePortIfIndex answered as usual,
+                but NO dot1dStpPortState rows at all in the DEFAULT context
+                -- VLAN 1's own member ports are all trunk-pruned. VLAN
+                contexts answer exactly as `pvst` -- the "the early return
+                before the per-VLAN block must not skip it" case.
+  pvst-no-scalars  DEFAULT context answers bridge ports and vtpVlanState
+                but no dot1dStp scalars at all (protocolSpecification
+                included); `public@20`/`public@30` answer port state as
+                `pvst` -- the "a per-VLAN answer must stop the
+                stp_capable=False latch" case.
+  pvst-disabled Port 7 reads disabled(1) in every VLAN context (20 and
+                30), forwarding(5) only in the DEFAULT context -- the
+                "listening/learning/disabled/broken must not collapse to
+                forwarding" case.
+  pvst-orphan   A third bridge port (9 -> ifIndex 3) answered only in the
+                DEFAULT context's dot1dStpPortState, never inside any VLAN
+                context -- the "global-only port keeps its global state"
+                case.
+  pvst-50vlan   50 VLANs in vtpVlanState (1-50); every context answers the
+                same port state as `pvst`'s DEFAULT -- the "sliced to the
+                first 48 VLANs still counts as a complete pass" case.
 
   airfiber      a Ubiquiti sysObjectID and the four RF_METRICS[41112]
                 scalars, numbered exactly as demo/personas.py's
@@ -251,6 +272,19 @@ PVST_PER_VLAN = {
     "1002": {"1.3.6.1.2.1.17.2.15.1.3.5": ("int", 2),
             "1.3.6.1.2.1.17.2.15.1.3.7": ("int", 2)},
 }
+
+# pvst-disabled: port 7 disabled(1) in every VLAN context.
+PVST_DISABLED_PER_VLAN = {"1.3.6.1.2.1.17.2.15.1.3.7": ("int", 1)}
+
+# pvst-orphan: a third bridge port answered only in the DEFAULT context.
+BRIDGE_PORTS_ORPHAN = {**BRIDGE_PORTS, "1.3.6.1.2.1.17.1.4.1.2.9": ("int", 3)}
+STP_PORT_STATE_ORPHAN_DEFAULT = {**PVST_PORT_STATE,
+                                 "1.3.6.1.2.1.17.2.15.1.3.9": ("int", 5)}
+
+# pvst-50vlan: vtpVlanState for VLANs 1-50, all operational(1).
+PVST_VTP_50 = {f"1.3.6.1.4.1.9.9.46.1.3.1.1.2.1.{v}": ("int", 1)
+              for v in range(1, 51)}
+
 SEEN_COMMUNITIES = set()   # communities seen since the last RESET (pvst modes)
 
 # --------------------------------------------------------------- PtP RF
@@ -439,6 +473,35 @@ def table_for(community="public"):
         return table
     if MODE == "pvst_no_vtp":
         return {**GENERIC_SCALARS, **BRIDGE_PORTS, **STP_SCALARS, **PVST_PORT_STATE}
+    if MODE == "pvst-empty1":
+        table = {**GENERIC_SCALARS, **BRIDGE_PORTS, **STP_SCALARS, **PVST_VTP}
+        if "@" in community:
+            vlan = community.split("@", 1)[1]
+            table.update(PVST_PER_VLAN.get(vlan, {}))
+        return table
+    if MODE == "pvst-no-scalars":
+        table = {**GENERIC_SCALARS, **BRIDGE_PORTS, **PVST_VTP}
+        if "@" in community:
+            vlan = community.split("@", 1)[1]
+            table.update(PVST_PER_VLAN.get(vlan, {}))
+        return table
+    if MODE == "pvst-disabled":
+        table = {**GENERIC_SCALARS, **BRIDGE_PORTS, **STP_SCALARS, **PVST_PORT_STATE,
+                 **PVST_VTP}
+        if "@" in community:
+            table.update(PVST_DISABLED_PER_VLAN)
+        return table
+    if MODE == "pvst-orphan":
+        table = {**GENERIC_SCALARS, **BRIDGE_PORTS_ORPHAN, **STP_SCALARS, **PVST_VTP}
+        if "@" in community:
+            vlan = community.split("@", 1)[1]
+            table.update(PVST_PER_VLAN.get(vlan, {}))
+        else:
+            table.update(STP_PORT_STATE_ORPHAN_DEFAULT)
+        return table
+    if MODE == "pvst-50vlan":
+        return {**GENERIC_SCALARS, **BRIDGE_PORTS, **STP_SCALARS, **PVST_PORT_STATE,
+                **PVST_VTP_50}
     if MODE == "airfiber":
         return {**GENERIC_SCALARS, **AIRFIBER_TABLE,
                 "1.3.6.1.2.1.1.2.0": ("str", "1.3.6.1.4.1.41112.1.3")}

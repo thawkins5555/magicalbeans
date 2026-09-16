@@ -237,8 +237,136 @@ try:
           ifaces[2]["stp_blocking_vlans"] == "20", ifaces[2])
     check("...and the stored VLAN count",
           ifaces[2]["stp_vlan_count"] == 2, ifaces[2])
-    check("...writing only the global read's own summary for stp_state",
+    check("...and the seeded stp_state is left alone, not flapped to the "
+          "global read's forwarding",
+          ifaces[2]["stp_state"] == "blocking", ifaces[2])
+    db.close()
+finally:
+    stub.kill()
+
+# ------------------------------------------- F1: no VLAN-1 member ports
+
+stub, port = spawn_stub("stub_agent_l2.py", "pvst-empty1")
+nodepoll_mod.DEFAULT_SNMP_PORT = port
+try:
+    db = new_db("pvst_empty1")
+    did = device_against(db, port, "empty1-sw")
+    two_ports(db, did)
+    mark_cisco(db, did)
+    poller = NodePoller(db)
+    device = db.device(did)
+    config = db.effective_config(device)
+
+    poller._poll_stp(did, device, config)
+
+    ifaces = {i["if_index"]: dict(i) for i in db.interfaces(did)}
+    check("VLAN 1 has no member ports, but the per-VLAN pass still runs "
+          "and lands its detail",
+          ifaces[2]["stp_state"] == "blocking", ifaces[2])
+    check("...with the blocking VLAN named",
+          ifaces[2]["stp_blocking_vlans"] == "20", ifaces[2])
+    db.close()
+finally:
+    stub.kill()
+
+# ------------------------- F1b: no scalars, but a VLAN context answers
+
+stub, port = spawn_stub("stub_agent_l2.py", "pvst-no-scalars")
+nodepoll_mod.DEFAULT_SNMP_PORT = port
+try:
+    db = new_db("pvst_no_scalars")
+    did = device_against(db, port, "no-scalars-sw")
+    two_ports(db, did)
+    mark_cisco(db, did)
+    poller = NodePoller(db)
+    device = db.device(did)
+    config = db.effective_config(device)
+
+    poller._poll_stp(did, device, config)
+
+    device = db.device(did)
+    check("a per-VLAN answer stops the stp_capable=False latch even "
+          "though the default context has no dot1dStp scalars at all",
+          device["stp_capable"] is None, device["stp_capable"])
+    db.close()
+finally:
+    stub.kill()
+
+# --------------------------------------- F3: 50 VLANs, sliced to 48
+
+stub, port = spawn_stub("stub_agent_l2.py", "pvst-50vlan")
+nodepoll_mod.DEFAULT_SNMP_PORT = port
+try:
+    db = new_db("pvst_50vlan")
+    did = device_against(db, port, "vlan50-sw")
+    two_ports(db, did)
+    mark_cisco(db, did)
+    poller = NodePoller(db)
+    device = db.device(did)
+    config = db.effective_config(device)
+
+    reset_count(port)
+    poller._poll_stp(did, device, config)
+
+    ifaces = {i["if_index"]: dict(i) for i in db.interfaces(did)}
+    check("a 50-VLAN VTP table sliced to the first 48 still counts as a "
+          "complete pass",
+          ifaces[2]["stp_vlan_count"] == 48, ifaces[2])
+    check("...port 7 forwards in all 48",
           ifaces[2]["stp_state"] == "forwarding", ifaces[2])
+    check("...port 5 blocks in all 48",
+          ifaces[1]["stp_state"] == "blocking" and ifaces[1]["stp_vlan_count"] == 48,
+          ifaces[1])
+    db.close()
+finally:
+    stub.kill()
+
+# --------------------------- F4: non-forwarding states must not collapse
+
+stub, port = spawn_stub("stub_agent_l2.py", "pvst-disabled")
+nodepoll_mod.DEFAULT_SNMP_PORT = port
+try:
+    db = new_db("pvst_disabled")
+    did = device_against(db, port, "disabled-sw")
+    two_ports(db, did)
+    mark_cisco(db, did)
+    poller = NodePoller(db)
+    device = db.device(did)
+    config = db.effective_config(device)
+
+    poller._poll_stp(did, device, config)
+
+    ifaces = {i["if_index"]: dict(i) for i in db.interfaces(did)}
+    check("disabled(1) in every VLAN context stays disabled, not "
+          "forwarding",
+          ifaces[2]["stp_state"] == "disabled", ifaces[2])
+    db.close()
+finally:
+    stub.kill()
+
+# ------------------------------- F5: global-only port keeps global state
+
+stub, port = spawn_stub("stub_agent_l2.py", "pvst-orphan")
+nodepoll_mod.DEFAULT_SNMP_PORT = port
+try:
+    db = new_db("pvst_orphan")
+    did = device_against(db, port, "orphan-sw")
+    db.replace_interfaces(did, [
+        {"if_index": 1, "descr": "Gi0/1"}, {"if_index": 2, "descr": "Gi0/2"},
+        {"if_index": 3, "descr": "Gi0/3"}])
+    mark_cisco(db, did)
+    poller = NodePoller(db)
+    device = db.device(did)
+    config = db.effective_config(device)
+
+    poller._poll_stp(did, device, config)
+
+    ifaces = {i["if_index"]: dict(i) for i in db.interfaces(did)}
+    check("a port answered only in the global read, never in any VLAN "
+          "context, keeps its global state",
+          ifaces[3]["stp_state"] == "forwarding", ifaces[3])
+    check("...and carries no per-VLAN detail",
+          ifaces[3]["stp_blocking_vlans"] is None, ifaces[3])
     db.close()
 finally:
     stub.kill()

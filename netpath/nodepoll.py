@@ -7625,11 +7625,12 @@ class NodePoller(Worker):
         not the device's default (VLAN 1) context the estate prunes off
         every trunk.
 
-        Returns ({if_index: {"blocking": [vlan, ...], "vlans": count}},
-        answered, complete); complete is False on a cut-short pass (sliced
-        VLAN list, an unfinished column walk, or the budget running out),
-        telling the caller to keep the stored detail rather than write a
-        partial view.
+        Returns ({if_index: {"blocking": [vlan, ...], "vlans": count,
+        "states": {name, ...}}}, answered, complete); a VLAN list sliced to
+        _MAX_VLAN_CONTEXTS still counts as complete, since the count then
+        reads "of the first 48 VLANs" — complete is False only for the
+        deadline break or an unfinished column walk, telling the caller to
+        keep the stored detail rather than write a partial view.
         """
         if snmp_version_of(config) == 3:
             return {}, False, True
@@ -7651,7 +7652,10 @@ class NodePoller(Worker):
             return {}, False, True
         ordered = sorted(vlans, key=int)
         sliced = ordered[:self._MAX_VLAN_CONTEXTS]
-        complete = len(sliced) == len(ordered)
+        # A list sliced to _MAX_VLAN_CONTEXTS is a complete pass over the
+        # first 48 VLANs, not a cut-short one — complete goes False only for
+        # the deadline break below or an unfinished column walk.
+        complete = True
         deadline = time.time() + self._VLAN_WALK_BUDGET_S
         rows: dict[int, dict] = {}
         answered = False
@@ -7678,8 +7682,12 @@ class NodePoller(Worker):
                 if_index = mapping.get(bridge_port)
                 if if_index is None or not isinstance(value, (int, float)):
                     continue
-                entry = rows.setdefault(if_index, {"blocking": [], "vlans": 0})
+                entry = rows.setdefault(
+                    if_index, {"blocking": [], "vlans": 0, "states": set()})
                 entry["vlans"] += 1
+                state_name = nodeoids.DOT1D_STP_PORT_STATE_ENUM.get(int(value))
+                if state_name is not None:
+                    entry["states"].add(state_name)
                 if int(value) == 2:                      # blocking
                     entry["blocking"].append(vlan)
         return rows, answered, complete
@@ -7816,9 +7824,17 @@ class NodePoller(Worker):
         protocol_spec_n = num(nodeoids.DOT1D_STP_PROTOCOL_SPEC)
         if protocol_spec_n is None:
             # Same "a miss on the first probe is a verdict, a miss later is
-            # just a miss" rule _poll_poe follows.
+            # just a miss" rule _poll_poe follows — except a Cisco v1/v2c
+            # device gets one per-VLAN pass tried first, since PVST+ often
+            # answers STP only inside a VLAN's own community, never in the
+            # default context.
             if capable is None:
-                self.db.set_stp_capable(device_id, False)
+                answered = False
+                if detected_vendor(device).lower() == "cisco" and snmp_version_of(config) != 3:
+                    _, answered, _ = self._cisco_vlan_stp(
+                        device, config, self._bridge_port_map(device, config))
+                if not answered:
+                    self.db.set_stp_capable(device_id, False)
             return
         if capable is None:
             self.db.set_stp_capable(device_id, True)
@@ -7859,8 +7875,6 @@ class NodePoller(Worker):
             port_state = self._walk_column(device, config, nodeoids.DOT1D_STP_PORT_STATE)
         except SnmpError:
             port_state = {}
-        if not port_state:
-            return
         port_map = self._bridge_port_map(device, config)
         rows: dict[int, dict] = {}
         for suffix, value in port_state.items():
@@ -7877,6 +7891,7 @@ class NodePoller(Worker):
 
         # Per-VLAN pass (see _cisco_vlan_stp). Probed once like stp_capable,
         # but a miss is re-tried hourly rather than latched forever.
+        skip_interface_update = False
         if detected_vendor(device).lower() == "cisco" and snmp_version_of(config) != 3:
             vlan_capable = device["stp_vlan_capable"]
             now = time.time()
@@ -7893,18 +7908,27 @@ class NodePoller(Worker):
                 if vlan_answered and vlan_complete:
                     for if_index, detail in vlan_rows.items():
                         blocking = detail["blocking"]
+                        states = detail.get("states", set())
                         row = rows.setdefault(if_index, {})
-                        row["stp_state"] = "blocking" if blocking else "forwarding"
+                        if blocking:
+                            row["stp_state"] = "blocking"
+                        elif "forwarding" in states:
+                            row["stp_state"] = "forwarding"
+                        elif len(states) == 1:
+                            row["stp_state"] = next(iter(states))
                         row["stp_blocking_vlans"] = ",".join(sorted(blocking, key=int))
                         row["stp_vlan_count"] = detail["vlans"]
                 elif vlan_answered and not vlan_complete:
-                    # SFP badge scan's own cut-short rule: keep what is stored.
+                    # SFP badge scan's own cut-short rule: keep what is
+                    # stored — the global read is skipped too, so a blocked
+                    # uplink doesn't flap to forwarding for this poll.
+                    skip_interface_update = True
                     self._log_media_diag(
                         device, f"Per-VLAN STP scan on {device['ip']}: cut "
                                 f"short, stored per-VLAN detail kept",
                         "stp_vlan_cut_short")
 
-        if rows:
+        if rows and not skip_interface_update:
             self.db.update_interface_stp(
                 device_id, [{"if_index": i, **fields} for i, fields in rows.items()])
 
