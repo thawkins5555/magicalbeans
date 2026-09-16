@@ -365,6 +365,39 @@ try:
 finally:
     stub.kill()
 
+# --- plain-host cage latch: a device answering nothing at all -------------
+# (5.35.0 review fix, should-fix): a complete-empty ENTITY-MIB answer marks
+# the device both sensor- and cage-incapable in one pass, so the next poll
+# is gated out to the hourly reprobe window instead of re-walked every
+# cadence. _walk_column_detail is stubbed directly, not via the SNMP stub
+# agent, so no real session is needed for it.
+db = new_nodes_db("plain_host")
+did = device_against(db, "plain-host")
+poller = NodePoller(db)
+walked: list = []
+
+
+def empty_complete_walk(device, config, oid, raise_on_timeout=False, deadline=None):
+    walked.append(oid)
+    return {}, True, ""
+
+
+poller._walk_column_detail = empty_complete_walk
+t0 = time.time()
+device = db.device(did)
+poller._poll_environment(did, device, db.effective_config(device), set(), t0)
+check("first probe of a plain host walks the ENTITY-MIB columns",
+      walked != [], walked)
+
+walked.clear()
+device = db.device(did)
+poller._poll_environment(did, device, db.effective_config(device), set(), t0 + 60)
+check("the next poll, 60s later, walks nothing -- the latch (cage) and "
+      "sensor_capable=False (outer gate) together confirm a plain host "
+      "once instead of re-probing it every cadence",
+      walked == [], walked)
+db.close()
+
 # ============================================== § 2 the dark optic's value
 
 stub, port = spawn_stub("stub_agent_ups_env.py", "sfp_media")

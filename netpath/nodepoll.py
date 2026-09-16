@@ -4368,14 +4368,8 @@ class NodePoller(Worker):
         return text
 
     def _refresh_default_gateway(self, device, config: dict) -> None:
-        """The device's own default-route next hop(s): ipCidrRouteNextHop
-        under dest/mask 0.0.0.0, then inetCidrRouteNextHop (IPv4) under the
-        same default route -- ipCidrRouteTable is deprecated and empty on
-        IOS 15.x/IOS-XE, which is what publishes the newer table instead --
-        falling back to the older ipRouteNextHop.0.0.0.0 GET for a box that
-        never filled either table. The first of the three that answers a
-        real next hop wins. Left alone (not stored as "") when none of the
-        three answers at all."""
+        """Default-route next hop, tried in order (ipCidrRouteTable is empty
+        on IOS 15.x/IOS-XE); first to answer wins, none leaves it alone."""
         device_id = device["id"]
         try:
             route_rows = self._walk_column(device, config,
@@ -5619,12 +5613,8 @@ class NodePoller(Worker):
         return str(raw).startswith(self._CISCO_ENTERPRISE_PREFIX)
 
     def _walk_sensor_columns(self, device, config: dict) -> tuple[str, dict, list, bool]:
-        """(source, columns, tables tried, whether the value-column walk
-        reached the end) — whichever sensor table this device actually
-        populates, walked once for every caller. A caller that goes on to
-        treat an empty result as "no DOM here" needs that last flag: an
-        empty result from a walk that merely timed out is not that.
-        """
+        """(source, columns, tried, complete) -- an empty result from a
+        walk that merely timed out must not read as "no DOM here"."""
         tried = ["ENTITY-SENSOR-MIB"]
         source = "ENTITY-SENSOR-MIB"
         values, complete = self._walk_column_status(device, config, self._ENT_SENSOR_VALUE)
@@ -5799,16 +5789,8 @@ class NodePoller(Worker):
 
     def _sfp_slot_media(self, device, config: dict, port_map: dict[int, int],
                         contained_in: dict[int, int], descrs: dict) -> tuple:
-        """({ifIndex: 'sfp' | 'sfp_empty' | 'copper'}, whether every walk it
-        made finished, entPhysicalClass row count for _cage_capable, and a
-        list of "<column> walk cut short (<reason>)" diagnostics) for the
-        transceiver cages this device describes -- the DOM scan cannot see
-        an empty or sensorless cage. 'copper' additionally names a copper
-        form factor (_COPPER_TEXT) in the entPhysical text; an unnamed
-        container is left as-is rather than guessed at. A walk cut short
-        must not be read as a cage or module that is not there — see
-        _poll_environment, which acts on the completeness flag.
-        """
+        """(media map, complete flag, class row count, cut-short diagnostics):
+        a walk cut short must never read as a cage that is not there."""
         raw_classes, complete, class_reason = self._walk_column_detail(
             device, config, self._ENT_PHYSICAL_CLASS)
         classes = _int_keyed(raw_classes)
@@ -6434,9 +6416,7 @@ class NodePoller(Worker):
             sensor_complete = False
         if cols:
             if not capable:
-                # None (never probed) and 0 (probed, answered nothing) both
-                # flip to 1 here — the latch has to be able to open again now
-                # that a second table can be the one that answers.
+                # Unproven or found-empty can still turn out capable later.
                 self.db.set_sensor_capable(device_id, True)
             sensor_values = cols["values"]
             types = cols["types"]
@@ -6445,9 +6425,7 @@ class NodePoller(Worker):
             statuses = cols["statuses"]
             units = cols["units"]
         else:
-            # No sensor answer (empty or SnmpError) still falls through to the
-            # cage scan below: a switch with no DOM-capable optics can still
-            # have ENTITY-MIB cages worth badging.
+            # No DOM answer still falls through: cages can be badge-worthy.
             if capable is None:
                 self.db.set_sensor_capable(device_id, False)
             cage_capable = self._cage_capable.get(device_id)
@@ -6464,9 +6442,7 @@ class NodePoller(Worker):
             f"entPhysicalDescr walk cut short ({descrs_reason})"]
         # The name fallback exists for Cisco gear with no alias rows; nothing
         # else should pay a whole entPhysicalName walk every cadence for it.
-        # An incomplete names walk maps fewer sensors than the device really
-        # has, so it must not be read as proof any of them are gone — it
-        # feeds slots_complete below just like the descr/class/model walks.
+        # An incomplete walk must not read as proof a sensor is gone.
         names = if_by_name = None
         names_done = True
         if self._cisco_sensor_table_plausible(device):
@@ -6481,13 +6457,8 @@ class NodePoller(Worker):
         if not port_map:
             if not alias_rows and not contained_in and contained_complete:
                 self._cage_capable[device_id] = False
-            # Nothing mapped to a port means a walk that answered nothing
-            # useful; the two ENTITY-MIB columns the cage scan needs would
-            # be two more dead walks. Diagnosed only when there was some
-            # ENTITY-MIB data to map in the first place — entAliasMapping
-            # rows or a containment tree — so a plain host with none of it
-            # never earns an hourly event about a scan it was never going
-            # to answer.
+            # Diagnosed only with ENTITY-MIB data to map, so a plain host
+            # never earns an event for a scan it was never going to answer.
             if alias_rows or contained_in:
                 self._log_media_diag(
                     device, f"SFP scan on {device['ip']}: no entity mapped "
@@ -6502,11 +6473,7 @@ class NodePoller(Worker):
             if class_rows:
                 self._cage_capable[device_id] = True
             elif slots_complete:
-                # A clean empty walk (ended cleanly, zero rows) is the
-                # noSuchObject verdict: this device has no ENTITY-MIB at
-                # all, so stop asking every cadence. A walk cut short with
-                # zero rows so far proves nothing either way and leaves
-                # the latch as it was.
+                # A clean empty walk is the noSuchObject verdict; a cut-short one proves nothing.
                 self._cage_capable[device_id] = False
         slots_complete = slots_complete and descrs_done and names_done
         if not slots_complete and media_reasons:
@@ -6571,12 +6538,8 @@ class NodePoller(Worker):
         # Sensor index suffix -> the (index, root) its published limits
         # belong to. See _poll_published_thresholds.
         threshold_roots: dict[str, tuple] = {}
-        # entPhysicalIndex (as its own suffix string) -> reading, for every
-        # chassis-classified (not port-mapped, not ambient) temperature row
-        # -- the per-sensor sibling of the chassis_temps worst-of below, and
-        # the reason those rows are also in threshold_roots: a chassis
-        # sensor publishes its own limits through the same
-        # entSensorThresholdTable an optic does.
+        # entPhysicalIndex -> reading, per chassis-classified temperature row;
+        # also in threshold_roots since a chassis sensor publishes limits the same way.
         chassis_sensor_temps: dict[str, float] = {}
         # Sensor rows this poll read that resolved to no port at all --
         # diagnosed below only when port_map is non-empty (the device maps
