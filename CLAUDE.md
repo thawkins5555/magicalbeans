@@ -42,6 +42,7 @@ Ask as many questions as necessary during planning. During deployment use all re
 - Do not run test suites on known environmental failures.
 - Perform a browser walk only on modules that had their code edited.
 - Do not take screenshots as part of the browser walk.
+- Do not perform another walk after code review. 
 
 Test entry points: standalone scripts run as `python3 tests/test_<name>.py`; the full suite is `python3 tests/run_all.py`. The headless browser walk is `PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers node tests/ui/walk.mjs`, after starting `demo/fleet.py`, `python3 -m netpath --headless`, and `demo/seed.py`.
 
