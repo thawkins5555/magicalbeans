@@ -273,6 +273,14 @@ landing straight on a device's own pane — it keeps the remembered Find
 text and filters as they were and simply selects the device; only a link
 followed from another module runs the reveal.
 
+**From 5.33.0, the revealed row is also highlighted amber and its
+checkbox ticked**, so the row a link pointed at is unmistakable rather
+than merely scrolled into view. The highlight is its own colour in every
+theme, distinct from the blue used for a selected or bulk-checked row,
+and it clears itself the moment you select a different device, type into
+the Find box, or otherwise move on — it marks "this is the one you asked
+for," not a lasting state.
+
 Two things it deliberately does not do. It is never a MAC address search, so
 a device named in hex (`beef01`) is looked up as the name it is rather than
 answered with "that looks like an attempt at a MAC address" — IPAM's
@@ -488,6 +496,27 @@ device's own IP address appeared twice in the same row, once as the name
 and again as the IP column. It now resolves the same display name Nodes,
 Syslog and Alerts already agree on (the polled sysName, or a manual rename
 when the device is pinned to one).
+
+**From 5.33.0, three Y-axis scaling faults on the graph tiles are fixed.**
+A percent metric (CPU, memory) with no **Y max** set now pins its axis to
+0–100 instead of auto-scaling to whatever the data happened to do, so a
+quiet 3% CPU line no longer reads as if it were pegged near the top of its
+own chart. A chart drawing more than one series no longer lets an
+invisible min/max band push the visible lines down the axis — that band
+only ever draws on a single-series chart, so only a single-series chart's
+own numbers should ever decide how tall the axis grows. And a reading
+above a chart's own ceiling — a set Y max, or the new 0–100 percent pin —
+now draws clamped to the top of the plot instead of being drawn past it,
+off the top of the chart.
+
+**From 5.33.0, the "Most interface events (24 h)" tile actually
+populates** — it has been empty since it shipped. It was built to count
+port up/down/flapping transitions the same way "Most device events"
+counts device-level ones, off the same table, but a port's own
+transitions have never been written there; they live in their own
+interface event log, keyed to the port rather than the device. The tile
+now reads that log instead, joined back to the device it belongs to, and
+"Most device events" is unaffected.
 
 ## Nodes — SNMP poller and device inventory
 
@@ -1334,6 +1363,29 @@ of an empty section; every other vendor shows no section. The existing
 per-sensor table also marks a Stack Power port `(stack power)`, the same
 way it already marks a power-supply row `(power supply)`.
 
+**From 5.33.0, a fan tray gets the same alerting the power supplies and
+Stack Power cables already have, Cisco gear only.** Two rules — **Fan
+degraded** and **Fan failed or not present** — read a normalised state
+per fan bay the same way **Power supply warning/failed** already does,
+tried first through CISCO-ENTITY-FRU-CONTROL-MIB and, only when that
+table is empty, the older CISCO-ENVMON-MIB as a fallback. The per-sensor
+table tags a fan row `(fan)` alongside its `(power supply)` and
+`(stack power)` tags.
+
+**From 5.33.0, a Sensor Snapshot button sits at the bottom of the dialog,
+beside Re-identify.** It accepts every power supply, stack power and fan
+reading the device has right now as normal for it — useful the moment a
+switch is discovered with, say, only one power supply and one stack
+cable fitted, which would otherwise alert as missing hardware forever.
+A later reading that still matches the accepted baseline stays quiet;
+one that gets worse still alerts, exactly as if no baseline had been
+taken. Taking a snapshot also clears whatever is currently open on those
+same alerts for the device, with a note on each saying so. The dialog
+shows a line — "Baseline taken ⟨when⟩ · N sensors" — once a snapshot
+exists. Temperature is not covered by a snapshot: it is judged against a
+limit or a vendor status enum, not a fixed pass/fail reading, and already
+has its own threshold handling.
+
 **The per-port bandwidth chart holds still under live polling.** Selecting a
 device polls it every few seconds, and a chart drawn from every one of those
 samples turned to hash the moment that started: the rate of a 3-second
@@ -1453,6 +1505,16 @@ bar with its own **Poll now**, which polls every ticked device immediately
 rather than waiting for each one's interval, and reports how many it queued
 and how many were already running. The detail pane's button only ever polls
 the one device open in it.
+
+**From 5.33.0, Poll now also learns MAC addresses, reads the ARP cache and
+walks VLAN membership for that device immediately**, rather than waiting
+for each table's own interval to come round — the same three background
+walks the poller already runs on their own schedule, just run now instead
+of on a stagger. A device already failing or with SNMP switched off is
+skipped, exactly as the scheduled walks skip it, and a walk turned off for
+the device (its interval set to 0) is not started. A walk already running
+for the device is never started a second time. Neighbour discovery (LLDP/
+CDP) is unaffected — a manual poll did not ask for neighbours.
 
 **Double-clicking a row opens that device in a dialog** — its identity
 line, its interface table and its event log — without moving what the
@@ -1632,8 +1694,25 @@ Cisco devices only, the **per-VLAN SNMP contexts** classic IOS hides its
 forwarding table behind (community indexing, `community@vlan`, with the
 VLAN list read from CISCO-VTP-MIB). The first source that returns
 anything wins. Devices that answer none of them show "no MAC address
-data" instead of an empty table. Per-interface "show run" still appears as a placeholder
-until SSH integration lands.
+data" instead of an empty table.
+
+**From 5.33.0, RUNNING CONFIGURATION shows this port's own stanza from the
+device's latest ConfigRX backup**, in place of the earlier placeholder
+saying a config is a whole-device thing. It reads the ConfigRX backup only
+— nothing here contacts the device — and pulls just this interface's block
+out of the stored text, matching Cisco IOS/IOS-XE/NX-OS/IOS-XR, Arista,
+Aruba/HP ProCurve and Aruba CX's indented style, plus Juniper's
+brace-delimited `interfaces { ge-0/0/0 { ... } } ` form. Matching the
+port's SNMP name against the config's own interface name accepts an exact
+match or a short/long-form pair sharing the same trailing digits — `Gi1/0/1`
+finds `GigabitEthernet1/0/1`, `Po1` finds `Port-channel1` — but never a
+different port with the same prefix (`Gi1/0/1` does not match a stanza for
+`Gi1/0/10`). A device with no backup, or a backup with no line naming this
+port, says so in place of the config text rather than leaving the tile
+blank. The tile is only fetched for an account that can read ConfigRX — a
+Nodes-only viewer keeps the earlier static hint instead of a request that
+would be refused — and beneath a permission that stops there, the text
+comes back redacted the same way ConfigRX's own backup view already is.
 
 **Priority port, from 5.23.0.** A checkbox in the port dialog's own
 header — a ★ appears beside the dialog title and in the interface list's
@@ -2188,7 +2267,7 @@ alerts and optionally emailing about them.
 
 ### Rules
 
-- **70 built-in rules ship, 69 of them enabled**: a device not responding, a
+- **72 built-in rules ship, 71 of them enabled**: a device not responding, a
   device recovering, a device rebooting, SNMP authentication failing, a
   device needing unsupported SNMPv3 privacy, a poll running longer than its
   own interval, a device whose vendor MIB is missing, an interface going
@@ -2407,6 +2486,22 @@ alerts and optionally emailing about them.
   the MIB publishes per port has no live reading to alert on — it is
   shown, not alerted on, in the Device Details STACK POWER section (see
   Nodes → Devices, above).
+- **From 5.33.0, a fan tray that degrades or fails alerts too, Cisco
+  devices only.** **Fan degraded** (warning) and **Fan failed or not
+  present** (critical) read a normalised state per fan bay the same way
+  **Power supply warning/failed** already does — 0 ok, 1 warning, 2
+  failed, 3 not present — off CISCO-ENTITY-FRU-CONTROL-MIB's
+  `cefcFanTrayOperStatus` first, falling back to the older
+  CISCO-ENVMON-MIB `ciscoEnvMonFanState` only when the FRU table answers
+  nothing (the two tables share no index space, so both are never read at
+  once). A tray that has answered before and now falls silent is treated
+  as failed, the same "was there, now silent" rule Power supply failed
+  already applies, rather than clearing a real fault because the device
+  stopped reporting it. **Fan failed or not present** rolls up under a
+  device outage the same way **Power supply failed** does; **Fan
+  degraded** rolls up under **Fan failed or not present**. Both are one
+  of the three families a Sensor Snapshot baseline (above) can accept as
+  normal for a device.
 - **Three of those 35 are new in 4.39.0**, and each one reports a failure
   that previously had nobody to report it. `snmp_failing_ping_ok` fires
   when a device answers ping while its SNMP agent has stopped answering —
@@ -4332,6 +4427,30 @@ like any other module.
   debounced, the same way a node move already does; renaming or
   recolouring a frame is audited, moving one is not, the same split
   already drawn between a node's position and its name.
+- **From 5.33.0, double-clicking a device box opens that device's own
+  Device Details dialog without leaving Mapper.** It is the exact same
+  dialog a double-click on a Nodes row already opens — its identity,
+  sensors, interface table and event log — just reachable from the map
+  without switching tabs first. Only a real, still-managed device has one
+  to open; an unmanaged LLDP/CDP peer and a device since removed from
+  Nodes both do nothing, the same case "Open in Nodes" already treats as
+  a no-op.
+- **From 5.33.0, Find's suggestions now match the application's own
+  theme**, a small dropdown styled like every other list here, in place
+  of the browser's own `<datalist>` popup, which read enough like an
+  unrelated autofill suggestion to be confusing. Typing narrows it to up
+  to twelve ranked matches over the same name/label/IP fields Find
+  itself searches, so nothing it suggests can fail to be found; the
+  up/down arrows move the highlight, Enter picks the highlighted
+  suggestion (or runs the search as typed with nothing highlighted),
+  Escape closes it, and clicking a suggestion fills the box and searches
+  it the same way.
+- **From 5.33.0, labels no longer overlap when devices are dragged close
+  together.** Each name is measured the way the browser will actually
+  draw it, and a name that would land on top of another box or another
+  name is pushed straight down, in whole line steps, until it clears
+  both — the box itself, and where links attach to it, never move; only
+  where its name is drawn shifts.
 
 ---
 

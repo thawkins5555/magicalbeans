@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.33.0 — Per-port running config from ConfigRX, Poll Now's three walks, fan alerts, Sensor Snapshot, and Mapper/Dashboard fixes](#5330--per-port-running-config-from-configrx-poll-nows-three-walks-fan-alerts-sensor-snapshot-and-mapperdashboard-fixes)
 - [5.32.0 — Cisco Stack Power: cable-down and fault-trap alerts on Device Details](#5320--cisco-stack-power-cable-down-and-fault-trap-alerts-on-device-details)
 - [5.31.0 — Mapper: find a device, select-all in the picker dialogs, and frames](#5310--mapper-find-a-device-select-all-in-the-picker-dialogs-and-frames)
 - [5.30.0 — Device links reveal the row, named interfaces and a default gateway on Addresses, tagged digests](#5300--device-links-reveal-the-row-named-interfaces-and-a-default-gateway-on-addresses-tagged-digests)
@@ -165,6 +166,165 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.33.0 — Per-port running config from ConfigRX, Poll Now's three walks, fan alerts, Sensor Snapshot, and Mapper/Dashboard fixes
+
+Ten items from one operator prompt, all shipped together in this release;
+`PROMPT-LOG.md` carries the full request and the planning calls made on it
+without the operator present.
+
+**The Interface Detail dialog's RUNNING CONFIGURATION tile now shows this
+port's own stanza from the device's latest ConfigRX backup**, not a static
+"this is a whole-device thing" hint. A new module, `configrx_stanza.py`,
+pulls just the one interface's block out of the stored config text: the
+indented-block vendors (Cisco IOS/IOS-XE/NX-OS/IOS-XR, Arista, Aruba/HP
+ProCurve, Aruba CX) by walking lines under an `interface ...` header until
+the next non-indented, non-`!` line, and Juniper's pretty-printed brace
+form (`interfaces { ge-0/0/0 { ... } }`) by matching braces — Junos'
+single-line `set` output is not handled. Matching a port's SNMP name
+against the config's own interface name accepts an exact match, or a
+shared numeric/slash tail with one name's letters a prefix of the
+other's (`Gi1/0/1` against `GigabitEthernet1/0/1`, `Po1` against
+`Port-channel1`) — `Gi1/0/1` never matches a stanza for `Gi1/0/10`. A
+device's operator-set port alias is never one of the candidates: it is a
+free-text label, not a form any vendor's config would ever print on an
+`interface` line, so matching against it risked a false stanza. The tile
+reads the device's most recent backup only; a device with no backup, or a
+port with no stanza in that backup, says so in place of the config text
+rather than showing nothing. `GET
+/api/nodes/devices/<id>/interfaces/<if_index>/config` is gated on both
+ConfigRX read (a stored configuration is what it hands back, redacted the
+same way `GET .../configrx/backup` already is for a caller without
+ConfigRX write) and Nodes read (this is still a per-device page) — a
+viewer with only one of the two is refused, and the dialog itself never
+even asks unless the signed-in account can read ConfigRX, so a Nodes-only
+viewer keeps today's static hint instead of a request that would fail.
+
+**Poll Now also learns MAC addresses, reads the ARP cache and walks VLAN
+membership for that device**, immediately rather than waiting for each
+table's own interval to come round. `NodePoller._walk_now` reuses the
+scheduler's own `_maybe_walk_mac_table`/`_maybe_walk_vlans`/
+`_maybe_walk_arp_table` in-flight guards and executor, so a walk already
+running for the device is never started a second time; it submits each
+walk directly rather than clearing the scheduler's own next-due stamp,
+because clearing that stamp for a device the scheduler has never walked
+before would hit the "first seen" branch and stagger the walk over a
+random fraction of its interval instead of starting it now — direct
+submission is what makes a manual poll actually prompt. The same guards
+that already skip a down or SNMP-disabled device, and a device with a
+walk turned off (interval 0), apply here unchanged; the LLDP/neighbour
+walk is untouched, since nothing about a manual poll asked for
+neighbours.
+
+**Double-clicking a device on Mapper now opens that device's own Device
+Details dialog without leaving the Mapper tab.** It reuses the exact
+dialog a double-click on a Nodes row already opens
+(`App.pages.nodes.openDeviceDialog`, reached through
+`App.whenModuleReady('nodes')` so Nodes need never have been the active
+tab this session), rather than switching tabs or building a second
+dialog. Only a real, still-managed device has one to open — an unmanaged
+LLDP/CDP peer and a device since removed from Nodes both do nothing, the
+same case "Open in Nodes" already treats as a no-op.
+
+**Clicking a device name link now highlights the row in yellow and ticks
+its checkbox, not just scrolls to it.** The reveal behaviour from 5.30.0
+— clearing the Find box, and the other filters if needed, then scrolling
+the row into view — now also marks that row with a dedicated `--reveal`
+amber (its own theme token in every shipped theme, distinct from the
+existing blue selection/checked colours) and ticks its bulk-select
+checkbox, so the row a link pointed at reads as unmistakable rather than
+just scrolled-to. The highlight clears itself the moment the operator
+selects a different device, types into the Find box, or otherwise moves
+on — it marks "you asked to find this one," not a lasting state.
+
+**A Sensor Snapshot button sits at the bottom of the Device Details
+dialog, beside Re-identify.** It accepts every power supply, stack power
+and fan reading the device has right now as that device's normal state,
+so a switch that has always had one power supply and one stack cable
+stops alerting about the ones it doesn't have. A later reading that is
+still exactly the accepted baseline stays quiet; the moment it reads
+worse, the alert opens exactly as it would with no baseline at all. Taking
+a snapshot also resolves whichever of those same alerts are open for the
+device right now, on the reasoning that the value that just became the
+baseline is, by construction, whatever that alert's current reading
+already is — each resolved alert gets a "Sensor snapshot" note. The
+dialog shows a "Baseline taken ⟨when⟩ · N sensors" line once one exists.
+Temperature is deliberately not covered: it is judged against a limit or
+a vendor state enum, not a fixed pass/fail reading, and already has its
+own published-threshold and hysteresis handling.
+
+**Fan alerts: "Fan degraded" and "Fan failed or not present," Cisco
+devices only.** Read on the same cadence as power-supply state, from
+CISCO-ENTITY-FRU-CONTROL-MIB's `cefcFanTrayOperStatus` first and, only
+when that comes back empty, CISCO-ENVMON-MIB's classic
+`ciscoEnvMonFanState` as a fallback — the two tables share no index
+space, so both are never polled at once. Normalised to the same 0 ok / 1
+warning / 2 failed / 3 not-present reading PSU state already uses, with a
+tray that stops answering after having answered before treated as
+failed, the same "was there, now silent" rule PSU state applies. The
+per-sensor table tags a fan row `(fan)`, alongside its existing
+`(power supply)` and `(stack power)` tags, and a fan reading is one of
+the three families a Sensor Snapshot baseline can cover.
+
+**Dashboard graphs: three separate scaling bugs, fixed.** A percent
+metric (CPU, memory) with no Y max set now pins its axis to 0–100 rather
+than auto-scaling to whatever the data happened to do, so a quiet 3% CPU
+line no longer looks like it is pegged at the top of its own chart. A
+chart with more than one series drawn on it no longer lets an undrawn
+min/max band push the visible lines down — only a single-series chart
+ever draws that band, so only a single-series chart's numbers should ever
+influence how tall the axis grows. And a reading above a chart's own
+ceiling — a set Y max, or the new 0–100 percent pin — is now clamped to
+the top of the plot instead of being drawn past it, off the top of the
+chart entirely.
+
+**The "Most interface events (24 h)" Dashboard tile has been empty since
+it shipped**, and now works. It was built to count port up/down/flapping
+transitions the same way the "Most device events" tile counts device
+transitions — off `device_events` — but a port's own transitions are
+never written there; they live in `interface_events`, keyed to the
+interface rather than the device, with kind `link_up`/`link_down`. A new
+query, `count_interface_events_by_device`, joins `interface_events`
+through `interfaces` back to a device to build this list, leaving "Most
+device events" untouched.
+
+**The Mapper Find dropdown is now themed, and Mapper labels no longer
+overlap.** Typing in Find now opens a dropdown styled like the rest of
+the application — up to twelve ranked suggestions, with the up/down
+arrows, Enter and Escape all working on it, and a click on a suggestion
+filling the box and running the same search Enter would — replacing the
+browser's own unstyled `<datalist>` popup, which read like an unrelated
+autofill suggestion. And two device boxes dragged close together no
+longer draw one name over the other, or over the neighbouring box: every
+node's name is measured the way the browser will actually render it (a
+detached canvas context, not a reflow-triggering `getBBox()`), and a name
+that would overlap another name or another box is pushed straight down,
+in whole line steps, until it clears both — the box itself never moves,
+only where its name is drawn.
+
+Files: `configrx_stanza.py` (new), `nodeoids.py`, `nodepoll.py`,
+`nodesdb.py`, `alertengine.py`, `alertrules.py`, `alertsdb.py`,
+`web/api.py`, `web/server.py`, `web/static/nodes.js`,
+`web/static/mapper.js`, `web/static/dashboard.js`, `web/static/app.js`,
+`web/static/app.css`, `web/static/tokens.css`, `web/static/index.html`.
+
+Verification: `tests/test_configrx_stanza.py` is new — the stanza
+extractor's vendor block shapes, the short/long name table, and the
+Juniper brace matcher. `tests/test_configrx_stanza_route.py` is new — the
+config route end to end: a matched stanza, no stanza, no backup at all,
+and the dual configrx-read/nodes-read gate. `tests/test_poll_now_walks.py`
+is new — Poll Now submitting all three walks, a device with every walk
+turned off getting none of them, a down device skipped, and an in-flight
+walk not doubled. `tests/test_sensor_snapshot.py` is new — the snapshot
+route storing a baseline per sensor, resolving what is open, the
+equality-only quiet rule against a worse reading, and its write/read
+permission split. `tests/test_dashboard_offenders.py` is new — the
+interface-events query and the tile it feeds. `tests/
+test_alert_sensor_rules.py` is extended for the fifth sensor family and
+the Sensor Snapshot baseline path across all three covered families.
+`tests/test_frontend_contracts.py` is updated for the Find dropdown
+markup in place of the datalist, the Sensor Snapshot button, and the fan
+row's per-sensor hint text.
 
 ### 5.32.0 — Cisco Stack Power: cable-down and fault-trap alerts on Device Details
 

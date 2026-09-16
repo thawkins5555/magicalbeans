@@ -4100,6 +4100,236 @@ calls it for the same decrypt it always did, and `reportsched.run_due`
 answer can never drift from what Alerts' own notification path already
 checks for the identical settings.
 
+### Per-port running config: `configrx_stanza.py` and the interface config route (`configrx_stanza.py`, `web/api.py`, `web/server.py`, `nodesdb.py`) — 5.33.0
+
+**Extraction (`configrx_stanza.interface_stanza`).** Pure text in, text or
+`None` out — no device access, no SNMP, no database — so it is unit
+tested directly against sample config text (`tests/
+test_configrx_stanza.py`). It walks the stored config line by line
+looking for an `^interface\s+(\S.*)$` header (case-insensitive) whose
+name matches one of the caller's candidates (`_names_match`, below); on a
+match, `_indented_block` collects that header plus every following line
+that is indented or a bare `!`, stopping at the first non-indented,
+non-`!` line — which is either a `!`-delimited block's own separator or,
+on NX-OS's separator-less style, the next stanza's own header — and drops
+a trailing `!` from the result. No header match at all falls through to
+`_juniper_block`, a simplified brace-matcher for Junos' pretty-printed
+`interfaces { ge-0/0/0 { ... } }` form: it tracks brace depth one line at
+a time, looking for a named block directly inside `interfaces { ... }`
+whose name matches a candidate, then collects lines until that block's
+own braces balance. It does not attempt Junos' single-line `set` output.
+
+**Name matching (`_names_match`).** Case-insensitive exact equality
+always matches — the only rule that applies to a vendor with no
+short/long split at all, such as ProCurve's `1/A1`. Otherwise
+`_split_prefix` splits each name into its leading run of letters/hyphens
+(`Gi`, `GigabitEthernet`, `Port-channel`) and everything after; a match
+needs the trailing parts to be identical strings (so `Gi1/0/1` never
+matches a config's `Gi1/0/10` — same prefix, longer trailing digits) and
+one prefix to be a case-insensitive prefix of the other (`Gi` of
+`GigabitEthernet`, `Po` of `Port-channel`). A name with no leading letter
+at all has an empty prefix and so can only ever match by exact equality.
+
+**Route (`api.get_nodes_device_interface_config`, `GET
+/api/nodes/devices/<id>/interfaces/<if_index>/config`).** Reads
+`configrx_db.backups_for(device_id, limit=1)` for the newest backup only
+— `{"backup_id": None, "ts": None, "text": None}` when there is none —
+then `configrx_redact.redact()`s the content unless the caller has
+ConfigRX *write* (`_may_read_secrets`, the same reduction
+`get_configrx_backup` already applies), then calls `interface_stanza`
+with `[iface["name"], iface["descr"]]` from `nodesdb.interface_row`
+(new — a single-row lookup alongside the existing `interfaces_with_media`
+etc.) as candidates. A device's `alias` column (an operator-typed port
+description) is deliberately never a candidate: it is free text, not a
+form any vendor's own config would print on an `interface` line, and
+matching against it risked a false stanza. **The route table entry itself
+gates ConfigRX read**
+(`server.ROUTES`); the handler additionally checks Nodes read by hand,
+since the route table can only carry one module per route and this page
+is reached from Nodes as much as from ConfigRX — the same shape
+`_dash_can` uses for `get_dashboard_offenders`'s own second gate. Both
+grants are required; either alone is refused (`tests/
+test_configrx_stanza_route.py` covers both one-sided cases plus the
+happy path, no-stanza and no-backup shapes end to end against a real
+`Service`/`WebServer`).
+
+**Front end (`nodes.js` interface dialog).** The RUNNING CONFIGURATION
+tile keeps its earlier static ConfigRX hint by default, and only fires
+the fetch above when `App.canRead('configrx')` — a Nodes-only viewer is
+never sent a request the server would 403. `backup_id == null` (no
+backup at all) leaves the static hint in place; a backup with no
+matching stanza (`text: null`) swaps in a one-line "no stanza for this
+interface" message instead; a matched stanza renders in a `<pre>`, with
+the backup's own timestamp and a link back to ConfigRX above it.
+
+### `nodepoll.NodePoller.poll_now` / `_walk_now`: MAC, VLAN and ARP walks on a manual poll — 5.33.0
+
+`poll_now`'s existing job — invalidate cached engines, submit the base
+counters/status poll — is unchanged; it now also calls the new
+`_walk_now(device_id)` before returning. `_walk_now` loops the same three
+`(interval config key, in-flight set, next-due stamps, walk function)`
+tuples the scheduler's own `_maybe_walk_mac_table`/`_maybe_walk_vlans`/
+`_maybe_walk_arp_table` already own (`mac_table_interval_s`/
+`_mac_running`/`_next_mac_walk`/`_run_mac_table`, and the VLAN/ARP
+equivalents), applying the same guards those three already apply by
+hand — the interval must be > 0, the device must not be down or failing,
+SNMP must be enabled — then submits straight to `self._mac_executor`
+under the same lock and in-flight set those methods use, so a walk this
+call starts and a walk the scheduler's own next tick would have started
+can never both run for the same device.
+
+**Why a direct submission rather than clearing the next-due stamp.** The
+obvious-looking alternative — pop the device out of `_next_mac_walk` (etc.)
+so the next scheduler tick treats it as due — does not actually work for
+this: a device the scheduler has never walked before has no entry in
+`_next_mac_walk` at all, and `_maybe_walk_mac_table` treats that as "first
+seen," staggering the walk over a random fraction of the interval rather
+than starting it now (the very thing that spreads a restart's first walks
+across a fleet instead of firing them all at once). Even for a device
+*with* an entry, clearing it only makes the walk due; actually starting
+it still waits for the scheduler's own next pass. Submitting directly is
+the only way a manual poll's walk is actually prompt. `_walk_now` still
+sets `next_walk[device_id] = now + interval` itself, so the walk it just
+started does not immediately look "due" again to the scheduler on its
+very next pass.
+
+`tests/test_poll_now_walks.py` drives this against a real `NodePoller`
+with a stubbed `_mac_executor` and stubbed walk functions (which still
+exercise the in-flight set's own `finally`-clearing round trip): all
+three walks fire when enabled, none fire when every interval is 0, none
+fire for a device already down, and an already-in-flight walk (one of
+the three sets pre-seeded) is not started a second time.
+
+### Cisco fan state: `FAN_TABLES` (`nodeoids.py`, `nodepoll.py`, `web/api.py`, `alertrules.py`, `alertsdb.py`) — 5.33.0
+
+`nodeoids.FAN_TABLES` is keyed by enterprise arc (9, Cisco only) to a pair
+of `PsuTable`s, reusing the same declarative shape `PSU_TABLES` already
+uses — a state column, an optional `entPhysicalClass` filter, a
+`state_map` — rather than a new table type, since `_vendor_psu_rows`
+already normalises any of these to 0 ok / 1 warning / 2 failed / 3 not
+present with nothing PSU-specific in it. The first table is
+CISCO-ENTITY-FRU-CONTROL-MIB's `cefcFanTrayOperStatus`
+(`entPhysicalClass == 7`, fan), mapped `unknown(1)` skipped, `up(2)` → ok,
+`down(3)` → failed, `warning(4)` → warning; the second, tried only when
+the first comes back with no rows, is the older CISCO-ENVMON-MIB
+`ciscoEnvMonFanState`, mapped `normal(1)` → ok, `warning(2)` → warning,
+`critical(3)`/`shutdown(4)`/`notFunctioning(6)` → failed, `notPresent(5)`
+→ not present. This is a real fallback, not "poll both": the two tables
+share no index space, so reading both would leave a platform that answers
+neither believed to answer both.
+
+`NodePoller._poll_vendor_sensors` reads `FAN_TABLES` on the exact same
+`due_psu` cadence as `PSU_TABLES` — fan state is not its own schedule —
+and writes `fan_state.<idx>` samples the same way `psu_state.<idx>`
+already is, including the same "seen before, now silent" rule: a fan
+index that has answered on a past poll and now answers nothing writes
+`_PSU_STATE_ABSENT` (3) rather than being left unwritten, so a tray that
+goes silent reads as failed rather than the alert clearing itself. An
+index this device has never answered for is simply never written.
+`alertrules.SENSOR_FAMILIES` gains `fan_state`, giving it the same
+per-sensor entity treatment (`sensor:<device_id>:<idx>`) temperature/PSU
+already have; `alertsdb._BUILTIN_RULES` gains **Fan degraded**
+(`fan_warning`, threshold, source `fan_state`, >= 1.0, warning) and **Fan
+failed or not present** (`fan_failed`, >= 2.0, critical); `ROLLED_UP_BY`
+maps `fan_warning` under `fan_failed` and `fan_failed` under
+`device_down`, the same two-level rollup `psu_warning`/`psu_failed`
+already has. `web/api.get_nodes_device_sensors` gains `fan_state` in
+`_SENSOR_FAMILY_KINDS` (kind `"fan"`) and `_FAN_STATE_WORDS`, so the
+per-sensor table's Status column and its `(fan)` tag come from the same
+place the PSU/stack-power ones already do. `tests/
+test_alert_sensor_rules.py` covers the 2/1/0 reading → failed/warning/
+silent progression against a live `AlertEngine`.
+
+### Sensor Snapshot: `sensor_baselines`, `BASELINE_FAMILIES` and the threshold skip/resolve path (`nodesdb.py`, `alertrules.py`, `alertengine.py`, `web/api.py`, `web/server.py`, `nodes.js`) — 5.33.0
+
+**Storage.** `sensor_baselines(device_id, metric_key, value, ts)`,
+primary keyed on `(device_id, metric_key)`, one row per sensor a snapshot
+has accepted. `NodesDatabase.replace_sensor_baselines(device_id, rows)`
+wholesale-replaces one device's baselines in a delete-then-insert
+transaction, the same shape `replace_interface_thresholds` already uses
+for one `(device, source)`; `sensor_baselines(device_id)` reads them back
+as `{metric_key: value}`; `sensor_baseline_meta(device_id)` returns
+`{"count", "ts"}` (the newest `ts` across every baselined key, `None`
+when there are none) for the dialog's "Baseline taken …" line;
+`delete_sensor_baselines` clears a device's baselines outright (currently
+unused by any route, present for symmetry / a future reset control).
+`sensor_baselines` is added to `NodesDatabase._PURGE_TABLES`
+(`device_id = ?`), so deleting a device drops its baselines with
+everything else, the same list `interface_thresholds`/`interface_flags`
+are already on.
+
+**Which families a baseline covers.** `alertrules.BASELINE_FAMILIES =
+{"psu_state", "stack_power_port", "fan_state"}` — a subset of
+`SENSOR_FAMILIES` deliberately excluding `temp_sensor_c`/
+`temp_sensor_state`: a temperature is judged against a published limit or
+its own hysteresis, not a fixed enum a snapshot could simply accept as
+"the new normal."
+
+**Evaluation (`AlertEngine._evaluate_thresholds`).** For a rule whose
+`source_kind` is in `BASELINE_FAMILIES`, once a sample's `value` is known,
+the engine loads that device's baselines at most once per pass
+(`baselines_by_device`, populated on first use) and compares
+`device_baselines.get(metric["key"])` against the sample. An exact match
+skips the breach entirely — not "clear if open," but "never open" — and,
+if this rule is currently open for the entity, resolves it on the way
+past (loading `open_dedup_keys()` at most once per pass, the same lazy
+load `open_keys` already uses elsewhere in this method) and counts it
+under `self.counters["resolved"]`. A value that does not exactly equal
+the baseline — including one that is *worse* — falls through to the
+method's ordinary breach/clear logic exactly as if there were no baseline
+at all, so a fault that gets worse than what was accepted always still
+alerts.
+
+**Routes.** `POST /api/nodes/devices/<id>/sensor-snapshot` (Nodes write,
+same gate as poll/identify) reads every current `psu_state`/
+`stack_power_port`/`fan_state` metric off `nodes_db.metrics(device_id)`
+whose `last_value` is not `None`, writes them wholesale via
+`replace_sensor_baselines`, then — for each baselined metric — resolves
+whatever is open on that metric's rule(s) via
+`alerts_db.resolve_by_dedup(f"{rule_key}:sensor:{device_id}:{suffix}")`
+and leaves a `"Sensor snapshot"` rollup note on it. This works by
+construction: the value just written as the baseline for a metric key IS
+that metric's current reading, so every rule judged against it is, at
+that instant, a value equal to its own new baseline — exactly the case
+the evaluator above treats as resolved. `GET
+.../sensor-snapshot` (Nodes read) returns `sensor_baseline_meta` for the
+dialog line. `_BASELINE_RULE_KEYS` maps each covered metric root to the
+rule key(s) it can resolve (`psu_state` → `psu_warning`/`psu_failed`,
+`stack_power_port` → `stack_power_cable_down`, `fan_state` →
+`fan_warning`/`fan_failed`).
+
+**Front end.** The Sensor Snapshot button sits in the vendor section's
+write-gated bar, beside Re-identify, disabling itself for the round trip
+the same way every sibling POST/PUT button in this dialog already does;
+a `#ndd-snapshot-line` paragraph, hidden until a baseline exists, is
+painted from the POST's own response and refreshed from the GET route on
+open. `tests/test_sensor_snapshot.py` drives the whole path against a
+real `Service`/`WebServer`: opening `psu_failed`/`fan_failed` before any
+snapshot, the snapshot resolving both with a note, a later tick at the
+same reading staying quiet, a worse reading re-opening it, and the
+write/read permission split.
+
+### Dashboard's "Most interface events" tile: `nodesdb.count_interface_events_by_device` (`nodesdb.py`, `web/api.py`) — 5.33.0
+
+The tile has been wired to `_offender_node_lists` since the modular
+Dashboard shipped (5.21.0), but it read `count_events_by_device(...,
+kinds=["interface_down", "interface_up", "interface_flapping"])` — a
+`device_events` query — and `device_events` has never once carried any of
+those three kinds; a port's own transitions are written to
+`interface_events` (keyed on `interface_id`, kind `link_up`/`link_down`)
+by `record_interface_event`, entirely separate from the device-level
+event log. The list was therefore reliably empty from the day it
+shipped. `count_interface_events_by_device(since, limit=None)` is a new
+query, `count_events_by_device`'s own shape (`device_id`, `name`, `ip`,
+`sys_name`, `display_name_source`, `n`, ordered `n DESC, name`) but
+`SELECT ... FROM interface_events e JOIN interfaces i ON i.id =
+e.interface_id JOIN devices d ON d.id = i.device_id WHERE e.ts >= ? AND
+e.kind IN ('link_up','link_down') GROUP BY d.id`. `_offender_node_lists`
+now calls it in place of the old `count_events_by_device` call for the
+`"interface_events"` list only; the `"events"` (device events) list is
+untouched. `tests/test_dashboard_offenders.py` covers the query directly
+and the API list builder that feeds the tile.
+
 ### History explorer's export route (`web/api.py`) — 5.23.0
 
 `get_nodes_series_export` is not a second query path: it calls
@@ -5175,6 +5405,83 @@ section in this file already uses.
 that selects a device by name, Add device's select-all ticking every
 listed row, and a frame drawn, renamed and removed in one pass.
 
+### Find dropdown replaces the `<datalist>` (`mapper.js`, `app.css`, `index.html`) — 5.33.0
+
+`index.html` drops `list="mp-find-list"` and the `<datalist>` element for
+a plain `<div id="mp-find-list" class="mp-suggest" role="listbox"
+hidden>`, since a `<datalist>` popup cannot be themed at all — it is
+rendered by the browser chrome, not the page. `findMatches(text)` (5.31.0,
+unchanged) still does the ranking; `showFindSuggestions(text)` calls it,
+keeps at most `FIND_SUGGEST_CAP` (12) results in module-level `findItems`,
+and `renderFindList()` writes them into the div as `.mp-suggest-item`
+rows, positioned under the input with `getBoundingClientRect()` since the
+list floats over the toolbar rather than living inside a positioned
+ancestor of its own (the same approach `.tooltip` already uses).
+`findActive` tracks the highlighted index; ArrowUp/ArrowDown wrap it,
+`aria-activedescendant` follows it onto the input, and Enter with a
+highlighted item calls `pickFindSuggestion(index)`, which fills the input
+with that node's own name/IP and calls `findNode(text)` — so a suggestion
+picked from the list is indistinguishable, from that point on, from the
+same text typed and entered by hand, and repeated Enter still cycles
+multiple hits for it. Escape and a blur close it; a `mousedown` on the
+list calls `preventDefault()` so the input never blurs out from under a
+click before the click's own handler runs — `onFindListClick` reads
+`event.target.closest('.mp-suggest-item')` and picks it the same way
+Enter does. A `mousedown` anywhere else in the document
+(`onFindOutsideClick`) closes it, skipping the input and the list itself.
+`rebuildFindList()` — called after every data reload, a poll tick
+included — now just re-runs `showFindSuggestions` against the current
+input text when the dropdown is open, and does nothing when it is closed,
+so a node that moved, was removed, or changed rank while the dropdown was
+open is never left stale on screen.
+
+`tests/test_frontend_contracts.py` §86 is updated for the new markup and
+functions (`showFindSuggestions`, `pickFindSuggestion`,
+`FIND_SUGGEST_CAP`) in place of the old datalist/`FIND_LIST_CAP` checks;
+the four-field ranking and the exact/prefix/substring rank order it
+already pinned are unchanged and still pinned.
+
+### Label collision avoidance: `placeLabels`/`labelRect` (`mapper.js`) — 5.33.0
+
+A name is drawn at a fixed offset inside its own node box
+(`drawNode`), and nothing stops two boxes being dragged close enough that
+one's name lands on top of the other box or the other's name. `placeLabels
+(nodes)` runs once per `draw()`, before any node is drawn: it measures
+every node's rendered name (`measureLabel`, a detached `<canvas>` 2D
+context's `measureText`, not the SVG text's own `getBBox()` — the whole
+scene is built off-document and appended once, so `getBBox()` before that
+attach would force the exact per-node reflow `draw()` is otherwise
+careful to avoid) and computes each label's scene rectangle at zero
+down-steps (`labelRect`, which also folds in the sub-line's height when
+`info.sub` is set, since `drawNode` always draws it as one visual block
+under the name). Processing nodes ordered by `(y, x)` for a stable result
+call to call, each label is pushed down one line-step (`ascent + descent +
+LABEL_GAP_PX`) at a time — up to `LABEL_STEP_CAP` (6) — until its rect
+clears every other node's box and every label already placed, and the
+resulting `steps` per node id is handed to `drawNode`, which draws the
+name (and, `LABEL_SUB_GAP` further down, the sub-line) that many line-steps
+lower than the box's default position. Only the label's own `y` moves; the
+box itself, and every link attachment point, are untouched, so a
+collision fix never moves what a link or the per-frame drag path — both
+unchanged by this — actually points at.
+
+### Double-click opens Device Details without leaving Mapper (`mapper.js`, `nodes.js`) — 5.33.0
+
+`nodes.js` exports `App.pages.nodes.openDeviceDialog(deviceId)`, a
+one-line wrapper around the same `deviceDialog(deviceId)` a Nodes row's
+own dblclick already calls — reached this way rather than by mapper.js
+importing anything of Nodes' own, since a lazy module's `pages` entry is
+only ever read from `app.js` itself. `drawNode`'s new `dblclick` listener
+calls `App.whenModuleReady('nodes').then((page) =>
+page.openDeviceDialog(node.device_id))`, which is `ensureModuleReady`
+(4.49.0, above) under its existing public alias — Nodes need never have
+been the active tab this session; the lazy-load mechanism fetches and
+`init()`s it on demand exactly as clicking the Nodes tab would.
+`info.unmanaged`/`info.gone` both short-circuit to a no-op first, the
+same case "Open in Nodes" already treats as one, since only a real,
+still-present device has a dialog to open. `App.state.tab` is never
+touched, so Mapper stays the active tab underneath the dialog.
+
 ---
 
 ## Alerts
@@ -5191,12 +5498,13 @@ occurrence increments one alert instead of opening a duplicate" behavior
 lives in the database's own conflict resolution, not in application code
 that could race between a read and a write.
 
-70 built-in rules (5.10.0 adds `wireless_ap_rebooted`,
+72 built-in rules (5.10.0 adds `wireless_ap_rebooted`,
 `wireless_radio_channel_changed` and `netpath_https_down`; the middle one
-ships disabled via `_BUILTIN_DISABLED` and is the only rule of the 70 that
+ships disabled via `_BUILTIN_DISABLED` and is the only rule of the 72 that
 does — every other built-in ships enabled; 5.23.0 adds
 `priority_interface_down`, sharing `interface_down`'s `(kind,
 source_kind)` and gated by `PRIORITY_ONLY_RULES` — see Priority ports,
+under Nodes; 5.33.0 adds `fan_warning`/`fan_failed` — see Cisco fan state,
 under Nodes) and 6 built-in templates are
 seeded via `INSERT OR IGNORE` keyed on each row's unique `key`, run on
 every open — idempotent,
@@ -10602,6 +10910,25 @@ then `opts.onClear`/`opts.refresh` if given. The Clear button itself now
 calls it with `refresh: go`; `revealDevice` calls it twice with no
 `refresh`, since it drives its own `App.refreshNow('nodes')` between steps
 instead.
+
+**5.33.0: `revealDevice` also sets `view.revealed`, painted as its own
+row colour.** `drawTable`'s row-class builder appends `' revealed'` when
+`view.revealed === row.id`, and `table.grid tr.revealed td { background:
+var(--reveal) }` (`app.css`) outranks both `tr.selected` and
+`tr.bulk-checked` on specificity alone — a revealed row that is also
+selected or bulk-checked still reads amber, since neither of those rules
+touches its own class. `--reveal` is a new token defined in every shipped
+theme (`tokens.css`), a dim amber distinct from the existing blue
+`--selected`/`--checked` family so the two read as different kinds of
+emphasis. `revealDevice` also `.add()`s the device to
+`view.devicesChecked` — a revealed row's checkbox is ticked the same way
+the row itself is highlighted. `view.revealed` is cleared — not left to
+linger — the moment `selectDevice` runs for a different id, a route
+change selects a different device without going through `revealDevice`,
+or the Find box's own `input` handler fires; it is deliberately not
+cleared by drawing the table again for the same reveal, or by the
+five-second refresh tick, since neither of those is the operator moving
+on.
 
 ### Lazy module loading (`app.js`, `index.html`) — 4.49.0
 
