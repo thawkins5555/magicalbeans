@@ -2038,15 +2038,17 @@
     const stacks = r.stacks || [];
     const switches = r.switches || [];
     const ports = r.ports || [];
+    const val = (v) => (v == null ? '—' : escape(String(v)));
     const stackLines = stacks.map((s) =>
-      `<p>Power stack ${escape(String(s.name || s.number))}: ${escape(s.mode_text)}, ` +
-      `${escape(s.topology)}, ${escape(String(s.members))} members</p>`).join('');
+      `<p>Power stack ${escape(String(s.name || s.number))}: ${val(s.mode_text)}, ` +
+      `${val(s.topology)}` +
+      (s.members == null ? '' : `, ${escape(String(s.members))} members`) + '</p>').join('');
     const switchTable = switches.length ? '<table><caption class="sr-only">Stack power switches</caption>' +
       '<tr><th scope="col">Switch</th><th scope="col">Budget W</th><th scope="col">Committed W</th>' +
       '<th scope="col">Allocated W</th></tr>' +
       switches.map((s) => `<tr><td>${escape(String(s.switch))}</td>` +
-        `<td>${escape(String(s.budget_w))}</td><td>${escape(String(s.committed_w))}</td>` +
-        `<td>${escape(String(s.allocated_w))}</td></tr>`).join('') + '</table>' : '';
+        `<td>${val(s.budget_w)}</td><td>${val(s.committed_w)}</td>` +
+        `<td>${val(s.allocated_w)}</td></tr>`).join('') + '</table>' : '';
     const portTable = ports.length ? '<table><caption class="sr-only">Stack power ports</caption>' +
       '<tr><th scope="col">Switch</th><th scope="col">Port</th><th scope="col">Neighbour</th>' +
       '<th scope="col">Admin</th><th scope="col">Link</th>' +
@@ -2063,7 +2065,7 @@
           : escape(p.state_text || '\u2014');
         return `<tr><td>${escape(String(p.switch))}</td><td>${escape(p.name)}</td>` +
           `<td>${p.neighbour_switch ? escape(String(p.neighbour_switch)) : '\u2014'}</td>` +
-          `<td>${escape(p.admin_text)}</td><td>${escape(p.link_text)}</td>` +
+          `<td>${escape(p.admin_text)}</td><td>${p.link_text ? escape(p.link_text) : '\u2014'}</td>` +
           `<td>${p.limit_a == null ? '\u2014' : escape(String(p.limit_a))}</td>` +
           `<td>${status}</td><td>${App.agoCell(p.last_ts)}</td></tr>`;
       }).join('') + '</table>' : '';
