@@ -299,6 +299,99 @@ walked_c.clear()
 poller_c._poll_vendor_sensors(11, dev_c, CONFIG, 1_700_000_400.0)
 check("cache: a dropped entry is rebuilt on the next poll", envmon.name in walked_c, walked_c)
 
+# ---------------------------------- vanish detection (5.35.0): a FRU row
+# that stops being mentioned in the walk at all, not one that reports
+# notPresent in it. Cisco's fan tables (primary/fallback) exercise the fan
+# half; the FRU PSU table (class-filtered chassis PSU rows) exercises the
+# PSU half.
+fan_primary, fan_fallback = nodeoids.FAN_TABLES[9]
+
+# --- PSU: a FRU supply present in poll 1, gone from a COMPLETE walk in poll 2
+poller_pv = new_poller()
+poller_pv._walk_column_detail = table_walker({
+    fru.state: {"10": 2}, fru.name: {"10": "PSU-0"}, fru.class_col: {"10": 6},
+})
+dev_pv = device(CISCO_OID, id=20)
+poller_pv._poll_vendor_sensors(20, dev_pv, CONFIG, 1_700_000_000.0)
+check("PSU vanish, poll 1: the FRU supply is present and ok",
+      poller_pv.db.samples_dict(20).get("psu_state.10") == 0.0,
+      poller_pv.db.samples_dict(20))
+poller_pv._walk_column_detail = table_walker({})   # complete, no rows at all
+poller_pv.db.sample_calls.clear()
+poller_pv._poll_vendor_sensors(20, dev_pv, CONFIG, 1_700_000_060.0)
+psu_vanish_sample = next(
+    (s for _did, samples in poller_pv.db.sample_calls for s in samples
+     if _did == 20 and s[0] == "psu_state.10"), None)
+check("PSU vanish, poll 2: a complete walk no longer mentioning the supply "
+      "writes _PSU_STATE_ABSENT (3.0) under its stored label",
+      psu_vanish_sample is not None and psu_vanish_sample[1] == "PSU-0"
+      and psu_vanish_sample[5] == 3.0, psu_vanish_sample)
+
+# --- PSU: the same disappearance, but the walk that would have shown it is
+# cut short -- must change nothing at all.
+poller_pc = new_poller()
+poller_pc._walk_column_detail = table_walker({
+    fru.state: {"10": 2}, fru.name: {"10": "PSU-0"}, fru.class_col: {"10": 6},
+})
+dev_pc = device(CISCO_OID, id=21)
+poller_pc._poll_vendor_sensors(21, dev_pc, CONFIG, 1_700_000_000.0)
+poller_pc._walk_column_detail = lambda *a, **kw: ({}, False, "cut short")
+poller_pc.db.sample_calls.clear()
+poller_pc._poll_vendor_sensors(21, dev_pc, CONFIG, 1_700_000_060.0)
+check("PSU vanish, cut-short walk: no new sample is written for the bay",
+      not any(s[0] == "psu_state.10" for _did, samples in poller_pc.db.sample_calls
+              for s in samples if _did == 21),
+      poller_pc.db.sample_calls)
+check("...and the remembered seen set is left exactly as poll 1 left it, "
+      "not cleared by the walk that could not confirm anything",
+      poller_pc._vendor_psu_seen.get((21, fru.state)) == {"10"},
+      poller_pc._vendor_psu_seen)
+
+# --- Fan: a FRU tray present in poll 1, gone from a COMPLETE walk in poll 2
+poller_fv = new_poller()
+poller_fv._walk_column_detail = table_walker({
+    fan_primary.state: {"1": 2}, fan_primary.name: {"1": "Fan Tray 1"},
+    fan_primary.class_col: {"1": 7},
+})
+dev_fv = device(CISCO_OID, id=22)
+poller_fv._poll_vendor_sensors(22, dev_fv, CONFIG, 1_700_000_000.0)
+check("fan vanish, poll 1: the FRU fan tray is present and ok",
+      poller_fv.db.samples_dict(22).get("fan_state.1") == 0.0,
+      poller_fv.db.samples_dict(22))
+poller_fv._walk_column_detail = table_walker({})   # complete, no rows at all
+poller_fv.db.sample_calls.clear()
+poller_fv._poll_vendor_sensors(22, dev_fv, CONFIG, 1_700_000_060.0)
+fan_vanish_sample = next(
+    (s for _did, samples in poller_fv.db.sample_calls for s in samples
+     if _did == 22 and s[0] == "fan_state.1"), None)
+check("fan vanish, poll 2: a complete walk no longer mentioning the tray "
+      "writes _PSU_STATE_ABSENT (3.0) under its stored label",
+      fan_vanish_sample is not None and fan_vanish_sample[1] == "Fan Tray 1"
+      and fan_vanish_sample[5] == 3.0, fan_vanish_sample)
+
+# --- Fan: the same disappearance, but cut short -- changes nothing, and
+# never spills onto the fallback (ENVMON) table's own key either.
+poller_fc = new_poller()
+poller_fc._walk_column_detail = table_walker({
+    fan_primary.state: {"1": 2}, fan_primary.name: {"1": "Fan Tray 1"},
+    fan_primary.class_col: {"1": 7},
+})
+dev_fc = device(CISCO_OID, id=23)
+poller_fc._poll_vendor_sensors(23, dev_fc, CONFIG, 1_700_000_000.0)
+poller_fc._walk_column_detail = lambda *a, **kw: ({}, False, "cut short")
+poller_fc.db.sample_calls.clear()
+poller_fc._poll_vendor_sensors(23, dev_fc, CONFIG, 1_700_000_060.0)
+check("fan vanish, cut-short walk: no new sample is written for the tray",
+      not any(s[0] == "fan_state.1" for _did, samples in poller_fc.db.sample_calls
+              for s in samples if _did == 23),
+      poller_fc.db.sample_calls)
+check("...the primary table's remembered seen set is untouched",
+      poller_fc._vendor_psu_seen.get((23, fan_primary.state)) == {"1"},
+      poller_fc._vendor_psu_seen)
+check("...and the fallback table's own key was never even seeded by it",
+      (23, fan_fallback.state) not in poller_fc._vendor_psu_seen,
+      poller_fc._vendor_psu_seen)
+
 print()
 if FAILS:
     print(f"{len(FAILS)} check(s) failed: {', '.join(FAILS)}")

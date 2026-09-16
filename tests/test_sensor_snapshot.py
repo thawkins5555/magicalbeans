@@ -130,6 +130,28 @@ try:
           len(service.alerts_db.alerts(
               state="unresolved", rule_id=service.alerts_db.rule_by_key("psu_failed")["id"])) == 1)
 
+    # 5.35.0: a fan pulled AFTER a healthy snapshot. Baseline captures it
+    # ok (0); nodepoll's own vanish detection (_mark_vendor_rows_absent)
+    # later writes 3 (not present) for the same key when it drops out of a
+    # complete walk entirely -- the engine compares against the BASELINE
+    # value only (alertengine.py), so a genuinely new failure still opens
+    # the alert even though a snapshot exists for this device.
+    nodes_db.record_metric_sample(did, "fan_state.9", "Fan 9", "", "gauge",
+                                  time.time(), 0.0)
+    engine._tick()
+    call("POST", f"/api/nodes/devices/{did}/sensor-snapshot", {}, token=admin)
+    check("fan_state.9 baselined at 0 (ok)",
+          nodes_db.sensor_baselines(did).get("fan_state.9") == 0.0,
+          nodes_db.sensor_baselines(did))
+    nodes_db.record_metric_sample(did, "fan_state.9", "Fan 9", "", "gauge",
+                                  time.time(), 3.0)
+    engine._tick()
+    check("the tray vanishing after the snapshot (baseline 0, now 3) opens "
+          "fan_failed -- baseline equality does not suppress a genuinely "
+          "new not-present reading",
+          len(service.alerts_db.alerts(
+              state="unresolved", rule_id=service.alerts_db.rule_by_key("fan_failed")["id"])) == 1)
+
     print("gates: needs nodes write to POST, nodes read to GET")
     from netpath.auth import hash_password
     service.app_db.add_user("snapshot-reader", hash_password("SnapshotReaderPW2026"),

@@ -85,6 +85,25 @@ def device_against(db: NodesDatabase, name: str) -> int:
     return db.add_device("127.0.0.1", name=name, group_id=gid)
 
 
+def mark_cisco(db: NodesDatabase, did: int) -> None:
+    """Writes vendor_detected without a real identify walk -- the idiom
+    tests/test_cisco_entity_sensor.py's own mark_cisco uses -- so
+    _cisco_sensor_table_plausible's entPhysicalName fallback walk runs."""
+    db.record_poll(did, ping_ok=None, ping_rtt_ms=None, snmp_ok=True,
+                   snmp_error="", identity={"vendor_detected": "cisco"},
+                   uptime_ticks=None, status="up", reachable=True)
+
+
+class CaptureLog:
+    """Just enough of eventlog to read back what the poller wrote."""
+
+    def __init__(self):
+        self.lines = []
+
+    def add(self, category, message, target="", detail=""):
+        self.lines.append(message)
+
+
 def rule(source_kind, threshold, clear_threshold, comparison):
     """The columns breaches() and evaluate_threshold() read off a rule row,
     as the plain dict alertrules' own contract says a caller may pass."""
@@ -247,6 +266,77 @@ try:
     check("...while the ports this poll's sensors did answer for are badged "
           "from it as usual: a cut-short walk stops nothing else",
           media.get(1) == "optic", media)
+    db.close()
+finally:
+    stub.kill()
+
+# ==================================== § 1b cage scan decoupled (5.35.0, F)
+
+# --- a device with no DOM sensors at all still gets its cages badged -----
+stub, port = spawn_stub("stub_agent_ups_env.py", "sfp_media_no_sensors")
+nodepoll_mod.DEFAULT_SNMP_PORT = port
+try:
+    db = new_nodes_db("no_sensors")
+    did = device_against(db, "no-sensors-sw")
+    db.replace_interfaces(did, PORTS)
+    poller = NodePoller(db)
+    device = db.device(did)
+    poller._poll_environment(did, device, db.effective_config(device), set(),
+                             time.time())
+    media = {r["if_index"]: r["media"] for r in db.interfaces(did)}
+    check("a device answering no ENTITY-SENSOR-MIB rows at all still badges "
+          "an occupied cage 'sfp' from entPhysicalClass/text alone -- the "
+          "cage scan no longer waits on the sensor gate",
+          media.get(2) == "sfp", media)
+    check("...and no metric samples are invented for a device with nothing "
+          "to measure (optic_ports/dbm_ports both empty)",
+          db.metrics(did) == [], db.metrics(did))
+    db.close()
+finally:
+    stub.kill()
+
+# --- an incomplete entPhysicalName fallback walk keeps stored badges -----
+stub, port = spawn_stub("stub_agent_ups_env.py", "sfp_media_no_names")
+nodepoll_mod.DEFAULT_SNMP_PORT = port
+try:
+    db = new_nodes_db("names_cut")
+    did = device_against(db, "names-cut-sw")
+    mark_cisco(db, did)
+    db.replace_interfaces(did, PORTS)
+    db.update_interface_media(did, [{"if_index": 2, "media": "sfp"},
+                                    {"if_index": 3, "media": "sfp_empty"}])
+    poller = NodePoller(db)
+    device = db.device(did)
+    poller._poll_environment(did, device, db.effective_config(device), set(),
+                             time.time())
+    media = {r["if_index"]: r["media"] for r in db.interfaces(did)}
+    check("a Cisco device whose entPhysicalName fallback walk times out "
+          "keeps its stored SFP badges -- a half-mapped pass must not "
+          "strip them",
+          (media.get(2), media.get(3)) == ("sfp", "sfp_empty"), media)
+    db.close()
+finally:
+    stub.kill()
+
+# --- diagnostic: nothing mapped to a port at all --------------------------
+stub, port = spawn_stub("stub_agent_ups_env.py", "sfp_media_no_port_map")
+nodepoll_mod.DEFAULT_SNMP_PORT = port
+try:
+    db = new_nodes_db("no_port_map")
+    did = device_against(db, "no-port-map-sw")
+    db.replace_interfaces(did, PORTS[:1])
+    poller = NodePoller(db)
+    poller.log = CaptureLog()
+    device = db.device(did)
+    poller._poll_environment(did, device, db.effective_config(device), set(),
+                             time.time())
+    check("the empty-port-map diagnostic names the alias row count and "
+          "says entPhysicalName matched nothing",
+          any("no entity mapped to a port" in line
+              and "entAliasMappingIdentifier had 1 row(s)" in line
+              and "entPhysicalName matched no stored ifDescr" in line
+              for line in poller.log.lines),
+          poller.log.lines)
     db.close()
 finally:
     stub.kill()

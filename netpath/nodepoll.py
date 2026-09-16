@@ -1234,6 +1234,7 @@ _IF_NAME_ABBREVIATIONS = {
     "fo": "fortygigabitethernet", "hu": "hundredgige",
     "eth": "ethernet", "tw": "twogigabitethernet",
     "fi": "fivegigabitethernet", "po": "port-channel",
+    "ap": "appgigabitethernet",
 }
 
 
@@ -1734,9 +1735,20 @@ class NodePoller(Worker):
         # probe-once-remember'd at the same _SENSOR_REPROBE_S cadence.
         self._mau_read: dict[int, float] = {}
         self._mau_capable: dict[int, bool] = {}
+        # device_id -> when the ENTITY-MIB cage scan was last tried/whether
+        # entPhysicalClass answered, same probe-once-remember shape as
+        # _mau_read/_mau_capable -- lets _poll_environment keep trying the
+        # SFP cage scan for a device that answers no ENTITY-SENSOR-MIB
+        # rows at all, without paying for the walk every cadence once it
+        # is confirmed to have none.
+        self._cage_read: dict[int, float] = {}
+        self._cage_capable: dict[int, bool] = {}
         # device_id -> when a sensor-diagnostic event was last written for
         # it. See _log_sensor_diag.
         self._sensor_diag_ts: dict[int, float] = {}
+        # device_id -> when a media (SFP/DOM) diagnostic event was last
+        # written for it. See _log_media_diag.
+        self._media_diag_ts: dict[int, float] = {}
         # device_id -> the GETBULK repetition count that last worked for it.
         # A device that answers "tooBig" is retried at half as many rows, and
         # remembering that means the next walk starts where the last one
@@ -2187,6 +2199,7 @@ class NodePoller(Worker):
         self._vendor_sensor_read.pop(device_id, None)
         self._vendor_sensor_threshold_read.pop(device_id, None)
         self._mau_read.pop(device_id, None)
+        self._cage_read.pop(device_id, None)
         self._forget_vendor_psu_static(device_id)
         self._stack_power_read.pop(device_id, None)
         # And "start from nothing": an explicit retry is the one place a
@@ -2746,8 +2759,9 @@ class NodePoller(Worker):
                       self._sensor_read, self._sensor_threshold_read,
                       self._vendor_sensor_read, self._vendor_sensor_threshold_read,
                       self._mau_read, self._mau_capable,
+                      self._cage_read, self._cage_capable,
                       self._stack_power_read, self._stack_power_capable,
-                      self._sensor_diag_ts, self._snmp_backoff,
+                      self._sensor_diag_ts, self._media_diag_ts, self._snmp_backoff,
                       self._snmp_failing_count, self._get_batch,
                       self._poll_cost):
             for device_id in [k for k in list(cache) if k not in keep]:
@@ -5799,11 +5813,16 @@ class NodePoller(Worker):
     def _sfp_slot_media(self, device, config: dict, port_map: dict[int, int],
                         contained_in: dict[int, int], descrs: dict) -> tuple:
         """({ifIndex: 'sfp' | 'sfp_empty' | 'copper'}, whether every walk it
-        made finished) for the transceiver cages this device describes. The
-        DOM scan cannot see these: a cage with nothing in it, or holding a
-        transceiver that reports no sensors, has no sensor row to be found
-        by, and until 5.2.0 an SFP slot like that was indistinguishable from
-        a copper port.
+        made finished, how many entPhysicalClass rows the device answered
+        at all -- _poll_environment's own probe-once-remember signal for
+        whether ENTITY-MIB is worth trying again (_cage_capable) -- and a
+        list of "<column> walk cut short (<reason>)" diagnostic lines for
+        whichever of the two walks below did not finish) for the
+        transceiver cages this device describes. The DOM scan cannot see
+        these: a cage with nothing in it, or holding a transceiver that
+        reports no sensors, has no sensor row to be found by, and until
+        5.2.0 an SFP slot like that was indistinguishable from a copper
+        port.
 
         'sfp' is an entity whose own entPhysical text names a transceiver
         (the module plugged into a cage, or a port an agent puts that text
@@ -5821,15 +5840,19 @@ class NodePoller(Worker):
         that is not there or a module that is not in one. See
         _poll_environment, which will not overwrite a stored badge on one.
         """
-        raw_classes, complete = self._walk_column_status(
+        raw_classes, complete, class_reason = self._walk_column_detail(
             device, config, self._ENT_PHYSICAL_CLASS)
         classes = _int_keyed(raw_classes)
+        reasons = [] if complete else [
+            f"entPhysicalClass walk cut short ({class_reason})"]
         if not classes:
-            return {}, complete
-        models, models_done = self._walk_column_status(
+            return {}, complete, len(classes), reasons
+        raw_models, models_done, model_reason = self._walk_column_detail(
             device, config, self._ENT_PHYSICAL_MODEL_NAME)
         complete = complete and models_done
-        models = _int_keyed(models)
+        if not models_done:
+            reasons.append(f"entPhysicalModelName walk cut short ({model_reason})")
+        models = _int_keyed(raw_models)
         by_descr = _int_keyed(descrs)
         children: dict[int, list[int]] = {}
         for entity, parent in contained_in.items():
@@ -5881,7 +5904,7 @@ class NodePoller(Worker):
                 media[if_index] = "copper" if copper else "sfp"
             else:
                 media.setdefault(if_index, "sfp_empty")
-        return media, complete
+        return media, complete, len(classes), reasons
 
     @staticmethod
     def _if_index_for_name(name, if_by_name: dict) -> int | None:
@@ -5991,6 +6014,18 @@ class NodePoller(Worker):
                 self._SENSOR_DIAG_INTERVAL_S:
             return
         self._sensor_diag_ts[device_id] = now
+        self.log.add(NODES, message, target=device["ip"])
+
+    def _log_media_diag(self, device, message: str) -> None:
+        """Same shape as _log_sensor_diag, but rate-limited to once per
+        _SENSOR_REPROBE_S per device rather than once a minute: a badge
+        gap is a standing condition, not a transient one, so there is
+        nothing to gain from repeating it every poll interval."""
+        now = time.time()
+        device_id = device["id"]
+        if now - self._media_diag_ts.get(device_id, 0.0) < self._SENSOR_REPROBE_S:
+            return
+        self._media_diag_ts[device_id] = now
         self.log.add(NODES, message, target=device["ip"])
 
     # entPhySensorType -> device-metric keys and prefixes read_hardware's
@@ -6428,45 +6463,95 @@ class NodePoller(Worker):
             _source, cols, _tried = self._walk_sensor_columns(device, config)
         except SnmpError:
             cols = {}
-        if not cols:
-            # No answer at all and an outright SnmpError are folded
+        if cols:
+            if not capable:
+                # None (never probed) and 0 (probed, answered nothing) both
+                # flip to 1 here — the latch has to be able to open again now
+                # that a second table can be the one that answers.
+                self.db.set_sensor_capable(device_id, True)
+            sensor_values = cols["values"]
+            types = cols["types"]
+            scales = cols["scales"]
+            precisions = cols["precisions"]
+            statuses = cols["statuses"]
+            units = cols["units"]
+        else:
+            # No sensor answer at all and an outright SnmpError are folded
             # together on purpose here, same as _poll_poe/_poll_stp do for
             # their own tables: either way this poll learned nothing from
-            # the device, and "empty" is the only verdict there is to
-            # record.
+            # the per-sensor DOM read. sensor_capable's own latch is about
+            # THAT alone, though — a switch with no DOM-capable optics can
+            # still have ENTITY-MIB cages worth badging (5.35.0: switches
+            # whose only optics have no DOM never got a badge at all), so
+            # this no longer returns here. It falls through with empty
+            # sensor columns and lets the cage scan below decide for
+            # itself whether ENTITY-MIB is worth trying, on its own
+            # probe-once-remember latch (_cage_capable/_cage_read, same
+            # shape as _mau_capable/_mau_read).
             if capable is None:
                 self.db.set_sensor_capable(device_id, False)
-            return
-        if not capable:
-            # None (never probed) and 0 (probed, answered nothing) both
-            # flip to 1 here — the latch has to be able to open again now
-            # that a second table can be the one that answers.
-            self.db.set_sensor_capable(device_id, True)
-        sensor_values = cols["values"]
-        types = cols["types"]
-        scales = cols["scales"]
-        precisions = cols["precisions"]
-        statuses = cols["statuses"]
-        units = cols["units"]
-        descrs, descrs_done = self._walk_column_status(
+            cage_capable = self._cage_capable.get(device_id)
+            cage_due = now - self._cage_read.get(device_id, 0.0) >= self._SENSOR_REPROBE_S
+            if cage_capable is False and not cage_due:
+                return
+            self._cage_read[device_id] = now
+            sensor_values = types = scales = precisions = statuses = units = {}
+
+        descrs, descrs_done, descrs_reason = self._walk_column_detail(
             device, config, self._ENT_PHYSICAL_DESCR)
         interfaces = list(self.db.interfaces(device_id))
+        media_reasons = [] if descrs_done else [
+            f"entPhysicalDescr walk cut short ({descrs_reason})"]
         # The name fallback exists for Cisco gear with no alias rows; nothing
         # else should pay a whole entPhysicalName walk every cadence for it.
+        # An incomplete names walk maps fewer sensors than the device really
+        # has, so it must not be read as proof any of them are gone — it
+        # feeds slots_complete below just like the descr/class/model walks.
         names = if_by_name = None
+        names_done = True
         if self._cisco_sensor_table_plausible(device):
-            names = self._walk_column(device, config, self._ENT_PHYSICAL_NAME)
+            names, names_done, names_reason = self._walk_column_detail(
+                device, config, self._ENT_PHYSICAL_NAME)
+            if not names_done:
+                media_reasons.append(f"entPhysicalName walk cut short ({names_reason})")
             if_by_name = self._if_index_by_name(interfaces)
         contained_in = self._entity_contained_in(device, config)
-        port_map, _alias_rows = self._entity_port_map(
+        port_map, alias_rows = self._entity_port_map(
             device, config, names, if_by_name, contained_in)
-        # Nothing mapped to a port means a walk that answered nothing useful;
-        # the two ENTITY-MIB columns the cage scan needs would be two more
-        # dead walks.
-        sfp_slots, slots_complete = (
-            self._sfp_slot_media(device, config, port_map, contained_in, descrs)
-            if port_map else ({}, True))
-        slots_complete = slots_complete and descrs_done
+        if not port_map:
+            # Nothing mapped to a port means a walk that answered nothing
+            # useful; the two ENTITY-MIB columns the cage scan needs would
+            # be two more dead walks. Diagnosed only when there was some
+            # ENTITY-MIB data to map in the first place — entAliasMapping
+            # rows or a containment tree — so a plain host with none of it
+            # never earns an hourly event about a scan it was never going
+            # to answer.
+            if alias_rows or contained_in:
+                self._log_media_diag(
+                    device, f"SFP scan on {device['ip']}: no entity mapped "
+                            f"to a port — entAliasMappingIdentifier had "
+                            f"{alias_rows} row(s), entPhysicalName matched "
+                            f"no stored ifDescr")
+            sfp_slots, slots_complete = {}, True
+        else:
+            sfp_slots, slots_complete, class_rows, slot_reasons = self._sfp_slot_media(
+                device, config, port_map, contained_in, descrs)
+            media_reasons.extend(slot_reasons)
+            if class_rows:
+                self._cage_capable[device_id] = True
+            elif slots_complete:
+                # A clean empty walk (ended cleanly, zero rows) is the
+                # noSuchObject verdict: this device has no ENTITY-MIB at
+                # all, so stop asking every cadence. A walk cut short with
+                # zero rows so far proves nothing either way and leaves
+                # the latch as it was.
+                self._cage_capable[device_id] = False
+        slots_complete = slots_complete and descrs_done and names_done
+        if not slots_complete and media_reasons:
+            for reason in media_reasons:
+                self._log_media_diag(
+                    device, f"SFP scan on {device['ip']}: {reason}, "
+                            f"stored badges kept")
 
         # MAU-MIB: the module text's copper proof, checked against the wire.
         # Gated like the cage scan (empty port_map); probe-once-remember'd
@@ -6528,6 +6613,11 @@ class NodePoller(Worker):
         # sensor publishes its own limits through the same
         # entSensorThresholdTable an optic does.
         chassis_sensor_temps: dict[str, float] = {}
+        # Sensor rows this poll read that resolved to no port at all --
+        # diagnosed below only when port_map is non-empty (the device maps
+        # SOME entities, just not these), so a UPS or room monitor with no
+        # ports to map anything to is never flagged for it.
+        unmapped_sensor_rows = 0
         for suffix, raw in sensor_values.items():
             sensor_type = int(types.get(suffix) or 0)
             try:
@@ -6535,6 +6625,8 @@ class NodePoller(Worker):
             except ValueError:
                 continue
             if_index = port_map.get(entity)
+            if if_index is None:
+                unmapped_sensor_rows += 1
             if if_index is not None:
                 # A failed optic is still an optic: any sensor resolving to
                 # a port is proof one is there, whatever it reads -- unless
@@ -6579,6 +6671,11 @@ class NodePoller(Worker):
             if root == "sfp_bias_ma":
                 value *= self._BIAS_A_TO_MA
             per_port.setdefault((if_index, root), []).append(value)
+
+        if port_map and unmapped_sensor_rows:
+            self._log_media_diag(
+                device, f"SFP scan on {device['ip']}: "
+                        f"{unmapped_sensor_rows} sensor row(s) mapped to no port")
 
         self._poll_published_thresholds(device_id, device, config, threshold_roots,
                                         scales, precisions, now)

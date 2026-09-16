@@ -102,6 +102,26 @@ Modes:
              `sfp_media`'s SFP_MEDIA_TABLE with no SFP_MAU_TABLE merged in
              -- ifMauType answers nothing (a clean empty walk, not a
              timeout), the noSuchObject case the reprobe gate is for.
+  sfp_media_no_sensors
+             `sfp_media`'s SFP_MEDIA_TABLE with every ENTITY-SENSOR-MIB row
+             (1.3.6.1.2.1.99.*) stripped out -- a switch that lists no DOM
+             sensors at all, so _walk_sensor_columns comes back empty and
+             the 5.35.0 cage-scan decoupling (F1) is what has to run for
+             any badge to appear at all. The cage/alias/containment rows
+             for if 2 (an occupied cage naming a transceiver, no sensor of
+             any kind) survive the strip, so it still badges 'sfp'.
+  sfp_media_no_names
+             `sfp_media`'s SFP_MEDIA_TABLE plus SFP_MAU_TABLE, served under
+             a CISCO sysObjectID so _poll_environment's Cisco-only
+             entPhysicalName fallback walk actually runs, with that column
+             (entPhysicalName) refused outright -- a timeout, not a clean
+             empty answer. Proves an incomplete names walk keeps whatever
+             badges were already stored rather than stripping them.
+  sfp_media_no_port_map
+             One lone entAliasMappingIdentifier row pointing at something
+             that is NOT an ifIndex column -- alias_rows > 0 (there was
+             ENTITY-MIB to map) but port_map ends up empty either way, the
+             diagnostic-event case (F3).
 
 Three control datagrams, on the same socket as SNMP itself (see
 stub_agent_fdb.py, which established this convention):
@@ -685,13 +705,27 @@ SFP_MAU_TABLE = {
     f"{IF_MAU_TYPE}.14.1": ("oid", "1.3.6.1.4.1.9.9.99.30"),
 }
 
+# sfp_media_no_sensors (5.35.0, F1): the cage/alias/containment rows, with
+# every ENTITY-SENSOR-MIB reading (1.3.6.1.2.1.99.*) removed.
+SFP_MEDIA_NO_SENSORS_TABLE = {oid: value for oid, value in SFP_MEDIA_TABLE.items()
+                              if not oid.startswith("1.3.6.1.2.1.99.")}
+
+# sfp_media_no_port_map (5.35.0, F3): one alias row that answers something,
+# just not an ifIndex -- so port_map ends up empty while alias_rows is not
+# zero, the "no entity mapped to a port" diagnostic's own trigger.
+PORT_MAP_EMPTY_TABLE = {
+    "1.3.6.1.2.1.47.1.3.2.1.2.900.1": ("str", "1.3.6.1.2.1.99.1.1.1.1.900"),
+}
+
 # A mode may refuse a whole column outright, which is not the same as
 # answering it empty: a real agent that goes quiet part-way through a big
 # entPhysical walk leaves its caller with a timeout, and a caller that
 # deletes rows its walk did not produce has to be able to tell the two
 # apart. Keyed by mode, the column's base OID.
+_ENT_PHYSICAL_NAME_COL = "1.3.6.1.2.1.47.1.1.1.1.7"
 DEAD_COLUMNS = {
     "sfp_media_no_class": ("1.3.6.1.2.1.47.1.1.1.1.5",),
+    "sfp_media_no_names": (_ENT_PHYSICAL_NAME_COL,),
 }
 
 # Which entPhysicalEntry columns (and ifMauType) a run was asked for at
@@ -734,6 +768,12 @@ def table_for():
         return {**GENERIC_SCALARS, **SFP_MEDIA_TABLE, **SFP_MAU_TABLE}
     if MODE in ("sfp_media_no_class", "sfp_media_no_mau"):
         return {**GENERIC_SCALARS, **SFP_MEDIA_TABLE}
+    if MODE == "sfp_media_no_sensors":
+        return {**GENERIC_SCALARS, **SFP_MEDIA_NO_SENSORS_TABLE}
+    if MODE == "sfp_media_no_names":
+        return {**CISCO_SCALARS, **SFP_MEDIA_TABLE, **SFP_MAU_TABLE}
+    if MODE == "sfp_media_no_port_map":
+        return {**GENERIC_SCALARS, **PORT_MAP_EMPTY_TABLE}
     return dict(GENERIC_SCALARS)
 
 
