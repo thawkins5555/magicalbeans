@@ -64,6 +64,11 @@ Modes:
   pvst-50vlan   50 VLANs in vtpVlanState (1-50); every context answers the
                 same port state as `pvst`'s DEFAULT -- the "sliced to the
                 first 48 VLANs still counts as a complete pass" case.
+  pvst-mixed    Port 7 absent from the DEFAULT context's port-state table
+                entirely, listening(3) in VLAN 20 and learning(4) in VLAN
+                30 -- two non-forwarding, non-blocking states with no
+                global reading to fall back on, so the merge must still
+                pick one rather than leave stp_state unset.
 
   airfiber      a Ubiquiti sysObjectID and the four RF_METRICS[41112]
                 scalars, numbered exactly as demo/personas.py's
@@ -285,6 +290,13 @@ STP_PORT_STATE_ORPHAN_DEFAULT = {**PVST_PORT_STATE,
 PVST_VTP_50 = {f"1.3.6.1.4.1.9.9.46.1.3.1.1.2.1.{v}": ("int", 1)
               for v in range(1, 51)}
 
+# pvst-mixed: port 7 listening in VLAN 20, learning in VLAN 30, answered in
+# neither the DEFAULT context.
+PVST_MIXED_PER_VLAN = {
+    "20": {"1.3.6.1.2.1.17.2.15.1.3.7": ("int", 3)},    # port 7: listening
+    "30": {"1.3.6.1.2.1.17.2.15.1.3.7": ("int", 4)},    # port 7: learning
+}
+
 SEEN_COMMUNITIES = set()   # communities seen since the last RESET (pvst modes)
 
 # --------------------------------------------------------------- PtP RF
@@ -498,6 +510,12 @@ def table_for(community="public"):
             table.update(PVST_PER_VLAN.get(vlan, {}))
         else:
             table.update(STP_PORT_STATE_ORPHAN_DEFAULT)
+        return table
+    if MODE == "pvst-mixed":
+        table = {**GENERIC_SCALARS, **BRIDGE_PORTS, **STP_SCALARS, **PVST_VTP}
+        if "@" in community:
+            vlan = community.split("@", 1)[1]
+            table.update(PVST_MIXED_PER_VLAN.get(vlan, {}))
         return table
     if MODE == "pvst-50vlan":
         return {**GENERIC_SCALARS, **BRIDGE_PORTS, **STP_SCALARS, **PVST_PORT_STATE,

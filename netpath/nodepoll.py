@@ -7652,9 +7652,6 @@ class NodePoller(Worker):
             return {}, False, True
         ordered = sorted(vlans, key=int)
         sliced = ordered[:self._MAX_VLAN_CONTEXTS]
-        # A list sliced to _MAX_VLAN_CONTEXTS is a complete pass over the
-        # first 48 VLANs, not a cut-short one — complete goes False only for
-        # the deadline break below or an unfinished column walk.
         complete = True
         deadline = time.time() + self._VLAN_WALK_BUDGET_S
         rows: dict[int, dict] = {}
@@ -7821,61 +7818,59 @@ class NodePoller(Worker):
                 return None
             return vb["value"] if isinstance(vb["value"], (int, float)) else None
 
+        cisco_v2c = (detected_vendor(device).lower() == "cisco"
+                     and snmp_version_of(config) != 3 and bool(config.get("community")))
+
         protocol_spec_n = num(nodeoids.DOT1D_STP_PROTOCOL_SPEC)
-        if protocol_spec_n is None:
+        if protocol_spec_n is None and not cisco_v2c:
             # Same "a miss on the first probe is a verdict, a miss later is
-            # just a miss" rule _poll_poe follows — except a Cisco v1/v2c
-            # device gets one per-VLAN pass tried first, since PVST+ often
-            # answers STP only inside a VLAN's own community, never in the
-            # default context.
+            # just a miss" rule _poll_poe follows.
             if capable is None:
-                answered = False
-                if detected_vendor(device).lower() == "cisco" and snmp_version_of(config) != 3:
-                    _, answered, _ = self._cisco_vlan_stp(
-                        device, config, self._bridge_port_map(device, config))
-                if not answered:
-                    self.db.set_stp_capable(device_id, False)
+                self.db.set_stp_capable(device_id, False)
             return
-        if capable is None:
-            self.db.set_stp_capable(device_id, True)
 
-        priority = num(nodeoids.DOT1D_STP_PRIORITY)
-        time_since_change = num(nodeoids.DOT1D_STP_TIME_SINCE_CHANGE)
-        top_changes = num(nodeoids.DOT1D_STP_TOP_CHANGES)
-        root_cost = num(nodeoids.DOT1D_STP_ROOT_COST)
-        root_port = num(nodeoids.DOT1D_STP_ROOT_PORT)
-        root_vb = values.get(nodeoids.DOT1D_STP_DESIGNATED_ROOT)
-        root_id = (str(root_vb["value"])
-                  if root_vb and root_vb["type"] not in
-                  ("noSuchObject", "noSuchInstance", "endOfMibView", "null")
-                  else None)
+        if protocol_spec_n is not None:
+            if capable is None:
+                self.db.set_stp_capable(device_id, True)
+                capable = True
 
-        self.db.update_stp_bridge(
-            device_id,
-            protocol_spec=nodeoids.DOT1D_STP_PROTOCOL_SPEC_ENUM.get(
-                int(protocol_spec_n), str(int(protocol_spec_n))),
-            priority=int(priority) if priority is not None else None,
-            root_id=root_id,
-            root_cost=int(root_cost) if root_cost is not None else None,
-            root_port=int(root_port) if root_port is not None else None,
-            time_since_change_s=(time_since_change / 100.0
-                                 if time_since_change is not None else None))
-        self._bump("stp_polls")
-        if top_changes is not None:
-            # A cumulative counter, stored as a gauge sample the same way
-            # dot1dStpTopChanges' RFC-defined semantics are — the future
-            # alerting wave rules on it *increasing* between samples
-            # (series()), not on any single reading, so no rate math
-            # belongs here.
-            self.db.record_metric_samples(device_id, [
-                ("stp_topology_changes", "STP topology changes", "count",
-                 "gauge", time.time(), float(top_changes))])
+            priority = num(nodeoids.DOT1D_STP_PRIORITY)
+            time_since_change = num(nodeoids.DOT1D_STP_TIME_SINCE_CHANGE)
+            top_changes = num(nodeoids.DOT1D_STP_TOP_CHANGES)
+            root_cost = num(nodeoids.DOT1D_STP_ROOT_COST)
+            root_port = num(nodeoids.DOT1D_STP_ROOT_PORT)
+            root_vb = values.get(nodeoids.DOT1D_STP_DESIGNATED_ROOT)
+            root_id = (str(root_vb["value"])
+                      if root_vb and root_vb["type"] not in
+                      ("noSuchObject", "noSuchInstance", "endOfMibView", "null")
+                      else None)
+
+            self.db.update_stp_bridge(
+                device_id,
+                protocol_spec=nodeoids.DOT1D_STP_PROTOCOL_SPEC_ENUM.get(
+                    int(protocol_spec_n), str(int(protocol_spec_n))),
+                priority=int(priority) if priority is not None else None,
+                root_id=root_id,
+                root_cost=int(root_cost) if root_cost is not None else None,
+                root_port=int(root_port) if root_port is not None else None,
+                time_since_change_s=(time_since_change / 100.0
+                                     if time_since_change is not None else None))
+            self._bump("stp_polls")
+            if top_changes is not None:
+                # A cumulative counter, stored as a gauge sample the same way
+                # dot1dStpTopChanges' RFC-defined semantics are — the future
+                # alerting wave rules on it *increasing* between samples
+                # (series()), not on any single reading, so no rate math
+                # belongs here.
+                self.db.record_metric_samples(device_id, [
+                    ("stp_topology_changes", "STP topology changes", "count",
+                     "gauge", time.time(), float(top_changes))])
 
         try:
             port_state = self._walk_column(device, config, nodeoids.DOT1D_STP_PORT_STATE)
         except SnmpError:
             port_state = {}
-        port_map = self._bridge_port_map(device, config)
+        port_map = self._bridge_port_map(device, config) if (port_state or cisco_v2c) else {}
         rows: dict[int, dict] = {}
         for suffix, value in port_state.items():
             try:
@@ -7889,10 +7884,12 @@ class NodePoller(Worker):
             if state is not None:
                 rows[if_index] = {"stp_state": state}
 
-        # Per-VLAN pass (see _cisco_vlan_stp). Probed once like stp_capable,
-        # but a miss is re-tried hourly rather than latched forever.
+        # Per-VLAN pass (see _cisco_vlan_stp), the only source of state for a
+        # PVST+ device whose default context has no dot1dStp scalars at all.
+        # Probed once like stp_capable, but a miss is re-tried hourly rather
+        # than latched forever.
         skip_interface_update = False
-        if detected_vendor(device).lower() == "cisco" and snmp_version_of(config) != 3:
+        if cisco_v2c:
             vlan_capable = device["stp_vlan_capable"]
             now = time.time()
             due = now - self._stp_vlan_read.get(device_id, 0.0) >= self._SENSOR_REPROBE_S
@@ -7900,6 +7897,8 @@ class NodePoller(Worker):
                 self._stp_vlan_read[device_id] = now
                 vlan_rows, vlan_answered, vlan_complete = self._cisco_vlan_stp(
                     device, config, port_map)
+                if capable is None:
+                    self.db.set_stp_capable(device_id, bool(vlan_answered))
                 if vlan_answered:
                     if not vlan_capable:
                         self.db.set_stp_vlan_capable(device_id, True)
@@ -7916,6 +7915,10 @@ class NodePoller(Worker):
                             row["stp_state"] = "forwarding"
                         elif len(states) == 1:
                             row["stp_state"] = next(iter(states))
+                        elif "stp_state" in row:
+                            pass
+                        elif states:
+                            row["stp_state"] = min(states)
                         row["stp_blocking_vlans"] = ",".join(sorted(blocking, key=int))
                         row["stp_vlan_count"] = detail["vlans"]
                 elif vlan_answered and not vlan_complete:
