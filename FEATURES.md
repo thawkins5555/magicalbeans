@@ -268,7 +268,10 @@ Only-with-overrides filters. If the fleet runs past one page, the grid
 pages forward on its own — up to ten pages — until the device turns up. The
 row is then highlighted and scrolled into view. A link that only fills the
 search box (the previous paragraph's second case) is unaffected: it behaves
-exactly as it always has.
+exactly as it always has. Neither does a page reload, or a first load,
+landing straight on a device's own pane — it keeps the remembered Find
+text and filters as they were and simply selects the device; only a link
+followed from another module runs the reveal.
 
 Two things it deliberately does not do. It is never a MAC address search, so
 a device named in hex (`beef01`) is looked up as the name it is rather than
@@ -1746,7 +1749,8 @@ evidence, since 5.27.0, that ever made two devices look like one.
 - **A "Default gateway:" line, from 5.30.0**, sits above the address
   table and shows the device's own default-route next hop — read on the
   same hourly walk as the address table — or "not published by this
-  device" when the device answers SNMP but reports no default route.
+  device" when the device reports no default route, or has not been
+  read yet.
 - **Adding an address another device already has configured is refused,
   and says which device.** The message names it, links to it, and offers
   **Add anyway** for the case where two boxes really do sit behind one

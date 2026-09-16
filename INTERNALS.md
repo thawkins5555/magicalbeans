@@ -3374,13 +3374,20 @@ its `name`, else `""` — the same descr-then-name precedence the interface
 table's own display already uses elsewhere. Each alias row's JSON gains an
 `interface` key built this way; the synthetic primary-address row (which
 has no `if_index` of its own) always carries `interface: ""`. `names` is
-optional and only built by a caller that already has a reason to pay for
-`nodes_db.interfaces(device_id)` — both `get_nodes_device_addresses`
-(the Addresses subtab's own endpoint) and `get_nodes_device` (which embeds
-`addresses` in the device detail payload) now build it and pass it through;
-nothing else calls `_device_addresses_json` without it, since the resulting
-`interface: ""` degrades to exactly the old ifIndex-only column via the
-front end's own fallback below. `nodes.js`'s `drawAddressesTable` prefers
+optional and only built by a caller that has a reason to pay for it:
+`get_nodes_device_addresses` (the Addresses subtab's own endpoint) and
+`get_nodes_device` (which embeds `addresses` in the device detail payload)
+each call the new `nodesdb.interface_labels(device_id)` — a `{if_index:
+row}` projection of just `if_index`/`descr`/`name`, in place of the full
+`interfaces()` read those two call sites no longer pay for — and pass it
+through. The device-list builder's own `_device_addresses_json` call
+(`api.py` ~4132, one per row on every page of the Devices grid) still
+passes no `names` at all, and rightly so: that list's `addresses` only
+feed the IP column's "+N other addresses" hint (`r.addresses.map(a =>
+a.ip)` in `nodes.js`'s `deviceIpCell`), which never reads `interface` at
+all — building an interface-name lookup per row for a field nothing
+displays would be pure waste, so `interface: ""` degrading to the old
+ifIndex-only shape there is harmless. `nodes.js`'s `drawAddressesTable` prefers
 `r.interface` (HTML-escaped) and falls back to `#<if_index>` (with a
 `title="ifIndex <n>"` tooltip) only when the interface itself is gone from
 the interfaces table, or an em dash when there is no `if_index` at all.
@@ -3401,8 +3408,13 @@ a separate timer:
    tos-scoped pair yields more than one row from one cheap walk of a
    subtree only a handful of routes wide.
 2. If the walk answered (no `SnmpError`) with at least one row, every
-   distinct non-`"0.0.0.0"` value is comma-joined, sorted, and written
-   with `nodesdb.set_default_gateway(device_id, text)`. This is the only
+   value is passed through `NodePoller._gateway_candidate` — a static
+   helper that runs it through `nodesdb.alias_candidate` (the same gate
+   `_refresh_addresses` uses, rejecting blank, `127.*`, `0.0.0.0`,
+   `::1`/`::`) and then an `ipaddress.ip_address` parse, so a misbehaving
+   agent's OctetString or integer answer can never land in the column.
+   The distinct survivors are comma-joined, sorted, and written with
+   `nodesdb.set_default_gateway(device_id, text)`. This is the only
    path taken on a device that answers the newer table at all, even if
    after filtering there turns out to be nothing to report — the
    fallback below is only for a device whose walk failed outright or
@@ -3412,8 +3424,9 @@ a separate timer:
    raises `SnmpError`, `_refresh_default_gateway` returns without calling
    `set_default_gateway` at all — the previously stored value, if any, is
    left alone rather than being blanked by one bad poll. If the GET
-   answers, the value is stored as-is, or `""` when it too reads
-   `"0.0.0.0"`.
+   answers, the value likewise goes through `_gateway_candidate`, storing
+   `""` for `"0.0.0.0"` and for any other junk answer alike, rather than
+   just the one literal value the walk path special-cases.
 
 `devices.default_gateway` (`nodesdb._migrate`, `ensure_columns`, `TEXT`) is
 `NULL` until the first successful read of either kind, and `""` once a
@@ -10167,14 +10180,32 @@ pane.** `App.deviceNameLink`'s `opts.id` branch (above) routes straight to
 `#/nodes/device/<id>` with no query of its own — no `?q=`/`?name=`/filter —
 so `activate()`'s existing `filtered` flag (set only by those query keys)
 stays `false` for it, and that is exactly the signal `nodes.js`'s route
-handler now uses: `if (!filtered) { await revealDevice(deviceId); }`, in
-place of the old plain `view.selected = deviceId; drawTable();`. A link
-that does carry a query — the `?name=` fallback above, or a MAC link from
-IPAM's conflicts — still takes the old branch unchanged, since a search
-term of its own means the operator (or the page) already chose what the
-grid should show.
+handler now uses: `if (!filtered && !opts.initial) { await
+revealDevice(deviceId); }`, in place of the old plain `view.selected =
+deviceId; drawTable();`. A link that does carry a query — the `?name=`
+fallback above, or a MAC link from IPAM's conflicts — still takes the old
+branch unchanged, since a search term of its own means the operator (or the
+page) already chose what the grid should show.
 
-`revealDevice(deviceId)` (`nodes.js`) clears the filter bar a step at a
+`opts.initial` is the boot-route guard: `app.js`'s own startup path (the
+`selectTab(landing, ...)` call that replays whatever route was on the URL
+when the page loaded) now passes `initial: true` down through `deliverRoute`
+to every module's `activate(opts)`, and a normal in-app hash change never
+sets it. A page reload or a first load landing on `#/nodes/device/<id>` is
+exactly this boot replay — the remembered Find text and filters (restored
+by `restoreControls` before `activate` runs) are what the operator left the
+tab in, not stale leftovers to clear — so `nodes.js` skips `revealDevice`
+for it and falls to the plain `view.selected = deviceId` branch instead,
+the same as before 5.30.0. Only a hash change driven by a link followed
+from another module — where `opts.initial` is never set — reveals the row.
+
+`revealDevice(deviceId)` (`nodes.js`) sets `view.selected = deviceId`
+before its very first refetch, not only once the row is found — each
+`App.refreshNow('nodes')` call along the way ends in the module's own
+`loadDetail()`, which fetches by `view.selected`, so setting it up front is
+what stops the detail pane fetching whatever device was selected before
+the link was followed while the paging loop below is still hunting for the
+right row. It then clears the filter bar a step at a
 time, cheapest first, refetching after each step and stopping the moment
 the row is in `view.devices`:
 

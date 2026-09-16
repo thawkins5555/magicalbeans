@@ -51,13 +51,15 @@ and how risky each piece is.
 
 **5.30.0 — Device link, Addresses tab, alert subject reset**
 Scope: the device-name link on Nodes -> Devices now clears the Find
-field and every other active filter, then highlights the selected row
-after routing to Device Details; the Addresses subtab resolves the
-numeric interface index to the actual VLAN/interface name and adds the
-device's IP default gateway where SNMP exposes one; every alert
-template (email/SMS/webhook) is reset to the built-in subject line
-carrying `[SEVERITY]` / `[RECOVER]`, and the digest roll-up subject
-gains a worst-severity tag.
+field, then clears the other active filters too only if the row would
+still be hidden, before highlighting the selected row after routing to
+Device Details; the Addresses subtab resolves the numeric interface
+index to the actual VLAN/interface name and adds the device's IP
+default gateway where SNMP exposes one; every built-in alert
+template's (email/SMS/webhook) subject line is reset to its built-in
+default carrying `[SEVERITY]` / `[RECOVER]` (an operator-edited
+template is left alone), and the digest roll-up subject gains a
+worst-severity tag.
 **Outcome:** _pending — to be filled in at push._
 
 **5.31.0 — Mapper find, select-all, frames**

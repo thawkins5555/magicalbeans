@@ -180,11 +180,15 @@ Details for it — it clears the Find box, returns the grid to page one and,
 if the row is still hidden, clears the Profile, Group, Status, Only-offline,
 Only-in-maintenance and Only-with-overrides filters too. If the fleet still
 runs past one page, the grid pages forward — up to ten pages — until the row
-turns up. The row is then highlighted and scrolled into view, same as
-before. A link that carries its own search term (the fallback used when a
+turns up. The row is then highlighted as before and now scrolled into
+view. A link that carries its own search term (the fallback used when a
 device can't be linked by id) is unaffected and still just fills the Find
 box as it always has. `App.clearFilters` is a new shared helper behind both
 this and the Devices grid's own Clear button, so the two behave identically.
+A page reload (or a first load) landing straight on `#/nodes/device/<id>`
+does not run this reveal either — it keeps whatever Find text and filters
+were already remembered and just selects the device, as before; only a
+link followed from elsewhere in the application triggers it.
 
 **Addresses subtab: named interfaces, and the default gateway.** The
 Interface column used to show the bare SNMP ifIndex number; it now shows
@@ -193,8 +197,8 @@ short name otherwise — e.g. `Vlan10`, `GigabitEthernet1/0/1`), falling back
 to `#<n>` only if the interface itself is no longer on file. A new "Default
 gateway:" line above the address table shows the device's own default-route
 next hop, read on the same hourly walk as the address table itself; it
-reads "not published by this device" when the device answers but reports no
-default route.
+reads "not published by this device" when the device reports no default
+route, or has not been read yet.
 
 **Alert digests now say how bad, at a glance.** The roll-up digest — the
 one email/webhook/text sent when several alerts open in a short window
