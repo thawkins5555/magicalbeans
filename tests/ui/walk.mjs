@@ -1295,7 +1295,7 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       return `frame ${frameId} drawn, renamed to Core, removed`;
     });
 
-  await check('Mapper: dragging a frame\'s edge and its resize handle each PUT the moved geometry (5.31.1)',
+  await check('Mapper: dragging a frame\'s edge and its resize handle each PUT the moved geometry',
     async () => {
       await page.keyboard.press('Escape').catch(() => {});
       await selectTab(page, 'mapper');

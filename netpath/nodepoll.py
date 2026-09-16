@@ -6862,7 +6862,9 @@ class NodePoller(Worker):
         topology = self._walk_column(device, config, nodeoids.CSW_STACK_POWER_TYPE)
         stack_name = self._walk_column(device, config, nodeoids.CSW_STACK_POWER_NAME)
 
-        answered = bool(oper or switch_num or mode)
+        # Only the tables that yield rows count: every data stack answers
+        # cswSwitchInfoTable, with or without StackPower cabling.
+        answered = bool(oper or mode)
         if answered:
             self._stack_power_capable[device_id] = 1
         elif capable is None:

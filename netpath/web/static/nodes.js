@@ -2046,7 +2046,7 @@
     const switchTable = switches.length ? '<table><caption class="sr-only">Stack power switches</caption>' +
       '<tr><th scope="col">Switch</th><th scope="col">Budget W</th><th scope="col">Committed W</th>' +
       '<th scope="col">Allocated W</th></tr>' +
-      switches.map((s) => `<tr><td>${escape(String(s.switch))}</td>` +
+      switches.map((s) => `<tr><td>${val(s.switch)}</td>` +
         `<td>${val(s.budget_w)}</td><td>${val(s.committed_w)}</td>` +
         `<td>${val(s.allocated_w)}</td></tr>`).join('') + '</table>' : '';
     const portTable = ports.length ? '<table><caption class="sr-only">Stack power ports</caption>' +
@@ -2063,7 +2063,7 @@
         const status = p.admin_text === 'disabled' ? 'disabled'
           : p.state === 2 ? '<span class="err">cable down \u2014 Stack Power cable down rule</span>'
           : escape(p.state_text || '\u2014');
-        return `<tr><td>${escape(String(p.switch))}</td><td>${escape(p.name)}</td>` +
+        return `<tr><td>${val(p.switch)}</td><td>${escape(p.name)}</td>` +
           `<td>${p.neighbour_switch ? escape(String(p.neighbour_switch)) : '\u2014'}</td>` +
           `<td>${escape(p.admin_text)}</td><td>${p.link_text ? escape(p.link_text) : '\u2014'}</td>` +
           `<td>${p.limit_a == null ? '\u2014' : escape(String(p.limit_a))}</td>` +
