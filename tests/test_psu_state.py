@@ -430,7 +430,10 @@ pcache_cols = {fru.state: {"10": 2, "11": 2}, fru.name: {"10": "PSU-0", "11": "P
 poller_pcache._walk_column_detail = table_walker(pcache_cols)
 dev_pcache = device(CISCO_OID, id=26)
 poller_pcache._poll_vendor_sensors(26, dev_pcache, CONFIG, 1_700_000_000.0)
-poller_pcache._forget_vendor_psu_static(26)
+# Drop only the static cache (not _vendor_psu_seen, which _forget_vendor_
+# psu_static would also clear) so poll 2 below re-walks class_col instead
+# of hitting the good cache poll 1 just built.
+poller_pcache._vendor_psu_static.pop((26, fru.state), None)
 
 
 def one_of_two_class_rows(device, config, oid, raise_on_timeout=False, deadline=None):
