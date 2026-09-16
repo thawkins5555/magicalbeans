@@ -1195,10 +1195,14 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
         () => (document.getElementById('nd-d-sub-addresses') || {}).textContent || '');
       assert(/own interfaces/.test(text),
         `Addresses subtab text did not mention "own interfaces": "${text}"`);
+      const gateway = await page.evaluate(
+        () => (document.getElementById('nd-addr-gateway') || {}).textContent || '');
+      assert(gateway.startsWith('Default gateway:'),
+        `#nd-addr-gateway did not start with "Default gateway:": "${gateway}"`);
       // Leave the device pane on its default subtab, like every other
       // check here that switches nested subtabs.
       await page.click('#nd-d-subs .subtab[data-subtab="interfaces"]').catch(() => {});
-      return 'Addresses subtab carries the own-interfaces hint';
+      return 'Addresses subtab carries the own-interfaces hint and the default gateway line';
     });
 }
 
@@ -2087,6 +2091,38 @@ async function checkMisc(page, watcher) {
     }
     return `"${state.label}", ${state.rows} row(s) on screen`;
   });
+
+  await check('a device-name link reveals the device in the Nodes grid (5.30.0)',
+    async () => {
+      // Leave the Nodes grid showing nothing for this device, the way a
+      // stale Find box would if the operator had typed here earlier.
+      await selectTab(page, 'nodes');
+      await settle(page, 800);
+      await page.waitForSelector('#nd-q', { timeout: 20000 });
+      await page.fill('#nd-q', 'zzz-nomatch');
+      await page.keyboard.press('Enter');
+      await settle(page, 900);
+      // Alerts' Object column already links a device by id (search:false,
+      // href*="/device/") wherever the alert names one; the alert list is
+      // already open from the check just above, the cheapest place to find
+      // one on screen.
+      await selectTab(page, 'alerts');
+      await settle(page, 800);
+      const link = page.locator('#alerts-table a.linkish.inline[href*="/device/"]').first();
+      await link.waitFor({ state: 'visible', timeout: 20000 });
+      await link.click();
+      await page.waitForSelector('#page-nodes.active', { timeout: 20000 });
+      await page.waitForSelector('#nd-detail:not([hidden])', { timeout: 20000 });
+      const state = await page.evaluate(() => ({
+        q: document.getElementById('nd-q').value,
+        selected: !!document.querySelector('#nodes-table tbody tr.selected'),
+        detail: !document.getElementById('nd-detail').hidden,
+      }));
+      assert(state.q === '', `#nd-q still reads "${state.q}"`);
+      assert(state.selected, 'no tr.selected in the devices table after the link');
+      assert(state.detail, 'the detail pane did not open');
+      return 'the device link cleared Find and selected the device';
+    });
 
   await check('this host says what it cannot store, and gates the DHCP form (E7)',
     async () => {

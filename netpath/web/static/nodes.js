@@ -650,6 +650,44 @@
     });
   }
 
+  /* A device-name link elsewhere (Alerts, IPAM, ...) names this tab's
+     #/nodes/device/<id> with no query of its own, and the row it means may
+     not be on screen — a Find term or a filter left over from whatever the
+     operator was last doing here, or the fleet simply spans more than one
+     page. Clears the bar a step at a time, cheapest first, stopping the
+     moment the row turns up, so an ordinary link (Find alone accounts for
+     most misses) costs one extra fetch, not six. Bounded to ten pages past
+     that: further than that, "not found" is a more honest answer than a
+     silent long fetch loop. Always runs to completion (no "already
+     selected" shortcut) — the same device linked twice with a stray Find
+     term typed in between still has that term to clear. */
+  async function revealDevice(deviceId) {
+    const hasRow = () => view.devices.some((d) => d.id === deviceId);
+    App.clearFilters('nodes', ['nd-q']);
+    view.macSearchPending = false;
+    view.pageOffset = 0;
+    await App.refreshNow('nodes');
+    if (!hasRow()) {
+      App.clearFilters('nodes', ['nd-filter-group', 'nd-filter-devgroup',
+        'nd-filter-status', 'nd-filter-offline', 'nd-filter-maintenance',
+        'nd-filter-overrides']);
+      view.pageOffset = 0;
+      await App.refreshNow('nodes');
+    }
+    let pagesLeft = 10;
+    while (!hasRow() && pagesLeft > 0
+           && view.pageOffset + view.pageLimit < view.pageTotal) {
+      view.pageOffset += view.pageLimit;
+      await App.refreshNow('nodes');
+      pagesLeft -= 1;
+    }
+    view.selected = deviceId;
+    drawTable();
+    const row = App.el('nodes-table')?.querySelector('tr.selected');
+    if (row) row.scrollIntoView({ block: 'nearest' });
+    await loadDetail().catch(() => { /* a link to a deleted device */ });
+  }
+
   /* A route into this tab: #/nodes, #/nodes?status=down, #/nodes?q=<mac>,
      #/nodes?name=<name>, #/nodes?add=<ip>, #/nodes/device/<id>,
      #/nodes/device/<id>/port/<ifIndex>, #/nodes/device/<id>/arp.
@@ -697,7 +735,11 @@
     if (parts[0] !== 'device' || parts[1] === undefined) return;
     const deviceId = Number(parts[1]);
     if (!Number.isFinite(deviceId)) return;
-    if (view.selected !== deviceId) {
+    if (!filtered) {
+      // No q/name/filter of its own: a plain device link, which is exactly
+      // when the row it names might not be showing (see revealDevice).
+      await revealDevice(deviceId);
+    } else if (view.selected !== deviceId) {
       view.selected = deviceId;
       drawTable();
       await loadDetail().catch(() => { /* a link to a deleted device */ });
@@ -3117,6 +3159,12 @@
   function drawAddressesTable() {
     const table = App.el('nd-addr-table');
     if (!table) return;
+    const gateway = App.el('nd-addr-gateway');
+    if (gateway) {
+      const gw = (view.detail && view.detail.default_gateway) || '';
+      App.setText(gateway, gw ? `Default gateway: ${gw}`
+                              : 'Default gateway: not published by this device.');
+    }
     const rows = (view.detail && view.detail.addresses) || [];
     table.innerHTML = '<caption class="sr-only">Addresses this device answers on</caption>' +
       '<thead><tr><th scope="col">Address</th><th scope="col">Interface</th>' +
@@ -3125,9 +3173,16 @@
     const body = document.createElement('tbody');
     for (const r of rows) {
       const tr = document.createElement('tr');
+      // r.interface is the device's own name for the port (ifDescr, else
+      // ifName); an address on one that never reported either still shows
+      // where it lives, by the ifIndex the interfaces table also sorts on.
+      const iface = r.interface ? escape(r.interface)
+        : (r.if_index == null ? '\u2014'
+            : `<span title="ifIndex ${escape(String(r.if_index))}">#${
+                escape(String(r.if_index))}</span>`);
       tr.innerHTML = `<td>${escape(r.ip)}${r.primary
           ? ' <span class="hint">(primary)</span>' : ''}</td>` +
-        `<td>${r.if_index == null ? '\u2014' : escape(String(r.if_index))}</td>` +
+        `<td>${iface}</td>` +
         `<td>${escape(r.netmask || '\u2014')}</td>` +
         `<td>${escape(r.source || '\u2014')}</td>` +
         `<td>${r.seen_ts ? App.agoCell(r.seen_ts) : '\u2014'}</td>`;

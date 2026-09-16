@@ -3657,7 +3657,8 @@ check("'<p class=\"hint\">Only addresses a device reports on its own interfaces 
       "duplicate today")
 check("Addresses on this device's own interfaces\n"
       "                (physical, VLAN, loopback, tunnel), read from its address\n"
-      "                table every hour. Its ARP table is on the ARP subtab." in INDEX82,
+      "                table every hour, and the default route it reports. Its ARP\n"
+      "                table is on the ARP subtab." in INDEX82,
       "the Addresses subtab (nd-d-sub-addresses) carries a static hint "
       "explaining what the table holds and where the ARP table is")
 check("np-discaddr" not in NODES82,
@@ -3747,6 +3748,60 @@ check("const already = found.filter((x) => x.existing_device_id).length;"
       in NODES83,
       "the already-monitored count is a plain existing_device_id filter, "
       "with no folded-row exclusion")
+
+# ---------------------------------------------------------------------------
+# 84. A device-name link reveals the device in the Nodes grid (5.30.0), and
+#     the Addresses subtab shows a device's own interface names and its
+#     default gateway.
+check("function clearFilters(tab, ids, opts = {}) {" in APP and "clearFilters," in APP,
+      "App.clearFilters exists and is exported")
+check("el.onclick = () => clearFilters(tab, fields, { onClear: spec.onClear, refresh: go });"
+      in APP,
+      "the Clear button's own handler now calls clearFilters, rather than "
+      "duplicating its body")
+check("async function revealDevice(deviceId) {" in NODES,
+      "nodes.js's revealDevice exists")
+check("await revealDevice(deviceId);" in NODES,
+      "activate() calls revealDevice for a device route carrying no "
+      "q/name/filter of its own")
+check("} else if (view.selected !== deviceId) {" in NODES,
+      "a device route that DOES carry a q/name/filter keeps the old "
+      "select-only behaviour, guarded the way it always was")
+REVEAL = NODES[NODES.index("async function revealDevice(deviceId) {"):
+               NODES.index("  /* A route into this tab: #/nodes,")]
+check("App.clearFilters('nodes', ['nd-q']);" in REVEAL,
+      "revealDevice clears the Find box through App.clearFilters, the same "
+      "reset the Clear button runs")
+check("App.clearFilters('nodes', ['nd-filter-group', 'nd-filter-devgroup',\n"
+      "        'nd-filter-status', 'nd-filter-offline', 'nd-filter-maintenance',\n"
+      "        'nd-filter-overrides']);" in REVEAL,
+      "revealDevice falls back to clearing the rest of the filter bar when "
+      "Find alone did not surface the row")
+check("let pagesLeft = 10;" in REVEAL and "pagesLeft > 0" in REVEAL,
+      "revealDevice is bounded to ten extra pages of paging before giving up")
+check("view.pageOffset + view.pageLimit < view.pageTotal" in REVEAL,
+      "revealDevice stops paging once the pager itself says there is no "
+      "next page left")
+check("row.scrollIntoView({ block: 'nearest' });" in REVEAL and "if (row) " in REVEAL,
+      "revealDevice scrolls the revealed row into view, guarded for a row "
+      "that never turned up")
+check('id="nd-addr-gateway"' in INDEX,
+      "index.html carries the #nd-addr-gateway hint line above the "
+      "Addresses table")
+check("const gateway = App.el('nd-addr-gateway');" in NODES
+      and "view.detail.default_gateway" in NODES,
+      "drawAddressesTable fills #nd-addr-gateway from "
+      "view.detail.default_gateway")
+check("gw ? `Default gateway: ${gw}`" in NODES
+      and "'Default gateway: not published by this device.'" in NODES,
+      "the gateway line names the address when the device published one, "
+      "or says plainly that it did not")
+check("const iface = r.interface ? escape(r.interface)" in NODES,
+      "drawAddressesTable's Interface cell prefers the device's own "
+      "r.interface name")
+check('`<span title="ifIndex ${escape(String(r.if_index))}">#${' in NODES,
+      "...falling back to #<if_index> with an \"ifIndex <n>\" title when no "
+      "interface name is known")
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))

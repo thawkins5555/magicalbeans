@@ -2803,6 +2803,27 @@ const App = (() => {
       `<th scope="col">By severity</th></tr></thead><tbody>${rows}</tbody>`;
   }
 
+  /* Empty a set of filter fields and settle the store on the emptied
+     values — the Clear button's own logic (below), pulled out so a route
+     handler can run the same reset (nodes.js's revealDevice, 5.30.0)
+     without wiring a fake click. `refresh`, not a boolean: the button
+     always refreshes itself, a caller stepping through several clears in
+     turn wants to refresh only once, at the end, itself. */
+  function clearFilters(tab, ids, opts = {}) {
+    for (const id of ids) {
+      const field = document.getElementById(id);
+      if (!field) continue;
+      if (field.type === 'checkbox') field.checked = false;
+      else field.value = '';
+    }
+    // Assigning .value from script fires no event, so without this the
+    // store would keep every filter Clear has just removed and a
+    // reload would come back filtered by them.
+    syncControls(tab, ids);
+    if (opts.onClear) opts.onClear();
+    if (opts.refresh) opts.refresh();
+  }
+
   /* -------------------------------------------- the filter bar, wired once
 
      Seven list pages each hand-wrote the same four things: Enter in a text
@@ -2831,20 +2852,7 @@ const App = (() => {
     if (spec.clear) {
       const el = document.getElementById(spec.clear);
       const fields = spec.clears || [...(spec.text || []), ...(spec.selects || [])];
-      if (el) el.onclick = () => {
-        for (const id of fields) {
-          const field = document.getElementById(id);
-          if (!field) continue;
-          if (field.type === 'checkbox') field.checked = false;
-          else field.value = '';
-        }
-        // Assigning .value from script fires no event, so without this the
-        // store would keep every filter Clear has just removed and a
-        // reload would come back filtered by them.
-        syncControls(tab, fields);
-        if (spec.onClear) spec.onClear();
-        go();
-      };
+      if (el) el.onclick = () => clearFilters(tab, fields, { onClear: spec.onClear, refresh: go });
     }
   }
 
@@ -6253,7 +6261,7 @@ const App = (() => {
     get, post, put, del, saveCsv, exportCsv, deviceIndex, deviceLink,
     deviceNameLink,
     clock, stamp, span, duration, ago, when, timeCell, agoCell, isoLocal,
-    emptyText, stackedHistogram, plottedRange, filterBar, filterValues,
+    emptyText, stackedHistogram, plottedRange, filterBar, filterValues, clearFilters,
     timeZoneLabel, timeZoneTitle, countLabel,
     bytes, rate, formatMac, fillRanges, wheelWindow,
     modal, modalToken, modalIsCurrent, pollWhileModal,
