@@ -11167,6 +11167,53 @@ down regardless of where an operator had scrolled to read history. The
 checkbox's meaning is unchanged — it still means "stay pinned to the
 newest row" — only *when* that pinning is allowed to act has changed.
 
+### Dashboard graph scaling: three faults in `drawSeriesChart` and its percent tiles (`app.js`, `dashboard.js`) — 5.33.0
+
+Three independent causes, one visible symptom ("the Y axis is wrong"):
+
+**1. A percent tile with no `Y max` auto-scaled instead of pinning to
+100.** `dashboard.js`'s tile renderer only ever passed `peak: cfg.y_max ||
+undefined` to `App.drawSeriesChart` — a device-metric or interface-traffic
+tile with a `%` unit and no operator-set ceiling fell through to
+`drawSeriesChart`'s own auto-scale (`niceCeiling` off the data's own
+max), so a quiet 3% CPU line drew scaled to fill the whole plot instead
+of sitting near the bottom of a 0–100 axis. `peak` is now `cfg.y_max ||
+(chart && chart.unit === '%' ? 100 : undefined)` — an explicit `Y max`
+still wins outright, and only a percent metric with none set falls back
+to the fixed 100 a percentage always has as its true ceiling.
+
+**2. A multi-series chart let an undrawn min/max band inflate the axis.**
+`drawSeriesChart`'s own `drawBand` flag (`(data.series || []).length ===
+1`) already decided whether the min/max band is drawn at all — two
+overlapping bands read as mud — but `allValues`, the list the axis ceiling
+is computed from, still included every point's `min`/`max` regardless of
+`drawBand`, so a multi-series chart's axis grew to fit numbers nothing on
+screen ever showed, compressing the actual drawn lines toward the bottom.
+`allValues` now branches on `drawBand`: when it is true, `[min, avg, max]`
+as before; when false, `[avg]` alone (or `[value]` for a raw, non-rollup
+point, unchanged either way) — the ceiling now comes only from what is
+actually drawn.
+
+**3. A value above the axis ceiling drew past the top of the plot.**
+`yFor(v)` computed `plot.y + plot.h - (Math.max(v, 0) / peak) * plot.h`
+— clamping only the *floor* at 0, never the *ceiling* at `peak` — so a
+reading above a pinned `opts.peak` (the loss/CPU/memory charts' 100, or
+the new percent-tile pin above) drew above the plot's top edge, off the
+visible chart entirely, rather than flat against the ceiling the way an
+operator reading a percentage chart would expect. `yFor` now clamps both
+ends: `Math.min(Math.max(v, 0), peak) / peak`. An auto-scaled chart
+(`opts.peak` unset) is unaffected in practice, since its `peak` is always
+computed to be at least the data's own max.
+
+Because `drawSeriesChart` is the one renderer shared by every chart in
+the application (5.21.0, above) — the packet-loss and RESOURCES charts,
+the per-port bandwidth chart, wireless history, every dashboard graph
+tile — fixes 2 and 3 apply everywhere the renderer is used, not only on
+Dashboard; fix 1 is dashboard-tile-specific, since it lives in
+`dashboard.js`'s own call site rather than in the shared renderer (every
+other caller already either pins its own known ceiling — the loss chart's
+100 — or has no fixed scale to pin at all).
+
 ### Multi-interface graph tiles, on-tile drill-down, and the batch series route (`web/api.py`, `web/static/dashboard.js`, `web/static/app.js`) — 5.22.0
 
 **The `iface_traffic` config schema widens without breaking a saved
