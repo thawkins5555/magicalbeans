@@ -75,8 +75,6 @@ ALLOWED = {
         "kinds come from its own status_map literal.",
     "nodesdb._event_segments":
         "kinds are the keys of the caller's status_map literal.",
-    "nodesdb.count_events_by_device":
-        "kinds are event-kind names from a fixed vocabulary.",
     "nodesseriesdb.record_metric_samples":
         "the keys are one device's own poll payload, already one statement's "
         "worth of metrics.",

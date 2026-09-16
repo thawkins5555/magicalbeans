@@ -72,6 +72,7 @@ try:
     did = db.add_device("10.96.0.1", name="cx-stanza-1", group_id=gid)
     db.replace_interfaces(did, [
         {"if_index": 1, "descr": "GigabitEthernet1/0/1", "name": "Gi1/0/1"},
+        {"if_index": 3, "descr": "GigabitEthernet1/0/3", "name": "Gi1/0/3"},
     ])
     did_nobackup = db.add_device("10.96.0.2", name="cx-stanza-2", group_id=gid)
     db.replace_interfaces(did_nobackup, [
@@ -94,8 +95,14 @@ try:
           (status, payload))
 
     status, payload = call(
+        "GET", f"/api/nodes/devices/{did}/interfaces/3/config", token=admin)
+    check("a port that exists but has no stanza in the latest backup: text is null",
+          status == 200 and payload["text"] is None and payload["backup_id"] is not None,
+          (status, payload))
+
+    status, payload = call(
         "GET", f"/api/nodes/devices/{did}/interfaces/2/config", token=admin)
-    check("a port with no matching stanza in the latest backup: text is null",
+    check("a port with no interface row at all: text is null",
           status == 200 and payload["text"] is None and payload["backup_id"] is not None,
           (status, payload))
 

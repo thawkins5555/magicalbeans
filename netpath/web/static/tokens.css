@@ -52,10 +52,7 @@
   --selected: #1E2837;
   --checked: #22304A;
   --checked-strong: #2E4470;
-  /* revealDevice()'s "you asked to find this one" row highlight — a dim
-     amber, distinct from the blue --selected/--checked family so it reads
-     as a different kind of emphasis rather than a stronger selection. */
-  --reveal: #5A4A00;
+  --reveal: #5A4A00;  /* revealDevice() row highlight, amber (distinct from --selected/--checked) */
 
   /* Categorical: eight hues for stacked NetFlow series, chosen for separation under protanopia simulation too.
      A ninth series onwards is --data-neutral, not a ninth hue. */

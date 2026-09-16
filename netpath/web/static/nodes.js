@@ -2253,8 +2253,8 @@
       </div>
       <p class="hint" id="ndd-snapshot-line" hidden></p>
       <p class="hint">Sensor Snapshot accepts every power supply, stack power and fan
-        reading this device has right now as normal for it — a later reading that is
-        still exactly that stays quiet; anything worse still alerts.</p>
+        reading this device has right now as normal for it — a reading that changes
+        from the baseline still alerts.</p>
       <p class="hint">${d.learnable
         ? 'A manual vendor also teaches every device with the same sysObjectID.'
         : `A manual vendor applies to this device only: ${escape(d.learn_reason || '')}.`}</p>`
@@ -2788,8 +2788,8 @@
       <div id="ifd-configrx-body"><p class="hint">Stored configurations live in
         <button type="button" class="linkish inline" id="ifd-configrx">ConfigRX</button>,
         which backs up this device over SSH and keeps every version it has
-        seen. There is no per-port view of a configuration — a config is a
-        whole-device thing.</p></div>
+        seen. The port's own stanza appears here when ConfigRX holds a
+        backup of this device.</p></div>
       <p class="section">MAC ADDRESSES ON PORT</p>
       <div id="ifd-mac"><p class="hint">Reading MAC address table…</p></div>
       <p class="section">DOM / SFP SENSORS</p>
@@ -3007,11 +3007,13 @@
         .then((r) => {
           const configBody = box.querySelector('#ifd-configrx-body');
           if (!configBody || !current()) return;
-          if (r.backup_id == null) return;   // no backup yet: keep the static hint
-          const content = r.text
+          const header = r.backup_id == null
+            ? 'No ConfigRX backup for this device yet.'
+            : `From backup ${escape(App.when(r.ts))}`;
+          const content = r.backup_id == null ? '' : (r.text
             ? `<pre class="detail" style="max-height:220px">${escape(r.text)}</pre>`
-            : '<p class="hint">No stanza for this interface in the latest backup.</p>';
-          configBody.innerHTML = `<p class="hint">From backup ${escape(App.when(r.ts))} — ` +
+            : '<p class="hint">No stanza for this interface in the latest backup.</p>');
+          configBody.innerHTML = `<p class="hint">${header} — ` +
             '<button type="button" class="linkish inline" id="ifd-configrx">ConfigRX</button></p>' +
             content;
           const link = configBody.querySelector('#ifd-configrx');

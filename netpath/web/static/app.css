@@ -1037,11 +1037,7 @@ tr.selected td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
    Nodes, Alerts and ConfigRX, which all use the same class. */
 tr.bulk-checked td { background: var(--checked); }
 tr.bulk-checked.selected td { background: var(--checked-strong); }
-/* A revealDevice() link ("Open in Nodes", a search result elsewhere in the
-   app): the row it points at needs to stand out even when it is also
-   .selected or .bulk-checked, so this outranks both on specificity alone
-   rather than depending on source order. The selection accent bar
-   (tr.selected td:first-child above) is untouched — only the fill changes. */
+/* Outranks .selected/.bulk-checked on specificity so a revealDevice() target still stands out. */
 table.grid tr.revealed td { background: var(--reveal); }
 /* Priority port: faint accent wash, mixed against --panel so the zebra stripe does not show through. */
 tr.priority td { background: color-mix(in srgb, var(--accent) 10%, var(--panel)); }
@@ -1970,10 +1966,7 @@ body.kiosk .card.strip > .hint { overflow: visible; white-space: normal; }
 }
 .mp-frame-handle { fill: var(--mp-frame-color); opacity: 0.8; cursor: nwse-resize; }
 
-/* #mp-find's suggestion dropdown: plain HTML, not SVG (the canvas above is
-   the map itself), positioned under the input the same way .tooltip is —
-   fixed, sized and placed from JS since it floats over the toolbar, not
-   inside any positioned ancestor of its own. */
+/* #mp-find's suggestion dropdown: plain HTML, fixed and positioned from JS like .tooltip. */
 .mp-suggest {
   position: fixed;
   z-index: var(--z-tooltip);

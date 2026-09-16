@@ -117,6 +117,29 @@ check("Juniper: brace-matched block for the named interface",
 check("Juniper: a name not present returns None",
       configrx_stanza.interface_stanza(juniper_text, ["ge-0/0/2"]) is None)
 
+# ------------------------------- exact match wins over an earlier prefix hit
+tw_text = (
+    "interface TwentyFiveGigE1/0/1\n shutdown\n!\n"
+    "interface TwoGigabitEthernet1/0/1\n description access\n!\n"
+)
+tw_result = configrx_stanza.interface_stanza(
+    tw_text, ["Tw1/0/1", "TwoGigabitEthernet1/0/1"])
+check("Tw1/0/1 finds the exact TwoGigabitEthernet1/0/1 header, not the "
+      "earlier TwentyFiveGigE1/0/1 prefix match",
+      tw_result is not None and tw_result.startswith("interface TwoGigabitEthernet1/0/1"),
+      tw_result)
+
+fo_text = (
+    "interface FourHundredGigE1/0/1\n shutdown\n!\n"
+    "interface FortyGigabitEthernet1/0/1\n description core\n!\n"
+)
+fo_result = configrx_stanza.interface_stanza(
+    fo_text, ["Fo1/0/1", "FortyGigabitEthernet1/0/1"])
+check("Fo1/0/1 finds the exact FortyGigabitEthernet1/0/1 header, not the "
+      "earlier FourHundredGigE1/0/1 prefix match",
+      fo_result is not None and fo_result.startswith("interface FortyGigabitEthernet1/0/1"),
+      fo_result)
+
 print()
 print("FAILURES:", FAILS if FAILS else "none")
 raise SystemExit(1 if FAILS else 0)

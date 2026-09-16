@@ -5460,7 +5460,7 @@ def post_nodes_device_poll(service, params, body, device_id) -> dict:
     # queued=False means a poll for this device was already in flight, so
     # this click started nothing. The button says so rather than reporting
     # "Polled" off the other poll's completion.
-    return {"ok": True, "queued": bool(service.node_poller.poll_now(device_id))}
+    return {"ok": True, "queued": bool(service.node_poller.poll_now(device_id, walks=True))}
 
 
 def post_nodes_devices_bulk_poll(service, params, body) -> dict:
@@ -5473,7 +5473,7 @@ def post_nodes_devices_bulk_poll(service, params, body) -> dict:
         if device_id not in existing:
             missing.append(device_id)
             continue
-        (queued if service.node_poller.poll_now(device_id) else busy).append(device_id)
+        (queued if service.node_poller.poll_now(device_id, walks=True) else busy).append(device_id)
     if queued:
         service.log.add(NODES_CATEGORY, f"Poll now requested for {len(queued)} device(s)")
     return {"ok": True, "queued": queued, "already_polling": busy, "missing": missing}
@@ -5574,7 +5574,7 @@ def post_nodes_device_sensor_snapshot(service, params, body, device_id) -> dict:
     worse still does.
     """
     device_id = int(device_id)
-    _require(service.nodes_db.device(device_id), "device")
+    device = _require(service.nodes_db.device(device_id), "device")
     now = time.time()
     rows = [{"metric_key": row["key"], "value": row["last_value"], "ts": now}
            for row in service.nodes_db.metrics(device_id)
@@ -5588,6 +5588,8 @@ def post_nodes_device_sensor_snapshot(service, params, body, device_id) -> dict:
                 f"{rule_key}:sensor:{device_id}:{suffix}", by="")
             if resolved is not None:
                 service.alerts_db.add_rollup_note(resolved["id"], "Sensor snapshot")
+    _audit(service, params, "device.sensor_snapshot", target=f"device:{device['ip']}",
+          detail=f"count={len(rows)}")
     return {"count": len(rows), "ts": now}
 
 
@@ -5741,10 +5743,10 @@ def get_nodes_device_interface_config(service, params, body, device_id, if_index
     Redacted like get_configrx_backup for a caller without configrx write.
     """
     device_id, if_index = int(device_id), int(if_index)
-    _require(service.nodes_db.device(device_id), "device")
     if not _permissions.allows(
             request_permissions(service, params).get("nodes"), _permissions.READ):
         raise _permissions.Forbidden("Reading devices is not permitted")
+    _require(service.nodes_db.device(device_id), "device")
     backups = service.configrx_db.backups_for(device_id, limit=1)
     if not backups:
         return {"backup_id": None, "ts": None, "text": None}
@@ -5753,7 +5755,7 @@ def get_nodes_device_interface_config(service, params, body, device_id, if_index
     if not _may_read_secrets(service, params, "configrx"):
         content, _ = configrx_redact.redact(content)
     iface = service.nodes_db.interface_row(device_id, if_index)
-    names = [iface["name"] if iface and "name" in iface.keys() else None,
+    names = [iface["name"] if iface else None,
             iface["descr"] if iface else None]
     text = configrx_stanza.interface_stanza(content, [n for n in names if n])
     return {"backup_id": backup["id"], "ts": backup["ts"], "text": text}

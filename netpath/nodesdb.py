@@ -4473,12 +4473,6 @@ class NodesDatabase(SqliteStore):
                 (device_id,)).fetchall()
         return {"count": len(rows), "ts": max((r["ts"] for r in rows), default=None)}
 
-    def delete_sensor_baselines(self, device_id: int) -> None:
-        with self._lock:
-            self._conn.execute(
-                "DELETE FROM sensor_baselines WHERE device_id = ?", (device_id,))
-            self._conn.commit()
-
     def interface_thresholds(self, device_id: int) -> dict[tuple, sqlite3.Row]:
         """(if_index, metric_root) -> the published limits row, for one
         device — the shape the DOM dialog reads."""
@@ -4881,7 +4875,6 @@ class NodesDatabase(SqliteStore):
         return self.max_device_event_id()
 
     def count_events_by_device(self, since: float,
-                               kinds: list[str] | None = None,
                                limit: int | None = None) -> list[sqlite3.Row]:
         """(device_id, name, ip, sys_name, display_name_source, n) for the
         devices with the most events since a wall-clock timestamp, busiest
@@ -4889,13 +4882,7 @@ class NodesDatabase(SqliteStore):
         sys_name/display_name_source ride along so a caller can resolve the
         same display name Nodes itself shows, since `name` equals the IP for
         a device nobody has renamed."""
-        clauses = ["e.ts >= ?"]
         params: list = [float(since)]
-        if kinds:
-            marks = ",".join("?" * len(kinds))
-            clauses.append(f"e.kind IN ({marks})")
-            params.extend(kinds)
-        where = " AND ".join(clauses)
         tail = ""
         if limit is not None:
             tail = " LIMIT ?"
@@ -4906,7 +4893,7 @@ class NodesDatabase(SqliteStore):
                 f" d.sys_name AS sys_name, d.display_name_source AS display_name_source,"
                 f" COUNT(*) AS n FROM device_events e"
                 f" JOIN devices d ON d.id = e.device_id"
-                f" WHERE {where} GROUP BY e.device_id"
+                f" WHERE e.ts >= ? GROUP BY e.device_id"
                 f" ORDER BY n DESC, d.name COLLATE NOCASE{tail}", params).fetchall()
 
     def count_interface_events_by_device(self, since: float,

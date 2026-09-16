@@ -27,19 +27,20 @@ def _split_prefix(name: str) -> tuple[str, str]:
     return (m.group(1), m.group(2)) if m else ("", name)
 
 
-def _names_match(a: str, b: str) -> bool:
-    """Nodes' SNMP ifName/ifDescr (short or long form) against a config's
-    own interface name. Exact (case-insensitive) equality always matches --
-    the only rule that applies to a vendor with no short/long split, like
-    Juniper or ProCurve. Otherwise the two must share the same trailing
-    digits/slashes/dots/colons, and one's alphabetic prefix must be a
-    case-insensitive prefix of the other's (Gi / GigabitEthernet, Po /
-    Port-channel, ...) -- so Gi1/0/1 never matches Gi1/0/10."""
+def _exact_match(a: str, b: str) -> bool:
+    a, b = a.strip(), b.strip()
+    return bool(a) and bool(b) and a.lower() == b.lower()
+
+
+def _prefix_match(a: str, b: str) -> bool:
+    """The Gi/GigabitEthernet, Po/Port-channel style match: same trailing
+    digits/slashes/dots/colons, and one's alphabetic prefix a
+    case-insensitive prefix of the other's -- so Gi1/0/1 never matches
+    Gi1/0/10. Ambiguous on its own (Tw also prefixes TwentyFiveGigE), so
+    callers try _exact_match across every header first."""
     a, b = a.strip(), b.strip()
     if not a or not b:
         return False
-    if a.lower() == b.lower():
-        return True
     prefix_a, rest_a = _split_prefix(a)
     prefix_b, rest_b = _split_prefix(b)
     if not prefix_a or not prefix_b:
@@ -48,6 +49,14 @@ def _names_match(a: str, b: str) -> bool:
         return False
     prefix_a, prefix_b = prefix_a.lower(), prefix_b.lower()
     return prefix_a.startswith(prefix_b) or prefix_b.startswith(prefix_a)
+
+
+def _names_match(a: str, b: str) -> bool:
+    """Nodes' SNMP ifName/ifDescr (short or long form) against a config's
+    own interface name -- exact match or the prefix rule (see
+    _prefix_match). Used by the Juniper brace-matcher, which has no
+    multi-header ambiguity to resolve with a two-pass search."""
+    return _exact_match(a, b) or _prefix_match(a, b)
 
 
 def _indented_block(lines: list[str], start: int) -> str:
@@ -107,15 +116,27 @@ def _juniper_block(text: str, candidates: list[str]) -> str | None:
 def interface_stanza(text: str, names: list[str]) -> str | None:
     """The stored config's own block for one interface, or None when no
     line names it. `names` is the caller's candidate list (typically the
-    interface's ifName and ifDescr); any one of them matching is enough."""
+    interface's ifName and ifDescr); any one of them matching is enough.
+
+    Two passes over every header: exact equality first, then the prefix
+    rule -- otherwise an earlier prefix-only match (Tw1/0/1 against
+    TwentyFiveGigE1/0/1) could win over a later exact one for the same
+    file."""
     if not text:
         return None
     candidates = [n for n in names if n]
     if not candidates:
         return None
     lines = text.split("\n")
+    headers = []
     for i, line in enumerate(lines):
         m = _INTERFACE_HEADER_RE.match(line)
-        if m and any(_names_match(m.group(1), c) for c in candidates):
+        if m:
+            headers.append((i, m.group(1)))
+    for i, header in headers:
+        if any(_exact_match(header, c) for c in candidates):
+            return _indented_block(lines, i)
+    for i, header in headers:
+        if any(_prefix_match(header, c) for c in candidates):
             return _indented_block(lines, i)
     return _juniper_block(text, candidates)

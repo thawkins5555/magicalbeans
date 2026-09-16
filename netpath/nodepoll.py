@@ -2140,22 +2140,13 @@ class NodePoller(Worker):
     def next_runs(self) -> dict[int, float]:
         return dict(self._next_run)
 
-    def poll_now(self, device_id: int) -> bool:
+    def poll_now(self, device_id: int, walks: bool = False) -> bool:
         """Submits this device to the worker pool now, ahead of its interval.
         True when it was queued, False when a poll for it was already queued
-        or running — a click during an in-flight poll cannot start a second
-        one, and reporting "Polled" off the first one's completion claimed
-        credit for work the click did not cause.
-
-        Also starts an immediate MAC-table, VLAN-membership and ARP-table
-        walk for this device (see _walk_now) when each is enabled and not
-        already running — the same three walks _schedule_pass's
-        _maybe_walk_mac_table/_maybe_walk_vlans/_maybe_walk_arp_table trio
-        starts on their own random-staggered interval, run here promptly and
-        without the stagger, since a manual poll is itself the operator
-        asking for current data now. The LLDP walk is untouched: nothing
-        here asked for neighbours, and it shares no code path that would
-        pull it in."""
+        or running — a click during an in-flight poll starts no second poll
+        (though the walks below still run for walks=True), and reporting
+        "Polled" off the first one's completion claimed credit for work the
+        click did not cause."""
         # Also doubles as "try the sensor walk again": dropping the cadence
         # stamp skips both _SENSOR_REFRESH_S and the hourly reprobe window.
         self._sensor_read.pop(device_id, None)
@@ -2177,14 +2168,12 @@ class NodePoller(Worker):
         # click cannot read the old entry first. The scheduler's own polls
         # keep the cache; _v3_exchange's timeout rule covers them.
         self._engines.invalidate(device_id)
-        self._walk_now(device_id)
+        if walks:
+            self._walk_now(device_id)
         return self._submit(device_id)
 
-    # (device_id) -> (interval config key, in-flight set, next-due stamps,
-    # the walk function to submit) -- one entry per table poll_now also
-    # kicks off, sharing _maybe_walk_mac_table/_maybe_walk_vlans/
-    # _maybe_walk_arp_table's own in-flight guard and executor so a walk
-    # already running for this device is never started twice.
+    # Starts each table's walk via the same in-flight guard/executor
+    # _maybe_walk_mac_table/_maybe_walk_vlans/_maybe_walk_arp_table use.
     def _walk_now(self, device_id: int) -> None:
         device = self.db.device(device_id)
         if device is None:

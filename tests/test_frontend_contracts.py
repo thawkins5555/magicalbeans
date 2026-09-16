@@ -4211,6 +4211,18 @@ check("s.kind === 'fan' ? ' <span class=\"hint\">(fan)</span>'" in NODES,
       "the per-sensor table hints a fan row the same way a psu/stack_power "
       "row is hinted")
 
+# ---------------------------------------------------------------------------
+# 91. --reveal (the revealDevice() row highlight, mapper.js Find/#mp-find):
+#     one declaration per themed :root block, and app.css's rule reads it.
+TOKENS91 = read("tokens.css")
+_reveal_blocks = re.findall(r':root\[data-theme="[a-z]+"\] \{.*?\n\}', TOKENS91, re.S)
+_reveal_count = sum(block.count("--reveal:") for block in _reveal_blocks)
+check(len(_reveal_blocks) > 0 and len(_reveal_blocks) == _reveal_count,
+      "--reveal is defined once in every :root[data-theme=] block of tokens.css "
+      "(%d blocks, %d --reveal declarations)" % (len(_reveal_blocks), _reveal_count))
+check("table.grid tr.revealed td" in read("app.css"),
+      "app.css styles table.grid tr.revealed td off --reveal")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

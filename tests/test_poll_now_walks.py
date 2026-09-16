@@ -57,7 +57,7 @@ did = db.add_device("10.0.0.80", name="sw", group_id=gid)
 poller = new_poller(db)
 calls = []
 stub_walks(poller, calls)
-poller.poll_now(did)
+poller.poll_now(did, walks=True)
 poller._mac_executor.shutdown(wait=True)
 check("poll_now submits the MAC, VLAN and ARP walks for the device",
       sorted(calls) == [("arp", did), ("mac", did), ("vlan", did)], calls)
@@ -76,7 +76,7 @@ did = db.add_device("10.0.0.81", name="sw-off", group_id=gid,
 poller = new_poller(db)
 calls = []
 stub_walks(poller, calls)
-poller.poll_now(did)
+poller.poll_now(did, walks=True)
 poller._mac_executor.shutdown(wait=True)
 check("a device with every walk interval explicitly 0 gets none of them",
       calls == [], calls)
@@ -94,7 +94,7 @@ db.record_poll(did, ping_ok=False, ping_rtt_ms=None, snmp_ok=False,
 poller = new_poller(db)
 calls = []
 stub_walks(poller, calls)
-poller.poll_now(did)
+poller.poll_now(did, walks=True)
 poller._mac_executor.shutdown(wait=True)
 check("a device already marked down/failing is not walked by poll_now",
       calls == [], calls)
@@ -110,10 +110,24 @@ poller = new_poller(db)
 calls = []
 stub_walks(poller, calls)
 poller._mac_running.add(did)   # a MAC walk is already running for this device
-poller.poll_now(did)
+poller.poll_now(did, walks=True)
 poller._mac_executor.shutdown(wait=True)
 check("a walk already in flight for this device is not started a second time",
       sorted(calls) == [("arp", did), ("vlan", did)], calls)
+db.close()
+
+# ------------------------------------------- 5. default (walks=False) walks none
+db = new_db("default")
+gid = db.ensure_default_group()
+db.update_group(gid, mac_table_interval_s=3600, vlan_interval_s=3600,
+                arp_table_interval_s=3600)
+did = db.add_device("10.0.0.84", name="sw-default", group_id=gid)
+poller = new_poller(db)
+calls = []
+stub_walks(poller, calls)
+poller.poll_now(did)   # walks defaults to False -- the bulk-import/trap/fortipoll callers
+poller._mac_executor.shutdown(wait=True)
+check("poll_now with no walks argument starts no walks", calls == [], calls)
 db.close()
 
 print()

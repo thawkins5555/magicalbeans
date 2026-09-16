@@ -50,10 +50,7 @@
   // matches post_mapper_map_frames' own server-side floor.
   const FRAME_MIN = 40;
   const FRAME_HANDLE = 10;   // the resize-handle square, in scene units
-  // #mp-find-list's own dropdown never needs more rows than fit without
-  // scrolling — a fleet-sized map still narrows to a handful of matches
-  // once the operator has typed a few characters.
-  const FIND_SUGGEST_CAP = 12;
+  const FIND_SUGGEST_CAP = 12;  // rows the #mp-find-list dropdown ever shows at once
 
   // mapperdb.MAP_STYLES, mirrored so the settings dialog's <select> and the
   // canvas's data-map-style attribute never drift from the server's own list.
@@ -552,13 +549,7 @@
     view.candidates = await App.get(`/api/mapper/maps/${view.mapId}/candidates`);
   }
 
-  /* ---------------------------------------------------------------- find
-     #mp-find/#mp-find-list: a themed suggestion dropdown, not a dialog —
-     the operator is orienting themselves on a map that may hold hundreds
-     of boxes, not picking rows to act on. Suggestions come from the same
-     four fields findNode itself matches against, so what the dropdown
-     offers is exactly what Enter can find. Open/active state is transient
-     UI state, not view.* — nothing else reads it and nothing persists it. */
+  // ---- find: #mp-find-list suggestion dropdown, matched via findMatches below
   let findOpen = false;
   let findItems = [];   // nodes currently listed in the dropdown, ranked
   let findActive = -1;  // index into findItems, -1 = none highlighted
@@ -585,10 +576,7 @@
     return ranked.map((r) => r.node);
   }
 
-  // Data reloading (a poll tick, a manual refresh) while the dropdown is
-  // open must not leave it showing a node that moved, was removed, or a
-  // rank that no longer applies — re-run the same query against the fresh
-  // view.nodes. Closed, there is nothing to refresh.
+  // Re-runs the current query against fresh view.nodes on a poll/refresh; no-op if closed.
   function rebuildFindList() {
     if (!findOpen) return;
     const input = App.el('mp-find');
@@ -638,10 +626,7 @@
     findActive = -1;
   }
 
-  // Shared by Enter and a click on an option: fills the box with the same
-  // text findNode itself would match on, so repeated Enter afterwards still
-  // cycles multiple hits for that text exactly as it does when nothing was
-  // ever picked from the dropdown.
+  // Shared by Enter and a dropdown click: fills the box, then calls findNode.
   function pickFindSuggestion(index) {
     const node = findItems[index];
     if (!node) return;
@@ -710,8 +695,7 @@
     showFindSuggestions(event.target.value);
   }
 
-  // A click on an option must not blur #mp-find first — pointerdown fires
-  // before click and would close the dropdown out from under the click.
+  // Prevents pointerdown from blurring #mp-find before the click fires.
   function onFindListPointerdown(event) {
     event.preventDefault();
   }
@@ -722,9 +706,7 @@
     pickFindSuggestion(Number(item.dataset.index));
   }
 
-  // Never races a click on an option: onFindListPointerdown keeps focus on
-  // the input for the whole click, so this only fires for a genuine move
-  // away from the field (Tab, clicking anything the list does not cover).
+  // Only fires for a genuine move away from #mp-find (see onFindListPointerdown).
   function onFindBlur() {
     hideFindSuggestions();
   }
@@ -1302,21 +1284,9 @@
     return `${a} ↔ ${b}\nVLAN ${vlanDisplay(strand.vlan)}${native}`;
   }
 
-  // ------------------------------------------------------ label collision
-  // A dragged box can land arbitrarily close to another — nothing stops it
-  // — and a name is drawn at a fixed spot inside its own box, so two boxes
-  // overlapping means one name sits under the other box, or under the
-  // other name. This measures every name the way the browser will actually
-  // render it and pushes a colliding one straight down, in whole-line
-  // steps, until it clears both. Only the (single) name label's own y
-  // drifts inside its <g> — the box itself never moves, since links attach
-  // at each node's real position, and no leader line points back to it.
-  //
-  // A detached canvas 2D context does the measuring, not the SVG text's own
-  // getBBox(): draw() builds its whole scene off-document and appends it
-  // once (see the comment beside svg.appendChild(group) below), precisely
-  // to avoid a reflow per node — getBBox() before that attach is exactly
-  // that reflow, paid once per label.
+  // ---- label collision: pushes a colliding name label straight down in whole-line
+  // steps until clear; measured off-document via canvas 2D, not getBBox(), to avoid
+  // a reflow per node. Only the label's y moves — the node box itself never does.
   const LABEL_X = 30, LABEL_BASE_Y = 22, LABEL_SUB_GAP = 14, LABEL_GAP_PX = 3;
   const LABEL_STEP_CAP = 6;
   const labelMeasureCtx = document.createElement('canvas').getContext('2d');
@@ -1333,8 +1303,7 @@
     if (!labelFontCache) labelFontCache = fontFor('--ui');
     return labelFontCache;
   }
-  // .mp-node-sub's own font (--mono, same size) — only its descent is ever
-  // read, to fold the sub-line into the name label's collision rect below.
+  // .mp-node-sub's font (--mono); only its descent feeds the collision rect below.
   function subFont() {
     if (!subFontCache) subFontCache = fontFor('--mono');
     return subFontCache;
@@ -1350,16 +1319,8 @@
     };
   }
 
-  // The one place a label's scene rect is computed, at a given number of
-  // down-steps — draw() (via drawNode below) writes the result straight
-  // into the live SVG, so hit-testing, hover/focus and the PNG export (a
-  // clone of that same SVG) all agree on it for free, with nothing of
-  // their own left to keep in sync.
-  //
-  // The rect covers the sub-line too when there is one: drawNode always
-  // draws info.sub LABEL_SUB_GAP below the name, as one visual block, so a
-  // name pushed clear of a collision but leaving its sub-line still
-  // sitting on the neighbour would just move the same overlap down a line.
+  // The one place a label's scene rect is computed; covers the sub-line too so a
+  // collision push clears both, not just the name.
   function labelRect(node, info, steps) {
     const pos = livePos(node);
     const { width, ascent, descent } = measureLabel(truncate(info.name, 24));
@@ -1376,10 +1337,7 @@
     return a.x < b.x + b.w && a.x + a.w > b.x;
   }
 
-  // node.id -> how many line-steps its name was pushed down. Processed by
-  // y then x for a stable result call to call; a node's own box is excluded
-  // from its own label's collision test (the untouched default position
-  // always sits inside it by design).
+  // node.id -> line-steps pushed down; processed by y then x for a stable result.
   function placeLabels(nodes) {
     const boxes = nodes.map((node) => {
       const pos = livePos(node);
@@ -1472,14 +1430,7 @@
       }
     });
     g.addEventListener('pointerdown', (event) => onNodePointerDown(event, node));
-    // Opens the same Device Details modal a Nodes row's dblclick does,
-    // without leaving Mapper (App.state.tab stays 'mapper'). Only a real,
-    // still-present device has one to show — an unmanaged LLDP/CDP peer
-    // and a device removed from Nodes both fall through to a no-op, same
-    // as "Open in Nodes" above is only offered for this same case.
-    // Routed through App.whenModuleReady rather than App.pages.nodes
-    // directly: Nodes may never have been the active tab this session, and
-    // a lazy module's App.pages entry is only ever read from app.js itself.
+    // Opens the same Device Details modal as a Nodes row dblclick, without leaving Mapper.
     g.addEventListener('dblclick', (event) => {
       if (info.unmanaged || info.gone) return;
       event.preventDefault();
@@ -1804,6 +1755,9 @@
       view.linkLabelEls.set(link.id, labels);
       drawLink(holder, link, labels);
     }
+    // Refreshed every draw so a theme switch's font change is picked up on the next redraw.
+    labelFontCache = fontFor('--ui');
+    subFontCache = fontFor('--mono');
     const labelOffsets = placeLabels(view.nodes);
     for (const node of view.nodes) view.nodeEls.set(node.id, drawNode(nodeLayer, node, labelOffsets));
 
