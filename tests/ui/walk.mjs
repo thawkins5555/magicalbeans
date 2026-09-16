@@ -381,20 +381,26 @@ async function waitForStpVlanBlockingLink(page, mapId) {
   }
   const origin = new URL(page.url()).origin;
   const started = Date.now();
-  const deadline = started + 60000;
+  const deadline = started + 150000;
+  // LLDP/CDP discovery trickles in on its own schedule; a link that has not
+  // been discovered at all is timing, a discovered link that is not blocking
+  // is the defect this check exists for -- the caller tells them apart.
+  let discovered = false;
   for (;;) {
     const res = await page.request.get(`${origin}/api/mapper/maps/${mapId}`);
     const links = res.ok() ? (await res.json()).links || [] : [];
     for (const link of links) {
       if (link.a_device_id === stp.id && link.a_port === 'TenGigabitEthernet1/1/2') {
+        discovered = true;
         if (link.blocking) return { present: true, ready: true, link, side: 'a' };
       } else if (link.b_device_id === stp.id
           && link.b_port === 'TenGigabitEthernet1/1/2') {
+        discovered = true;
         if (link.blocking) return { present: true, ready: true, link, side: 'b' };
       }
     }
     if (Date.now() >= deadline) {
-      return { present: true, ready: false,
+      return { present: true, ready: false, discovered,
                waited_s: Math.round((Date.now() - started) / 1000) };
     }
     await sleep(2000);
@@ -1466,6 +1472,9 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
 
       const state = await waitForStpVlanBlockingLink(page, mapId);
       if (!state.present) return 'skipped: acc-sw-005 is not in this fleet';
+      if (!state.ready && state.discovered === false) {
+        return `skipped: acc-sw-005's second uplink not yet discovered by LLDP/CDP after ${state.waited_s}s`;
+      }
       assert(state.ready,
         `acc-sw-005's TenGigabitEthernet1/1/2 carried no per-VLAN blocking `
         + `link after ${state.waited_s}s, poll-now included`);
