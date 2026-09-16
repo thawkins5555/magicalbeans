@@ -261,11 +261,11 @@ device really has, with nothing recording that it happened, and could
 strip a badge that a previous, complete pass had already written. It now
 only ever keeps what is already stored on an incomplete pass. Short names
 for AppGigabitEthernet (`Ap1/0/1`) are recognised by the interface-name
-matcher. And the Nodes event log now explains, once an hour per device,
-exactly why a switch could not be badged when the scan found sensor data
-it could not place: an empty port map (with the row counts that produced
-it), a walk that did not finish and why, or sensor rows that read fine
-but resolved to no port at all.
+matcher. And the Nodes event log now explains, once an hour per device
+and cause, exactly why a switch could not be badged when the scan found
+sensor data it could not place: an empty port map (with the row counts
+that produced it), a walk that did not finish and why, or sensor rows
+that read fine but resolved to no port at all.
 
 Files: `netpath/configrx.py`, `netpath/configrx_stanza.py`,
 `netpath/configrxdb.py`, `netpath/flowdb.py`, `netpath/nodeoids.py`,

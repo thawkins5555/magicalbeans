@@ -1334,20 +1334,23 @@ its own rows. `CREATE TABLE IF NOT EXISTS` in `nodesdb.SCHEMA` *is* the
 migration: `SCHEMA` is `executescript`ed on every open.
 
 The same pass writes `interfaces.media` (`update_interface_media`, batched
-like `update_interface_poe`): `'optic'` for every port a sensor resolved to
-— whatever it read and whatever its status, since a failed optic is still an
-optic — and `NULL` for every other row of that device that currently names a
-medium. It is reached only after the walk answered, so a timeout never
-strips the badge — the early return for an *incomplete* walk covers that
-(from 5.35.0, a walk that completes with zero rows no longer early-returns
-at all; see the cage-scan section below). This is the only media signal
-the app has, because IF-MIB has none, and it is what
-`nodes.js`'s `sfpBadge` renders. The device dialog additionally patches the
-rows it fetched with the `if_index` set from its own `/dom` read, in the
-dialog's own closure, so whichever of the two fetches lands second paints
-the badge on a device the poller has not yet walked. That patch only ever
-UPGRADES a row to `'optic'`: the live read proves DOM on the ports it names
-and says nothing about the ones it does not.
+like `update_interface_poe`): `'optic'` for every port a sensor resolved
+to — whatever it read and whatever its status, since a failed optic is
+still an optic — and `NULL` for every other row of that device that
+currently names a medium. It is reached only after the walk answered, so a
+timeout never strips the badge — `_poll_environment` carries the sensor
+walk's own completion flag through to the badge-preservation step later in
+the same pass, gated on `not slots_complete or not sensor_complete`, that
+keeps a stored badge where it is (from 5.35.0, both a clean-empty and an
+incomplete sensor walk fall through to the rest of the pass rather than
+returning early; see the cage-scan section below). This is the only media
+signal the app has, because IF-MIB has none, and it is what `nodes.js`'s
+`sfpBadge` renders. The device dialog additionally patches the rows it
+fetched with the `if_index` set from its own `/dom` read, in the dialog's
+own closure, so whichever of the two fetches lands second paints the badge
+on a device the poller has not yet walked. That patch only ever UPGRADES a
+row to `'optic'`: the live read proves DOM on the ports it names and says
+nothing about the ones it does not.
 
 **5.25.0 narrows that live-read upgrade twice, now that a copper badge
 exists to protect.** `dialogOptics` — the set of `if_index` values the
@@ -1485,46 +1488,57 @@ before 5.35.0 that meant a switch whose optics carry no DOM/light-level
 data at all (real hardware, correctly identified, just nothing to read
 sensor-wise) never reached the ENTITY-MIB cage scan either, so it never
 earned a badge on any port. `_walk_sensor_columns` now also reports
-whether the sensor value walk itself finished, and the empty-`cols`
-branch splits on that: a **clean** empty table — the walk completed and
-there is genuinely nothing in it, a plain host or an all-copper switch —
-falls through instead of returning, `sensor_values`/`types`/`scales`/
+whether the sensor value walk itself finished, and the empty-`cols` branch
+splits on that: a **clean** empty table — the walk completed and there is
+genuinely nothing in it, a plain host or an all-copper switch — falls
+through instead of returning, `sensor_values`/`types`/`scales`/
 `precisions`/`statuses`/`units` set to empty dicts, and the rest of the
-pass — `entPhysicalDescr`, the port map, `_sfp_slot_media`, MAU-MIB —
-runs and badges the device off the cage scan alone, exactly as it would
-with a real sensor answer, just with nothing to add to `per_port`. An
+pass — `entPhysicalDescr`, the port map, `_sfp_slot_media`, MAU-MIB — runs
+and badges the device off the cage scan alone, exactly as it would with a
+real sensor answer, just with nothing to add to `per_port`. An
 **incomplete** walk — a timeout or row cap, not a real "nothing here"
-answer — still takes the old early return, so stored `'optic'` badges
-are preserved right alongside `'sfp'`/`'sfp_empty'`/`'copper'`: a slow
-device must not read as one that lost its optics. `sensor_capable`'s own
-latch (`self.db.set_sensor_capable`) is unaffected either way — it is
-still about whether the DOM/sensor tables themselves answer, nothing
-else.
+answer — falls through the same way rather than returning early; what
+protects stored badges is that this walk's own completion flag
+(`sensor_complete`) is carried to the badge-preservation step later in
+`_poll_environment`, gated on `not slots_complete or not sensor_complete`,
+so stored `'optic'` badges are preserved right alongside
+`'sfp'`/`'sfp_empty'`/`'copper'`: a slow device must not read as one that
+lost its optics. `sensor_capable`'s own latch
+(`self.db.set_sensor_capable`) is unaffected either way — it is still
+about whether the DOM/sensor tables themselves answer, nothing else.
 
 Falling through to a real ENTITY-MIB walk on *every* poll for a device
-that has genuinely never answered it — a plain host, a PDU with no
-optics at all — would cost every non-switch in the fleet a dead walk
-every `_SENSOR_REFRESH_S` (300 s). A new probe-once-remember pair,
+that has genuinely never answered it — a plain host, a PDU with no optics
+at all — would cost every non-switch in the fleet a dead walk every
+`_SENSOR_REFRESH_S` (300 s). A new probe-once-remember pair,
 `self._cage_read`/`self._cage_capable` (`dict[int, float]`/`dict[int,
 bool]`, same shape as `_mau_read`/`_mau_capable`), gates that: when the
-sensor branch is the clean-empty one, the cage scan below is skipped
-unless `_cage_capable.get(device_id)` is not `False` (never probed, or
-probed and it answered) or `_SENSOR_REPROBE_S` (3600 s) has passed since
-`_cage_read[device_id]` — in practice, a device is probed once, then
-re-probed hourly until it is proven capable, and every cadence
-(`_SENSOR_REFRESH_S`) after that. `_cage_capable` is set `True` the
-moment `_sfp_slot_media` reports any `entPhysicalClass` rows at all —
-from either code path, sensor-answered or not — and set `False` only on
-a *complete* cage walk that answered zero rows (a clean `noSuchObject`
-verdict: this device has no ENTITY-MIB); a walk cut short with zero rows
-so far proves nothing and leaves the latch as it was. `poll_now`
-(`nodepoll.py`) drops `_cage_read` alongside `_mau_read`/`_sensor_read`
-on a manual poll, so a fresh probe is not stuck behind a stale hour-old
-timestamp; `_cage_capable` is left untouched there, consistent with
-`_mau_capable` — the capability latch outlives a single poll, since an
-operator's retry proves nothing either way about whether ENTITY-MIB
-exists on the box. (There is no `_reset_device_caches` method — the pop
-is one line inside `poll_now` itself.)
+sensor branch is the clean-empty one, the cage scan below is skipped when
+`not _cage_capable.get(device_id) and not cage_due` — that is, unless the
+device is already latched capable, or the hourly reprobe window has
+arrived (`_SENSOR_REPROBE_S`, 3600 s, since `_cage_read[device_id]`). A
+**never-probed** device (`_cage_capable.get(device_id)` is `None`) is
+gated exactly like one that already answered `False`: it is probed once
+and then held to the same hourly reprobe cadence as a device that failed,
+until a walk proves it capable — in practice, a device is probed once,
+then re-probed hourly until it is proven capable, and every cadence
+(`_SENSOR_REFRESH_S`) after that. `_cage_capable` is set `True` the moment
+`_sfp_slot_media` reports any `entPhysicalClass` rows at all — from either
+code path, sensor-answered or not — and set `False` on either of two
+paths: a *complete* cage walk that answered zero rows (a clean
+`noSuchObject` verdict: this device has no ENTITY-MIB), or, before the
+cage scan is even reached, a `port_map` that came back empty with no
+`entAliasMapping` rows and a containment walk that itself ended cleanly
+empty — the plain-host latch, which reads an ENTITY-MIB-less device the
+same way whether the cage scan proper ever ran. A walk cut short with zero
+rows so far proves nothing on either path and leaves the latch as it was.
+`poll_now` (`nodepoll.py`) drops `_cage_read` alongside
+`_mau_read`/`_sensor_read` on a manual poll, so a fresh probe is not stuck
+behind a stale hour-old timestamp; `_cage_capable` is left untouched
+there, consistent with `_mau_capable` — the capability latch outlives a
+single poll, since an operator's retry proves nothing either way about
+whether ENTITY-MIB exists on the box. (There is no `_reset_device_caches`
+method — the pop is one line inside `poll_now` itself.)
 
 **`_sfp_slot_media` now returns four values, not two**: `(media,
 complete, class_rows, reasons)`. `class_rows` is the raw
@@ -1545,7 +1559,7 @@ advisory-only, the same "keep whatever is already stored" doctrine
 5.2.0 gave the class/model walks, rather than letting a half-mapped pass
 quietly downgrade or clear a badge a complete pass had already written.
 
-**`_log_media_diag(device, message)`** writes one line to the Nodes
+**`_log_media_diag(device, message, cause)`** writes one line to the Nodes
 event log, rate-limited per `(device, cause)` to `_SENSOR_REPROBE_S` (an
 hour) — a badge gap is a standing condition, not a transient one, so
 nothing is gained by repeating it every `_SENSOR_REFRESH_S` poll the way
@@ -1553,8 +1567,12 @@ nothing is gained by repeating it every `_SENSOR_REFRESH_S` poll the way
 the limit per cause rather than per device alone means a device hitting
 two distinct problems in the same hour — say an empty port map and a
 walk that did not finish — logs both, rather than the second cause going
-silent because the device already logged once. Three call sites, each
-naming a distinct cause:
+silent because the device already logged once. For a cut-short walk,
+`cause` is the column name alone (`reason.split(" walk cut short", 1)[0]`),
+not the full reason text: the row/dropped counts inside `message` change
+every poll, and keying the hourly limit on that changing text would defeat
+it, logging the "cut short" line fresh every cadence instead of once an
+hour. Three call sites, each naming a distinct cause:
 
 - **Empty port map.** When `port_map` comes back empty, the cage scan
   and MAU walk are skipped entirely (unchanged from before — two more
@@ -4536,7 +4554,14 @@ longer the state column's `_walk_column_status` alone; it now also folds
 in whether the columns the table filters and labels rows by
 (`entPhysicalClass`, the skip predicate, the name column) themselves
 walked to completion, the same completeness signal `_sfp_slot_media`
-already threads through for the badge scan. Before this, a class walk
+already threads through for the badge scan. Those class/skip/name
+columns are usually read back from `_vendor_psu_static` rather than
+walked fresh (see the per-sensor temperature/PSU section above), and
+that cache is written only when every static column it holds came back
+from a *complete* walk — so a class walk cut short cannot populate it
+with a partial answer that a later poll would then read back from cache
+as complete for the next `_SENSOR_REFRESH_S` (five minutes); it is
+re-walked next poll instead. Before this, a class walk
 cut short — one that answered zero rows because it timed out, not
 because the tray is genuinely empty — still let a complete state-column
 walk read as `complete`, and a table with nothing left to filter by then

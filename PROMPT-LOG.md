@@ -1451,3 +1451,41 @@ labelled as such. Testing: the full suite on the release commit passed 159 of 16
 → Stephen_King. `CHANGELOG.md`, `FEATURES.md`, `INTERNALS.md`,
 `NETWORK-AND-STORAGE-REQUIREMENTS.md` written for 5.23.0; no code
 touched.
+
+## Reviewer findings — six corrections to the SFP/cage-scan writeup
+
+**Prompt:** fix six reviewer findings in `INTERNALS.md` and
+`CHANGELOG.md` about how the SFP/DOM badge scan behaves in
+`nodepoll._poll_environment`, checked against the actual code, no code
+changes.
+
+**What was wrong and what changed.** The doc still described an "early
+return" for a timed-out or incomplete sensor walk; that return was
+removed in 5.35.0 — both a clean-empty and a cut-short sensor walk now
+fall through, and what actually protects a stored badge is a later
+preservation step gated on `not slots_complete or not sensor_complete`.
+Two passages making the old claim are rewritten to say so. The doc also
+said the ENTITY-MIB cage scan is skipped for a device unless it was
+"never probed, or probed and it answered" — in the real gate, a
+never-probed device is treated exactly like one that already failed: it
+gets one probe, then waits out the same hourly reprobe window, until it
+proves itself capable. Also added the second way a device gets latched
+"not cage-capable": not only a complete cage walk that answers zero
+rows, but also a clean, completely-empty port map with no alias rows
+and no containment tree at all (a plain host). The `_log_media_diag`
+signature was shown as two arguments; it is three — `(device, message,
+cause)` — and a line was added explaining why that matters: the cause
+passed for a cut-short walk is the column name, not the row-count text,
+so a changing row count each poll can't dodge the hourly log limit. The
+vanish-detection writeup for pulled PSU/fan trays didn't say that the
+class/skip/name columns it depends on are themselves cached, and that
+the cache is only ever written from a complete walk — a note was added
+so a partial class walk can't get served back out of that cache as
+"complete" for the next five minutes. Last, `CHANGELOG.md` said the SFP
+diagnostic log line fires "once an hour per device" where it is
+actually once an hour per device *and cause* (matching what
+`FEATURES.md` already said, and what the code does).
+
+**Outcome.** All six passages corrected against the code
+(`netpath/nodepoll.py`), with the surrounding prose rewrapped where the
+edits changed line lengths. No code, HTML, or other files touched.

@@ -421,6 +421,39 @@ check("...and the seen set is left exactly as poll 1 left it",
       poller_ctx._vendor_psu_seen.get((25, fru.state)) == {"10"},
       poller_ctx._vendor_psu_seen)
 
+# --- a partial (incomplete) class walk must not be cached as complete ----
+# (5.35.0 review fix): caching it forced static_complete True on the next
+# poll's cache hit, so an unreached supply read as filtered-out-and-gone.
+poller_pcache = new_poller()
+pcache_cols = {fru.state: {"10": 2, "11": 2}, fru.name: {"10": "PSU-0", "11": "PSU-1"},
+              fru.class_col: {"10": 6, "11": 6}}
+poller_pcache._walk_column_detail = table_walker(pcache_cols)
+dev_pcache = device(CISCO_OID, id=26)
+poller_pcache._poll_vendor_sensors(26, dev_pcache, CONFIG, 1_700_000_000.0)
+poller_pcache._forget_vendor_psu_static(26)
+
+
+def one_of_two_class_rows(device, config, oid, raise_on_timeout=False, deadline=None):
+    if oid == fru.class_col:
+        return {"10": 6}, False, "cut short"   # only 1 of 2 rows reached
+    return dict(pcache_cols.get(oid, {})), True, ""
+
+
+poller_pcache._walk_column_detail = one_of_two_class_rows
+poller_pcache.db.sample_calls.clear()
+poller_pcache._poll_vendor_sensors(26, dev_pcache, CONFIG, 1_700_000_060.0)
+check("partial class walk: not cached as complete",
+      (26, fru.state) not in poller_pcache._vendor_psu_static,
+      poller_pcache._vendor_psu_static)
+
+poller_pcache._walk_column_detail = table_walker(pcache_cols)
+poller_pcache.db.sample_calls.clear()
+poller_pcache._poll_vendor_sensors(26, dev_pcache, CONFIG, 1_700_000_120.0)
+check("...poll 60s later, everything complete: the unreached supply reads "
+      "ok, not a stale ABSENT off a cached partial class map",
+      poller_pcache.db.samples_dict(26).get("psu_state.11") == 0.0,
+      poller_pcache.db.samples_dict(26))
+
 print()
 if FAILS:
     print(f"{len(FAILS)} check(s) failed: {', '.join(FAILS)}")
