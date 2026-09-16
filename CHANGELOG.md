@@ -220,7 +220,12 @@ nothing for that poll — neither the detail nor the summary — so a
 blocked uplink never flickers to forwarding because one VLAN walk was
 slow; the stored state stands until the next complete pass. A port that
 is disabled or broken in every VLAN keeps that word rather than reading
-forwarding. Whether a device answers a per-VLAN
+forwarding. One walker rule changed for every SNMPv1 device, not only
+PVST ones: a noSuchName reply to GETNEXT after at least one row of a
+column has been accepted is now read as the end of the MIB view (RFC
+1157) and the walk counts as complete, where it used to count as cut
+short; with no rows accepted it is still a refusal with the status named.
+Whether a device answers a per-VLAN
 context at all is probed once and remembered (`stp_vlan_capable`), the
 same idiom the media/sensor probes use, with a device that has never
 answered re-tried once an hour rather than given up on for good.

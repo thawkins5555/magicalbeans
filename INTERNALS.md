@@ -6157,7 +6157,14 @@ read's own value; a port the global read listed but no VLAN context
 mentioned keeps the global value. The per-VLAN pass runs before the
 `stp_capable` verdict is latched to 0 on a Cisco v1/v2c device, and
 before the empty-`dot1dStpPortState` early return, so a switch whose
-VLAN 1 carries no ports at all still gets its detail.
+VLAN 1 carries no ports at all still gets its detail. `_walk_column_
+status` gained one v1-only rule for the same feature: on a configured
+SNMPv1 device (`snmp_version_of(config) == 0`) a noSuchName(2) reply to
+GETNEXT after at least one row of the column has been accepted is the
+end of the MIB view (RFC 1157), so the walk breaks with `complete=True`
+and no reason; with no rows accepted the existing incomplete-with-reason
+path stands (the PAN-OS refusal case). v2c/v3 paths are untouched, and
+`tests/test_stp_vlan.py` pins both branches directly.
 
 **Storage**: `nodesdb.ensure_columns` adds `devices.stp_vlan_capable
 INTEGER` beside `stp_capable`, and `interfaces.stp_blocking_vlans TEXT`/
