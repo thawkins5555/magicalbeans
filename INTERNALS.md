@@ -5989,17 +5989,22 @@ the "every key a discovered link carries" contract `tests/
 test_mapper_api.py` pins.
 
 **One line per cable: `assemble_links` gains an optional `port_index`
-kwarg**, `(device_id, port_text) -> if_index | None`. For a row that
-already matched a device (`matched_id` set) but not a specific port
-(`matched_if_index` is `None` — the ordinary CDP-only shape), it tries
-`port_index(matched_id, row["port_id"])` then `row["port_descr"]`; a hit
-keys the link on the same `link_identity` frozenset a MAC-matched row
-would use and fills `b_if_index`/`b_port` from the resolved port, so two
+kwarg**, `(device_id, port_text) -> if_index | None`. For every row that
+matched a device (`matched_id` set) it tries
+`port_index(matched_id, row["port_id"])` then `row["port_descr"]` first,
+ahead of `matched_if_index`: the chassis-MAC join proves which device
+answered, not which port (it returns the lowest interface carrying the
+base MAC, the same port for every cable from that switch), so an LLDP row
+for a second cable to the same neighbour used to land on the same wrong
+port and draw twice. A hit keys the link on the same `link_identity`
+frozenset a MAC-matched row would use and fills `b_if_index`/`b_port`
+from the resolved port, so two
 real cables between one device pair each resolve to their own distinct
 frozenset key instead of competing for the single ambiguous
 `("name-match", …)` key `_fold_reciprocal_name_matched` (5.7.0) can only
 safely fold when a pair reports exactly one link from each side. A miss
-falls back to the pre-5.36.0 per-row key untouched. `link_identity`'s
+falls back to `matched_if_index`, and failing that to the pre-5.36.0
+per-row key, untouched. `link_identity`'s
 and `_fold_reciprocal_name_matched`'s docstrings each gained one
 sentence noting this third route to the same frozenset shape, since the
 neighbour naming its own port is evidence a resolver can act on, not the

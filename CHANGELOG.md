@@ -247,7 +247,10 @@ cables between one pair now draw as two links, not four. The "still
 draws as separate lines" caveat that applied to a LAG or a cross-
 connected pair now applies only when the reported port name resolves to
 nothing at all; wherever it resolves, the pairing is evidence the
-neighbour itself sent, not a guess.
+neighbour itself sent, not a guess. The same port name also outranks the
+port the chassis-MAC join used to pick for an LLDP row: that join names
+the switch, not the port, so a second LLDP cable to the same switch used
+to resolve to the same far-end port as the first and draw twice.
 
 **Parallel links between the same two devices now fan apart on the
 canvas instead of stacking on identical coordinates.** Each link in a
