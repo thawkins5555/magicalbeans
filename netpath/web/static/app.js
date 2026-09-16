@@ -2973,9 +2973,15 @@ const App = (() => {
         : smoothed };
     });
     const value = (p) => p.avg !== undefined ? p.avg : p.value;
-    const allValues = seriesList.flatMap((s) => s.points.flatMap((p) =>
-      p.avg !== undefined ? [p.min, p.avg, p.max].filter((v) => v != null)
-        : (p.value != null ? [p.value] : [])));
+    // The ceiling comes from what is actually drawn: the avg/value line for
+    // every series, plus the min/max band only when drawBand puts it on
+    // screen — an undrawn band must not push visible lines down.
+    const allValues = seriesList.flatMap((s) => s.points.flatMap((p) => {
+      if (p.avg !== undefined) {
+        return drawBand ? [p.min, p.avg, p.max].filter((v) => v != null) : [p.avg];
+      }
+      return p.value != null ? [p.value] : [];
+    }));
     const plot = { x: PAD.left, y: PAD.top,
       w: Math.max(width - PAD.left - PAD.right, 10),
       h: Math.max(height - PAD.top - PAD.bottom, 10) };
@@ -3004,7 +3010,7 @@ const App = (() => {
       mem.peak = peak;
     }
     const xFor = (ts) => plot.x + ((ts - t0) / Math.max(t1 - t0, 1)) * plot.w;
-    const yFor = (v) => plot.y + plot.h - (Math.max(v, 0) / peak) * plot.h;
+    const yFor = (v) => plot.y + plot.h - (Math.min(Math.max(v, 0), peak) / peak) * plot.h;
 
     for (let step = 0; step <= 2; step += 1) {
       const frac = step / 2;

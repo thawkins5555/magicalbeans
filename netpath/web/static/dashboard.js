@@ -1118,8 +1118,11 @@
       const svg = wrap.querySelector('svg');
       if (!svg) continue;
       const cfg = (layoutTile && layoutTile.config) || {};
+      // A percent tile with no user-set ceiling still needs a fixed 0-100
+      // axis — otherwise a 3% CPU line auto-scales to fill the plot.
+      const peak = cfg.y_max || (chart && chart.unit === '%' ? 100 : undefined);
       const geo = App.drawSeriesChart(svg, wrap, chart || null,
-        { emptyText: 'No data in this window', peak: cfg.y_max || undefined });
+        { emptyText: 'No data in this window', peak });
       if (layoutTile && !view.editing && geo) {
         App.attachChartZoom(svg, geo, {
           wheelRequiresCtrl: true,

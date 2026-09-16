@@ -11503,10 +11503,10 @@ def _offender_rows(rows, n: int, value_key: str, unit: str) -> list[dict]:
 def _offender_node_lists(service, since: float, n: int) -> tuple[list, list]:
     """(event lists, metric lists); the gated alerts list goes between them."""
     events = service.nodes_db.count_events_by_device(since, limit=n)
-    # Flaps are their own list so a flapping port is not hidden by a noisy device.
-    flaps = service.nodes_db.count_events_by_device(
-        since, kinds=["interface_down", "interface_up", "interface_flapping"],
-        limit=n)
+    # Flaps are their own list so a flapping port is not hidden by a noisy
+    # device. Port transitions live in interface_events (link_up/link_down),
+    # not device_events, hence the separate query.
+    flaps = service.nodes_db.count_interface_events_by_device(since, limit=n)
     head = [
         {"key": "events", "title": "Most device events (24 h)",
          "unit": "", "rows": _offender_rows(events, n, "n", "")},

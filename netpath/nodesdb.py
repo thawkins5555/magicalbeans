@@ -4844,6 +4844,29 @@ class NodesDatabase(SqliteStore):
                 f" WHERE {where} GROUP BY e.device_id"
                 f" ORDER BY n DESC, d.name COLLATE NOCASE{tail}", params).fetchall()
 
+    def count_interface_events_by_device(self, since: float,
+                                         limit: int | None = None) -> list[sqlite3.Row]:
+        """count_events_by_device's shape (device_id, name, ip, sys_name,
+        display_name_source, n), but for port transitions: those are stored
+        in interface_events (interface_id keyed, kind link_up/link_down),
+        not device_events, so they need their own join through `interfaces`
+        to reach a device."""
+        tail = ""
+        params: list = [float(since)]
+        if limit is not None:
+            tail = " LIMIT ?"
+            params.append(int(limit))
+        with self._lock:
+            return self._conn.execute(
+                "SELECT d.id AS device_id, d.name AS name, d.ip AS ip,"
+                " d.sys_name AS sys_name, d.display_name_source AS display_name_source,"
+                " COUNT(*) AS n FROM interface_events e"
+                " JOIN interfaces i ON i.id = e.interface_id"
+                " JOIN devices d ON d.id = i.device_id"
+                " WHERE e.ts >= ? AND e.kind IN ('link_up','link_down')"
+                " GROUP BY d.id"
+                f" ORDER BY n DESC, d.name COLLATE NOCASE{tail}", params).fetchall()
+
     def record_interface_event(self, interface_id: int, kind: str, detail: str = "") -> None:
         with self._lock:
             self._conn.execute(
