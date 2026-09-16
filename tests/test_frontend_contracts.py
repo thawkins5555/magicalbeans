@@ -781,8 +781,10 @@ check(not mapper_ungated,
 # 5.18.0: the label layer moved above the node layer too, so a label is
 #      never painted under a node box.
 INDEX_HTML = read("index.html")
-check("group.append(gridLayer, linkLayer, nodeLayer, labelLayer)" in MAPPER,
-      "the label layer paints above both links and node boxes")
+check("group.append(gridLayer, frameLayer, linkLayer, nodeLayer, labelLayer)" in MAPPER,
+      "the label layer paints above both links and node boxes; frameLayer "
+      "(5.31.0) sits between the grid and the links so a frame paints under "
+      "both")
 check("function drawLink(layer, link, labelLayer = layer)" in MAPPER
       # 3: the per-strand VLAN number, the collapsed-trunk VLAN count, and
       # (5.23.0, D2) a manual line's own label.
@@ -1203,10 +1205,12 @@ check("  function renderDetail()" in MAPPER_JS
 #      aria-label advertises did nothing at all after a click on the map.
 check("function focusCanvas()" in MAPPER_JS,
       "a press on the map moves focus to #mp-canvas itself")
-check(MAPPER_JS.count("focusCanvas();") == 4,
-      "all four presses that preventDefault — a node, a pan, a Drag-pans pan and a rubber band "
-      "— focus the canvas, so the keyboard controls its aria-label promises are "
-      "live straight after a click")
+check(MAPPER_JS.count("focusCanvas();") == 7,
+      "the four presses that preventDefault — a node, a pan, a Drag-pans pan and "
+      "a rubber band — still focus the canvas, so the keyboard controls its "
+      "aria-label promises are live straight after a click; 5.31.0 adds three "
+      "more (the framing drag, a frame press in onFramePointerDown, and "
+      "centerOn's Find)")
 check("canvas.focus({ preventScroll: true })" in MAPPER_JS,
       "and it does not scroll the page to the canvas that is already under the "
       "pointer")
@@ -3823,6 +3827,250 @@ check("{ fromRoute: true, route: bootRoute, initial: true }" in APP,
 check("if (!filtered && !opts.initial) {" in NODES,
       "activate() skips revealDevice (and so keeps every remembered "
       "filter) on the boot-time replay of a device route")
+
+# ---------------------------------------------------------------------------
+# 86. MAPPER (5.31.0): Find a node. A plain text box beside the Map select,
+#     not a dialog — the operator is orienting themselves on a map that may
+#     hold hundreds of boxes, so autocomplete and Enter answer the question
+#     without one more thing to click through.
+MAPPER86 = read("mapper.js")
+INDEX86 = read("index.html")
+_MP_BAR86 = INDEX86[INDEX86.index('<div class="bar wrap">'):INDEX86.index('id="mp-add-device"')]
+check('<label>Map <select id="mp-map"></select></label>' in _MP_BAR86
+      and '<label>Find <input id="mp-find"' in _MP_BAR86
+      and 'list="mp-find-list"' in _MP_BAR86
+      and '<datalist id="mp-find-list"></datalist>' in _MP_BAR86,
+      "the Find box and its datalist sit in the Mapper action bar, right "
+      "after the Map select and before Add device")
+check('data-requires-write' not in _MP_BAR86[_MP_BAR86.index('id="mp-find"'):
+                                             _MP_BAR86.index('id="mp-find"') + 200],
+      "Find is a read control: it selects a node already on the map, it "
+      "does not write one")
+check("function rebuildFindList()" in MAPPER86 and "function findMatches(text)" in MAPPER86
+      and "function findNode(text)" in MAPPER86 and "function centerOn(node)" in MAPPER86,
+      "rebuildFindList/findMatches/findNode/centerOn all exist")
+_FIND86 = MAPPER86[MAPPER86.index("  function rebuildFindList()"):
+                   MAPPER86.index("  // Reassigned (not mutated in place)")]
+check("for (const value of [node.label, node.name, node.resolved_name, node.ip])" in _FIND86,
+      "both the datalist and findMatches read the same four fields — label, "
+      "name, resolved_name, ip — so a suggestion is always something Enter "
+      "can actually find")
+check(_FIND86.count("for (const value of [node.label, node.name, node.resolved_name, node.ip])") == 2,
+      "...once to build the datalist, once to rank a match — no third, "
+      "independent field list to drift out of step with either")
+check("options.push(`<option value=\"${escape(value)}`" in _FIND86.replace("\n      ", " ")
+      or "options.push(`<option value=\"${escape(value)}\">`)" in _FIND86,
+      "the datalist's option values are escaped, like every other "
+      "interpolated name in this file")
+check("options.length < FIND_LIST_CAP" in _FIND86 and "const FIND_LIST_CAP = 300;" in MAPPER86,
+      "the datalist is capped at 300 distinct suggestions")
+check("field === q ? 0 : field.startsWith(q) ? 1 : field.includes(q) ? 2 : 4" in _FIND86,
+      "a node ranks by exact match, then prefix, then plain substring, "
+      "case-insensitively")
+check("view.frame.cx = pos.x;" in _FIND86 and "view.frame.cy = pos.y;" in _FIND86
+      and "view.pan = { x: 0, y: 0 };" in _FIND86
+      and "view.zoom = Math.max(view.zoom, 1);" in _FIND86
+      and "applyTransform();" in _FIND86,
+      "centerOn re-centres the frame on the node and never zooms OUT to "
+      "show it — a Find should not leave the operator squinting at a map "
+      "that was already zoomed in further than 1x")
+check("setSelection(new Set([node.id]));" in _FIND86 and "focusCanvas();" in _FIND86,
+      "centerOn selects the found node and hands the canvas keyboard focus, "
+      "the same as clicking it would")
+check("view.findIndex = (view.findQuery.toLowerCase() === q.toLowerCase() && view.findIndex >= 0)"
+      in _FIND86,
+      "findNode only advances to the NEXT hit when the box still holds the "
+      "same text as last time — a changed search restarts at the first hit")
+check('App.toast(`No device on this map matches "${q}".`, \'fail\');' in _FIND86,
+      "no match at all is reported through App.toast, not silence")
+check("App.el('mp-find').addEventListener('keydown', onFindKeydown);" in MAPPER86,
+      "init() wires Enter on #mp-find to findNode")
+check("rebuildFindList();" in MAPPER86
+      and MAPPER86.count("rebuildFindList();") == 2,
+      "loadMapData rebuilds the datalist on both its branches (a real "
+      "payload, and the no-map-selected reset)")
+
+# ---------------------------------------------------------------------------
+# 87. MAPPER (5.31.0): Select all in Add device and Add neighbours. Each
+#     dialog keeps its own picked-id/-key Set OUTSIDE the DOM (draw2/
+#     redrawNeighbourRows tear the tbody down and rebuild it on every
+#     keystroke and every sort), so the header checkbox and the Add button
+#     both read that Set, never the DOM's own checked state.
+MAPPER87 = read("mapper.js")
+_ADD_DEVICE87 = MAPPER87[MAPPER87.index("  async function openAddDevice()"):
+                         MAPPER87.index("  // netpath/web/api.py's get_mapper_map_candidates")]
+_ADD_NEIGH87 = MAPPER87[MAPPER87.index("  async function openAddNeighbours()"):
+                        MAPPER87.index("  function removeSelected()")]
+for _name, _block, _picked, _field in (
+    ("Add device", _ADD_DEVICE87, "devicePicked", "r.id"),
+    ("Add neighbours", _ADD_NEIGH87, "neighbourPicked", "r.key"),
+):
+    check("selectAll: {" in _block,
+          "%s passes a selectAll option to App.grid" % _name)
+    check("key: 'check'," in _block, "...keyed to the 'check' column")
+    check("label: 'Select all listed devices'," in _block,
+          "...with the label 'Select all listed devices'" )
+    check("checked: rows.length > 0 && rows.every((r) => %s.has(%s))" % (_picked, _field) in _block,
+          "...checked is true only when EVERY currently filtered row (not "
+          "the full candidate list) is in %s" % _picked)
+    check("some: rows.some((r) => %s.has(%s))" % (_picked, _field) in _block,
+          "...some (the indeterminate state) reads the same filtered rows")
+    check("onToggle: (on) => {" in _block,
+          "...onToggle is provided")
+    check("for (const r of rows) { if (on) %s." % _picked in _block,
+          "...onToggle adds or removes exactly the filtered rows, not the "
+          "whole candidate list")
+    check(("const %s = [...%s];" % ("ids" if _picked == "devicePicked" else "keys", _picked)) in _block,
+          "the Add button reads %s directly, not a fresh "
+          "querySelectorAll('.mp-pick:checked') over a tbody that may have "
+          "just been rebuilt" % _picked)
+    check("%s = new Set();" % _picked in _block,
+          "...and the dialog starts each open with a fresh, empty Set")
+    check("body.addEventListener('change', (event) => {" in _block,
+          "a checkbox tick is caught by delegation on the tbody, since the "
+          "tbody itself is rebuilt on every redraw")
+check("cell: (r) => `<input type=\"checkbox\" class=\"mp-pick\" data-id=\"${r.id}\"` +\n"
+      "        `${devicePicked.has(r.id) ? ' checked' : ''}>` }" in MAPPER87,
+      "DEVICE_PICK_COLUMNS' checkbox cell renders `checked` from devicePicked, "
+      "not from nothing (a checkbox that never shows a previously-ticked row "
+      "as ticked again after a redraw is the same bug as never keeping the "
+      "pick at all)")
+check("cell: (r) => `<input type=\"checkbox\" class=\"mp-pick\" data-key=\"${escape(r.key)}\"` +\n"
+      "        `${neighbourPicked.has(r.key) ? ' checked' : ''}>` }" in MAPPER87,
+      "NEIGHBOUR_PICK_COLUMNS' checkbox cell renders `checked` from "
+      "neighbourPicked the same way")
+
+# ---------------------------------------------------------------------------
+# 88. MAPPER (5.31.0): Frames — a labelled decoration drawn under every
+#     link and node. A frame never moves what it encloses: nothing in this
+#     section reads or writes view.nodes' own x/y.
+MAPPER88 = read("mapper.js")
+INDEX88 = read("index.html")
+APP_CSS88 = read("app.css")
+_MP_BAR88 = INDEX88[INDEX88.index('<div class="bar wrap">'):INDEX88.index("</div>", INDEX88.index('<div class="bar wrap">'))]
+check('id="mp-add-frame" data-requires-write="mapper"' in INDEX88,
+      "the Frame button exists and is gated on mapper write")
+check(INDEX88.index('id="mp-connect"') < INDEX88.index('id="mp-add-frame"'),
+      "Frame sits after Connect in the action bar")
+check("['mp-add-frame', !canWrite || !hasMap]," in MAPPER88,
+      "Frame is disabled with no map selected or no write access, in the "
+      "same toolbar-state table as every other mapper write control")
+
+# 88a. The three frame routes, and the fill/stroke pointer-events split
+#      that keeps a rubber-band drag or a pan working with the pointer
+#      resting over the INSIDE of a frame.
+check("await App.post(`/api/mapper/maps/${view.mapId}/frames`, { x, y, width, height });" in MAPPER88,
+      "createFrame POSTs the new rectangle to .../maps/<id>/frames")
+check("await App.put(`/api/mapper/maps/${view.mapId}/frames/${frame.id}`, { label });" in MAPPER88
+      and "await App.put(`/api/mapper/maps/${view.mapId}/frames/${frame.id}`, { color });" in MAPPER88,
+      "the label save and each colour swatch PUT .../frames/<id> with just "
+      "their own field")
+check("() => App.del(`/api/mapper/maps/${view.mapId}/frames/${id}`)," in MAPPER88,
+      "removeFrame DELETEs .../frames/<id>, through the same "
+      "App.confirmDestructive action-callback shape confirmDeleteMap and "
+      "removeSelected already use")
+check("'pointer-events': 'none'" in MAPPER88 and "'pointer-events': 'stroke'" in MAPPER88,
+      "the fill rect takes no pointer events at all, and the stroke rect "
+      "only on the outline itself, so a drag started over a frame's own "
+      "interior still reaches the canvas below it")
+
+# 88b. frameLayer paints under both links and nodes (§28d's own pin, above,
+#      already covers the exact append order — this just names the class
+#      list a frame's <g> carries and the fixed child order within it).
+_DRAW_FRAME88 = MAPPER88[MAPPER88.index("  function drawFrame(layer, frame)"):
+                         MAPPER88.index("  // `bounds`/size come from draw()")]
+check("g.append(fill, stroke, label, handle);" in _DRAW_FRAME88,
+      "a frame's <g> holds its fill, stroke, label and resize handle in "
+      "that fixed order")
+check("class: `mp-frame ${frameColorClass(frame)}${selected ? ' selected' : ''}`" in _DRAW_FRAME88,
+      "the <g> carries .selected only when it is the selected frame")
+for _idx in range(6):
+    check(".mp-frame-c%d {" % _idx in APP_CSS88, "app.css defines .mp-frame-c%d" % _idx)
+check("--mp-frame-color: var(--canvas-vlan-1);" in APP_CSS88
+      and "--mp-frame-color: var(--canvas-vlan-6);" in APP_CSS88,
+      "the six frame colours share --canvas-vlan-1..6, the same "
+      "canvas-tuned hues a VLAN strand already draws with in every theme")
+
+# 88c. Drawing: Frame arms view.framing, the next empty-canvas drag reuses
+#      the rubber-band gesture, and disarming is the same one function
+#      whichever way the gesture ends.
+check("view.rubber = { x0: p.x, y0: p.y, x1: p.x, y1: p.y, drawFrame: true };" in MAPPER88,
+      "the framing drag reuses view.rubber (and so onSvgPointerMove/"
+      "drawRubber) wholesale, distinguished only by the drawFrame flag")
+check("if (view.rubber && view.rubber.drawFrame) {" in MAPPER88,
+      "onSvgPointerUp branches on that flag before the ordinary "
+      "rubber-band/multi-select handling runs")
+check("if (width >= FRAME_MIN && height >= FRAME_MIN) createFrame(x, y, width, height);" in MAPPER88
+      and "const FRAME_MIN = 40;" in MAPPER88,
+      "a rectangle under 40x40 scene units is dropped, not POSTed")
+check("function disarmFraming()" in MAPPER88
+      and MAPPER88.count("disarmFraming();") >= 3,
+      "disarmFraming is the one place that un-arms the tool — called after "
+      "a finished drag (including a too-small one), on Escape, and when "
+      "the toolbar state itself would otherwise leave a disabled button "
+      "looking armed")
+check("if (event.key !== 'Escape' || App.state.tab !== 'mapper' || !view.framing) return;" in MAPPER88,
+      "Escape only disarms while framing is actually armed, and only on "
+      "the Mapper tab")
+
+# 88d. Selecting, editing and removing a frame.
+check("view.selectedFrameId = frame.id;" in MAPPER88
+      and "view.selection = new Set();" in MAPPER88[MAPPER88.index("function onFramePointerDown"):]
+      and "view.selectedLinkId = null;" in MAPPER88[MAPPER88.index("function onFramePointerDown"):
+                                                     MAPPER88.index("function onFramePointerDown") + 600],
+      "onFramePointerDown selects the frame and clears whatever node/link "
+      "selection there was")
+check("view.selectedFrameId = null;" in MAPPER88[MAPPER88.index("function setSelection("):
+                                                 MAPPER88.index("function setSelection(") + 200]
+      and "view.selectedFrameId = null;" in MAPPER88[MAPPER88.index("function selectLink("):
+                                                      MAPPER88.index("function selectLink(") + 300],
+      "...and selecting a node or a link clears the frame selection back")
+check("if (view.selectedFrameId) {" in MAPPER88[MAPPER88.index("function renderDetail()"):
+                                                MAPPER88.index("function renderDetail()") + 400],
+      "renderDetail's FRAME branch runs before the link/node branches")
+check("function frameDetailHtml(frame)" in MAPPER88 and "function frameSwatchesHtml(frame, canWrite)" in MAPPER88,
+      "the frame pane has its own label-input/colour-swatch/Remove markup")
+check("data-requires-write=\"mapper\"${gate}" in MAPPER88,
+      "the frame pane's input/swatches/Remove are gated on mapper write "
+      "exactly the way the node rename field is (disabled, not hidden)")
+check("if ((event.key === 'Delete' || event.key === 'Backspace') && view.selectedFrameId) {" in MAPPER88,
+      "Delete/Backspace on the canvas removes the selected frame")
+check("function removeFrame(id)" in MAPPER88 and "App.confirmDestructive('Remove frame'," in MAPPER88,
+      "removeFrame confirms the same way removeSelected does for nodes, "
+      "shared by the pane's own Remove button and the keyboard shortcut")
+
+# 88e. Moving/resizing: a debounced, per-frame write with the same
+#      debounce/retry constants flushPositionWrites already uses.
+check("function queueFrameWrite(id, patch)" in MAPPER88 and "function flushFrameWrite(id)" in MAPPER88,
+      "queueFrameWrite/flushFrameWrite exist")
+check("view.frameWriteTimers.set(id, setTimeout(() => flushFrameWrite(id), WRITE_DEBOUNCE_MS));"
+      in MAPPER88,
+      "a frame write debounces on WRITE_DEBOUNCE_MS, the same constant "
+      "flushPositionWrites uses for a node drag")
+check("view.frameWriteRetryTimers.set(id, setTimeout(() => flushFrameWrite(id), WRITE_RETRY_MS));"
+      in MAPPER88,
+      "...and retries on WRITE_RETRY_MS after a failed PUT, with a toast "
+      "(the same idiom, not a silently dropped edit)")
+check("view.pendingFramePatches = new Map();" in MAPPER88 or "pendingFramePatches: new Map()," in MAPPER88,
+      "one pending patch is tracked per frame id, not one shared patch for "
+      "every frame being edited at once")
+check("if (snap) { x = snapValue(x); y = snapValue(y); }" in MAPPER88[MAPPER88.index("function onFramePointerDown"):],
+      "a frame move snaps to the grid the same way a node drag does when "
+      "Snap is on")
+check("Math.max(FRAME_MIN, snapValue(width))" in MAPPER88 and "Math.max(FRAME_MIN, snapValue(height))" in MAPPER88,
+      "a resize never snaps below the 40-unit floor")
+
+# 88f. contentBounds (Fit / PNG export) encloses frames too.
+_CONTENT_BOUNDS88 = MAPPER88[MAPPER88.index("  function contentBounds()"):
+                             MAPPER88.index("  // `bounds`/size come from draw()")]
+check("for (const frame of view.frames) {" in _CONTENT_BOUNDS88
+      and "liveFrameRect(frame)" in _CONTENT_BOUNDS88,
+      "contentBounds folds every frame's live rect into the same min/max "
+      "it already computes for nodes, so Fit and the PNG export enclose "
+      "a frame that sticks out past every node on the map")
+check("!view.nodes.length && !view.frames.length" in MAPPER88,
+      "an all-frames, no-devices map still has content to fit, rather than "
+      "reading as empty")
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))

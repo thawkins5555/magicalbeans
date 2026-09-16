@@ -1928,6 +1928,45 @@ body.kiosk .card.strip > .hint { overflow: visible; white-space: normal; }
 .mp-swatch.selected { outline: 2px solid var(--focus); outline-offset: 1px; }
 .mp-swatch-grid { display: flex; flex-wrap: wrap; gap: var(--space-sm); }
 
+/* Frame tool arm/disarm: the toolbar button reads pressed the way
+   button.primary does elsewhere, and the canvas gets a crosshair while a
+   drag is expected. */
+#mp-add-frame.active { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+#mp-canvas.framing #mp-svg { cursor: crosshair; }
+
+/* Frames: a labelled rectangle drawn under every link and node — see
+   mapper.js's file-header comment on why nothing here ever moves a node.
+   Six palette entries share --canvas-vlan-1..6, the same canvas-tuned
+   hues a VLAN strand already draws with, so a frame reads correctly
+   against #mp-canvas in every theme without a palette of its own. */
+.mp-frame-c0 { --mp-frame-color: var(--canvas-vlan-1); }
+.mp-frame-c1 { --mp-frame-color: var(--canvas-vlan-2); }
+.mp-frame-c2 { --mp-frame-color: var(--canvas-vlan-3); }
+.mp-frame-c3 { --mp-frame-color: var(--canvas-vlan-4); }
+.mp-frame-c4 { --mp-frame-color: var(--canvas-vlan-5); }
+.mp-frame-c5 { --mp-frame-color: var(--canvas-vlan-6); }
+.mp-frame-fill { fill: var(--mp-frame-color); fill-opacity: 0.14; }
+.mp-frame.selected .mp-frame-fill { fill-opacity: 0.22; }
+.mp-frame-stroke {
+  fill: none;
+  stroke: var(--mp-frame-color);
+  stroke-width: 1.5;
+  stroke-dasharray: 6 4;
+  cursor: move;
+}
+.mp-frame.selected .mp-frame-stroke { stroke-width: 2.5; }
+.mp-frame-label {
+  fill: var(--mp-frame-color);
+  font-family: var(--ui);
+  font-size: var(--fs-2xs);
+  cursor: move;
+  paint-order: stroke;
+  stroke: var(--canvas);
+  stroke-width: 3px;
+  stroke-linejoin: round;
+}
+.mp-frame-handle { fill: var(--mp-frame-color); opacity: 0.8; cursor: nwse-resize; }
+
 /* ----------------------------------------------------------- breakpoints
    Density above keys on height only, so a narrow, tall window still got the
    full sidebar and a 420px dialog. Width steps: below 1200px the fixed

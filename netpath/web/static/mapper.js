@@ -45,6 +45,14 @@
   // How far the pointer travels, in SCREEN pixels, before a press on a node
   // counts as a drag rather than a click.
   const MOVE_THRESHOLD_PX = 3;
+  // A frame's minimum drawn size in scene units, both ways: a drag that
+  // draws one smaller is ignored, and a resize never shrinks one further —
+  // matches post_mapper_map_frames' own server-side floor.
+  const FRAME_MIN = 40;
+  const FRAME_HANDLE = 10;   // the resize-handle square, in scene units
+  // How many distinct name/IP strings #mp-find-list offers before it stops
+  // growing — a fleet-sized map's datalist should not become its own scroll.
+  const FIND_LIST_CAP = 300;
 
   // mapperdb.MAP_STYLES, mirrored so the settings dialog's <select> and the
   // canvas's data-map-style attribute never drift from the server's own list.
@@ -83,12 +91,14 @@
     links: [],
     peersByKey: new Map(),
     vlans: [],
+    frames: [],           // map_frames rows, x/y/width/height possibly overridden by an in-flight drag/resize
     // Rebuilt with the payload in loadMapData; replaces an Array.find()
     // per lookup that made a 60-node/200-link map quadratic.
     nodeMap: new Map(),        // map_nodes id -> row
     linkMap: new Map(),        // link id -> link
     vlanNameById: new Map(),   // vlan id -> its name on this map ('' when unnamed)
     linksByNode: new Map(),    // map_nodes id -> the links touching it
+    frameMap: new Map(),       // frame id -> row
 
     // The drawn SVG, kept so pan/zoom/drag can move it instead of
     // rebuilding (applyTransform, redrawDragged, drawRubber).
@@ -97,12 +107,14 @@
     nodeEls: new Map(),        // map_nodes id -> its <g>
     linkEls: new Map(),        // link id -> the <g> holding that link's own elements
     linkLabelEls: new Map(),   // link id -> its port/VLAN labels, drawn above every link
+    frameEls: new Map(),       // frame id -> its <g>
     dragPans: false,           // the Drag pans checkbox: left-drag on empty canvas pans
     settings: {},        // mapperdb.DEFAULTS shape, refreshed with every maps/settings fetch
     candidates: { devices: [], neighbours: [] },
 
     selection: new Set(),    // selected node ids
     selectedLinkId: null,
+    selectedFrameId: null,
     selectedVlan: null,      // vlan id highlighted from the VLAN table
     detailShowAllVlans: false,   // the open link's VLAN list, past VLAN_DETAIL_CAP
 
@@ -111,11 +123,19 @@
     zoom: 1, needsFit: true, pan: { x: 0, y: 0 }, frame: null,
     panDrag: null, spaceHeld: false,
     nodeDrag: null,          // {ids, from:Map(id->{x,y}), dx, dy, moved}
-    rubber: null,            // {x0,y0,x1,y1, additive}
+    rubber: null,            // {x0,y0,x1,y1, additive} or {..., drawFrame:true} while framing
+    framing: false,          // Frame button armed: the next empty-canvas drag draws one
+    frameDrag: null,         // {id, mode:'move'|'resize', startRect, dx, dy, moved}
 
     pendingPositions: new Map(),   // node id -> {x,y}, awaiting the debounced PUT
     writeTimer: null,
     writeRetryTimer: null,
+    pendingFramePatches: new Map(),   // frame id -> merged {x,y,width,height,label,color} patch
+    frameWriteTimers: new Map(),      // frame id -> debounce timeout handle
+    frameWriteRetryTimers: new Map(), // frame id -> retry timeout handle
+
+    // findNode's own "same text, next hit" cycling state.
+    findQuery: '', findIndex: -1,
 
     // Bumped per loadMapData() and checked after its await, the same
     // guard netpath.js's refreshGen and configrx.js's searchGen use: a map
@@ -243,7 +263,7 @@
   // pane resize) waits, which is the promise FEATURES.md makes for MAPPER's
   // auto-refresh.
   function gestureActive() {
-    return !!(view.nodeDrag || view.rubber || view.panDrag);
+    return !!(view.nodeDrag || view.rubber || view.panDrag || view.frameDrag);
   }
 
   function snapValue(v) {
@@ -471,6 +491,7 @@
     }
     view.linkMap = new Map(view.links.map((l) => [l.id, l]));
     view.vlanNameById = new Map(view.vlans.map((v) => [v.vlan, v.name || '']));
+    view.frameMap = new Map(view.frames.map((f) => [f.id, f]));
     view.linksByNode = new Map();
     for (const link of view.links) {
       const a = linkNodeA(link), b = linkNodeB(link);
@@ -486,7 +507,9 @@
     const generation = ++view.loadGen;
     if (view.mapId === null) {
       view.map = null; view.nodes = []; view.links = []; view.peersByKey = new Map(); view.vlans = [];
+      view.frames = [];
       rebuildLookups();
+      rebuildFindList();
       drawStatus(); draw(); drawDetail(); drawVlanTable(); drawLegend();
       return;
     }
@@ -497,17 +520,21 @@
     view.links = payload.links || [];
     view.peersByKey = new Map((payload.peers || []).map((p) => [p.peer_key, p]));
     view.vlans = payload.vlans || [];
+    view.frames = payload.frames || [];
     rebuildLookups();
+    rebuildFindList();
     // A reload landing mid-drag (a settings save) ends the drag: the payload
     // replaces the ids and positions it holds.
     if (view.nodeDrag) view.nodeDrag = null;
+    if (view.frameDrag) view.frameDrag = null;
     if (payload.settings) view.settings = payload.settings;
-    // A selection or a highlighted link that no longer exists on the fresh
-    // payload (removed elsewhere) is dropped rather than left pointing at
-    // nothing — drawDetail below reads view.selection/selectedLinkId as
-    // ground truth for what to show.
+    // A selection or a highlighted link/frame that no longer exists on the
+    // fresh payload (removed elsewhere) is dropped rather than left pointing
+    // at nothing — drawDetail below reads view.selection/selectedLinkId/
+    // selectedFrameId as ground truth for what to show.
     for (const id of [...view.selection]) if (!nodeById(id)) view.selection.delete(id);
     if (view.selectedLinkId && !linkById(view.selectedLinkId)) view.selectedLinkId = null;
+    if (view.selectedFrameId && !view.frameMap.has(view.selectedFrameId)) view.selectedFrameId = null;
     App.el('mp-map-name').textContent = view.map ? view.map.name : '';
     App.el('mp-snap').checked = !!view.settings.snap_to_grid;
     drawStatus();
@@ -524,9 +551,96 @@
     view.candidates = await App.get(`/api/mapper/maps/${view.mapId}/candidates`);
   }
 
+  /* ---------------------------------------------------------------- find
+     #mp-find/#mp-find-list: a plain text box, not another dialog — the
+     operator is orienting themselves on a map that may hold hundreds of
+     boxes, not picking rows to act on. Suggestions come from the same four
+     fields findNode itself matches against, so what autocompletes is
+     exactly what Enter can find. */
+  function rebuildFindList() {
+    const list = App.el('mp-find-list');
+    if (!list) return;
+    const seen = new Set();
+    const options = [];
+    for (const node of view.nodes) {
+      for (const value of [node.label, node.name, node.resolved_name, node.ip]) {
+        if (!value || seen.has(value)) continue;
+        seen.add(value);
+        if (options.length < FIND_LIST_CAP) options.push(`<option value="${escape(value)}">`);
+      }
+    }
+    list.innerHTML = options.join('');
+  }
+
+  // Case-insensitive, over label/name/resolved_name/ip: a node ranks by its
+  // BEST field (an exact match on any field beats a prefix match on every
+  // field, a prefix beats a plain substring), and view.nodes' own order
+  // breaks ties, so results are stable call to call.
+  function findMatches(text) {
+    const q = String(text || '').trim().toLowerCase();
+    if (!q) return [];
+    const ranked = [];
+    for (const node of view.nodes) {
+      let rank = 4;
+      for (const value of [node.label, node.name, node.resolved_name, node.ip]) {
+        if (!value) continue;
+        const field = String(value).toLowerCase();
+        const r = field === q ? 0 : field.startsWith(q) ? 1 : field.includes(q) ? 2 : 4;
+        if (r < rank) rank = r;
+      }
+      if (rank < 4) ranked.push({ node, rank });
+    }
+    ranked.sort((a, b) => a.rank - b.rank);
+    return ranked.map((r) => r.node);
+  }
+
+  // The pan/zoom half of a Find: put the node dead centre at no less than
+  // 1x zoom (a Find should never leave the operator squinting at a map
+  // that was zoomed out), select it and hand the canvas keyboard focus.
+  function centerOn(node) {
+    if (!view.frame) return;   // no scene painted yet to point at
+    const pos = livePos(node);
+    view.frame.cx = pos.x;
+    view.frame.cy = pos.y;
+    view.pan = { x: 0, y: 0 };
+    view.zoom = Math.max(view.zoom, 1);
+    applyTransform();
+    setSelection(new Set([node.id]));
+    focusCanvas();
+  }
+
+  // Enter on #mp-find: the first hit, or — typing the SAME text again — the
+  // next one, so repeated Enter cycles a name that matches several nodes.
+  function findNode(text) {
+    const q = String(text || '').trim();
+    if (!q) return;
+    const hits = findMatches(q);
+    if (!hits.length) {
+      App.toast(`No device on this map matches "${q}".`, 'fail');
+      view.findQuery = ''; view.findIndex = -1;
+      return;
+    }
+    view.findIndex = (view.findQuery.toLowerCase() === q.toLowerCase() && view.findIndex >= 0)
+      ? (view.findIndex + 1) % hits.length : 0;
+    view.findQuery = q;
+    centerOn(hits[view.findIndex]);
+  }
+
+  function onFindKeydown(event) {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    findNode(event.currentTarget.value);
+  }
+
+  // Reassigned (not mutated in place) at the top of each openAddDevice()
+  // call, so the DEVICE_PICK_COLUMNS cell below — a module-level constant,
+  // reused across every open of the dialog — always renders the CURRENT
+  // dialog's own picks rather than a stale one left over from the last.
+  let devicePicked = new Set();
   const DEVICE_PICK_COLUMNS = [
     { key: 'check', label: '', width: 34, sortable: false,
-      cell: (r) => `<input type="checkbox" class="mp-pick" data-id="${r.id}">` },
+      cell: (r) => `<input type="checkbox" class="mp-pick" data-id="${r.id}"` +
+        `${devicePicked.has(r.id) ? ' checked' : ''}>` },
     { key: 'name', label: 'Name', width: 200, value: (r) => (r.name || r.ip || '').toLowerCase(),
       cell: (r) => escape(r.name || r.ip) },
     { key: 'ip', label: 'IP', width: 130, cell: (r) => escape(r.ip || '—') },
@@ -552,12 +666,13 @@
 
   async function openAddDevice() {
     await loadCandidates();
+    devicePicked = new Set();
     const box = App.modal('Add device', `
       <input id="mpad-q" placeholder="Search by name, IP or vendor…" style="width:100%;margin-bottom:var(--space-sm)">
       <div class="table-wrap tall"><table id="mpad-table"></table></div>`, [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Add', primary: true, onClick: async (b) => {
-        const ids = [...b.querySelectorAll('.mp-pick:checked')].map((el) => Number(el.dataset.id));
+        const ids = [...devicePicked];
         if (!ids.length) { App.closeModal(); return; }
         const bounds = contentBounds();
         for (let i = 0; i < ids.length; i += 1) {
@@ -574,13 +689,36 @@
       const rows = (view.candidates.devices || []).filter((r) =>
         !q || (r.name || '').toLowerCase().includes(q) || (r.ip || '').toLowerCase().includes(q)
         || (r.vendor || '').toLowerCase().includes(q));
+      // Recomputed from THIS redraw's filtered rows, not the full candidate
+      // list — a header tick above a search that narrowed the table must
+      // only ever mean "every row shown", never "every row that exists".
       const table = App.grid(box.querySelector('#mpad-table'), {
         name: 'mapper-add-device', caption: 'Devices not yet on this map',
         columns: DEVICE_PICK_COLUMNS, sort, onSort: (key, descending) => { sort = { key, descending }; draw2(); },
+        selectAll: {
+          key: 'check',
+          checked: rows.length > 0 && rows.every((r) => devicePicked.has(r.id)),
+          some: rows.some((r) => devicePicked.has(r.id)),
+          label: 'Select all listed devices',
+          onToggle: (on) => {
+            for (const r of rows) { if (on) devicePicked.add(r.id); else devicePicked.delete(r.id); }
+            draw2();
+          },
+        },
       });
       const body = document.createElement('tbody');
       App.drawRows(body, App.sortRows(rows, sort.key, sort.descending, DEVICE_PICK_COLUMNS),
         DEVICE_PICK_COLUMNS, null, 'Every device is already on this map, or none matched the search.');
+      // Delegated on the tbody rather than per-checkbox: draw2/App.drawRows
+      // rebuild every row (and so every checkbox) on each redraw, the same
+      // reason redrawNeighbourRows' own listener below is wired this way.
+      body.addEventListener('change', (event) => {
+        const box2 = event.target.closest('.mp-pick');
+        if (!box2) return;
+        const id = Number(box2.dataset.id);
+        if (box2.checked) devicePicked.add(id); else devicePicked.delete(id);
+        draw2();
+      });
       table.appendChild(body);
     };
     box.querySelector('#mpad-q').oninput = draw2;
@@ -593,9 +731,12 @@
   // seen_from_port} — no protocol field travels with a candidate (only an
   // already-placed LINK's own `protocols` does), so there is no "Via"
   // column to draw here.
+  // Same reassign-not-mutate reason as devicePicked above.
+  let neighbourPicked = new Set();
   const NEIGHBOUR_PICK_COLUMNS = [
     { key: 'check', label: '', width: 34, sortable: false,
-      cell: (r) => `<input type="checkbox" class="mp-pick" data-key="${escape(r.key)}">` },
+      cell: (r) => `<input type="checkbox" class="mp-pick" data-key="${escape(r.key)}"` +
+        `${neighbourPicked.has(r.key) ? ' checked' : ''}>` },
     { key: 'name', label: 'Name', width: 200, value: (r) => (r.name || '').toLowerCase(),
       cell: (r) => escape(r.name || r.peer_key || `#${r.device_id}`) },
     { key: 'seen_from', label: 'Seen from', width: 180, value: (r) => (r.seenFromName || '').toLowerCase(),
@@ -619,13 +760,14 @@
         seenFromName: seenFrom ? seenFrom.name : `#${r.seen_from_device_id}`,
       };
     });
+    neighbourPicked = new Set();
     const box = App.modal('Add neighbours', `
       <p class="hint">Neighbours seen by a device already on this map, one hop out. ` +
       'Nothing is added automatically — pick which ones belong here.</p>' +
       '<div class="table-wrap tall"><table id="mpan-table"></table></div>', [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Add', primary: true, onClick: async (b) => {
-        const keys = [...b.querySelectorAll('.mp-pick:checked')].map((el) => el.dataset.key);
+        const keys = [...neighbourPicked];
         if (!keys.length) { App.closeModal(); return; }
         const bounds = contentBounds();
         for (let i = 0; i < keys.length; i += 1) {
@@ -647,16 +789,36 @@
     let sort = { key: 'name', descending: false };
     // App.grid re-run per redraw (as drawVlanTable does): called once
     // outside, re-sorting appended a second <tbody> and doubled every row.
+    // Nothing here is filtered by a search box, so "rows" IS the currently
+    // listed set — unlike Add device's draw2, there is no narrower subset
+    // the select-all header would need to distinguish from the full list.
     function redrawNeighbourRows() {
       const table = App.grid(box.querySelector('#mpan-table'), {
         name: 'mapper-add-neighbours', caption: 'Neighbours not yet on this map',
         columns: NEIGHBOUR_PICK_COLUMNS, sort, onSort: (key, descending) => {
           sort = { key, descending }; redrawNeighbourRows(); },
+        selectAll: {
+          key: 'check',
+          checked: rows.length > 0 && rows.every((r) => neighbourPicked.has(r.key)),
+          some: rows.some((r) => neighbourPicked.has(r.key)),
+          label: 'Select all listed devices',
+          onToggle: (on) => {
+            for (const r of rows) { if (on) neighbourPicked.add(r.key); else neighbourPicked.delete(r.key); }
+            redrawNeighbourRows();
+          },
+        },
       });
       const body = document.createElement('tbody');
       App.drawRows(body, App.sortRows(rows, sort.key, sort.descending, NEIGHBOUR_PICK_COLUMNS),
         NEIGHBOUR_PICK_COLUMNS, null,
         'No neighbours to add — every one already on this map, or nothing placed here has reported any.');
+      body.addEventListener('change', (event) => {
+        const cb = event.target.closest('.mp-pick');
+        if (!cb) return;
+        const key = cb.dataset.key;
+        if (cb.checked) neighbourPicked.add(key); else neighbourPicked.delete(key);
+        redrawNeighbourRows();
+      });
       table.appendChild(body);
     }
     redrawNeighbourRows();
@@ -678,6 +840,24 @@
       async (confirmed) => {
         if (!confirmed) return;
         view.selection.clear();
+        await loadMapData();
+      });
+  }
+
+  // Same confirm idiom as removeSelected above — a frame's own Remove
+  // button in the detail pane and Delete/Backspace on the canvas (with a
+  // frame selected) both call this one function.
+  function removeFrame(id) {
+    const frame = view.frameMap.get(id);
+    if (!frame) return;
+    App.confirmDestructive('Remove frame',
+      `<p>Remove the frame${frame.label ? ` <b>${escape(frame.label)}</b>` : ''}? ` +
+      'Nothing it encloses is moved or affected — only the frame itself is removed.</p>',
+      'Remove',
+      () => App.del(`/api/mapper/maps/${view.mapId}/frames/${id}`),
+      async (confirmed) => {
+        if (!confirmed) return;
+        if (view.selectedFrameId === id) view.selectedFrameId = null;
         await loadMapData();
       });
   }
@@ -1105,15 +1285,98 @@
     return s.length > max ? `${s.slice(0, max - 1)}…` : s;
   }
 
+  // The rect a frame is drawn at RIGHT NOW — livePos's own logic, for a
+  // frame's x/y/width/height instead of a node's x/y.
+  function liveFrameRect(frame) {
+    const drag = view.frameDrag;
+    if (drag && drag.id === frame.id) {
+      if (drag.mode === 'move') {
+        return { x: drag.startRect.x + drag.dx, y: drag.startRect.y + drag.dy,
+          width: drag.startRect.width, height: drag.startRect.height };
+      }
+      return { x: drag.startRect.x, y: drag.startRect.y,
+        width: Math.max(FRAME_MIN, drag.startRect.width + drag.dx),
+        height: Math.max(FRAME_MIN, drag.startRect.height + drag.dy) };
+    }
+    const pending = view.pendingFramePatches.get(frame.id);
+    return {
+      x: (pending && pending.x !== undefined) ? pending.x : frame.x,
+      y: (pending && pending.y !== undefined) ? pending.y : frame.y,
+      width: (pending && pending.width !== undefined) ? pending.width : frame.width,
+      height: (pending && pending.height !== undefined) ? pending.height : frame.height,
+    };
+  }
+
   function contentBounds() {
-    if (!view.nodes.length) return null;
+    if (!view.nodes.length && !view.frames.length) return null;
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     for (const node of view.nodes) {
       const p = livePos(node);
       minX = Math.min(minX, p.x - NODE_W / 2); maxX = Math.max(maxX, p.x + NODE_W / 2);
       minY = Math.min(minY, p.y - NODE_H / 2); maxY = Math.max(maxY, p.y + NODE_H / 2);
     }
+    for (const frame of view.frames) {
+      const r = liveFrameRect(frame);
+      minX = Math.min(minX, r.x); maxX = Math.max(maxX, r.x + r.width);
+      minY = Math.min(minY, r.y); maxY = Math.max(maxY, r.y + r.height);
+    }
     return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+  }
+
+  /* ------------------------------------------------------------- frames
+     Decoration only — see the file header comment: a frame's own x/y/
+     width/height never touch a node, so nothing here reads or writes
+     view.nodes. Each frame is a <g class="mp-frame"> of four children in a
+     fixed order (fill, stroke, label, resize handle); updateFrameElement
+     repositions all four in place, shared by the initial draw and every
+     drag/resize redraw so the geometry is written in exactly one place. */
+  function frameColorClass(frame) {
+    const idx = Number.isInteger(frame.color) ? Math.max(0, Math.min(5, frame.color)) : 0;
+    return `mp-frame-c${idx}`;
+  }
+
+  function updateFrameElement(g, frame) {
+    const r = liveFrameRect(frame);
+    const fill = g.querySelector('.mp-frame-fill');
+    const stroke = g.querySelector('.mp-frame-stroke');
+    const label = g.querySelector('.mp-frame-label');
+    const handle = g.querySelector('.mp-frame-handle');
+    for (const el of [fill, stroke]) {
+      el.setAttribute('x', r.x); el.setAttribute('y', r.y);
+      el.setAttribute('width', r.width); el.setAttribute('height', r.height);
+    }
+    label.setAttribute('x', r.x + 6);
+    label.setAttribute('y', r.y + 16);
+    handle.setAttribute('x', r.x + r.width - FRAME_HANDLE);
+    handle.setAttribute('y', r.y + r.height - FRAME_HANDLE);
+  }
+
+  function drawFrame(layer, frame) {
+    const selected = view.selectedFrameId === frame.id;
+    const g = App.svgNode('g', { class: `mp-frame ${frameColorClass(frame)}${selected ? ' selected' : ''}` });
+    g.dataset.frameId = frame.id;
+    // (a) the fill: pointer-events none, so a rubber-band drag or a pan
+    // started over the inside of a frame still reaches the canvas below it.
+    const fill = App.svgNode('rect', { class: 'mp-frame-fill', 'pointer-events': 'none' });
+    // (b) the stroke: pointer-events stroke, so only the dashed outline
+    // itself — not the whole rect — is what a click/drag on the frame hits.
+    const stroke = App.svgNode('rect', { class: 'mp-frame-stroke', 'pointer-events': 'stroke' });
+    // (c) the label. Not escape()'d: this is an SVG text node's textContent
+    // (App.svgNode's third argument), never parsed as markup, the same
+    // reason no other label on this canvas (a port name, a VLAN id) is
+    // either — escape() belongs where a name lands in an HTML string.
+    const label = App.svgNode('text', { class: 'mp-frame-label' }, truncate(frame.label || 'Frame', 40));
+    // (d) the resize handle, bottom-right.
+    const handle = App.svgNode('rect', {
+      class: 'mp-frame-handle', width: FRAME_HANDLE, height: FRAME_HANDLE,
+    });
+    g.append(fill, stroke, label, handle);
+    stroke.addEventListener('pointerdown', (event) => onFramePointerDown(event, frame, 'move'));
+    label.addEventListener('pointerdown', (event) => onFramePointerDown(event, frame, 'move'));
+    handle.addEventListener('pointerdown', (event) => onFramePointerDown(event, frame, 'resize'));
+    updateFrameElement(g, frame);
+    layer.appendChild(g);
+    return g;
   }
 
   // `bounds`/size come from draw(), which already measured both — redoing
@@ -1185,6 +1448,23 @@
     }
   }
 
+  // The frame-drag analogue of requestDragDraw/redrawDragged: one redraw of
+  // just the dragged frame per animation frame, not the whole scene.
+  let frameDragPending = 0;
+
+  function requestFrameDragDraw() {
+    if (frameDragPending) return;
+    frameDragPending = window.requestAnimationFrame(() => { frameDragPending = 0; redrawFrameDragged(); });
+  }
+
+  function redrawFrameDragged() {
+    const drag = view.frameDrag;
+    const frame = drag && view.frameMap.get(drag.id);
+    const el = drag && view.frameEls.get(drag.id);
+    if (!frame || !el) { requestDraw(); return; }
+    updateFrameElement(el, frame);
+  }
+
   // Toggles a class in place: a full redraw at drag-start would replace
   // the very <g> the pointer is captured on.
   function applySelectionClasses() {
@@ -1217,12 +1497,14 @@
     canvas.dataset.mapStyle = currentMapStyle();
     // Replacing the <g> a drag captured means its release never arrives.
     view.nodeDrag = null;
+    view.frameDrag = null;
     svg.innerHTML = '';
     view.sceneGroup = null;
     view.rubberEl = null;
     view.nodeEls = new Map();
     view.linkEls = new Map();
     view.linkLabelEls = new Map();
+    view.frameEls = new Map();
 
     if (!view.mapId) {
       return emptyCanvas(svg, canvas, 'No map selected. Use Maps to create or pick one.');
@@ -1255,11 +1537,16 @@
     } else { view.frame.width = width; view.frame.height = height; }
     const group = App.svgNode('g');
     const gridLayer = App.svgNode('g');
+    const frameLayer = App.svgNode('g');
     const linkLayer = App.svgNode('g');
     const labelLayer = App.svgNode('g');
     const nodeLayer = App.svgNode('g');
-    group.append(gridLayer, linkLayer, nodeLayer, labelLayer);
+    // frameLayer sits between the grid and the links: a frame is
+    // decoration an operator draws to group boxes visually, and must never
+    // sit over a link or a node it encloses.
+    group.append(gridLayer, frameLayer, linkLayer, nodeLayer, labelLayer);
     if (shouldDrawGrid() && bounds) drawGrid(gridLayer, bounds);
+    for (const frame of view.frames) view.frameEls.set(frame.id, drawFrame(frameLayer, frame));
     // Own <g> per link: redrawDragged refills just the ones that moved.
     for (const link of view.links) {
       const holder = App.svgNode('g');
@@ -1334,6 +1621,7 @@
   function setSelection(ids) {
     view.selection = ids;
     view.selectedLinkId = null;
+    view.selectedFrameId = null;
     requestDraw();
     drawDetail();
   }
@@ -1341,6 +1629,7 @@
   function selectLink(id) {
     view.selectedLinkId = id;
     view.selection.clear();
+    view.selectedFrameId = null;
     // Each link opens on its capped VLAN list; "Show all" is a decision
     // about the link being read, not a mode the pane stays in.
     view.detailShowAllVlans = false;
@@ -1370,6 +1659,44 @@
   function renderDetail() {
     const nameEl = App.el('mp-detail-name');
     const detail = App.el('mp-detail');
+    if (view.selectedFrameId) {
+      const frame = view.frameMap.get(view.selectedFrameId);
+      if (!frame) { view.selectedFrameId = null; return renderDetail(); }
+      nameEl.textContent = 'FRAME';
+      detail.innerHTML = frameDetailHtml(frame);
+      const saveBtn = detail.querySelector('#mpf-label-save');
+      if (saveBtn) saveBtn.onclick = async () => {
+        const label = detail.querySelector('#mpf-label').value.trim();
+        try {
+          await App.put(`/api/mapper/maps/${view.mapId}/frames/${frame.id}`, { label });
+          frame.label = label;
+          requestDraw();
+          drawDetail();
+        } catch (error) {
+          App.toast(`Could not rename the frame: ${error.message}`, 'fail');
+        }
+      };
+      const labelInput = detail.querySelector('#mpf-label');
+      if (labelInput) labelInput.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' && saveBtn) { event.preventDefault(); saveBtn.click(); }
+      });
+      for (const swatch of detail.querySelectorAll('[data-frame-color]')) {
+        swatch.onclick = async () => {
+          const color = Number(swatch.dataset.frameColor);
+          try {
+            await App.put(`/api/mapper/maps/${view.mapId}/frames/${frame.id}`, { color });
+            frame.color = color;
+            requestDraw();
+            drawDetail();
+          } catch (error) {
+            App.toast(`Could not change the frame's colour: ${error.message}`, 'fail');
+          }
+        };
+      }
+      const removeBtn = detail.querySelector('#mpf-remove');
+      if (removeBtn) removeBtn.onclick = () => removeFrame(frame.id);
+      return;
+    }
     if (view.selectedLinkId) {
       const link = linkById(view.selectedLinkId);
       if (!link) { view.selectedLinkId = null; return renderDetail(); }
@@ -1581,6 +1908,36 @@
     return lines.join('\n');
   }
 
+  // Six swatches, not the VLAN table's sixteen: a frame's colour is a
+  // fixed palette index (mapperdb validates 0-5), not a VLAN's free-form
+  // --canvas-vlan-N choice — --canvas-vlan-1..6 supplies the six hues so a
+  // frame reads with the same canvas-tuned palette a VLAN strand does.
+  function frameSwatchesHtml(frame, canWrite) {
+    return Array.from({ length: 6 }, (_, i) => {
+      const selected = Number(frame.color) === i;
+      return `<button class="mp-swatch${selected ? ' selected' : ''}" data-frame-color="${i}" ` +
+        `data-requires-write="mapper"${canWrite ? '' : ' disabled'} ` +
+        `style="background:var(--canvas-vlan-${i + 1})" aria-label="Colour ${i + 1}"></button>`;
+    }).join('');
+  }
+
+  function frameDetailHtml(frame) {
+    const canWrite = App.canWrite('mapper');
+    const gate = canWrite ? '' : ' disabled';
+    const lines = [
+      `Label       <input id="mpf-label" type="text" maxlength="60" value="${escape(frame.label || '')}" ` +
+        `placeholder="Frame" data-requires-write="mapper"${gate}> ` +
+        `<button id="mpf-label-save" data-requires-write="mapper"${gate}>Save</button>`,
+      '',
+      `Colour      ${frameSwatchesHtml(frame, canWrite)}`,
+      '',
+      `Added       ${escape(App.ago(frame.added_ts))}`,
+      '',
+      `<button id="mpf-remove" class="danger" data-requires-write="mapper"${gate}>Remove</button>`,
+    ];
+    return lines.join('\n');
+  }
+
   /* -------------------------------------------------------- pointer input */
 
   // null until draw() sets a frame — an empty map or a pre-paint pointer
@@ -1714,6 +2071,106 @@
     }
   }
 
+  // The same debounce/retry idiom as queuePositionWrite/flushPositionWrites
+  // above, one timer per FRAME rather than one shared timer for every
+  // node: a frame write is its own PUT (no batched `updates` route exists
+  // for frames), so two frames dragged one after another must not have the
+  // second cancel the first's still-pending save.
+  function queueFrameWrite(id, patch) {
+    view.pendingFramePatches.set(id, { ...view.pendingFramePatches.get(id), ...patch });
+    const existing = view.frameWriteTimers.get(id);
+    if (existing) clearTimeout(existing);
+    view.frameWriteTimers.set(id, setTimeout(() => flushFrameWrite(id), WRITE_DEBOUNCE_MS));
+  }
+
+  async function flushFrameWrite(id) {
+    view.frameWriteTimers.delete(id);
+    const patch = view.pendingFramePatches.get(id);
+    if (!patch || !view.mapId) return;
+    const mapId = view.mapId;
+    try {
+      await App.put(`/api/mapper/maps/${mapId}/frames/${id}`, patch);
+      // Only clear it if nothing newer queued while this PUT was in flight.
+      if (view.pendingFramePatches.get(id) === patch) view.pendingFramePatches.delete(id);
+    } catch (error) {
+      App.toast(`Could not save the frame: ${error.message}. Will retry.`, 'fail');
+      const retrying = view.frameWriteRetryTimers.get(id);
+      if (retrying) clearTimeout(retrying);
+      view.frameWriteRetryTimers.set(id, setTimeout(() => flushFrameWrite(id), WRITE_RETRY_MS));
+    }
+  }
+
+  // Selecting a frame (the stroke, the label or the handle all start this)
+  // clears whatever else was selected, same as onNodePointerDown does in
+  // reverse; the handle starts a RESIZE, everything else starts a MOVE.
+  function onFramePointerDown(event, frame, mode) {
+    if (event.button !== 0 || !event.isPrimary || view.spaceHeld || view.framing) return;
+    event.preventDefault();
+    event.stopPropagation();
+    focusCanvas();
+    view.selectedFrameId = frame.id;
+    view.selection = new Set();
+    view.selectedLinkId = null;
+    requestDraw();
+    drawDetail();
+    if (!App.canWrite('mapper')) return;   // selection only: nothing to drag
+    const target = event.currentTarget;
+    target.setPointerCapture(event.pointerId);
+    const startRect = { x: frame.x, y: frame.y, width: frame.width, height: frame.height };
+    const rect = App.el('mp-svg').getBoundingClientRect();
+    const perPixelX = (view.frame.width / Math.max(rect.width, 1)) / view.zoom;
+    const perPixelY = (view.frame.height / Math.max(rect.height, 1)) / view.zoom;
+    const startClient = { x: event.clientX, y: event.clientY };
+    view.frameDrag = { id: frame.id, mode, startRect, dx: 0, dy: 0, moved: false };
+    App.hideTooltip();
+    const move = (moveEvent) => {
+      if (!view.frameDrag) return;
+      const cdx = moveEvent.clientX - startClient.x, cdy = moveEvent.clientY - startClient.y;
+      if (!view.frameDrag.moved) {
+        if (Math.hypot(cdx, cdy) <= MOVE_THRESHOLD_PX) return;
+        view.frameDrag.moved = true;
+      }
+      view.frameDrag.dx = cdx * perPixelX;
+      view.frameDrag.dy = cdy * perPixelY;
+      requestFrameDragDraw();
+    };
+    const detach = () => {
+      target.removeEventListener('pointermove', move);
+      target.removeEventListener('pointerup', up);
+      target.removeEventListener('pointercancel', cancel);
+    };
+    const up = () => {
+      try {
+        if (view.frameDrag && view.frameDrag.moved) {
+          const snap = !!view.settings.snap_to_grid;
+          const r = liveFrameRect(frame);
+          let patch;
+          if (mode === 'move') {
+            let x = r.x, y = r.y;
+            if (snap) { x = snapValue(x); y = snapValue(y); }
+            frame.x = x; frame.y = y;
+            patch = { x, y };
+          } else {
+            let width = r.width, height = r.height;
+            if (snap) { width = Math.max(FRAME_MIN, snapValue(width)); height = Math.max(FRAME_MIN, snapValue(height)); }
+            frame.width = width; frame.height = height;
+            patch = { width, height };
+          }
+          queueFrameWrite(frame.id, patch);
+        }
+      } finally {
+        detach();
+        view.frameDrag = null;
+        requestDraw();
+        drawDetail();
+      }
+    };
+    const cancel = () => { detach(); view.frameDrag = null; requestDraw(); };
+    target.addEventListener('pointermove', move);
+    target.addEventListener('pointerup', up);
+    target.addEventListener('pointercancel', cancel);
+  }
+
   function onSvgPointerDown(event) {
     if (!event.isPrimary) return;
     if (event.button === 1 || (event.button === 0 && view.spaceHeld)) {
@@ -1731,6 +2188,19 @@
     // here instead, or pressing down on one and moving a couple of pixels
     // before release would start a rubber-band from under a click.
     if (event.target.closest('.mp-node') || event.target.closest('.mp-link')) return;
+    if (view.framing) {
+      // Reuses the rubber-band gesture wholesale (onSvgPointerMove/Up and
+      // drawRubber read view.rubber generically) — only the `drawFrame`
+      // flag and what pointerup does with the finished rectangle differ
+      // from an ordinary multi-select drag.
+      const p = scenePoint(event);
+      if (!p) return;
+      event.preventDefault();
+      focusCanvas();
+      event.currentTarget.setPointerCapture(event.pointerId);
+      view.rubber = { x0: p.x, y0: p.y, x1: p.x, y1: p.y, drawFrame: true };
+      return;
+    }
     if (view.dragPans) {
       event.preventDefault();
       focusCanvas();
@@ -1770,6 +2240,16 @@
 
   function onSvgPointerUp() {
     if (view.panDrag) { view.panDrag = null; App.el('mp-svg').classList.remove('dragging'); return; }
+    if (view.rubber && view.rubber.drawFrame) {
+      const { x0, y0, x1, y1 } = view.rubber;
+      view.rubber = null;
+      drawRubber();
+      disarmFraming();   // one shot: a click without drag disarms the same way
+      const x = Math.min(x0, x1), y = Math.min(y0, y1);
+      const width = Math.abs(x1 - x0), height = Math.abs(y1 - y0);
+      if (width >= FRAME_MIN && height >= FRAME_MIN) createFrame(x, y, width, height);
+      return;
+    }
     if (view.rubber) {
       const { x0, y0, x1, y1, additive } = view.rubber;
       const left = Math.min(x0, x1), right = Math.max(x0, x1), top = Math.min(y0, y1), bottom = Math.max(y0, y1);
@@ -1783,6 +2263,26 @@
         for (const id of hit) next.add(id);
         setSelection(next);
       } else drawRubber();
+    }
+  }
+
+  // Un-arms the Frame tool: the toolbar button loses its pressed look and
+  // the canvas its crosshair. Called whichever way framing ends — a
+  // finished drag, a click with no drag, or Escape.
+  function disarmFraming() {
+    view.framing = false;
+    const btn = App.el('mp-add-frame');
+    if (btn) btn.classList.remove('active');
+    const canvas = App.el('mp-canvas');
+    if (canvas) canvas.classList.remove('framing');
+  }
+
+  async function createFrame(x, y, width, height) {
+    try {
+      await App.post(`/api/mapper/maps/${view.mapId}/frames`, { x, y, width, height });
+      await loadMapData();
+    } catch (error) {
+      App.toast(`Could not add the frame: ${error.message}`, 'fail');
     }
   }
 
@@ -1811,6 +2311,11 @@
 
   function onCanvasKeyDown(event) {
     if (event.target !== App.el('mp-canvas')) return;   // a node/link handles its own Enter/Space
+    if ((event.key === 'Delete' || event.key === 'Backspace') && view.selectedFrameId) {
+      event.preventDefault();
+      removeFrame(view.selectedFrameId);
+      return;
+    }
     const panStep = 40 / view.zoom;
     const pan = (dx, dy) => {
       view.pan.x += dx; view.pan.y += dy;
@@ -1850,6 +2355,19 @@
     });
     window.addEventListener('keyup', (event) => {
       if (event.code === 'Space') view.spaceHeld = false;
+    });
+  }
+
+  // Escape disarms the Frame tool from wherever focus is — the toolbar
+  // button most of the time, since clicking it is what armed framing in
+  // the first place, not necessarily the canvas itself.
+  function wireFrameEscape() {
+    window.addEventListener('keydown', (event) => {
+      if (event.key !== 'Escape' || App.state.tab !== 'mapper' || !view.framing) return;
+      if (!App.el('modal').hidden) return;
+      view.rubber = null;
+      disarmFraming();
+      drawRubber();
     });
   }
 
@@ -1917,12 +2435,16 @@
       ['mp-align', !canWrite || view.selection.size < 2],
       ['mp-add-device', !canWrite || !hasMap],
       ['mp-add-neighbours', !canWrite || !hasMap],
+      ['mp-add-frame', !canWrite || !hasMap],
       ['mp-snap', !canWrite || !hasMap],
     ];
     for (const [id, disabled] of states) {
       const button = App.el(id);
       if (button && button.disabled !== disabled) button.disabled = disabled;
     }
+    // Write revoked (or the map changed out) mid-arm: nothing left to draw
+    // a frame onto, so the tool disarms rather than staying pressed.
+    if (view.framing && (!canWrite || !hasMap)) disarmFraming();
   }
 
   /* -------------------------------------------------------------- VLANs */
@@ -2232,6 +2754,14 @@
     canvas.addEventListener('keydown', onCanvasKeyDown);
     canvas.oncontextmenu = (event) => event.preventDefault();   // the middle/space pan owns the gesture
     wireSpaceModifier();
+    wireFrameEscape();
+    App.el('mp-find').addEventListener('keydown', onFindKeydown);
+    App.el('mp-add-frame').onclick = () => {
+      if (!App.canWrite('mapper') || !view.mapId) return;
+      view.framing = !view.framing;
+      App.el('mp-add-frame').classList.toggle('active', view.framing);
+      App.el('mp-canvas').classList.toggle('framing', view.framing);
+    };
 
     App.el('mp-refresh').onclick = () => App.runJob(App.el('mp-refresh'),
       { queued: 'Refreshing…', done: 'Refreshed' }, forceRefresh());
@@ -2275,6 +2805,7 @@
     window.addEventListener('blur', () => {
       if (!gestureActive() && !view.spaceHeld) return;
       view.nodeDrag = null; view.panDrag = null; view.rubber = null; view.spaceHeld = false;
+      view.frameDrag = null;
       const svg = App.el('mp-svg');
       if (svg) svg.classList.remove('dragging');
       drawRubber();

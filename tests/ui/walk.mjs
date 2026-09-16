@@ -1093,6 +1093,136 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       return `${before} -> ${afterConnect} -> ${afterRemove}`;
     });
 
+  await check('Mapper: Find selects a device by name (#mp-find)',
+    async () => {
+      await page.keyboard.press('Escape').catch(() => {});
+      await selectTab(page, 'mapper');
+      await settle(page, 1000);
+      const target = await page.evaluate(() => {
+        const g = document.querySelector('#mp-svg .mp-node');
+        if (!g) return null;
+        const label = g.querySelector('.mp-node-label');
+        return { id: g.dataset.nodeId, name: label ? label.textContent : '' };
+      });
+      if (!target || !target.name) return 'skipped: no device on the demo map to find';
+      await page.fill('#mp-find', target.name);
+      await page.locator('#mp-find').press('Enter');
+      await page.waitForFunction((id) => {
+        const g = document.querySelector(`#mp-svg .mp-node[data-node-id="${id}"]`);
+        return !!g && g.classList.contains('selected');
+      }, target.id, { timeout: 10000 });
+      return `found "${target.name}"`;
+    });
+
+  await check('Mapper: Add device dialog select-all ticks every listed row',
+    async () => {
+      await page.keyboard.press('Escape').catch(() => {});
+      await selectTab(page, 'mapper');
+      await settle(page, 800);
+      const addBtn = page.locator('#mp-add-device');
+      if (await addBtn.isDisabled()) return 'skipped: Add device is disabled (no write access, or no map selected)';
+      await addBtn.click();
+      await page.waitForSelector('#modal:not([hidden]) #mpad-table', { timeout: 10000 });
+      await settle(page, 400);
+      const rowCount = await page.locator('#mpad-table tbody tr .mp-pick').count();
+      if (rowCount === 0) {
+        const cancelled0 = await page.evaluate(() => {
+          const cancel = [...document.querySelectorAll('#modal:not([hidden]) .modal-buttons button')]
+            .find((b) => b.textContent.trim() === 'Cancel');
+          if (!cancel) return false;
+          cancel.click();
+          return true;
+        });
+        assert(cancelled0, 'no Cancel button in the Add device dialog');
+        return 'skipped: no candidate devices left to add on the demo map';
+      }
+      await page.click('#modal:not([hidden]) #mpad-table th .select-all');
+      await page.waitForFunction(() => {
+        const boxes = [...document.querySelectorAll('#mpad-table tbody .mp-pick')];
+        return boxes.length > 0 && boxes.every((b) => b.checked);
+      }, { timeout: 10000 });
+      const cancelled = await page.evaluate(() => {
+        const cancel = [...document.querySelectorAll('#modal:not([hidden]) .modal-buttons button')]
+          .find((b) => b.textContent.trim() === 'Cancel');
+        if (!cancel) return false;
+        cancel.click();
+        return true;
+      });
+      assert(cancelled, 'no Cancel button in the Add device dialog');
+      return `${rowCount} listed row(s) all ticked by the header checkbox`;
+    });
+
+  await check('Mapper: Frame tool draws a frame, renames it, then removes it',
+    async () => {
+      await page.keyboard.press('Escape').catch(() => {});
+      await selectTab(page, 'mapper');
+      await settle(page, 1000);
+      const frameBtn = page.locator('#mp-add-frame');
+      if (await frameBtn.isDisabled()) return 'skipped: Frame is disabled (no write access, or no map selected)';
+      const box = await page.locator('#mp-svg').boundingBox();
+      if (!box) return 'skipped: #mp-svg has no bounding box';
+      // A corner well inside the canvas, away from wherever the demo map's
+      // own nodes happen to sit -- the same reasoning the Connect check
+      // above uses to pick nodes actually on screen, in reverse.
+      const x0 = box.x + 24, y0 = box.y + 24;
+      await frameBtn.click();
+      await page.waitForFunction(() => document.getElementById('mp-add-frame').classList.contains('active'),
+        { timeout: 5000 });
+      await page.mouse.move(x0, y0);
+      await page.mouse.down();
+      const steps = 8;
+      for (let i = 1; i <= steps; i += 1) {
+        await page.mouse.move(x0 + (120 * i) / steps, y0 + (90 * i) / steps);
+      }
+      await page.mouse.up();
+      await page.waitForSelector('#mp-svg .mp-frame', { timeout: 10000 });
+      const frameId = await page.evaluate(() => document.querySelector('#mp-svg .mp-frame').dataset.frameId);
+
+      // Selecting by a real Playwright click on a thin SVG label is exactly
+      // the pixel-precision problem the Connect check's own manual-link
+      // click already works around above: dispatch the pointerdown the
+      // label's own listener is wired for, straight on the element.
+      const selected = await page.evaluate((id) => {
+        const label = document.querySelector(`#mp-svg .mp-frame[data-frame-id="${id}"] .mp-frame-label`);
+        if (!label) return false;
+        label.dispatchEvent(new PointerEvent('pointerdown', {
+          bubbles: true, cancelable: true, button: 0, isPrimary: true, pointerId: 1,
+        }));
+        return true;
+      }, frameId);
+      assert(selected, 'could not find the frame label to click');
+      await page.waitForFunction((id) => {
+        const g = document.querySelector(`#mp-svg .mp-frame[data-frame-id="${id}"]`);
+        return !!g && g.classList.contains('selected');
+      }, frameId, { timeout: 10000 });
+
+      await page.waitForSelector('#mp-detail #mpf-label', { timeout: 10000 });
+      await page.fill('#mp-detail #mpf-label', 'Core');
+      const renamed = page.waitForResponse((response) =>
+        /\/api\/mapper\/maps\/\d+\/frames\/\d+$/.test(response.url())
+        && response.request().method() === 'PUT', { timeout: 10000 });
+      await page.click('#mp-detail #mpf-label-save');
+      const renameResponse = await renamed;
+      assert(renameResponse.ok(), `frame rename answered ${renameResponse.status()}`);
+      await page.waitForFunction((id) => {
+        const label = document.querySelector(`#mp-svg .mp-frame[data-frame-id="${id}"] .mp-frame-label`);
+        return !!label && label.textContent === 'Core';
+      }, frameId, { timeout: 10000 });
+
+      await page.click('#mp-detail #mpf-remove');
+      // App.confirmDestructive: Cancel + a danger-styled confirm button,
+      // not a native browser dialog.
+      await page.waitForSelector('#modal:not([hidden]) .modal-buttons button.danger', { timeout: 10000 });
+      const removed = page.waitForResponse((response) =>
+        /\/api\/mapper\/maps\/\d+\/frames\/\d+$/.test(response.url())
+        && response.request().method() === 'DELETE', { timeout: 10000 });
+      await page.click('#modal:not([hidden]) .modal-buttons button.danger');
+      const removeResponse = await removed;
+      assert(removeResponse.ok(), `frame remove answered ${removeResponse.status()}`);
+      await page.waitForFunction(() => !document.querySelector('#mp-svg .mp-frame'), { timeout: 10000 });
+      return `frame ${frameId} drawn, renamed to Core, removed`;
+    });
+
   await check('Wireless: opening an AP draws (or explains an empty) history chart (G3)',
     async () => {
       await page.keyboard.press('Escape').catch(() => {});
