@@ -940,11 +940,12 @@ try:
     # any chassis-MAC match at all (mapper.assemble_links's port_index
     # kwarg). Adding a chassis-MAC row for the same cable (both now agree
     # on dev_b, so matched_device_id/matched_device_name are unchanged)
-    # exercises the stronger MAC-matched path on top of that same result,
-    # so the far end's OWN if_index -- however it resolved -- is the one
-    # its vlan_ports row is checked against below. The still-unmatched peer
-    # row is repeated unchanged so it does not age out from this same
-    # replace_neighbors call.
+    # exercises that same port_index resolution now running ahead of the
+    # chassis-MAC join too -- the neighbour's own port_id still wins and
+    # resolves to the SAME if_index the join would have found here, so the
+    # far end's if_index is the one its vlan_ports row is checked against
+    # below. The still-unmatched peer row is repeated unchanged so it does
+    # not age out from this same replace_neighbors call.
     service.nodes_db.replace_interfaces(dev_b, [
         {"if_index": 2, "descr": "Gi0/2", "alias": "to-a", "phys_addr": "aa:bb:cc:00:00:02",
          "admin_status": "up", "oper_status": "up"}])

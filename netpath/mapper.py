@@ -297,10 +297,14 @@ def link_identity(device_id, if_index, matched_id, matched_if_index) -> object:
     either side of the same device pair (a LAG, or a pair of switches
     cross-connected twice), where any pairing would still be the guess this
     key exists to avoid. A third route to this same frozenset shape: where a
-    caller passes `assemble_links` a `port_index` resolver, a name-matched
-    row whose neighbour reported its OWN port name or description can
-    resolve straight to the far end's if_index without ever touching this
-    function — the neighbour naming its own port is evidence, not a guess."""
+    caller passes `assemble_links` a `port_index` resolver, ANY matched row
+    whose neighbour reported its OWN port name or description resolves
+    straight to the far end's if_index without ever touching this function,
+    even when `matched_if_index` is already set -- the neighbour naming its
+    own port outranks the MAC-derived one, since the chassis-MAC join proves
+    only which device is across the cable, not which of its ports, and a
+    second cable to the same neighbour would otherwise resolve to the same
+    wrong port every time."""
     if matched_if_index is not None:
         return frozenset({(device_id, if_index), (matched_id, matched_if_index)})
     return ("name-match", device_id, if_index)
@@ -472,12 +476,16 @@ def assemble_links(neighbour_rows, *, port_vlans, port_label, on_map, now,
     rather than imported, so this module never depends on api.py.
 
     `port_index`, if given, is a callable(device_id, port_text) -> if_index
-    or None, tried on a matched row whose `matched_if_index` is NULL --
-    first against `row["port_id"]`, then `row["port_descr"]` -- so a CDP-only
-    row still resolves the far end's real port from the name the neighbour
-    itself sent, and keys the link on the same frozenset shape a MAC-matched
-    row would (see `link_identity`'s own note on this route). A miss falls
-    back to the existing per-row key untouched.
+    or None, tried on EVERY matched row -- first against `row["port_id"]`,
+    then `row["port_descr"]` -- before `matched_if_index` is even looked at,
+    because the neighbour naming its own port outranks the MAC-derived one:
+    `matched_if_index` only proves which DEVICE is across the cable (the
+    chassis MAC can sit on a single SVI/port shared by every cable from that
+    device), while the neighbour's own port_id/port_descr proves which PORT.
+    A resolved if_index is used as the far end whenever it resolves, keying
+    the link on the same frozenset shape a MAC-matched row would (see
+    `link_identity`'s own note on this route); a miss falls back to
+    `matched_if_index`, and then to the existing per-row key, untouched.
 
     Processing order per row matters and is deliberate:
       1. protocol / present / staleness filters drop rows that should not
@@ -567,7 +575,7 @@ def assemble_links(neighbour_rows, *, port_vlans, port_label, on_map, now,
 
         if matched_id is not None:
             resolved_if_index = None
-            if matched_if_index is None and port_index is not None:
+            if port_index is not None:
                 resolved_if_index = (port_index(matched_id, row["port_id"])
                                      or port_index(matched_id, row["port_descr"]))
             if resolved_if_index is not None:

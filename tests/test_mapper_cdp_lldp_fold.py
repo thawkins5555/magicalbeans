@@ -323,6 +323,66 @@ if len(links_lldp_cdp) == 1:
           links_lldp_cdp[0]["protocols"] == ["cdp", "lldp"], links_lldp_cdp[0])
 
 
+# ------------------------------------ the base-MAC-port case (real Cisco gear)
+
+# Two cables between the same pair, both walked over LLDP. The chassis MAC
+# join gives every row from device 2 the SAME matched_if_index (21, the base
+# MAC's own port) and every row from device 1 the SAME matched_if_index (11)
+# -- proving the DEVICE, not the port, exactly as a real switch with one base
+# MAC on an SVI/port behaves. Each row's own port_id names the REAL far port,
+# so a port_index resolver must be tried, and win, ahead of matched_if_index,
+# or the two cables would wrongly fold onto one link (or resolve to the wrong
+# port).
+def port_index_base_mac(device_id, port_text):
+    return {
+        (2, "Gi1/0/21"): 21, (2, "Gi1/0/22"): 22,
+        (1, "Gi1/0/11"): 11, (1, "Gi1/0/12"): 12,
+    }.get((device_id, port_text))
+
+
+rows_base_mac = [
+    lldp_row(1, 11, chassis_mac="aa:bb:cc:dd:ee:ff", matched_device_id=2,
+             matched_if_index=21, port_id="Gi1/0/21", rem_index="0.11.1"),
+    lldp_row(1, 12, chassis_mac="aa:bb:cc:dd:ee:ff", matched_device_id=2,
+             matched_if_index=21, port_id="Gi1/0/22", rem_index="0.12.1"),
+    lldp_row(2, 21, chassis_mac="11:22:33:44:55:66", matched_device_id=1,
+             matched_if_index=11, port_id="Gi1/0/11", rem_index="0.21.1"),
+    lldp_row(2, 22, chassis_mac="11:22:33:44:55:66", matched_device_id=1,
+             matched_if_index=11, port_id="Gi1/0/12", rem_index="0.22.1"),
+]
+links_base_mac, _ = assemble_links(rows_base_mac, port_vlans={}, port_label=label_of,
+                                   on_map=all_on_map, now=NOW,
+                                   port_index=port_index_base_mac)
+check("two cables to a neighbour sharing one base-MAC port resolve to TWO links, "
+      "not folded onto each other by the shared matched_if_index",
+      len(links_base_mac) == 2, links_base_mac)
+if len(links_base_mac) == 2:
+    endpoints = {frozenset({(link["a_device_id"], link["a_if_index"]),
+                            (link["b_device_id"], link["b_if_index"])})
+                 for link in links_base_mac}
+    check("...keyed (1,11)~(2,21) and (1,12)~(2,22), the real ports, not port 21 twice",
+          endpoints == {frozenset({(1, 11), (2, 21)}), frozenset({(1, 12), (2, 22)})},
+          endpoints)
+    check("...both ends' if_index filled on every link",
+          all(link["a_if_index"] is not None and link["b_if_index"] is not None
+              for link in links_base_mac), links_base_mac)
+    check("...each link still carrying lldp",
+          all("lldp" in link["protocols"] for link in links_base_mac), links_base_mac)
+
+# A resolver miss on an LLDP row must not lose the far end it already had --
+# it falls back to matched_if_index exactly as before this fix.
+rows_base_mac_miss = [
+    lldp_row(1, 13, chassis_mac="aa:bb:cc:dd:ee:00", matched_device_id=2,
+             matched_if_index=23, port_id="Gi1/0/99", rem_index="0.13.1"),
+]
+links_base_mac_miss, _ = assemble_links(rows_base_mac_miss, port_vlans={}, port_label=label_of,
+                                        on_map=all_on_map, now=NOW,
+                                        port_index=lambda device_id, port_text: None)
+check("a resolver miss on an LLDP row keeps the matched_if_index behaviour",
+      len(links_base_mac_miss) == 1 and links_base_mac_miss[0]["b_if_index"] == 23,
+      links_base_mac_miss)
+
+
 # ------------------------------------------- one chassis MAC, many interfaces
 
 def _fanout_rows():
