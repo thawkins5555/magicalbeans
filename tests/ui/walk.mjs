@@ -1728,6 +1728,72 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       return `frame ${frameId} dragged (PUT x/y) and resized (PUT width/height), removed`;
     });
 
+  await check('Mapper: Note tool draws a note, edits its text, then removes it',
+    async () => {
+      await page.keyboard.press('Escape').catch(() => {});
+      await selectTab(page, 'mapper');
+      await settle(page, 1000);
+      const noteBtn = page.locator('#mp-add-note');
+      if (await noteBtn.isDisabled()) return 'skipped: Note is disabled (no write access, or no map selected)';
+      const box = await page.locator('#mp-svg').boundingBox();
+      if (!box) return 'skipped: #mp-svg has no bounding box';
+      // A corner well inside the canvas, away from wherever the demo map's
+      // own nodes happen to sit -- same reasoning the Frame tool check uses.
+      const x0 = box.x + 24, y0 = box.y + 180;
+      await noteBtn.click();
+      await page.waitForFunction(() => document.getElementById('mp-add-note').classList.contains('active'),
+        { timeout: 5000 });
+      await page.mouse.move(x0, y0);
+      await page.mouse.down();
+      const steps = 8;
+      for (let i = 1; i <= steps; i += 1) {
+        await page.mouse.move(x0 + (120 * i) / steps, y0 + (90 * i) / steps);
+      }
+      await page.mouse.up();
+      await page.waitForSelector('#mp-svg .mp-note', { timeout: 10000 });
+      const noteId = await page.evaluate(() => document.querySelector('#mp-svg .mp-note').dataset.noteId);
+
+      // Same real-pointerdown-on-the-element idiom the Frame check's own
+      // label click uses, for the same reason (a thin SVG target).
+      const selected = await page.evaluate((id) => {
+        const text = document.querySelector(`#mp-svg .mp-note[data-note-id="${id}"] .mp-note-text`);
+        if (!text) return false;
+        text.dispatchEvent(new PointerEvent('pointerdown', {
+          bubbles: true, cancelable: true, button: 0, isPrimary: true, pointerId: 1,
+        }));
+        return true;
+      }, noteId);
+      assert(selected, 'could not find the note text to click');
+      await page.waitForFunction((id) => {
+        const g = document.querySelector(`#mp-svg .mp-note[data-note-id="${id}"]`);
+        return !!g && g.classList.contains('selected');
+      }, noteId, { timeout: 10000 });
+
+      await page.waitForSelector('#mp-detail #mpn-text', { timeout: 10000 });
+      await page.fill('#mp-detail #mpn-text', 'Uplink to the core');
+      const edited = page.waitForResponse((response) =>
+        /\/api\/mapper\/maps\/\d+\/notes\/\d+$/.test(response.url())
+        && response.request().method() === 'PUT', { timeout: 10000 });
+      await page.click('#mp-detail #mpn-text-save');
+      const editResponse = await edited;
+      assert(editResponse.ok(), `note text edit answered ${editResponse.status()}`);
+      await page.waitForFunction((id) => {
+        const text = document.querySelector(`#mp-svg .mp-note[data-note-id="${id}"] .mp-note-text`);
+        return !!text && text.textContent.includes('Uplink to the core');
+      }, noteId, { timeout: 10000 });
+
+      await page.click('#mp-detail #mpn-remove');
+      await page.waitForSelector('#modal:not([hidden]) .modal-buttons button.danger', { timeout: 10000 });
+      const removed = page.waitForResponse((response) =>
+        /\/api\/mapper\/maps\/\d+\/notes\/\d+$/.test(response.url())
+        && response.request().method() === 'DELETE', { timeout: 10000 });
+      await page.click('#modal:not([hidden]) .modal-buttons button.danger');
+      const removeResponse = await removed;
+      assert(removeResponse.ok(), `note remove answered ${removeResponse.status()}`);
+      await page.waitForFunction(() => !document.querySelector('#mp-svg .mp-note'), { timeout: 10000 });
+      return `note ${noteId} drawn, text edited, removed`;
+    });
+
   await check('Wireless: opening an AP draws (or explains an empty) history chart (G3)',
     async () => {
       await page.keyboard.press('Escape').catch(() => {});

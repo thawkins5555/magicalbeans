@@ -4260,8 +4260,6 @@ check("for (const note of view.notesByNode.get(id) || []) {" in MAPPER88[
 check(".mp-note-c0 { --mp-note-color: var(--canvas-vlan-1); }" in APP_CSS
       and ".mp-note-c5 { --mp-note-color: var(--canvas-vlan-6); }" in APP_CSS,
       "a note shares a frame's six-swatch --canvas-vlan-1..6 palette")
-check("Notes are canvas-only" not in MAPPER88,   # documented in mapperdb.py/api.py, not restated in JS
-      "the map CSV export is untouched by notes (mapper.py, out of scope here)")
 check("function noteDetailHtml(note)" in MAPPER88 and "function noteSwatchesHtml(note, canWrite)"
       in MAPPER88,
       "notes get their own detail-pane editor beside a frame's (text + colour), "
