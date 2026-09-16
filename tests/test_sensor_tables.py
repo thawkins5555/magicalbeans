@@ -3,12 +3,13 @@ into temp_sensor_c.<idx>/temp_sensor_state.<idx>, and the published limits
 that go with them (via _poll_vendor_sensor_thresholds) into
 interface_thresholds with metric_root='temp_sensor_c'.
 
-No real SNMP session: _walk_column is replaced on the NodePoller instance
-directly, the way tests/test_swversion_entity_walk.py does -- this suite is
-about the table-driven walk and its scaling/skip/state rules, not the wire
-format. self.db is a small in-memory fake recording what was written, since
-this is polling-and-stored-rows coverage only (alertrules/alertengine are
-covered elsewhere).
+No real SNMP session: _walk_column_detail is replaced on the NodePoller
+instance directly (both _walk_column and _walk_column_status funnel
+through it) -- this suite is about the table-driven walk and its
+scaling/skip/state rules, not the wire format. self.db is a small
+in-memory fake recording what was written, since this is
+polling-and-stored-rows coverage only (alertrules/alertengine are covered
+elsewhere).
 """
 import sys
 
@@ -78,17 +79,18 @@ SOPHOS_OID = "1.3.6.1.4.1.2604.5.1"
 
 
 def only(base_oid, mapping):
-    """A fake _walk_column that answers `mapping` for exactly `base_oid`
-    and {} for everything else -- most cases here need only one column."""
+    """A fake _walk_column_detail (which _walk_column/_walk_column_status
+    both funnel through) that answers `mapping` for exactly `base_oid` and
+    {} for everything else -- most cases here need only one column."""
     def fake(device, config, oid, raise_on_timeout=False, deadline=None):
-        return dict(mapping) if oid == base_oid else {}
+        return (dict(mapping) if oid == base_oid else {}), True, ""
     return fake
 
 
 def table_walker(columns: dict):
-    """A fake _walk_column dispatching on a {oid: {suffix: value}} map."""
+    """A fake _walk_column_detail dispatching on a {oid: {suffix: value}} map."""
     def fake(device, config, oid, raise_on_timeout=False, deadline=None):
-        return dict(columns.get(oid, {}))
+        return dict(columns.get(oid, {})), True, ""
     return fake
 
 
@@ -96,7 +98,7 @@ def table_walker(columns: dict):
 
 t = nodeoids.SENSOR_TABLES[9]
 poller = new_poller()
-poller._walk_column = table_walker({
+poller._walk_column_detail = table_walker({
     t.value: {"1": 45, "2": 80},
     t.name: {"1": "Inlet", "2": "Outlet"},
     t.thresholds["high_alarm"]: {"1": 70, "2": 90},
@@ -122,7 +124,7 @@ check("vendor_sensor_capable is latched true on a device that answered",
 
 # --- Rev1 value column empty: falls back to the deprecated plain one
 poller2 = new_poller()
-poller2._walk_column = table_walker({
+poller2._walk_column_detail = table_walker({
     t.value_fallback: {"1": 33},
 })
 dev2 = device(CISCO_OID)
@@ -133,7 +135,7 @@ check("Cisco ENVMON: Rev1 empty falls back to the deprecated value column",
 
 # --- notPresent(5)/notFunctioning(6) states are skipped, not written
 poller3 = new_poller()
-poller3._walk_column = table_walker({
+poller3._walk_column_detail = table_walker({
     t.value: {"1": 20},
     t.state: {"1": 5},
 })
@@ -151,7 +153,7 @@ check("a notPresent state is skipped entirely, not written as a fourth level",
 mk_temp = nodeoids.SENSOR_TABLES[14988]
 mk_psu = nodeoids.PSU_TABLES[14988]
 poller4 = new_poller()
-poller4._walk_column = table_walker({
+poller4._walk_column_detail = table_walker({
     mk_temp.value: {"0": 350},          # would become temp_sensor_c.0 if run
     mk_psu.state: {"0": 1},             # ok
 })
@@ -166,7 +168,7 @@ check("...but its PSU table still runs independently",
 
 # ------------------------------------------------------- MikroTik fallback
 poller5 = new_poller()
-poller5._walk_column = table_walker({
+poller5._walk_column_detail = table_walker({
     mk_temp.value_fallback: {"0": 410},   # only the older scalar answers
 })
 dev5 = device("1.3.6.1.4.1.14988.1.1")
@@ -179,7 +181,7 @@ check("MikroTik: primary scalar empty falls back to the processor one, "
 # --------------------------------------------------------------- HP ProCurve
 hp = nodeoids.SENSOR_TABLES[11]
 poller6 = new_poller()
-poller6._walk_column = table_walker({
+poller6._walk_column_detail = table_walker({
     hp.value: {"1": "45C"},
     hp.thresholds["high_alarm"]: {"1": "70C"},
     hp.state: {"1": 2},   # no -> normal
@@ -199,7 +201,7 @@ check("...over temp 'no' maps to normal (0)",
 # --------------------------------------------------------------- Fortinet
 ft = nodeoids.SENSOR_TABLES[12356]
 poller7 = new_poller()
-poller7._walk_column = table_walker({
+poller7._walk_column_detail = table_walker({
     ft.value: {"1": "45.0 C", "2": "3200 RPM"},
     ft.name: {"1": "Temp1 (temp)", "2": "Fan1"},
 })
@@ -214,7 +216,7 @@ check("Fortinet: only rows whose name contains 'temp' are kept -- the fan "
 # --------------------------------------------------------------- Aruba CX
 cx = nodeoids.SENSOR_TABLES[47196]
 poller8 = new_poller()
-poller8._walk_column = table_walker({
+poller8._walk_column_detail = table_walker({
     cx.value: {"1": 45230, "2": 50000, "3": 41000},
     cx.name: {"1": "Sensor1", "2": "Sensor2", "3": "Sensor3"},
     cx.state: {"1": "normal", "2": "critical fault", "3": "unknown"},
@@ -234,7 +236,7 @@ check("...an unrecognised string falls to the declared default (1, warning)",
 # ------------------------------------------------------------ Juniper skip
 jn = nodeoids.SENSOR_TABLES[2636]
 poller9 = new_poller()
-poller9._walk_column = table_walker({
+poller9._walk_column_detail = table_walker({
     jn.value: {"1": 45, "2": 0},
     jn.name: {"1": "FPC 0", "2": "PSU 0"},
     jn.state: {"1": 2, "2": 6},   # running -> 0, down -> 2
@@ -251,7 +253,7 @@ check("...its state still comes through independently (down -> critical)",
 # --------------------------------------------------------------- APC -1 skip
 apc = nodeoids.SENSOR_TABLES[318]
 poller10 = new_poller()
-poller10._walk_column = table_walker({
+poller10._walk_column_detail = table_walker({
     apc.value: {"1": 22, "2": -1},
     apc.thresholds["high_warn"]: {"1": 30},
     apc.thresholds["high_alarm"]: {"1": 35},
@@ -272,7 +274,7 @@ check("...its high_warn/high_alarm band is published",
 # ------------------------------------------------------- Sophos extra scalars
 so = nodeoids.SENSOR_TABLES[2604]
 poller11 = new_poller()
-poller11._walk_column = table_walker({
+poller11._walk_column_detail = table_walker({
     so.value: {"0": 350},
     so.extra_scalars[0][0]: {"0": 420},
 })
@@ -287,7 +289,7 @@ check("Sophos: NPU and CPU are two independent always-read scalars, not a "
 # ----------------------------------------------------- Netgear global range
 ng = nodeoids.SENSOR_TABLES[4526]
 poller12 = new_poller()
-poller12._walk_column = table_walker({
+poller12._walk_column_detail = table_walker({
     ng.value: {"1": 30, "2": 55},
     ng.threshold_scalars["high_alarm"]: {"0": 65},
     ng.state: {"1": 1, "2": 4},   # normal, shutdown
@@ -305,7 +307,7 @@ check("...state 4 (shutdown) maps to the top of the common scale",
 
 # --------------------------------------------------- capability latch: nothing
 poller13 = new_poller()
-poller13._walk_column = only("nothing", {})
+poller13._walk_column_detail = only("nothing", {})
 dev13 = device(CISCO_OID)
 poller13._poll_vendor_sensors(13, dev13, CONFIG, 1_700_000_000.0)
 check("a device answering nothing at all is latched incapable, once",
@@ -318,10 +320,10 @@ walked14 = []
 
 def counting(device, config, oid, raise_on_timeout=False, deadline=None):
     walked14.append(oid)
-    return {"1": 40} if oid == t.value else {}
+    return ({"1": 40} if oid == t.value else {}), True, ""
 
 
-poller14._walk_column = counting
+poller14._walk_column_detail = counting
 dev14 = device(CISCO_OID)
 poller14._poll_vendor_sensors(14, dev14, CONFIG, 1_700_000_000.0)
 walked14.clear()

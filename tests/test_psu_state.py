@@ -33,15 +33,16 @@ class _FakeDB:
     def __init__(self):
         self.sample_calls = []
         self.capable_calls = []
-        self._existing: dict[int, set] = {}
+        self._existing: dict[int, dict] = {}   # device_id -> {key: label}
 
     def metrics(self, device_id):
-        return [{"key": k} for k in self._existing.get(device_id, set())]
+        return [{"key": k, "label": lbl}
+                for k, lbl in self._existing.get(device_id, {}).items()]
 
     def record_metric_samples(self, device_id, samples):
         self.sample_calls.append((device_id, list(samples)))
         for row in samples:
-            self._existing.setdefault(device_id, set()).add(row[0])
+            self._existing.setdefault(device_id, {})[row[0]] = row[1]
 
     def replace_interface_thresholds(self, device_id, source, rows):
         pass
@@ -57,8 +58,8 @@ class _FakeDB:
                     out[key] = value
         return out
 
-    def seed_existing(self, device_id, key):
-        self._existing.setdefault(device_id, set()).add(key)
+    def seed_existing(self, device_id, key, label=None):
+        self._existing.setdefault(device_id, {})[key] = label or key
 
 
 def new_poller():
@@ -227,9 +228,11 @@ check("a device answering neither table is latched incapable, once",
 
 # ------------------------------------------- per-poll PSU cadence (section 2)
 def recording_walker(columns: dict, calls: list):
+    """Same _walk_column_detail stub shape as table_walker, plus a record
+    of every OID asked for."""
     def fake(device, config, oid, raise_on_timeout=False, deadline=None):
         calls.append(oid)
-        return dict(columns.get(oid, {}))
+        return dict(columns.get(oid, {})), True, ""
     return fake
 
 temp_table = nodeoids.SENSOR_TABLES[9]

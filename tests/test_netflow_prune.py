@@ -389,18 +389,18 @@ def test_8_size_cap_respects_the_minute_watermark() -> None:
     watermark_bucket = flowdb._align_down(watermark_ts, 60)
     db._set_private_setting(flowdb._FLOOR % 60, start)
     db._set_private_setting(flowdb._WATERMARK % 60, watermark_bucket)
+    unsummarised_before = db._conn.execute(
+        "SELECT COUNT(*) AS n FROM flows WHERE ts_end >= ?",
+        (watermark_bucket,)).fetchone()["n"]
 
     db.trim_to_size(int(before * 0.1), budget_s=60.0)
 
     unsummarised_left = db._conn.execute(
         "SELECT COUNT(*) AS n FROM flows WHERE ts_end >= ?",
         (watermark_bucket,)).fetchone()["n"]
-    unsummarised_total = db._conn.execute(
-        "SELECT COUNT(*) AS n FROM flows WHERE ts_end >= ? AND ts_end < ?",
-        (watermark_bucket, flow(n - 1, start + (n - 1) * 0.5).ts_end + 1)).fetchone()["n"]
-    check(unsummarised_left == unsummarised_total and unsummarised_left > 0,
+    check(unsummarised_left == unsummarised_before,
           f"every flow at or after the watermark survives the size cap "
-          f"({unsummarised_left} of {unsummarised_total})")
+          f"({unsummarised_left} of {unsummarised_before})")
     check(db.cap_held_back > 0,
           f"and the trim counts what it held back ({db.cap_held_back})")
     db.close()

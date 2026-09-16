@@ -9,10 +9,10 @@ Also covers built-in rule seeding: a fresh AlertsDatabase ships both
 stack_power_cable_down and stack_power_trap, and a database that predates
 them gains both on reopen (alertsdb._seed_rules is INSERT OR IGNORE).
 
-No real SNMP session: _walk_column is replaced on the NodePoller instance
-directly, the style tests/test_psu_state.py already uses. self.db is the
-same small in-memory fake, extended to also carry label/unit/last_ts so
-api.get_nodes_device_stack_power (stored data only) can read it back.
+No real SNMP session: _walk_column_detail is replaced on the NodePoller
+instance directly, the style tests/test_psu_state.py already uses. self.db
+is the same small in-memory fake, extended to also carry label/unit/last_ts
+so api.get_nodes_device_stack_power (stored data only) can read it back.
 """
 import os
 import sys
@@ -90,10 +90,12 @@ ST_NAME = nodeoids.CSW_STACK_POWER_NAME
 
 
 def table_walker(columns: dict, calls: list | None = None):
+    """Stubs _walk_column_detail, which _walk_column/_walk_column_status
+    both funnel through. Every OID answers complete."""
     def fake(device, config, oid, raise_on_timeout=False, deadline=None):
         if calls is not None:
             calls.append(oid)
-        return dict(columns.get(oid, {}))
+        return dict(columns.get(oid, {})), True, ""
     return fake
 
 
@@ -115,7 +117,7 @@ FULL_STACK = {
 
 # ------------------------------------------------------------- basic walk
 poller = new_poller()
-poller._walk_column = table_walker(FULL_STACK)
+poller._walk_column_detail = table_walker(FULL_STACK)
 dev = device(CISCO_OID)
 poller._poll_stack_power(1, dev, CONFIG, 1_700_000_000.0)
 samples = poller.db.samples_dict(1)
@@ -160,7 +162,7 @@ check("capability latches answered",
 
 # ---------------------------------------------------- disabled port -> 0
 poller_dis = new_poller()
-poller_dis._walk_column = table_walker({
+poller_dis._walk_column_detail = table_walker({
     **FULL_STACK,
     P_OPER: {"1001.1": 2},          # administratively disabled
     P_LINK: {"1001.1": 2},          # ...and the link happens to read down too
@@ -174,7 +176,7 @@ check("an admin-disabled port reads 0 regardless of link -- deliberately "
 # ---------------------------------------------------- non-Cisco never probed
 walked_nc = []
 poller_nc = new_poller()
-poller_nc._walk_column = table_walker(FULL_STACK, walked_nc)
+poller_nc._walk_column_detail = table_walker(FULL_STACK, walked_nc)
 poller_nc._poll_vendor_sensors(3, device(JUNIPER_OID, id=3), CONFIG, 1_700_000_000.0)
 check("a non-Cisco device's _poll_vendor_sensors never walks a CSW_* OID",
       not any(oid.startswith("1.3.6.1.4.1.9.9.500") for oid in walked_nc), walked_nc)
@@ -185,7 +187,7 @@ check("...and no stack_power_* metric is ever written",
 # ---------------------------------------- unanswered probe latched + reprobed
 walked_u = []
 poller_u = new_poller()
-poller_u._walk_column = table_walker({}, walked_u)
+poller_u._walk_column_detail = table_walker({}, walked_u)
 dev_u = device(CISCO_OID, id=4)
 poller_u._poll_stack_power(4, dev_u, CONFIG, 1_700_000_000.0)
 check("a device answering none of the tables writes nothing",
@@ -202,11 +204,11 @@ check("past the hourly reprobe window, it tries again",
 
 # -------------------------------------------------------- vanished port
 poller_v = new_poller()
-poller_v._walk_column = table_walker(FULL_STACK)
+poller_v._walk_column_detail = table_walker(FULL_STACK)
 dev_v = device(CISCO_OID, id=5)
 poller_v._poll_stack_power(5, dev_v, CONFIG, 1_700_000_000.0)
 before = poller_v.db.samples_dict(5).get("stack_power_port.1001002")
-poller_v._walk_column = table_walker({
+poller_v._walk_column_detail = table_walker({
     **FULL_STACK,
     P_OPER: {"1001.1": 1},   # port 2 gone from the walk entirely
     P_LINK: {"1001.1": 1},

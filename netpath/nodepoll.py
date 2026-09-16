@@ -6809,10 +6809,20 @@ class NodePoller(Worker):
         if fan_tables:
             primary, fallback = fan_tables
             fan_rows, fan_complete = self._vendor_psu_rows(device, config, primary, now)
-            fan_table = primary
+            # Primary's own vanish check runs on primary's own rows/keys
+            # BEFORE any fallback below can reassign fan_rows to the OTHER
+            # table's: each table's absence tracking is keyed on its own
+            # state OID and driven only by its own walk, so a device that
+            # falls back to the other table this poll (because primary
+            # answered empty) never reads as primary's whole tray vanishing.
+            self._mark_vendor_rows_absent(device_id, primary.state, "fan_state",
+                                          fan_rows, fan_complete, existing,
+                                          existing_labels, samples, now)
             if not fan_rows:
                 fan_rows, fan_complete = self._vendor_psu_rows(device, config, fallback, now)
-                fan_table = fallback
+                self._mark_vendor_rows_absent(device_id, fallback.state, "fan_state",
+                                              fan_rows, fan_complete, existing,
+                                              existing_labels, samples, now)
             if fan_rows:
                 answered = True
             for idx, row in fan_rows.items():
@@ -6828,12 +6838,6 @@ class NodePoller(Worker):
                     continue
                 samples.append((key, row["label"], "state", "gauge", now,
                                 float(row["state"])))
-            # Only the table THIS poll actually used: the fallback pattern
-            # means a device that switches which of the two answers must
-            # never read as the other one's whole fan tray vanishing.
-            self._mark_vendor_rows_absent(device_id, fan_table.state, "fan_state",
-                                          fan_rows, fan_complete, existing,
-                                          existing_labels, samples, now)
 
         if not capable and answered:
             self.db.set_vendor_sensor_capable(device_id, True)
