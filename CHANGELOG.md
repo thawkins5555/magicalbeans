@@ -230,7 +230,7 @@ shipped with below — see that entry's own note, and **FEATURES.md**'s
 Mapper section, both of which now point here instead.
 
 **Demo:** `cisco_access` now answers per-VLAN SNMP contexts the same way
-`cisco_core` already did, and acc-sw-004's second uplink is rebuilt to
+`cisco_core` already did, and acc-sw-005's second uplink is rebuilt to
 prove the read actually matters — it blocks only in VLAN 30 and reads
 forwarding in the default (VLAN 1) context, so its dotted Mapper line can
 only be explained by the per-VLAN read, not the old one.
@@ -252,7 +252,7 @@ extend for the `a_stp_vlans`/`b_stp_vlans` map-JSON keys (`None` on a
 manual link) and the CSV row's ` (VLANs 20, 30)` suffix.
 `tests/test_frontend_contracts.py` section 94 pins the Nodes `blocking ·
 ` cell text and the Mapper `(VLANs ` tooltip fragment. `tests/ui/
-walk.mjs` extends its existing FiberView and Nodes checks to acc-sw-004's
+walk.mjs` extends its existing FiberView and Nodes checks to acc-sw-005's
 own blocked uplink.
 
 ### 5.36.0 — Optic single/multimode per port, FiberView by mode, STP-blocked and parallel Mapper links

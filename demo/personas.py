@@ -1214,13 +1214,13 @@ def _access_second_uplink_port(name: str) -> int:
 def _access_uplink2_vlan_state(vlan_ctx: str):
     """dot1dStpPortState for the second uplink, inside the per-VLAN
     community context built for `vlan_ctx` -- blocking in every context
-    for most instances; acc-sw-004 blocks only in VLAN 30 (its own
+    for most instances; acc-sw-005 blocks only in VLAN 30 (its own
     DEFAULT-context reply for this port is forced to forwarding, below, so
     its Mapper dotted line can only come from the per-VLAN read). A
     lambda on `st.name` because every cisco_access instance shares one
     memoised Table per vlan_ctx (Persona.table()) -- see _uplink_optic_text."""
     def state(st, now):
-        if st.name == "acc-sw-004":
+        if st.name == "acc-sw-005":
             return 2 if vlan_ctx == "30" else 5
         return 2
     return state
@@ -1228,9 +1228,9 @@ def _access_uplink2_vlan_state(vlan_ctx: str):
 
 def _access_uplink2_default_state(st, now) -> int:
     """The second uplink's DEFAULT-context (VLAN 1) dot1dStpPortState --
-    blocking, except acc-sw-004, which is forwarding here so its dotted
+    blocking, except acc-sw-005, which is forwarding here so its dotted
     Mapper line can only come from the per-VLAN read above."""
-    return 5 if st.name == "acc-sw-004" else 2
+    return 5 if st.name == "acc-sw-005" else 2
 
 
 def _build_cisco_access(wrap32: bool, ports: int, vlan: str | None) -> dict:
