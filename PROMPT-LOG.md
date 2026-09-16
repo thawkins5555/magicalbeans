@@ -5,6 +5,49 @@ grouped by the version that carries it. This is a working record for the
 operator — the full story of each change is in `CHANGELOG.md`, and this file
 does not replace it.
 
+## 5.35.0 — Interface stanzas by indent, default gateways from ConfigRX, a single-PSU report, sensor vanish alerts, and SFP badges restored fleet-wide
+
+**Operator prompt, verbatim:**
+> -Nodes -> Devices -> Interfaces pop up dialog is not showing the running dialog specific to that port.  It simply says 'No stanza found.'
+> -IP Default gateway is not being recognized and shown on the 'Addresses' tab.  It says 'Default gateway: not published by this device' when the device does in fact have a default gateway assigned to it. 
+> -Random blocks of data are missing from Netflow still - is the data being added to the graph based off of when it's received or is it being placed on the graph based off of the timestamp in the netflow data?   Here is a screenshot showing the missing data.  
+>
+>
+> I would like to create a report that lists all switches that only have 1 power supply.  Do not include a device with a down power supply if that device has valid stack power cables. 
+>
+> I ran a 'Sensor Snapshot' on a device and then removed the FAN module - the device details popup dialog changed Switch 1 FAN - T1 1, NORMAL to ', NotExist' and status 'notPresent' - because the sensor status changed after running a sensor snapshot this should have thrown an alert. 
+>
+> I have multiple 2960X's on the network that are properly showing SFP's and DOM SFP's - I have a single 2960X that appears to not be properly showing the tags.  I have confirmed it's the same SFP in each switch.  Please look into this.
+
+**Follow-up, verbatim:**
+> Regarding the missing SFP/Copper/DOM icon on some switches - this appears to be more widespread than just 2960x's - I have verified the transceiver type is viewable via a full SNMP Walk of the devices.
+
+**Plan.** Six items, all bugs or gaps in code already shipped rather than
+new asks, so each got a code-grounded diagnosis before anything was
+changed. Planning answers given for the questions each item raised:
+Cisco IOS/IOS-XE, and the `interface …` header **is** present in the
+latest ConfigRX backup for the affected port (stanza); the affected
+boxes are Layer-2 switches configured with `ip default-gateway`, not a
+routed default (gateway); the NetFlow gap sits in a window with a
+confirmed exporter restart/outage, Sep 14 04:00–14:00 (NetFlow); the new
+report judges per stack member, "covered" means at least one StackPower
+port enabled, link up, with a neighbour, and it goes on the SCHEDULED
+list like the others (single-PSU report); and, after the follow-up, the
+missing SFP/DOM badges are fleet-wide, not one model, on switches that
+do list sensors in HARDWARE SENSORS with the badge still missing
+(badges). Team split: Thing1 took the three poller-only items (fan/PSU
+vanish alert, SFP badge scan and diagnostics, gateway's third SNMP leg
+and ConfigRX fallback); Thing2 took the single-PSU report, the stanza
+indented-header search and the NetFlow size-cap guard. Testy ran each
+touched test file as the builders worked and the full suite once at the
+end; Javariius reviewed the whole diff before push, with no walk or
+review run until every item was coded, and no second walk after review,
+per standing rules. Stephen_King wrote CHANGELOG/FEATURES/INTERNALS and
+this entry. Version bumped to 5.35.0, committed on the session branch,
+pushed, then fast-forwarded onto `main`.
+
+**Outcome.** (filled in at release)
+
 ## 5.34.0 — Mapper FiberView: fiber links draw bold and glowing blue
 
 **Operator prompt, verbatim:**

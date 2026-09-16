@@ -662,6 +662,21 @@ own subtabs.
   has no media column of its own. A badge is cleared by the first walk
   that answers and finds nothing there; a walk that times out leaves it
   alone rather than blinking the whole fleet's optics out of existence.
+- **From 5.35.0, the cage scan runs even on a switch that answers no DOM
+  or sensor rows at all.** A switch whose optics carry no light-level
+  data to read used to skip the whole badge scan along with the sensor
+  read, so it never earned a badge on any port even with transceivers
+  correctly identified — this was widespread, not tied to one switch
+  model. The two scans are now independent, so a switch like that still
+  gets scanned for its port names and populated cages on its own
+  probe-once-remember schedule. Separately, a name walk cut short by a
+  timeout or row cap can no longer strip a badge a previous, complete
+  pass had already written — it only ever keeps what is stored. **The
+  Nodes event log now explains, once an hour per device, exactly why a
+  switch could not be badged** when the scan read sensor data it could
+  not place on a port: an empty port map (naming the row counts behind
+  it), a walk that did not finish and why, or sensor rows that read fine
+  but matched no port at all.
 - **A device inherits its settings from a "polling profile"** (a group) —
   credentials, poll interval, timeout, retries, which of ping/SNMP are
   enabled, how many ping probes to send and how long to wait for them,
@@ -1372,6 +1387,17 @@ table is empty, the older CISCO-ENVMON-MIB as a fallback. The per-sensor
 table tags a fan row `(fan)` alongside its `(power supply)` and
 `(stack power)` tags.
 
+**From 5.35.0, a fan tray or power supply pulled from the chassis is
+reported gone, not left showing its last reading.** Cisco's own hardware
+inventory tables simply stop listing a row the moment the part is
+removed — they do not report it as "not present," the row is just no
+longer in the walk — so a reading taken before the part came out used to
+sit on file, unchanged, forever, with no alert. A bay that drops out of
+a *complete* poll of that table (never a poll cut short by a timeout or
+a row limit, which proves nothing either way) is now recorded as "not
+present," which opens the same **Fan failed or not present** / **Power
+supply warning/failed** alert a live not-present reading already opens.
+
 **From 5.33.0, a Sensor Snapshot button sits at the bottom of the dialog,
 beside Re-identify.** It accepts every power supply, stack power and fan
 reading the device has right now as normal for it — useful the moment a
@@ -1715,10 +1741,19 @@ none match exactly, so a short name whose letters also happen to prefix a
 different, longer interface name earlier in the file (`Tw1/0/1` against
 `TwentyFiveGigE1/0/1`) always resolves to that name's own exact header
 (`TwoGigabitEthernet1/0/1`) instead. `Gi1/0/1` still never matches a
-stanza for `Gi1/0/10`. A device with no ConfigRX backup at all says "No
-ConfigRX backup for this device yet."; a backup with no line naming this
-port says so instead — either way the **ConfigRX** button stays offered,
-never a blank tile. The tile is only fetched for an account that can read
+stanza for `Gi1/0/10`. **From 5.35.0, a header does not have to sit at
+the very start of the line to be found** — a paged capture that left
+pager residue ahead of the line, or a header nested under something else
+entirely, is now tried too, once no column-0 header has matched, so a
+real top-level stanza never loses to a nested one sharing its name. A
+device with no ConfigRX backup at all says "No ConfigRX backup for this
+device yet."; a backup that just does not have this port's stanza now
+says exactly what it searched for and how large the backup was — "No
+stanza for Gi1/0/1 / GigabitEthernet1/0/1 among 42 interface stanzas in
+this backup." — and a port with no stored SNMP name to search for at all
+says "This port has no stored interface row." instead. Either way the
+**ConfigRX** button stays offered, never a blank tile. The tile is only
+fetched for an account that can read
 ConfigRX — a Nodes-only viewer keeps the dialog's static hint ("The
 port's own stanza appears here when ConfigRX holds a backup of this
 device.") instead of a request that would be refused — and beneath a
@@ -1858,7 +1893,18 @@ evidence, since 5.27.0, that ever made two devices look like one.
   table and shows the device's own default-route next hop — read on the
   same hourly walk as the address table — or "not published by this
   device" when the device reports no default route, or has not been
-  read yet.
+  read yet. **From 5.35.0 the walk also tries `inetCidrRouteTable`**,
+  which is what IOS 15.x and IOS-XE actually populate now that the older
+  `ipCidrRouteTable` is deprecated, before falling back to the original
+  RFC1213 route table read — the first of the three tables that answers
+  a real next hop wins. **And for a Layer-2 switch that answers none of
+  the three** — one configured only with `ip default-gateway`, with
+  nothing in any route table SNMP publishes — the line falls back to
+  whatever the device's latest ConfigRX backup says, parsed off its
+  stored `ip default-gateway` or default static route line, and reads
+  "Default gateway: 10.1.1.1 (from ConfigRX backup)" so it is plain the
+  figure came from a saved config rather than a live SNMP read. A live
+  SNMP answer always takes precedence over the backup.
 - **Adding an address another device already has configured is refused,
   and says which device.** The message names it, links to it, and offers
   **Add anyway** for the case where two boxes really do sit behind one
@@ -1887,10 +1933,10 @@ evidence, since 5.27.0, that ever made two devices look like one.
 
 ### Reporting — Nodes → REPORTS
 
-Three reports, computed from history and identity data the poller already
-keeps rather than requiring a query written by hand. All three live on
-their own subtab of Nodes → **REPORTS**, all three are read-only
-(`nodes:read`, so a viewer account can run them in full), and all three
+Five reports, computed from history and identity data the poller already
+keeps rather than requiring a query written by hand. All five live on
+their own subtab of Nodes → **REPORTS**, all five are read-only
+(`nodes:read`, so a viewer account can run them in full), and all five
 take an optional device **Group** filter to narrow from the whole fleet
 to one group.
 
@@ -1970,17 +2016,35 @@ the report is free. Same two export buttons as Firmware inventory —
 for a fresh build — and the same API reach: `GET
 /api/nodes/reports/sfp` and `/sfp/export.csv`.
 
+**SINGLE PSU, from 5.35.0** — every stack member, or standalone switch,
+currently running on exactly one power supply, fleet-wide or narrowed to
+a device **Group**. A stack of switches is judged member by member, not
+by the chassis as a whole, since a stack member's own power state is
+what matters for it. A member with a down or missing supply is left off
+the list — and counted in a separate "covered" total instead — when that
+same member has at least one StackPower port that is administratively
+enabled, shows a link up, and has a neighbour switch on the other end of
+the cable: a genuine failover path to another member's supply, not
+merely a cable that happens to be plugged in. Each row names the device,
+the stack member (blank for a standalone switch), how many supply bays
+were seen against how many are present, and a plain reading of each
+supply ("Power Supply A ok · Power Supply B not present") alongside its
+StackPower coverage. Same two export buttons and API reach as the
+reports above: `GET /api/nodes/reports/psu` and `/psu/export.csv`.
+
 ### Scheduled reports — Nodes → REPORTS → SCHEDULED, from 5.23.0
 
 Any of the reports above, sent by email on a repeating schedule instead
 of run by hand — availability, top-N by metric, firmware inventory,
-and, from 5.24.0, SFP inventory. Up to 50 schedules, each its own
+SFP inventory (from 5.24.0), and, from 5.35.0, SINGLE PSU. Up to 50
+schedules, each its own
 **daily**, **weekly** (pick the weekday) or **monthly** (pick the day
 of month — clamped to the last day of a shorter month, so "the 31st"
 still sends in February) cadence at a chosen local hour and minute, its
 own list of recipients, and the same report kind and parameters (device
-group, period, metric, top-N, or — for SFP inventory — device group and
-include-empty) the on-demand report takes.
+group, period, metric, top-N, for SFP inventory device group and
+include-empty, or for SINGLE PSU device group alone) the on-demand
+report takes.
 
 **The email is a text summary, not a spreadsheet pretending to be one.**
 The period covered, the totals, and up to 20 rows in the body — the
@@ -3122,6 +3186,11 @@ Listens for exported flow records, stores them, and charts them.
 - **Send test packet** sends a valid zero-record NetFlow v5 packet over
   loopback and shows the PowerShell equivalent, so you can prove the socket is
   receiving before blaming the exporter.
+- **A flow is charted by its own end time, not by when it was received** —
+  v9's `LAST_SWITCHED` against the exporter's own boot time, IPFIX's own
+  `flowEnd` fields — so a chart's gap is a real gap in what the exporter
+  sent for that stretch of time, from an outage or a restart on its end,
+  not data misplaced on the graph.
 
 ### Views
 
@@ -3271,7 +3340,11 @@ Routes, a range picked here is not remembered across a page reload.
 ### Storage
 
 Flows live in their own database so a busy exporter does not contend with the
-trace scheduler. Retention, a row cap and a file size cap all apply.
+trace scheduler. Retention, a row cap and a file size cap all apply. **From
+5.35.0, the size cap also holds back raw flows the minute-by-minute summary
+has not gotten to yet**, the same protection the row cap already had, so a
+summariser that falls behind can no longer have the size cap delete flows
+out from under it before they are counted into the rollup.
 
 Beside the individual records the collector keeps **summaries**: every minute
 and every hour, the heaviest keys of each Group by dimension, plus that

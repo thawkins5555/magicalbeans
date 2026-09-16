@@ -376,6 +376,34 @@ day-based retention prunes for each module,
 `AppDatabase.prune_hostnames()` for the reverse-DNS cache and
 `AppDatabase.prune_asn_cache()` for the ASN/owner cache.
 
+**A subclass can cap how far `trim_to_size` is allowed to delete, from
+5.35.0 (`sqlitebase.py`, `flowdb.py`).** `SqliteStore._trim_id_ceiling()`
+is a new hook, returning `None` by default (no ceiling — the existing
+behaviour, unchanged for every store but flowdb). `trim_to_size`'s own
+delete-batch call now clamps its computed cut point (`low + want`) down
+to whatever `_trim_id_ceiling()` returns, when that is lower; if the
+clamp leaves nothing above the floor to delete this pass, it sets
+`deletable = 0` and moves straight to reclaiming rather than deleting
+zero rows and looping. `flowdb.FlowDatabase._trim_id_ceiling` is the one
+override: it reads `rollup_bounds(60)` (the minute tier's own watermark
+— the same query `prune()`'s row-cap stage has used since 5.23.0 to stop
+the row cap deleting past it) and returns the lowest id with `ts_end` at
+or past that watermark, so the size cap's first stage now shares the
+row cap's own protection against outrunning a summariser that has
+fallen behind. It also sets `self.cap_held_back` and logs a warning
+whenever it actually holds something back, the same counter and log
+line `prune()`'s row-cap stage already writes, so the two causes are not
+told apart on screen — either one reads as "the minute rollup is behind
+and flows are being held back for it," which is the fact that matters
+from an operator's chair. Before this, a `max_flow_db_mb` pass had no
+such floor: a minute-rollup stall lasting longer than it took the size
+cap to work through its own backlog could delete a block of
+never-summarised flows outright, with nothing recorded to show it had
+happened — unlike the row cap, which has had this exact protection
+since 5.23.0. `tests/test_netflow_prune.py` covers a size trim with the
+watermark held behind, asserting the unsummarised tail survives and
+`cap_held_back` reports it.
+
 `web/service.py`'s module-level **`STORES`** is the one list of what those
 databases are: per store a `name` (the prefix its keys carry in the storage
 block, and the `entity_id` of any alert about it), a `label`, an `attr`
@@ -1440,6 +1468,95 @@ whenever *this* poll's own sensors or MAU-MIB did not themselves prove
 that port optic or copper, exactly the same "advisory only" treatment
 `'sfp'`/`'sfp_empty'` already had — a slow device does not flicker a
 copper badge off and back every five minutes either.
+
+### The cage scan runs without a sensor answer, and says why a port stayed unbadged: `_cage_capable`/`_cage_read`, `_log_media_diag` (`nodepoll.py`) — 5.35.0
+
+**Decoupling the cage scan from the sensor gate.** `_poll_environment`
+used to `return` the moment `_walk_sensor_columns` came back empty —
+before 5.35.0 that meant a switch whose optics carry no DOM/light-level
+data at all (real hardware, correctly identified, just nothing to read
+sensor-wise) never reached the ENTITY-MIB cage scan either, so it never
+earned a badge on any port. The empty-`cols` branch now falls through
+instead of returning: `sensor_values`/`types`/`scales`/`precisions`/
+`statuses`/`units` are set to empty dicts and the rest of the pass —
+`entPhysicalDescr`, the port map, `_sfp_slot_media`, MAU-MIB — runs
+exactly as it would with a real sensor answer, just with nothing to add
+to `per_port`. `sensor_capable`'s own latch (`self.db.
+set_sensor_capable`) is unaffected either way — it is still about
+whether the DOM/sensor tables themselves answer, nothing else.
+
+Falling through to a real ENTITY-MIB walk on *every* poll for a device
+that has genuinely never answered it — a plain host, a PDU with no
+optics at all — would cost every non-switch in the fleet a dead walk
+every `_SENSOR_REFRESH_S` (300 s). A new probe-once-remember pair,
+`self._cage_read`/`self._cage_capable` (`dict[int, float]`/`dict[int,
+bool]`, same shape as `_mau_read`/`_mau_capable`), gates that: when the
+sensor branch is the empty one, the cage scan below is skipped unless
+`_cage_capable.get(device_id)` is not `False` (never probed, or probed
+and it answered) or `_SENSOR_REPROBE_S` (3600 s) has passed since
+`_cage_read[device_id]`. `_cage_capable` is set `True` the moment
+`_sfp_slot_media` reports any `entPhysicalClass` rows at all — from
+either code path, sensor-answered or not — and set `False` only on a
+*complete* cage walk that answered zero rows (a clean `noSuchObject`
+verdict: this device has no ENTITY-MIB); a walk cut short with zero rows
+so far proves nothing and leaves the latch as it was. `_reset_device_caches`
+drops `_cage_read` alongside `_mau_read` on a device removed or
+re-identified, so a fresh probe is not stuck behind a stale hour-old
+timestamp.
+
+**`_sfp_slot_media` now returns four values, not two**: `(media,
+complete, class_rows, reasons)`. `class_rows` is the raw
+`entPhysicalClass` row count — what feeds `_cage_capable` above, since
+the caller needs to know "did ENTITY-MIB answer at all," not only the
+mapped/complete verdict. `reasons` is a list of `"<column> walk cut
+short (<detail>)"` strings, one per column that did not finish, built
+from `_walk_column_detail`'s own reason text in place of the plain
+`_walk_column_status` the two column walks (`entPhysicalClass`,
+`entPhysicalModelName`) used before. The `entPhysicalDescr` walk and,
+when it runs, the Cisco-only `entPhysicalName` walk are switched to
+`_walk_column_detail` too, in `_poll_environment` itself, and both now
+feed `slots_complete` (`slots_complete and descrs_done and names_done`)
+— an `entPhysicalName` walk cut short by a timeout or row cap used to
+map fewer sensors to ports than the device really has with nothing
+recording that it happened, so `_poll_environment` now treats it as
+advisory-only, the same "keep whatever is already stored" doctrine
+5.2.0 gave the class/model walks, rather than letting a half-mapped pass
+quietly downgrade or clear a badge a complete pass had already written.
+
+**`_log_media_diag(device, message)`** writes one line to the Nodes
+event log, rate-limited per device to `_SENSOR_REPROBE_S` (an hour) — a
+badge gap is a standing condition, not a transient one, so nothing is
+gained by repeating it every `_SENSOR_REFRESH_S` poll the way
+`_log_sensor_diag` does for its own, faster-changing diagnostics. Three
+call sites, each naming a distinct cause:
+
+- **Empty port map.** When `port_map` comes back empty, the cage scan
+  and MAU walk are skipped entirely (unchanged from before — two more
+  dead walks would cost nothing useful), but now, *only when there was
+  some ENTITY-MIB data to map in the first place* (`alias_rows` from
+  `_entity_port_map` or a non-empty `contained_in` tree — a plain host
+  with neither never earns an hourly event about a scan it was never
+  going to answer), one line names the row counts behind the empty
+  result: `"no entity mapped to a port — entAliasMappingIdentifier had
+  N row(s), entPhysicalName matched no stored ifDescr"`.
+- **A walk that did not finish.** Whenever `slots_complete` is `False`
+  and `media_reasons` is non-empty, every collected reason (descr, name,
+  class, model — whichever did not finish) is logged as its own line,
+  ending `", stored badges kept"` to say plainly that nothing was wiped.
+- **Sensor rows that read but mapped nowhere.** The per-sensor loop now
+  counts `unmapped_sensor_rows` (any resolved entity with `port_map.get
+  (entity) is None`); when `port_map` is non-empty (the device maps
+  *something*, just not these — a UPS or room monitor with nothing to
+  map at all is never flagged for it) and the count is nonzero, one line
+  reads `"N sensor row(s) mapped to no port"`.
+
+**`_IF_NAME_ABBREVIATIONS` gains `"ap": "appgigabitethernet"`**, so the
+interface-name matcher (used by the badge/port-map resolution and the
+5.33.0 stanza matcher alike) recognises `Ap1/0/1` against
+`AppGigabitEthernet1/0/1`. `et`/`e` are deliberately not added — too
+ambiguous against Ethernet's own many short forms to be worth the risk
+of a false match.
+
 
 **A −40 dBm optic is dark, not dying.** A transceiver with its port powered
 down or no fiber in it clamps at the bottom of its scale, and
@@ -3442,6 +3559,55 @@ differently from an operator's chair. `index.html` adds the `#nd-addr-gateway`
 paragraph above the address table and updates the subtab's own hint text to
 mention the default route alongside the hourly address read.
 
+### A third route table, then a ConfigRX fallback (`nodeoids.py`, `nodepoll.py`, `configrx.py`, `configrxdb.py`, `web/api.py`, `nodes.js`) — 5.35.0
+
+`_refresh_default_gateway` gained a middle leg: `ipCidrRouteTable`
+(the 5.30.0 walk above) is deprecated and answers nothing on IOS 15.x and
+IOS-XE, which publish its replacement, `inetCidrRouteTable`, instead. A
+new OID, `nodeoids.INET_CIDR_ROUTE_NEXTHOP_DEFAULT_V4`
+(`inetCidrRouteNextHop`, IPv4 dest 0.0.0.0/0,
+`1.3.6.1.2.1.4.24.7.1.7.1.4.0.0.0.0.0`), is walked whenever the first leg
+answered nothing; the order is now ipCidr → inetCidr → RFC1213 GET, and
+the first of the three that yields at least one real next hop wins and
+stops the chain — a leg that answers rows which all filter out to
+nothing (rather than raising `SnmpError`) falls through to the next leg
+exactly like an empty walk always has. `inetCidrRouteNextHop` is an
+`InetAddress` (RFC 4001), not the dotted-decimal-shaped OctetString
+`ipCidrRouteNextHop` is, so a new helper, `_inet_address_text(value)`,
+decodes it before it ever reaches `_gateway_candidate`: plain dotted text
+passes through, real bytes are joined the same way, and the
+space-separated hex-pair form (`"0A 00 00 01"`) `snmppoll` already
+produces for a non-printable OCTET STRING is parsed byte by byte — the
+same decoding `fortipoll._format_ip` does for a different InetAddress
+column. Anything that is not exactly 4 bytes long (IPv6, garbage) returns
+`""`, which `_gateway_candidate` then discards like any other non-address.
+
+**The ConfigRX fallback covers a Layer-2 switch that answers none of the
+three** — one configured only with `ip default-gateway`, with nothing in
+any route table SNMP walks. `configrx._config_gateway(text)` runs two
+regexes over a cleaned backup, `^ip default-gateway (\S+)` first and
+`^ip route 0\.0\.0\.0 0\.0\.0\.0 (\S+)` second, and validates whatever
+either one captures with `ipaddress.ip_address` before returning it —
+an address that fails to parse is treated as no match, falling through to
+the second pattern or to `""`. `ConfigRxWorker._store_backup` calls it
+and stores the result with the new `configrxdb.set_config_gateway
+(device_id, text)` on *every* backup, changed or not, so a device backed
+up only once still has a value on file; `"device_config.config_gateway"`
+(`TEXT`, `ensure_columns` migration) holds it. `api.py`'s
+`get_nodes_device` reads SNMP's own `devices.default_gateway` first and,
+only when that is empty, looks up `configrx_db.device_config(device_id)`
+and takes its `config_gateway` if any — a `"config_gateway" in
+rx_config.keys()` guard covers a row shape from before the column
+existed. The response carries a new `default_gateway_source` field,
+`"snmp"`, `"configrx"` or `""` (nothing published either way), so the
+browser knows which line to draw without re-deriving it. `nodes.js`'s
+`drawAddressesTable` reads that field: `"Default gateway: <value> (from
+ConfigRX backup)"` for `"configrx"`, `"Default gateway: <value>"` for
+`"snmp"`, unchanged from before, the value escaped either way. SNMP's own
+read is never displaced by a stale ConfigRX capture: the fallback is
+consulted only when the SNMP column itself is empty on this exact
+request, not cached in the device row.
+
 ### MIB parser (`mibparse.py`)
 
 Not a MIB compiler, the same framing `trapdecode.py`'s own OID name table
@@ -4186,6 +4352,50 @@ below it; a matched stanza renders in a `<pre>` under that same "From
 backup ⟨when⟩" line, with the link back to ConfigRX above it in all
 three backup-found cases.
 
+### Indented headers, and naming what the search tried (`configrx_stanza.py`, `web/api.py`, `nodes.js`) — 5.35.0
+
+**A header does not have to start at column 0 to be found.** A second
+regex, `_INTERFACE_HEADER_INDENTED_RE` (`^(\s+)interface\s+(\S.*?)\s*$`),
+catches a paged capture with pager residue left ahead of the line, and a
+header genuinely nested under something else — IOS-XR writes
+`interface X` lines inside a `router ospf`/`router bgp` stanza, not only
+as its own top-level block. `interface_stanza` collects both header
+lists up front, then runs the existing exact-then-prefix passes over the
+column-0 list *first*, exactly as in 5.33.0, before trying the same two
+passes over the indented list — so a real top-level stanza always wins
+over a same-named header nested somewhere else, whichever order they sit
+in the file. `_indented_header_block(lines, start, header_indent)` is
+the indented counterpart to `_indented_block`: it collects the header
+plus every following line indented *deeper* than the header's own
+column, stopping at the first line at or shallower than that indent, or
+a bare `!`. Unlike the column-0 form there is no trailing `!` to strip —
+a shallower-or-equal line ends the block cleanly on its own — so the
+function does not attempt to.
+
+**`count_interface_headers(text)`** is new and counts every `interface`
+header the file carries, column-0 and indented combined — what the
+dialog's hint names as "N interface stanzas" when nothing matched.
+`api.get_nodes_device_interface_config`'s response gains two fields
+alongside the existing `backup_id`/`ts`/`text`: `searched` (the
+candidate name list actually passed to `interface_stanza` — `[ifName,
+ifDescr]` with blanks dropped, so `["Gi1/0/1", "GigabitEthernet1/0/1"]`
+for a normal port) and `headers` (that header count). No backup at all
+still returns `searched: []`, `headers: 0` alongside the unchanged
+`text: None`.
+
+**`nodes.js`'s interface dialog builds the hint from those two fields**
+rather than a fixed sentence: an empty `searched` list — a port with no
+stored `ifName`/`ifDescr` at all — reads "This port has no stored
+interface row."; a non-empty `searched` list with `text: null` reads "No
+stanza for ⟨name⟩ / ⟨name⟩ among ⟨headers⟩ interface stanzas in this
+backup.", every name passed through `escape()` before it is joined with
+" / " and interpolated. This replaces the fixed 5.33.0 wording ("No
+stanza for this interface in the latest backup") with one that says
+plainly what was actually looked for, so a genuine "the header just
+isn't in this backup" reads differently on screen from "the dialog
+never had a name to search with in the first place" — the two used to
+look identical.
+
 ### `nodepoll.NodePoller.poll_now` / `_walk_now`: MAC, VLAN and ARP walks on a manual poll — 5.33.0
 
 `poll_now`'s existing job — invalidate cached engines, submit the base
@@ -4277,6 +4487,57 @@ per-sensor table's Status column and its `(fan)` tag come from the same
 place the PSU/stack-power ones already do. `tests/
 test_alert_sensor_rules.py` covers the 2/1/0 reading → failed/warning/
 silent progression against a live `AlertEngine`.
+
+### A pulled FRU row vanishes from the walk entirely, not just its state: `_vendor_psu_seen`/`_mark_vendor_rows_absent` (`nodepoll.py`) — 5.35.0
+
+**The 5.33.0 "seen before, now silent" rule above only covered half the
+case.** It fires when `_vendor_psu_rows` still returns an entry for an
+index but with `state: None` — the shape that table produces for a row
+its class/skip mapping says to ignore. It does **not** fire when the
+index is missing from the walk's result altogether, because
+`for idx, row in rows.items()` simply never visits an index the walk
+did not mention this time. That is exactly what a pulled Cisco FRU tray
+or supply does: `cefcFanTrayOperStatus`/the FRU PSU table does not
+answer `notPresent` for a bay that is physically gone, it just stops
+having a row for that index. Before 5.35.0 that meant the previous
+`fan_state.<idx>`/`psu_state.<idx>` reading, and any alert on it, stayed
+exactly as it was forever — the live ENVMON read in the device dialog
+(`read_hardware`) did see the removal, since it polls fresh every time
+the dialog opens, which is why the two disagreed.
+
+**`_vendor_psu_rows` now returns `(rows, complete)`** — `complete` from
+the state column's own `_walk_column_status`, the same completeness
+signal `_sfp_slot_media` already threads through for the badge scan. A
+new per-poll helper, `_mark_vendor_rows_absent(device_id, table_state,
+family, rows, complete, existing, labels, samples, now)`, is called once
+per table (`psu_state` against each `PSU_TABLES` entry; `fan_state`
+against `FAN_TABLES`' primary *and*, separately, its fallback — never the
+other table's own rows, since falling back to the other table this poll
+must not read as the first table's whole tray disappearing) right after
+that table's own rows are read. It keeps `self._vendor_psu_seen
+[(device_id, table_state)]`, the index set the *last complete* walk of
+that exact OID returned, and on another complete walk appends a
+`_PSU_STATE_ABSENT` (3.0) sample for every index that set held which the
+current walk no longer mentions, under its previously stored label
+(`existing_labels`, built from `self.db.metrics(device_id)` once per
+poll) — but only for an index already in `existing`, the same "never
+seen, stays silent" guard the 5.33.0 rule uses, so a bay this device has
+never reported before cannot open an alert about going missing. **A
+walk that did not finish — timeout, row cap — changes nothing**:
+`complete` being `False` returns immediately, before touching either the
+remembered set or `samples`, because an incomplete walk is not evidence
+anything left; treating everything it did not reach as pulled would flag
+half a chassis absent on a single slow poll. The remembered set is
+cleared by `_forget_vendor_psu_static` alongside `_vendor_psu_static` —
+a manual retry, a device removed, or the fallback fan table's own OID
+(a different key entirely) — and the first complete walk after that
+reset only seeds the set rather than comparing against nothing and
+marking every bay absent on discovery. `tests/test_psu_state.py` covers
+a fan row present on poll one and gone from a complete poll two (→
+`3.0`), the same row missing from a poll cut short (→ unchanged), and
+the equivalent PSU FRU case; `tests/test_sensor_snapshot.py` covers a
+`0` baseline followed by a `3` opening the alert exactly as any other
+changed reading would.
 
 ### Sensor Snapshot: `sensor_baselines`, `BASELINE_FAMILIES` and the threshold skip/resolve path (`nodesdb.py`, `alertrules.py`, `alertengine.py`, `web/api.py`, `web/server.py`, `nodes.js`) — 5.33.0
 
@@ -7597,6 +7858,104 @@ this one function instead of duplicating the string by hand, so the
 dropdown and the field's own resting value can never disagree on how a
 device is named.
 
+### SINGLE PSU report: `single_psu_report`, per-member grouping and the StackPower coverage rule (`report.py`, `reportsched.py`, `web/api.py`, `web/static/index.html`, `nodes.js`) — 5.35.0
+
+**One query, not one per device.** `single_psu_report(nodesdb,
+device_ids=None, dns_names=None, hostnames=None)` calls
+`nodesdb.metrics_for_families(["psu_state", "stack_power_port",
+"stack_power_port_switch", "stack_power_port_admin",
+"stack_power_port_neighbour"])` once — the same fleet-wide
+metrics-by-family read `top_metric_ranking` and the other reports
+already use — rather than opening each device's own metric set in turn.
+`device_ids`, when given, filters rows in Python against `wanted =
+set(device_ids)` as they are read, the same narrowing shape
+`firmware_inventory`/`sfp_inventory` use.
+
+**Member grouping (`_PSU_MEMBER_RE = r"^Switch\s+(\d+)"`).** A
+`psu_state` row's own `label` — the ENVMON description or
+`entPhysicalName` text the poller already stored, which on a stack
+starts `"Switch N ..."` on both sources — is matched against this
+regex; `_psu_member(label)` returns the digit string as the member id,
+or `""` for a standalone switch with no such prefix. Every `psu_state`
+row is accumulated per `(device_id, member)` into `psus[key] = {total,
+present, down, supplies, last_ts}`: `state 0` (ok) or `1` (degraded)
+count as `present`, `state 2` (failed) or `3` (not present) count as
+`down`, and `supplies` collects `"<label> <state word>"` strings
+(`_PSU_STATE_WORDS = {0: "ok", 1: "degraded", 2: "failed", 3: "not
+present"}`, a shorter vocabulary than `api.py`'s own live-sensor
+`_PSU_STATE_WORDS`, since this text sits in a table cell/CSV column,
+not a device dialog). `_metric_idx(key)` (the `<idx>` half of a
+`"<family>.<idx>"` metric key) does the matching job on the StackPower
+side: every `stack_power_port*` row is folded into `stack_ports[
+(device_id, idx)]`, one dict per port carrying whichever of the four
+roots answered for it, then regrouped into `member_ports[(device_id,
+member)]` by that port's own `stack_power_port_switch` value — so a
+StackPower port is matched to a PSU member by which switch in the stack
+it belongs to, not by proximity in the metric table or any other
+inference.
+
+**The listing and covered rules, both per member.** A member is a
+candidate row only when `psu_present == 1` — exactly one supply bay
+reads ok or degraded; two present supplies is not a single-PSU
+condition and a member with zero present supplies has nothing left to
+report a "single" PSU about. A candidate is then dropped from the list,
+and counted in `covered_count` instead, when `acc["down"] >= 1` *and*
+`covered` — `covered = any(p["stack_power_port"] == 0 and
+p["stack_power_port_admin"] != 2 and (p["stack_power_port_neighbour"]
+or 0) > 0 for p in member_ports.get((device_id, member), []))`: state
+`0` is up, `admin != 2` excludes administratively disabled, and a
+neighbour id greater than zero is a real cable to another switch — all
+three together, not merely a cable present, is what "covered" means.
+`stack_power` (the row's own descriptive text) is computed separately
+from the exclusion rule and shown regardless of whether the member was
+excluded: `"N up"` counts ports with `stack_power_port == 0` and a real
+neighbour (independent of admin state, since the text is descriptive,
+not the gate), `"cable down"` when none are up but at least one reads
+`state == 2`, else `"none"`. Device rows are looked up once,
+`devices_by_ids(sorted(devices_seen))`, and named through the same
+`device_label`/`"name (ip)"` convention every other report uses. Rows
+sort `(name.lower(), member)`. `PsuReport` carries `device_count`
+(distinct devices with at least one PSU member seen — not the group's
+whole membership), `row_count` and `covered_count` alongside the rows.
+
+**Routes and CSV.** `web/api._psu_report(service, params)` parses
+`device_ids` and calls `single_psu_report` with
+`hostnames=service.app_db.hostnames`, the same shape every other report
+helper uses; `get_nodes_reports_psu` returns `.to_dict()`,
+`get_nodes_reports_psu_export` builds the CSV from `PSU_CSV_HEADER =
+["device_id", "name", "ip", "member", "psu_total", "psu_present",
+"psu_down", "supplies", "stack_power", "covered", "last_ts",
+"device"]` — the same header both `api.py`'s export route and
+`reportsched._render_psu`'s attachment build from, and the one
+`nodes.js`'s own client-side CSV mirrors, pinned equal by `tests/
+test_frontend_contracts.py`. Routes: `GET /api/nodes/reports/psu`,
+`/api/nodes/reports/psu/export.csv`, both `nodes:read` like every other
+report.
+
+**Scheduling.** `reportsched.KINDS` and `web/api._REPORT_SCHEDULE_KINDS`
+both gain `"psu"`; `_clean_report_schedule_params`'s `psu` branch takes
+only an optional `device_group_id` (`int`), the narrowest params shape
+of any report kind — there is no period, metric or include-empty toggle
+for this one. `reportsched._render_psu` resolves the group to
+`device_ids` through the shared `_device_ids_for_group` helper, builds
+a subject (`"Single power supply — N switch(es)"`), a body listing up
+to `_BODY_ROW_CAP` rows (name, member, supplies text) with a "…and N
+more" tail, and the same CSV as the export route, added to
+`_RENDERERS["psu"]` alongside the other four kinds so `run_due` needs
+no special-casing. The SCHEDULED subpage's own hint text — "Run one of
+the reports above automatically…" — drops its old, now-inaccurate
+"three reports above" wording (there are five now that count).
+
+**Front end.** `index.html` adds a `SINGLE PSU` subtab
+(`data-subtab="psu"`) and its own subpage, `nd-rep-sub-psu` — Group
+select, Run report, Export CSV, Download CSV from server, a summary
+line and a table — following the SFP report's own markup shape exactly.
+`nodes.js` adds `PSU_COLUMNS`, `runPsuReport`, `drawPsuReportTable` and
+`exportPsuReportCsv`, and keys each on-screen row by `` `${r.device_id}:
+${r.member}` `` rather than `device_id` alone, since one device can
+contribute two rows (two stack members) that must sort and select
+independently.
+
 ### Scheduled reports: `report_schedules`, `reportsched.py` (`nodesdb.py`, `alertmail.py`, `web/service.py`, `web/api.py`) — 5.23.0
 
 `reportsched.py` sits above `report.py` the way `report.py` sits above
@@ -8490,7 +8849,13 @@ or after the watermark survive the pass regardless of how far over
 log line it triggers) is how many rows the cap wanted to remove but
 didn't, so a store where this actually happens is visible rather than
 quietly losing history. `coverage()` (below) exposes the same figure to
-the UI as `cap_held_back`.
+the UI as `cap_held_back`. **From 5.35.0 the *size* cap
+(`max_flow_db_mb`, `trim_to_size`) shares this exact protection** —
+`FlowDatabase._trim_id_ceiling()` clamps its own delete range to the
+same minute watermark, since a stalled rollup pass could otherwise let
+the size cap delete an unsummarised block the row cap was never asked
+to touch. See **A subclass can cap how far `trim_to_size` is allowed to
+delete**, under Data layer.
 
 **A rollup pass that used its whole bucket budget now triggers
 immediate catch-up passes, not just a longer wait.** `compact_rollup(tier)`

@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.35.0 — Interface stanzas by indent, default gateways from ConfigRX, a single-PSU report, sensor vanish alerts, and SFP badges restored fleet-wide](#5350--interface-stanzas-by-indent-default-gateways-from-configrx-a-single-psu-report-sensor-vanish-alerts-and-sfp-badges-restored-fleet-wide)
 - [5.34.0 — Mapper FiberView: fiber links draw bold and glowing blue](#5340--mapper-fiberview-fiber-links-draw-bold-and-glowing-blue)
 - [5.33.0 — Per-port running config from ConfigRX, Poll Now's three walks, fan alerts, Sensor Snapshot, and Mapper/Dashboard fixes](#5330--per-port-running-config-from-configrx-poll-nows-three-walks-fan-alerts-sensor-snapshot-and-mapperdashboard-fixes)
 - [5.32.0 — Cisco Stack Power: cable-down and fault-trap alerts on Device Details](#5320--cisco-stack-power-cable-down-and-fault-trap-alerts-on-device-details)
@@ -167,6 +168,132 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.35.0 — Interface stanzas by indent, default gateways from ConfigRX, a single-PSU report, sensor vanish alerts, and SFP badges restored fleet-wide
+
+Six items from one operator prompt, all reported against the live fleet:
+`PROMPT-LOG.md` carries the full request and the planning answers given
+for it.
+
+**Interface dialog RUNNING CONFIGURATION now finds a stanza whose header
+is indented, and says exactly what it looked for when it still finds
+nothing.** The stanza matcher already tried a header sitting at the very
+start of a line; it now also tries one with leading whitespace ahead of
+it — a paged capture with pager residue left on the line, or a nested
+header under something else entirely (IOS-XR writes `interface X` inside
+a `router ospf` block, not just as its own top-level stanza) — with the
+block taken as the header plus every following line indented deeper than
+it. A column-0 header always wins first, so a genuine top-level stanza
+never loses to a nested one that happens to share a name. When nothing
+still matches, the tile stops saying the unhelpful "No stanza found." and
+instead names what it actually searched and how big the backup was:
+"No stanza for Gi1/0/1 / GigabitEthernet1/0/1 among 42 interface stanzas
+in this backup." A port with no stored SNMP name to search for at all
+says "This port has no stored interface row." instead.
+
+**Default gateway now reads three SNMP tables before falling back to a
+ConfigRX backup.** The poller already walked `ipCidrRouteTable`, which is
+deprecated and comes back empty on IOS 15.x and IOS-XE; it now also walks
+`inetCidrRouteTable` — the table those platforms actually populate — before
+falling back to the original RFC1213 `ipRouteTable` GET, and stops at the
+first of the three that actually answers a next hop. For a Layer-2 switch
+that answers none of the three — configured only with `ip
+default-gateway`, nothing in any route table — the Addresses tab now
+falls back to the device's latest ConfigRX backup, parsing `ip
+default-gateway` or a default static route (`ip route 0.0.0.0 0.0.0.0
+…`) out of the stored config, and shows it as "Default gateway: 10.1.1.1
+(from ConfigRX backup)" so it is plain the figure came from a saved
+config rather than a live SNMP read. A live SNMP answer always takes
+precedence over the backup.
+
+**NetFlow: flows are, and have always been, charted by the record's own
+end time, not by when they arrived.** For NetFlow v9 that is
+`LAST_SWITCHED` measured against the exporter's own boot time, read off
+each packet's header; for IPFIX it is the record's own `flowEnd` fields.
+Only a record carrying no timestamp at all, or one more than 30 days old
+or an hour in the future, is stamped with the time it was received
+instead. A real gap on a wide chart is therefore a real gap in what the
+exporter sent for that stretch of time — which is exactly what the
+confirmed restart/outage in this case was — not data misplaced on the
+graph. Alongside that answer, one related hardening: the flow store's
+overall size cap (`max_flow_db_mb`) now holds back raw flow rows the
+once-a-minute rollup has not summarised yet, the same protection the row
+cap already had. Before this, a minute-rollup pass that fell behind for
+longer than the size cap took to catch up to it could let the size cap
+delete a block of never-summarised flows for good, with nothing to show
+it had happened.
+
+**A new report: Reports → SINGLE PSU.** Lists every stack member — or
+standalone switch — running on exactly one power supply, fleet-wide or
+narrowed to a device Group. It is judged per member, not per device: a
+member whose one working supply has failed is left off the list, and
+counted separately, when that member has at least one StackPower port
+that is administratively enabled, link-up, and has a neighbour on the
+other end of the cable — a genuine failover path, not merely a cable
+plugged in. On-demand as JSON or CSV — **Export CSV** off the screen or
+**Download CSV from server** for a fresh build — and it can be put on a
+repeating email schedule the same way the other reports already are.
+
+**Sensors: a fan tray or power supply pulled from the chassis is now
+reported gone, not left showing its last reading.** Cisco's own FRU
+tables simply stop listing a row once the hardware is removed — they do
+not report it as "not present," the row is just absent from the walk —
+and until now that meant the stored reading, and any alert built on it,
+stayed exactly as it was the moment the part came out, indefinitely. A
+bay that drops out of a *complete* walk (never a walk that was cut short
+by a timeout or a row cap — that proves nothing either way) is now
+recorded as "not present," which opens the same **Fan failed or not
+present** / **Power supply warning/failed** alert a live not-present
+reading already opens.
+
+**SFP/DOM badges: the transceiver scan runs even on a switch that
+answers no sensor rows at all, and a cut-short name walk no longer wipes
+out badges already stored.** A switch whose optics carry no light-level
+data to read — no DOM at all — used to skip the ENTITY-MIB cage scan
+entirely along with the sensor read, so it never earned a badge on any
+port even with transceivers plugged in and correctly identified. The two
+scans are now independent: the cage scan runs on its own probe-once
+schedule regardless of whether the sensor read found anything. Separately,
+the `entPhysicalName` walk the badge logic depends on to map a sensor to
+a port is now tracked for whether it actually finished; a walk cut short
+by a timeout or row cap used to quietly map fewer sensors than the
+device really has, with nothing recording that it happened, and could
+strip a badge that a previous, complete pass had already written. It now
+only ever keeps what is already stored on an incomplete pass. Short names
+for AppGigabitEthernet (`Ap1/0/1`) are recognised by the interface-name
+matcher. And the Nodes event log now explains, once an hour per device,
+exactly why a switch could not be badged when the scan found sensor data
+it could not place: an empty port map (with the row counts that produced
+it), a walk that did not finish and why, or sensor rows that read fine
+but resolved to no port at all.
+
+Files: `netpath/configrx.py`, `netpath/configrx_stanza.py`,
+`netpath/configrxdb.py`, `netpath/flowdb.py`, `netpath/nodeoids.py`,
+`netpath/nodepoll.py`, `netpath/report.py`, `netpath/reportsched.py`,
+`netpath/sqlitebase.py`, `netpath/web/api.py`, `netpath/web/server.py`,
+`netpath/web/static/index.html`, `netpath/web/static/nodes.js`.
+
+Verification: `tests/test_configrx_stanza.py` and
+`tests/test_configrx_stanza_route.py` are extended for the indented-header
+passes and the new `searched`/`headers` response fields.
+`tests/test_configrx_gateway.py` and `tests/test_default_gateway.py` are
+new/extended for the `inetCidrRouteTable` walk and the ConfigRX
+fallback, including a stub agent that answers only that table.
+`tests/test_netflow_prune.py` is extended for the size cap's hold-back
+behaviour against a lagging minute rollup. `tests/test_psu_report.py` is
+new — the per-member rules, the StackPower coverage exclusion and its
+counter, a device with two members producing two rows, and group
+narrowing — alongside `tests/test_report_routes.py` for the JSON and CSV
+routes and a `reportsched` test for the new `psu` schedule kind.
+`tests/test_psu_state.py` and `tests/test_sensor_snapshot.py` are
+extended for a FRU row present on one poll and gone from a complete walk
+on the next, a cut-short walk changing nothing, and the alert this opens.
+`tests/test_sfp_media.py` is new and `tests/test_sensor_tables.py` is
+extended for a device with no sensor rows still getting cage-scanned, a
+cut-short name walk keeping stored badges, and the new diagnostic event
+text. `tests/test_frontend_contracts.py` pins the new interface-dialog
+hint text, the gateway source line, and the SINGLE PSU report's markup,
+routes and CSV header against `report.py`'s own.
 
 ### 5.34.0 — Mapper FiberView: fiber links draw bold and glowing blue
 
