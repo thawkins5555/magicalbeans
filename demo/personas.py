@@ -1181,6 +1181,27 @@ def _access_trunk_vlans(name: str) -> tuple[int, ...]:
     return _ACCESS_TRUNK_VLANS.get(name, _DEFAULT_TRUNK_VLANS)
 
 
+# FiberView demo fixture (5.36.0): acc-sw-001 and acc-sw-003 plug a
+# multimode optic into both 10G uplinks, everyone else single-mode --
+# matched against _build_cisco_core's own per-instance downlink text
+# (GLC-SX-MMD/GLC-LH-SMD) so acc-sw-001 reads MM both ends (blue),
+# acc-sw-002 reads SM both ends (dark yellow) and acc-sw-003's LH-at-the-
+# core answer disagrees with its own SR (dotted red mismatch).
+def _uplink_optic_text(name: str) -> str:
+    return "SFP-10G-SR" if name in ("acc-sw-001", "acc-sw-003") else "SFP-10G-LR"
+
+
+# The core-side GigabitEthernet1/0/N port an access switch's SECOND (STP-
+# blocked) uplink lands on: 11..20 for acc-sw-001..010, the same
+# lambda-on-st.name pattern _access_trunk_vlans reads at reply time --
+# every other instance reuses port 20.
+_ACCESS_SECOND_UPLINK_PORT = {f"acc-sw-{i:03d}": 10 + i for i in range(1, 11)}
+
+
+def _access_second_uplink_port(name: str) -> int:
+    return _ACCESS_SECOND_UPLINK_PORT.get(name, 20)
+
+
 def _build_cisco_access(wrap32: bool, ports: int, vlan: str | None) -> dict:
     access = 48
     names, kinds, rates = _gig_ports(access, 2)
@@ -1194,6 +1215,12 @@ def _build_cisco_access(wrap32: bool, ports: int, vlan: str | None) -> dict:
         # the FDB — see APPLE_OUI/SAMSUNG_OUI's comment: a tablet has no
         # SNMP agent, so this is the only honest place to represent one.
         tablet_ports={103: APPLE_OUI, 107: SAMSUNG_OUI})
+    # _switch_fdb_ports only bridges the access ports (1..access); the two
+    # 10G uplinks need their own bridge ports too, so dot1dStpPortState can
+    # say which one is blocked (100+i, continuing that function's own
+    # numbering).
+    port_to_if[100 + access + 1] = access + 1
+    port_to_if[100 + access + 2] = access + 2
     entries.update(bridge_ports(port_to_if))
     entries.update(qbridge_fdb(port_macs, vlan=10))
     # Per-port VLAN membership (Q-BRIDGE-MIB standards path): a real
@@ -1223,6 +1250,18 @@ def _build_cisco_access(wrap32: bool, ports: int, vlan: str | None) -> dict:
     # lit on the other end, the case a -40 dBm reading must never alert on.
     entries.update(entity_sensors({access + 1: DOM_SENSORS,
                                    access + 2: DOM_SENSORS_DARK}))
+    # Both 10G uplinks also carry a real transceiver cage (module text/model
+    # per instance, via _uplink_optic_text) so Nodes' SM/MM badge and
+    # MAPPER's FiberView colour have something to read alongside the DOM
+    # readings above.
+    entries.update(sfp_cages(populated={
+        access + 1: (names[access],
+                    lambda st, now: f"{_uplink_optic_text(st.name)} SFP+",
+                    lambda st, now: _uplink_optic_text(st.name)),
+        access + 2: (names[access + 1],
+                    lambda st, now: f"{_uplink_optic_text(st.name)} SFP+",
+                    lambda st, now: _uplink_optic_text(st.name)),
+    }))
     # Copper modules for the COP badge: GLC-T with no sensors, SFP-10G-T-S
     # with a lone temperature sensor; MAU arcs 30/54, and 36 on the SR uplink.
     entries.update(sfp_cages(populated={
@@ -1259,6 +1298,23 @@ def _build_cisco_access(wrap32: bool, ports: int, vlan: str | None) -> dict:
     entries.update(cdp_neighbor(
         uplink_if, device_id="core-sw-01", device_port="GigabitEthernet1/0/1",
         platform="cisco WS-C9500-24Y4C"))
+    # A second, redundant uplink to the same core switch -- one of the
+    # parallel-cable/STP-blocked pair MAPPER's fan-out and dotted-blocking
+    # line are meant to draw. Its core-side port varies per instance
+    # (_access_second_uplink_port, the same lambda-on-st.name pattern the
+    # trunk VLAN list above uses).
+    entries.update(lldp_neighbor(
+        access + 2, sys_name="core-sw-01", chassis_id=_mac_for("core-sw-01", 1),
+        port_id=lambda st, now:
+            f"GigabitEthernet1/0/{_access_second_uplink_port(st.name)}",
+        port_descr=lambda st, now:
+            f"downlink {_access_second_uplink_port(st.name)}",
+        sys_descr=CISCO_CORE_DESCR))
+    entries.update(cdp_neighbor(
+        access + 2, device_id="core-sw-01",
+        device_port=lambda st, now:
+            f"GigabitEthernet1/0/{_access_second_uplink_port(st.name)}",
+        platform="cisco WS-C9500-24Y4C"))
     # The same uplink is a real Cisco trunk: CISCO-VTP-MIB supersedes the
     # Q-BRIDGE standards answer for this ONE port (uplink_if), never for
     # the access ports above — see nodepoll.read_device_vlans' authority
@@ -1288,7 +1344,11 @@ def _build_cisco_access(wrap32: bool, ports: int, vlan: str | None) -> dict:
                     for i in range(1, access + 1) if h("poedraw", i) % 3 == 0},
         cisco_extension=True))
     entries.update(dot1d_stp(priority=32768, root_cost=4, root_port=uplink_if))
-    entries.update(dot1d_stp_ports({port: 5 for port in port_to_if}))  # forwarding
+    # The second uplink (access + 2) is the redundant/blocked one -- every
+    # other port forwards.
+    entries.update(dot1d_stp_ports({
+        port: (2 if port == if_to_port[access + 2] else 5)
+        for port in port_to_if}))
     # CISCO-STACKWISE-MIB (5.32.0): 3-member ring, redundant mode, 30 A cables;
     # entPhysicalIndex 1001/2001/3001 sit outside this persona's ~50-port range.
     stack_switches = {1001: 1, 2001: 2, 3001: 3}
@@ -1374,6 +1434,15 @@ def _build_cisco_core(wrap32: bool, ports: int, vlan: str | None) -> dict:
     # topology, and claiming the same ten access switches would make two
     # different "core" devices both report being their upstream.
     if access == 88:
+        # FiberView demo fixture (5.36.0): the module plugged into each
+        # downlink's cage, matched against _uplink_optic_text on the access
+        # side -- acc-sw-001 reads MM both ends, acc-sw-002 SM both ends,
+        # acc-sw-003's core end (LH) disagrees with its own SR end.
+        downlink_module = {n: ("GLC-SX-MMD" if n == 1 else "GLC-LH-SMD")
+                          for n in range(1, 11)}
+        downlink_text = {"GLC-SX-MMD": "1000Base-SX SFP",
+                        "GLC-LH-SMD": "1000Base-LX SFP"}
+        downlink_cages = {}
         for n in range(1, 11):
             name = f"acc-sw-{n:03d}"
             entries.update(lldp_neighbor(
@@ -1383,6 +1452,19 @@ def _build_cisco_core(wrap32: bool, ports: int, vlan: str | None) -> dict:
             entries.update(cdp_neighbor(
                 n, device_id=name, device_port="GigabitEthernet1/0/49",
                 platform="cisco WS-C2960X-48FPD-L"))
+            # The reciprocal end of acc-sw-NNN's SECOND (redundant, STP-
+            # blocked) uplink -- see _access_second_uplink_port's own
+            # comment for why this is port 10+n.
+            entries.update(lldp_neighbor(
+                10 + n, sys_name=name, chassis_id=_mac_for(name, 49),
+                port_id="TenGigabitEthernet1/1/2", port_descr="uplink to core (2)",
+                sys_descr=CISCO_ACCESS_DESCR))
+            entries.update(cdp_neighbor(
+                10 + n, device_id=name, device_port="TenGigabitEthernet1/1/2",
+                platform="cisco WS-C2960X-48FPD-L"))
+            module = downlink_module[n]
+            downlink_cages[n] = (names[n - 1], downlink_text[module], module)
+            downlink_cages[10 + n] = (names[10 + n - 1], downlink_text[module], module)
             # The core's own end of the SAME trunk acc-sw-NNN's uplink_if
             # answers above — same allow-list per access switch
             # (_access_trunk_vlans), same native VLAN, so both ends of one
@@ -1394,6 +1476,7 @@ def _build_cisco_core(wrap32: bool, ports: int, vlan: str | None) -> dict:
             entries[f"{VTP_TRUNK_NATIVE_VLAN}.{n}"] = (T_INTEGER, 10)
             entries[f"{VTP_TRUNK_VLANS_ENABLED}.{n}"] = (
                 T_OCTET_STRING, encode_vlan_bitmap(_access_trunk_vlans(name), 0))
+        entries.update(sfp_cages(populated=downlink_cages))
         entries.update(dot1d_stp(priority=4096, root_cost=0, root_port=0))
         entries.update(dot1d_stp_ports({port: 5 for port in port_to_if}))
         # The ARP cache, gated the same way and for the same reason as the

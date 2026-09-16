@@ -252,6 +252,88 @@ async function waitForCopperClassification(page, name) {
   }
 }
 
+async function waitForOpticModeClassification(page, name) {
+  // Same deterministic wait as waitForCopperClassification, for an
+  // optic_mode='mm' interface -- acc-sw-001's two 10G uplinks
+  // (demo/personas.py's _build_cisco_access, 5.36.0).
+  const origin = new URL(page.url()).origin;
+  const list = await page.request.get(
+    `${origin}/api/nodes/devices?q=${encodeURIComponent(name)}`);
+  const devices = list.ok() ? (await list.json()).devices || [] : [];
+  const device = devices.find((d) => d.name === name);
+  if (!device) return { present: false };
+  const started = Date.now();
+  const deadline = started + 150000;
+  let polled = false;
+  for (;;) {
+    const res = await page.request.get(
+      `${origin}/api/nodes/devices/${device.id}/interfaces`);
+    const interfaces = res.ok() ? (await res.json()).interfaces || [] : [];
+    if (interfaces.some((row) => row.optic_mode === 'mm')) {
+      return { present: true, id: device.id, classified: true };
+    }
+    if (!polled) {
+      polled = true;
+      await page.request.post(`${origin}/api/nodes/devices/${device.id}/poll`,
+        { data: {} }).catch(() => {});
+    }
+    if (Date.now() >= deadline) {
+      return { present: true, id: device.id, classified: false,
+               waited_s: Math.round((Date.now() - started) / 1000) };
+    }
+    await sleep(3000);
+  }
+}
+
+async function waitForFiberViewLinks(page, mapId) {
+  // Deterministic replacement for racing nodepoll's environment/STP poll
+  // cadences: wait, via the API, until the map's own links carry the
+  // SM/MM/mismatch/blocking facts demo/personas.py seeds on acc-sw-001..003's
+  // dual uplinks to core-sw-01 (see _build_cisco_access/_build_cisco_core).
+  const origin = new URL(page.url()).origin;
+  const started = Date.now();
+  const deadline = started + 150000;
+  let polled = false;
+  for (;;) {
+    const res = await page.request.get(`${origin}/api/mapper/maps/${mapId}`);
+    const links = res.ok() ? (await res.json()).links || [] : [];
+    const byPair = new Map();
+    for (const link of links) {
+      const a = link.a_device_id, b = link.b_device_id;
+      if (a == null || b == null) continue;
+      const key = a < b ? `${a}:${b}` : `${b}:${a}`;
+      if (!byPair.has(key)) byPair.set(key, []);
+      byPair.get(key).push(link);
+    }
+    const parallelPair = [...byPair.values()].find((group) => group.length >= 2);
+    const ready = parallelPair
+      && links.some((l) => l.fiber_mode === 'sm')
+      && links.some((l) => l.fiber_mode === 'mismatch')
+      && links.some((l) => l.blocking);
+    if (ready) return { ready: true, links, parallelPair };
+    if (!polled) {
+      // Poll now the four demo devices this fixture depends on, rather than
+      // waiting out the environment (300s)/STP poll cadences.
+      polled = true;
+      for (const name of ['acc-sw-001', 'acc-sw-002', 'acc-sw-003', 'core-sw-01']) {
+        const list = await page.request.get(
+          `${origin}/api/nodes/devices?q=${encodeURIComponent(name)}`);
+        const devices = list.ok() ? (await list.json()).devices || [] : [];
+        const device = devices.find((d) => d.name === name);
+        if (device) {
+          await page.request.post(`${origin}/api/nodes/devices/${device.id}/poll`,
+            { data: {} }).catch(() => {});
+        }
+      }
+    }
+    if (Date.now() >= deadline) {
+      return { ready: false, links,
+               waited_s: Math.round((Date.now() - started) / 1000) };
+    }
+    await sleep(3000);
+  }
+}
+
 async function shoot(page, dir, name) {
   try {
     await page.screenshot({ path: path.join(dir, `${name}.png`), fullPage: false });
@@ -950,6 +1032,39 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       return 'COP badge present';
     });
 
+  await check('the Nodes interface list shows a ·MM badge for a multimode '
+    + 'optic (5.36.0)',
+    async () => {
+      await page.keyboard.press('Escape').catch(() => {});
+      await page.waitForSelector('#modal[hidden]', { state: 'attached', timeout: 5000 }).catch(() => {});
+      await selectTab(page, 'nodes');
+      await settle(page, 800);
+      await page.click('#page-nodes > .subtabs > .subtab[data-subtab="devices"]').catch(() => {});
+      // acc-sw-001's two 10G uplinks both plug in an SFP-10G-SR (multimode)
+      // module -- see demo/personas.py's _build_cisco_access/
+      // _uplink_optic_text.
+      const row = page.locator('#nodes-table tbody tr', { hasText: 'acc-sw-001' }).first();
+      const found = await row.count() > 0;
+      if (!found) return 'skipped: acc-sw-001 is not in this fleet';
+      const optic = await waitForOpticModeClassification(page, 'acc-sw-001');
+      if (!optic.present) return 'skipped: acc-sw-001 is not in this fleet';
+      assert(optic.classified,
+        `acc-sw-001 had no multimode interface after ${optic.waited_s}s, poll-now included`);
+      await row.click();
+      const hasRow = await page.waitForSelector('#nd-if-table tbody tr', { timeout: 20000 })
+        .then(() => true).catch(() => false);
+      if (!hasRow) return 'skipped: acc-sw-001 lists no interfaces';
+      await page.waitForResponse((res) => new URL(res.url()).pathname.endsWith('/interfaces')
+        && res.request().method() === 'GET', { timeout: 5000 }).catch(() => {});
+      await sleep(500);
+
+      const hasMmBadge = await page.evaluate(() =>
+        [...document.querySelectorAll('#nd-if-table td')]
+          .some((cell) => cell.textContent.includes('·MM')));
+      assert(hasMmBadge, 'expected a ·MM badge in #nd-if-table for acc-sw-001');
+      return '·MM badge present';
+    });
+
   await check('the Device Details dialog shows STACK POWER for a Cisco access switch (stack power)',
     async () => {
       await page.keyboard.press('Escape').catch(() => {});
@@ -1163,6 +1278,50 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       assert(afterRemove === before,
         `link count after Remove is ${afterRemove}, expected back to ${before}`);
       return `${before} -> ${afterConnect} -> ${afterRemove}`;
+    });
+
+  await check('Mapper: FiberView draws SM/MM/mismatch colours and a fanned, '
+    + 'blocked parallel pair (5.36.0)',
+    async () => {
+      await page.keyboard.press('Escape').catch(() => {});
+      await selectTab(page, 'mapper');
+      await settle(page, 1000);
+      const mapId = await page.evaluate(() => {
+        const sel = document.getElementById('mp-map');
+        return sel && sel.value ? sel.value : null;
+      });
+      if (!mapId) return 'skipped: no map selected on the demo Mapper';
+
+      const state = await waitForFiberViewLinks(page, mapId);
+      if (!state.ready) {
+        return 'skipped: FiberView facts (SM/mismatch/blocking/parallel pair) '
+          + `not seeded after ${state.waited_s}s, poll-now included`;
+      }
+
+      await page.check('#mp-fiberview');
+      await page.waitForSelector('#mp-canvas[data-fiberview="1"]', { timeout: 10000 });
+      await settle(page, 800);
+
+      const counts = await page.evaluate(() => ({
+        sm: document.querySelectorAll('#mp-svg .mp-link.fiber-sm').length,
+        mismatch: document.querySelectorAll('#mp-svg .mp-link.fiber-mismatch').length,
+        blocking: document.querySelectorAll('#mp-svg .mp-link.blocking').length,
+      }));
+      assert(counts.sm > 0, 'expected at least one .mp-link.fiber-sm under FiberView');
+      assert(counts.mismatch > 0,
+        'expected at least one .mp-link.fiber-mismatch under FiberView');
+      assert(counts.blocking > 0, 'expected at least one .mp-link.blocking under FiberView');
+
+      const pairLinkIds = state.parallelPair.map((l) => String(l.id));
+      const drawnForPair = await page.evaluate((ids) =>
+        ids.filter((id) =>
+          document.querySelector(`#mp-svg path.mp-link[data-link-id="${id}"]`)).length,
+        pairLinkIds);
+      assert(drawnForPair >= 2,
+        `expected 2 drawn link holders for the parallel pair, found ${drawnForPair}`);
+
+      return `sm=${counts.sm} mismatch=${counts.mismatch} blocking=${counts.blocking}, `
+        + `${drawnForPair} link(s) drawn for the parallel pair`;
     });
 
   await check('Mapper: Find selects a device by name (#mp-find)',
