@@ -229,6 +229,68 @@ nodes.close(); alerts.close()
 for store in stores:
     store.close()
 
+# --------------------------------------------------------------- S5 fans
+nodes, alerts, engine, stores = build()
+did = nodes.add_device("10.30.0.6", name="fan-sw", group_id=nodes.ensure_default_group())
+engine._tick()
+base = time.time()
+sample(nodes, did, "fan_state.1", "Fan 1", "", base, 2.0)
+engine._tick()
+check("a fan reading 2 opens fan_failed",
+      len(open_rows(alerts, "fan_failed")) == 1)
+sample(nodes, did, "fan_state.1", "Fan 1", "", base + 1, 1.0)
+engine._tick()
+check("1 opens fan_warning only",
+      len(open_rows(alerts, "fan_warning")) == 1 and open_rows(alerts, "fan_failed") == [])
+sample(nodes, did, "fan_state.1", "Fan 1", "", base + 2, 0.0)
+engine._tick()
+check("0 stays silent on both", open_rows(alerts, "fan_warning") == []
+      and open_rows(alerts, "fan_failed") == [])
+nodes.close(); alerts.close()
+for store in stores:
+    store.close()
+
+# --------------------------------------------------- S6 Sensor Snapshot baseline
+check("the three baseline-covered families are declared",
+      BASELINE_FAMILIES == {"psu_state", "stack_power_port", "fan_state"})
+
+nodes, alerts, engine, stores = build()
+did = nodes.add_device("10.30.0.7", name="baseline-sw", group_id=nodes.ensure_default_group())
+engine._tick()
+base = time.time()
+sample(nodes, did, "psu_state.2", "Power supply 2", "", base, 3.0)
+engine._tick()
+check("psu_state.2 == 3 (not present) opens psu_failed before any baseline exists",
+      len(open_rows(alerts, "psu_failed")) == 1)
+nodes.replace_sensor_baselines(did, [{"metric_key": "psu_state.2", "value": 3.0, "ts": base}])
+sample(nodes, did, "psu_state.2", "Power supply 2", "", base + 1, 3.0)
+engine._tick()
+check("...and once 3 is the accepted baseline, a fresh sample still reading 3 "
+      "does not keep it open (this tick's pass resolves it on the way past)",
+      open_rows(alerts, "psu_failed") == [])
+sample(nodes, did, "psu_state.2", "Power supply 2", "", base + 2, 2.0)
+engine._tick()
+check("...but a value WORSE than the baseline (2, an outright failure) still opens it",
+      len(open_rows(alerts, "psu_failed")) == 1)
+sample(nodes, did, "psu_state.2", "Power supply 2", "", base + 3, 3.0)
+engine._tick()
+check("...and back to exactly the baseline (3) is quiet again",
+      open_rows(alerts, "psu_failed") == [])
+
+sample(nodes, did, "stack_power_port.5", "Stack power port 5", "state", base + 4, 2.0)
+engine._tick()
+check("a stack power port with no baseline opens as normal",
+      len(open_rows(alerts, "stack_power_cable_down")) == 1)
+nodes.replace_sensor_baselines(did, [{"metric_key": "psu_state.2", "value": 3.0, "ts": base},
+                                     {"metric_key": "stack_power_port.5", "value": 2.0, "ts": base}])
+sample(nodes, did, "stack_power_port.5", "Stack power port 5", "state", base + 5, 2.0)
+engine._tick()
+check("...and with a baseline of 2, the same reading stays quiet",
+      open_rows(alerts, "stack_power_cable_down") == [])
+nodes.close(); alerts.close()
+for store in stores:
+    store.close()
+
 print()
 if FAILS:
     print(f"{len(FAILS)} check(s) failed: {', '.join(FAILS)}")
