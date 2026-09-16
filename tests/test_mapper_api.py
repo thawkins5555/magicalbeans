@@ -1012,6 +1012,36 @@ try:
           "not the L2 link the neighbour row still confirms)",
           ab_link is not None, ab_link)
 
+    # ------------------------------------- 15b. ambiguous port text (Finding 4)
+    #
+    # dev_c gets two interfaces that canonicalise to the same text ("Gi0/1"
+    # duplicated, as net-snmp/Windows hosts sometimes report). The B->C
+    # neighbour row seeded near the top of this file (if_index 3, sys_name
+    # "Switch C", port_id/port_descr "Gi0/1", chassis_id "") already matches
+    # dev_c by sysName alone, with no chassis-MAC join to supply
+    # matched_if_index -- so the far end's if_index can only come from
+    # _mapper_port_index's own text resolution. With the text ambiguous on
+    # dev_c, that resolver must return None rather than silently pick
+    # whichever if_index was seeded last.
+    service.nodes_db.replace_interfaces(dev_c, [
+        {"if_index": 5, "descr": "Gi0/1", "admin_status": "up", "oper_status": "up"},
+        {"if_index": 6, "descr": "Gi0/1", "admin_status": "up", "oper_status": "up"}])
+    status, payload = call("POST", f"/api/mapper/maps/{map_id}/nodes",
+                           {"device_id": dev_c, "x": 200, "y": 20}, token=admin)
+    check("placing C (now with the ambiguous interfaces) is accepted",
+          status == 200, (status, payload))
+    status, payload = call("GET", f"/api/mapper/maps/{map_id}", token=admin)
+    bc_link = next((l for l in payload.get("links", [])
+                    if {l.get("a_device_id"), l.get("b_device_id")} == {dev_b, dev_c}),
+                   None) if status == 200 else None
+    check("the B-C link draws (matched by sysName)", bc_link is not None,
+          (status, bc_link))
+    c_if_index = (bc_link.get("b_if_index") if bc_link and bc_link.get("b_device_id") == dev_c
+                  else bc_link.get("a_if_index") if bc_link else None)
+    check("a duplicate canonical port text on the far device resolves to no "
+          "if_index at all, not the last-written one (5 or 6)",
+          bc_link is not None and c_if_index is None, (status, bc_link))
+
     # -------------------------------------------------- 16. mapper settings validation (Finding 8)
     status, payload = call("POST", "/api/settings",
                            {"scope": "mapper", "values": {"max_strand_vlans": 0}},

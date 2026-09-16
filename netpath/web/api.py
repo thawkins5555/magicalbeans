@@ -4425,7 +4425,14 @@ def _mapper_port_index(service, device_ids):
         by_name = index.setdefault(row["device_id"], {})
         for text in (row["name"], row["descr"]):
             if text:
-                by_name[nodepoll._canonical_if_name(text)] = row["if_index"]
+                key = nodepoll._canonical_if_name(text)
+                # A second, different if_index for the same canonical key on
+                # this device is ambiguous: mark it so the resolver returns
+                # None and the row falls back to matched_if_index instead.
+                if key in by_name and by_name[key] != row["if_index"]:
+                    by_name[key] = None
+                elif key not in by_name:
+                    by_name[key] = row["if_index"]
 
     def port_index(device_id, port_text):
         if not port_text:
