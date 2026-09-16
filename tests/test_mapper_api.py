@@ -432,6 +432,88 @@ try:
     check("...and it is gone from the map payload",
           status == 200 and not any(l.get("manual") for l in payload["links"]), payload)
 
+    # -------------------------------------------------- 7c. frames (5.31.0)
+
+    status, payload = call("GET", f"/api/mapper/maps/{map_id}", token=admin)
+    check("a freshly built map's payload already carries an (empty) frames list",
+          status == 200 and payload.get("frames") == [], payload.get("frames"))
+
+    status, payload = call("POST", f"/api/mapper/maps/{map_id}/frames",
+                           {"x": 10, "y": 20, "width": 300, "height": 200,
+                            "label": "Core Rack", "color": 2}, token=admin)
+    check("adding a frame is accepted", status == 200 and "id" in payload, (status, payload))
+    frame_id = payload["id"]
+
+    status, payload = call("GET", f"/api/mapper/maps/{map_id}", token=admin)
+    frame = next((f for f in payload.get("frames", []) if f["id"] == frame_id), None) \
+        if status == 200 else None
+    check("the frame appears in the map payload with every field",
+          frame is not None and frame["x"] == 10 and frame["y"] == 20
+          and frame["width"] == 300 and frame["height"] == 200
+          and frame["label"] == "Core Rack" and frame["color"] == 2, frame)
+
+    status, payload = call("PUT", f"/api/mapper/maps/{map_id}/frames/{frame_id}",
+                           {"x": 50, "y": 60}, token=admin)
+    check("moving a frame (position only) is accepted", status == 200 and payload["ok"],
+          (status, payload))
+    status, payload = call("GET", f"/api/mapper/maps/{map_id}", token=admin)
+    moved = next((f for f in payload["frames"] if f["id"] == frame_id), None)
+    check("...and the move landed, label untouched",
+          moved is not None and moved["x"] == 50 and moved["y"] == 60
+          and moved["label"] == "Core Rack", moved)
+
+    status, payload = call("PUT", f"/api/mapper/maps/{map_id}/frames/{frame_id}",
+                           {}, token=admin)
+    check("an empty PUT body is a 400", status == 400, (status, payload))
+
+    status, payload = call("POST", f"/api/mapper/maps/{map_id}/frames",
+                           {"x": 0, "y": 0, "width": 10, "height": 100}, token=admin)
+    check("width under 40 is a 400", status == 400, (status, payload))
+
+    status, payload = call("POST", f"/api/mapper/maps/{map_id}/frames",
+                           {"x": 0, "y": 0, "width": 100, "height": 100,
+                            "label": "x" * 61}, token=admin)
+    check("a label over 60 chars is a 400", status == 400, (status, payload))
+
+    status, payload = call("POST", f"/api/mapper/maps/{map_id}/frames",
+                           {"x": 0, "y": 0, "width": 100, "height": 100, "color": 9},
+                           token=admin)
+    check("an out-of-range color is a 400", status == 400, (status, payload))
+
+    status, payload = call("POST", f"/api/mapper/maps/{map_id}/frames",
+                           {"y": 0, "width": 100, "height": 100}, token=admin)
+    check("a missing x is a 400", status == 400, (status, payload))
+
+    status, payload = call("POST", "/api/mapper/maps/999999/frames",
+                           {"x": 0, "y": 0, "width": 100, "height": 100}, token=admin)
+    check("adding a frame to a map that does not exist is a 404", status == 404,
+          (status, payload))
+
+    status, payload = call("POST", f"/api/mapper/maps/{map_id}/frames",
+                           {"x": 0, "y": 0, "width": 100, "height": 100,
+                            "label": "Doomed"}, token=admin)
+    doomed_frame_id = payload["id"]
+    status, payload = call("DELETE",
+                           f"/api/mapper/maps/{map_id}/frames/{doomed_frame_id}", token=admin)
+    check("deleting a frame is accepted", status == 200 and payload["ok"], (status, payload))
+    status, payload = call("GET", f"/api/mapper/maps/{map_id}", token=admin)
+    check("...and it is gone from the map payload",
+          status == 200 and all(f["id"] != doomed_frame_id for f in payload["frames"]), payload)
+    status, payload = call("DELETE",
+                           f"/api/mapper/maps/{map_id}/frames/{doomed_frame_id}", token=admin)
+    check("deleting an already-gone frame reports ok: false, not an error",
+          status == 200 and payload["ok"] is False, (status, payload))
+
+    status, payload = call("POST", f"/api/mapper/maps/{map_id}/frames",
+                           {"x": 0, "y": 0, "width": 100, "height": 100}, token=viewer)
+    check("a read-only account cannot add a frame", status == 403, (status, payload))
+    status, payload = call("PUT", f"/api/mapper/maps/{map_id}/frames/{frame_id}",
+                           {"label": "Nope"}, token=viewer)
+    check("...nor move/rename one", status == 403, (status, payload))
+    status, payload = call("DELETE", f"/api/mapper/maps/{map_id}/frames/{frame_id}",
+                           token=viewer)
+    check("...nor delete one", status == 403, (status, payload))
+
     # ---------------------------------------- 8. a device deleted from Nodes
 
     status, payload = call("POST", f"/api/mapper/maps/{map_id}/nodes",

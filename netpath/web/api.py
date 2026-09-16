@@ -10133,12 +10133,19 @@ def get_mapper_map(service, params, body, map_id) -> dict:
                     "known": False, "vlan_count": 0, "vlans": [], "label_step": 0.0},
         })
 
+    frames = [
+        {"id": row["id"], "label": row["label"], "x": row["x"], "y": row["y"],
+         "width": row["width"], "height": row["height"], "color": row["color"],
+         "added_ts": row["added_ts"]}
+        for row in service.mapper_db.frames(map_id)]
+
     return {
         "map": _mapper_map_json(map_row),
         "nodes": nodes,
         "links": links,
         "peers": peers,
         "vlans": _mapper_vlans_json(service, links, device_ids, color_overrides),
+        "frames": frames,
         "settings": settings,
     }
 
@@ -10234,6 +10241,51 @@ def delete_mapper_map_link(service, params, body, map_id, link_id) -> dict:
     if ok:
         _audit(service, params, "mapper.link.remove", target=str(map_id),
               detail=f"link_id={link_id}")
+    return {"ok": ok}
+
+
+_FRAME_UPDATE_FIELDS = ("label", "x", "y", "width", "height", "color")
+
+
+def post_mapper_map_frames(service, params, body, map_id) -> dict:
+    """A labelled rectangle dropped on the map for visual grouping only --
+    decoration, never a device placement, so this never touches map_nodes.
+    add_frame itself raises ValueError, with an operator-readable message,
+    for a bad size/color/label; left to surface unchanged."""
+    _require(service.mapper_db.map_row(map_id), "map")
+    try:
+        x, y = float(body.get("x")), float(body.get("y"))
+        width, height = float(body.get("width")), float(body.get("height"))
+    except (TypeError, ValueError):
+        raise ValueError("x, y, width and height are required.")
+    frame_id = service.mapper_db.add_frame(
+        map_id, x=x, y=y, width=width, height=height,
+        label=str(body.get("label", "") or ""), color=int(body.get("color", 0) or 0))
+    _audit(service, params, "mapper.frame", target=str(map_id),
+          detail=f"frame_id={frame_id}")
+    return {"id": frame_id}
+
+
+def put_mapper_map_frame(service, params, body, map_id, frame_id) -> dict:
+    """Position/size writes happen on every drag and are not audited, same
+    as put_mapper_map_nodes; a label or color change is an accountability-
+    worthy edit an operator made on purpose, so that alone is audited."""
+    _require(service.mapper_db.map_row(map_id), "map")
+    fields = _pick(body, _FRAME_UPDATE_FIELDS)
+    if not fields:
+        raise ValueError("No frame fields to update.")
+    ok = service.mapper_db.update_frame(map_id, frame_id, **fields)
+    if ok and ("label" in fields or "color" in fields):
+        _audit(service, params, "mapper.frame.update", target=str(map_id),
+              detail=f"frame_id={frame_id}")
+    return {"ok": ok}
+
+
+def delete_mapper_map_frame(service, params, body, map_id, frame_id) -> dict:
+    ok = service.mapper_db.delete_frame(map_id, frame_id)
+    if ok:
+        _audit(service, params, "mapper.frame.remove", target=str(map_id),
+              detail=f"frame_id={frame_id}")
     return {"ok": ok}
 
 

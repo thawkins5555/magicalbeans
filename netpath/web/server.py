@@ -456,6 +456,10 @@ ROUTES = [
     ("POST", r"^/api/mapper/maps/(\d+)/links$", api.post_mapper_map_links, ("mapper", W)),
     ("DELETE", r"^/api/mapper/maps/(\d+)/links/(\d+)$",
      api.delete_mapper_map_link, ("mapper", W)),
+    ("POST", r"^/api/mapper/maps/(\d+)/frames$", api.post_mapper_map_frames, ("mapper", W)),
+    ("PUT", r"^/api/mapper/maps/(\d+)/frames/(\d+)$", api.put_mapper_map_frame, ("mapper", W)),
+    ("DELETE", r"^/api/mapper/maps/(\d+)/frames/(\d+)$",
+     api.delete_mapper_map_frame, ("mapper", W)),
     # Matched before the "(\d+)" map route above would ever get the chance:
     # "candidates" and "export.csv" are not \d+, so there is no actual
     # ordering hazard, but this keeps every /maps/(\d+)/... sub-route

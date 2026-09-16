@@ -6,7 +6,7 @@ import time
 
 from _paths import tmpdir
 
-from netpath.mapperdb import DEFAULTS, MAP_STYLES, MapperDatabase, ROLES
+from netpath.mapperdb import DEFAULTS, FRAME_COLOR_MAX, MAP_STYLES, MapperDatabase, ROLES
 
 TMPDIR = tmpdir("mapperdb_")
 
@@ -73,6 +73,7 @@ map_id = db.create_map("Cascade Map")
 node_id = db.add_node(map_id, device_id=1, x=1, y=2)
 node2_id = db.add_node(map_id, device_id=2, x=3, y=4)
 link_id = db.add_link(map_id, node_id, node2_id, "")
+frame_id = db.add_frame(map_id, x=0, y=0, width=100, height=80, label="Rack A")
 check("node exists before delete", len(db.nodes(map_id)) == 2)
 db.delete_map(map_id)
 with db._lock:
@@ -80,9 +81,12 @@ with db._lock:
         "SELECT COUNT(*) AS n FROM map_nodes WHERE id = ?", (node_id,)).fetchone()["n"]
     remaining_links = db._conn.execute(
         "SELECT COUNT(*) AS n FROM map_links WHERE id = ?", (link_id,)).fetchone()["n"]
+    remaining_frames = db._conn.execute(
+        "SELECT COUNT(*) AS n FROM map_frames WHERE id = ?", (frame_id,)).fetchone()["n"]
 check("deleting a map cascades its map_nodes rows away (foreign_keys=ON is live)",
       remaining == 0, remaining)
 check("...and its map_links rows too", remaining_links == 0, remaining_links)
+check("...and its map_frames rows too", remaining_frames == 0, remaining_frames)
 db.close()
 
 # ------------------------------------------------------------------ nodes
@@ -217,6 +221,76 @@ check("...it is actually gone", len(db.links(map_id)) == 1)
 db.remove_node(map_id, b_id)
 check("removing a node the remaining link points at cascades the link away",
       db.links(map_id) == [])
+db.close()
+
+# --------------------------------------------------------------- map_frames
+
+db = new_db("frames")
+map_id = db.create_map("Frames map")
+
+frame_id = db.add_frame(map_id, x=10, y=20, width=200, height=150, label="Core Rack", color=2)
+check("add_frame returns an int id", isinstance(frame_id, int))
+rows = db.frames(map_id)
+check("frames(map_id) reads it back",
+      len(rows) == 1 and rows[0]["x"] == 10 and rows[0]["y"] == 20
+      and rows[0]["width"] == 200 and rows[0]["height"] == 150
+      and rows[0]["label"] == "Core Rack" and rows[0]["color"] == 2, [dict(r) for r in rows])
+
+blank_id = db.add_frame(map_id, x=0, y=0, width=40, height=40)
+check("label/color default to '' and 0",
+      next(r for r in db.frames(map_id) if r["id"] == blank_id)["label"] == "" and
+      next(r for r in db.frames(map_id) if r["id"] == blank_id)["color"] == 0)
+
+for kwargs, why in (
+    ({"x": 0, "y": 0, "width": 39.9, "height": 100}, "width under 40"),
+    ({"x": 0, "y": 0, "width": 100, "height": 10}, "height under 40"),
+    ({"x": 0, "y": 0, "label": "x" * 61, "width": 100, "height": 100}, "label over 60 chars"),
+    ({"x": 0, "y": 0, "color": FRAME_COLOR_MAX + 1, "width": 100, "height": 100},
+     "color out of range"),
+    ({"x": 0, "y": 0, "color": -1, "width": 100, "height": 100}, "negative color"),
+    ({"x": float("nan"), "y": 0, "width": 100, "height": 100}, "non-finite x"),
+    ({"x": float("inf"), "y": 0, "width": 100, "height": 100}, "infinite x"),
+):
+    try:
+        db.add_frame(map_id, **kwargs)
+        check(f"add_frame rejects {why}", False)
+    except ValueError as exc:
+        check(f"add_frame rejects {why}", True)
+        check(f"...with a readable message ({why})", len(str(exc)) > 0, str(exc))
+
+check("update_frame changes only the given fields",
+      db.update_frame(map_id, frame_id, label="Renamed Rack") is True)
+renamed = next(r for r in db.frames(map_id) if r["id"] == frame_id)
+check("...label changed, position untouched",
+      renamed["label"] == "Renamed Rack" and renamed["x"] == 10 and renamed["y"] == 20,
+      dict(renamed))
+
+check("update_frame moves x/y/width/height together",
+      db.update_frame(map_id, frame_id, x=50, y=60, width=300, height=250) is True)
+moved = next(r for r in db.frames(map_id) if r["id"] == frame_id)
+check("...all four landed",
+      moved["x"] == 50 and moved["y"] == 60 and moved["width"] == 300
+      and moved["height"] == 250, dict(moved))
+
+check("update_frame ignores a key that isn't a frame column",
+      db.update_frame(map_id, frame_id, bogus="nope", label="Still Renamed") is True)
+check("...the recognised key still landed",
+      next(r for r in db.frames(map_id) if r["id"] == frame_id)["label"] == "Still Renamed")
+
+check("update_frame on a missing frame id returns False",
+      db.update_frame(map_id, 999999, label="Nope") is False)
+
+try:
+    db.update_frame(map_id, frame_id, width=10)
+    check("update_frame validates like add_frame (width under 40 raises)", False)
+except ValueError:
+    check("update_frame validates like add_frame (width under 40 raises)", True)
+
+check("delete_frame returns False for an id that is not there",
+      db.delete_frame(map_id, 999999) is False)
+check("delete_frame returns True and removes a real frame",
+      db.delete_frame(map_id, blank_id) is True)
+check("...it is actually gone", all(r["id"] != blank_id for r in db.frames(map_id)))
 db.close()
 
 # --------------------------------------------------------------- settings

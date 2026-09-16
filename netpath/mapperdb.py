@@ -10,6 +10,7 @@ and is read live, joined against these placements, when a map is rendered.
 
 from __future__ import annotations
 
+import math
 import sqlite3
 import time
 
@@ -77,6 +78,23 @@ CREATE TABLE IF NOT EXISTS map_links (
     UNIQUE(map_id, a_node_id, b_node_id)
 );
 CREATE INDEX IF NOT EXISTS ix_map_links_map ON map_links(map_id);
+
+-- A labelled rectangle drawn on a map for visual grouping only -- it never
+-- moves or owns a device the way a map_nodes row does. x/y are the
+-- top-left corner in scene units (map_nodes' x/y are a node's centre).
+CREATE TABLE IF NOT EXISTS map_frames (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    map_id     INTEGER NOT NULL,
+    label      TEXT NOT NULL DEFAULT '',
+    x          REAL NOT NULL,
+    y          REAL NOT NULL,
+    width      REAL NOT NULL,
+    height     REAL NOT NULL,
+    color      INTEGER NOT NULL DEFAULT 0,
+    added_ts   REAL NOT NULL,
+    FOREIGN KEY (map_id) REFERENCES maps(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS ix_map_frames_map ON map_frames(map_id);
 
 CREATE TABLE IF NOT EXISTS vlan_colors (
     vlan         INTEGER PRIMARY KEY,
@@ -163,6 +181,38 @@ ROLES = ("", "switch", "router", "firewall", "ap", "server", "unmanaged")
 # concern even for an operator using the app's "light" theme.
 MAP_STYLES = ("modern", "classic", "blueprint", "minimal")
 
+# A frame's fill/border palette index -- fixed at 6 swatches (0-5), same
+# palette-by-index idiom as a node's role or a VLAN's colour_index.
+FRAME_COLOR_MAX = 5
+FRAME_MIN_SIZE = 40.0
+FRAME_LABEL_MAX = 60
+
+
+def _validate_frame_fields(fields: dict) -> None:
+    """Checks only the keys present in `fields` (shared by add_frame, which
+    passes all of them, and update_frame, which passes whatever subset the
+    caller sent), raising ValueError with an operator-readable message.
+    Mutates `fields["label"]` to its stripped form when present."""
+    if "label" in fields:
+        label = (fields["label"] or "").strip()
+        if len(label) > FRAME_LABEL_MAX:
+            raise ValueError(f"Frame label is limited to {FRAME_LABEL_MAX} characters.")
+        fields["label"] = label
+    for key in ("x", "y", "width", "height"):
+        if key in fields:
+            value = fields[key]
+            if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                    or not math.isfinite(value):
+                raise ValueError(f"Frame {key} must be a finite number.")
+    for key in ("width", "height"):
+        if key in fields and fields[key] < FRAME_MIN_SIZE:
+            raise ValueError(f"Frame {key} must be at least {FRAME_MIN_SIZE:g}.")
+    if "color" in fields:
+        color = fields["color"]
+        if isinstance(color, bool) or not isinstance(color, int) \
+                or not (0 <= color <= FRAME_COLOR_MAX):
+            raise ValueError(f"Frame color must be an integer between 0 and {FRAME_COLOR_MAX}.")
+
 
 class MapperDatabase(SqliteStore):
     SCHEMA = SCHEMA
@@ -220,10 +270,10 @@ class MapperDatabase(SqliteStore):
             self._conn.commit()
 
     def delete_map(self, map_id: int) -> bool:
-        # map_nodes rows are removed by the ON DELETE CASCADE declared in
-        # SCHEMA (foreign_keys=ON is one of SqliteStore.PRAGMAS) -- not by a
-        # DELETE here, so there is exactly one place that decides what
-        # deleting a map takes with it.
+        # map_nodes, map_links and map_frames rows are removed by the ON
+        # DELETE CASCADE declared in SCHEMA (foreign_keys=ON is one of
+        # SqliteStore.PRAGMAS) -- not by a DELETE here, so there is exactly
+        # one place that decides what deleting a map takes with it.
         with self._lock:
             cur = self._conn.execute("DELETE FROM maps WHERE id = ?", (map_id,))
             self._conn.commit()
@@ -406,6 +456,60 @@ class MapperDatabase(SqliteStore):
         with self._lock:
             cur = self._conn.execute(
                 "DELETE FROM map_links WHERE id = ? AND map_id = ?", (link_id, map_id))
+            if cur.rowcount:
+                self._touch_map(map_id)
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    # ---------------------------------------------------------------- frames
+
+    def frames(self, map_id: int) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM map_frames WHERE map_id = ? ORDER BY id",
+                (map_id,)).fetchall()
+
+    def add_frame(self, map_id: int, x: float, y: float, width: float, height: float,
+                 label: str = "", color: int = 0, now: float | None = None) -> int:
+        fields = {"x": x, "y": y, "width": width, "height": height,
+                  "label": label, "color": color}
+        _validate_frame_fields(fields)
+        now = time.time() if now is None else now
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO map_frames(map_id, label, x, y, width, height, color, added_ts)"
+                " VALUES (?,?,?,?,?,?,?,?)",
+                (map_id, fields["label"], fields["x"], fields["y"], fields["width"],
+                 fields["height"], fields["color"], now))
+            self._touch_map(map_id, now)
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def update_frame(self, map_id: int, frame_id: int, **fields) -> bool:
+        """Any of label/x/y/width/height/color; a key not in that set is
+        silently dropped, same as update_nodes' fixed column list. Returns
+        False, not a raise, when frame_id/map_id do not match a row -- a
+        stale edit from a tab open on a since-deleted frame must not
+        explode (add_frame/mapperdb's other update_* methods agree)."""
+        allowed = {k: v for k, v in fields.items()
+                  if k in ("label", "x", "y", "width", "height", "color")}
+        _validate_frame_fields(allowed)
+        if not allowed:
+            return False
+        sets = [f"{col} = ?" for col in allowed]
+        vals = list(allowed.values()) + [frame_id, map_id]
+        with self._lock:
+            cur = self._conn.execute(
+                f"UPDATE map_frames SET {', '.join(sets)} WHERE id = ? AND map_id = ?", vals)
+            if cur.rowcount:
+                self._touch_map(map_id)
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def delete_frame(self, map_id: int, frame_id: int) -> bool:
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM map_frames WHERE id = ? AND map_id = ?", (frame_id, map_id))
             if cur.rowcount:
                 self._touch_map(map_id)
             self._conn.commit()
