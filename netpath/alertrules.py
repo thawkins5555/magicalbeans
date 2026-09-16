@@ -567,10 +567,7 @@ ROLLED_UP_BY = {
     "temp_sensor_state_critical": "device_down",
     "psu_warning": "psu_failed",
     "psu_failed": "device_down",
-    # 5.32.0: Stack Power cable ports are also `sensor` entities (see
-    # SENSOR_FAMILIES below); a stack still routes power over its ring the
-    # other way, so a downed cable rolls up under the device rather than
-    # under psu_failed, which is about a supply, not a link.
+    # Rolls up under the device, not psu_failed, which is about a supply not a link.
     "stack_power_cable_down": "device_down",
 }
 

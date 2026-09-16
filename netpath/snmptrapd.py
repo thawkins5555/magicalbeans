@@ -22,11 +22,8 @@ BATCH = 200
 FLUSH_S = 1.0
 
 # Cisco supply/power/stack-power traps that trigger an immediate PSU or
-# stack-power re-read, at most once per device per POWER_TRAP_REREAD_S. The
-# stack power OIDs are the nine genuine fault notifications
-# (CISCO-STACKWISE-MIB, ...500.0.0.7/8/10-18) -- version mismatch (9) is
-# left out, the same "not a fault worth a re-read" call the MIB's own text
-# makes for it.
+# stack-power re-read, at most once per device per POWER_TRAP_REREAD_S. All
+# eleven stack power OIDs but version mismatch (...500.0.0.9) are included.
 POWER_TRAP_OIDS = frozenset({
     "1.3.6.1.4.1.9.9.13.3.0.1", "1.3.6.1.4.1.9.9.13.3.0.5", "1.3.6.1.4.1.9.9.13.3.0.9",
     "1.3.6.1.4.1.9.9.117.2.0.2", "1.3.6.1.4.1.9.9.117.2.0.3", "1.3.6.1.4.1.9.9.117.2.0.4",

@@ -1688,9 +1688,7 @@ class NodePoller(Worker):
         self._vendor_sensor_read: dict[int, float] = {}
         # (device_id, PsuTable.state) -> static PSU columns, _SENSOR_REFRESH_S TTL.
         self._vendor_psu_static: dict[tuple, dict] = {}
-        # device_id -> when CISCO-STACKWISE-MIB was last walked / whether it
-        # answered (1/0/absent=unknown). _poll_stack_power's own latch, kept
-        # apart from vendor_sensor_capable -- see that method's docstring.
+        # device_id -> last CISCO-STACKWISE-MIB walk time / capable flag (1/0/absent=unknown).
         self._stack_power_read: dict[int, float] = {}
         self._stack_power_capable: dict[int, int] = {}
         # device_id -> when the vendor table's own published thresholds
@@ -6629,11 +6627,7 @@ class NodePoller(Worker):
         keys = device.keys() if hasattr(device, "keys") else device
         raw_oid = device["sys_object_id"] if "sys_object_id" in keys else ""
         arc = nodeoids.enterprise_arc(raw_oid or "")
-        # CISCO-STACKWISE-MIB stack power (5.32.0): its own probe-once-
-        # remember latch (_poll_stack_power/_stack_power_capable), entirely
-        # independent of vendor_sensor_capable below -- a Cisco device can
-        # answer PSU or temperature and have no power stack cabling at all,
-        # or the reverse.
+        # Stack power support (_stack_power_capable) is independent of vendor_sensor_capable below.
         if arc == 9:
             self._poll_stack_power(device_id, device, config, now)
 
@@ -6834,23 +6828,17 @@ class NodePoller(Worker):
 
     def _poll_stack_power(self, device_id: int, device, config: dict,
                           now: float) -> None:
-        """CISCO-STACKWISE-MIB (nodeoids.CSW_*) stack power cabling —
+        """CISCO-STACKWISE-MIB (nodeoids.CSW_*) stack power cabling, arc 9
+        (Cisco) only, called from _poll_vendor_sensors. Writes
         stack_power_port(_admin|_switch|_neighbour|_limit_a).<idx> (idx =
         _flatten_vendor_idx("<entPhysicalIndex>.<cswStackPowerPortIndex>")),
-        stack_power_stack_*.<stack number> and stack_power_*_w.<entPhysicalIndex>.
-        Called from _poll_vendor_sensors for arc 9 (Cisco) only.
+        stack_power_stack_*.<stack> and stack_power_*_w.<entPhysicalIndex>.
+        _admin's label is the raw cswStackPowerPortName, not the friendly
+        stack_power_port.<idx> label -- the API reads a port's name off it.
 
-        _admin/_switch/_neighbour/_limit_a are display/lookup facts, not
-        alerts of their own: _admin's label is the raw cswStackPowerPortName,
-        so the API reads a port's name off it rather than parsing the
-        friendly label stack_power_port.<idx> carries for the alert.
-
-        Its own probe-once-remember latch (_stack_power_capable/_read),
-        deliberately separate from vendor_sensor_capable: whether a Cisco
-        device has stack power cabling at all has nothing to do with
-        whether it answers ENVMON/FRU PSU state. A device that has
-        answered before is walked every poll; one that has not is retried
-        at most once an hour (_SENSOR_REPROBE_S), same as PSU.
+        Own probe-once-remember latch (_stack_power_capable/_read), separate
+        from vendor_sensor_capable; retried at most once an hour
+        (_SENSOR_REPROBE_S) until it answers.
         """
         capable = self._stack_power_capable.get(device_id)
         if capable != 1 and (now - self._stack_power_read.get(device_id, 0.0)
@@ -6912,10 +6900,6 @@ class NodePoller(Worker):
                 label += f" -> switch {int(nbr)}"
             idx = _flatten_vendor_idx(suffix)
             samples.append((f"stack_power_port.{idx}", label, "state", "gauge", now, state))
-            # admin's label is the raw PortName, not the friendly label above:
-            # get_nodes_device_stack_power reads a port's name off it and its
-            # switch/neighbour off the two metrics below, rather than parsing
-            # the friendly label back apart.
             samples.append((f"stack_power_port_admin.{idx}", name, "state",
                             "gauge", now, admin))
             if switch is not None:

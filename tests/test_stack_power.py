@@ -273,6 +273,8 @@ dis_port = resp_dis["ports"][0] if resp_dis["ports"] else {}
 check("an admin-disabled port reads state_text 'disabled', not 'ok'",
       dis_port.get("state_text") == "disabled" and dis_port.get("admin_text") == "disabled",
       resp_dis["ports"])
+check("...and link_text '' rather than an invented 'up'",
+      dis_port.get("link_text") == "", resp_dis["ports"])
 
 resp_empty = webapi.get_nodes_device_stack_power(_FakeService(_FakeDB()), {}, {}, 9)
 check("present is false for a device with no stack power metrics at all",

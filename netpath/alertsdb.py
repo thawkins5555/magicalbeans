@@ -855,11 +855,8 @@ _BUILTIN_RULES = [
     ("temp_sensor_state_critical", "Sensor reports temperature critical", "threshold", "temp_sensor_state", 2, "threshold_breach", 2.0, 2.0, 1),
     ("psu_warning", "Power supply degraded", "threshold", "psu_state", 4, "threshold_breach", 1.0, 1.0, 1),
     ("psu_failed", "Power supply failed or lost input", "threshold", "psu_state", 2, "threshold_breach", 2.0, 2.0, 1),
-    # 5.32.0: CISCO-STACKWISE-MIB. stack_power_port is 0 ok (up, or
-    # deliberately admin-disabled) / 2 cable down -- same shape as psu_state
-    # bar the "not present" state, since a stack power port that stops
-    # answering is a vanished walk row, not a removed bay (nodepoll
-    # deliberately writes nothing for it; see _poll_stack_power).
+    # stack_power_port: 0 ok/admin-disabled, 2 cable down; no "not present"
+    # state (nodepoll._poll_stack_power writes nothing for a vanished row).
     ("stack_power_cable_down", "Stack Power cable down", "threshold", "stack_power_port", 2, "threshold_breach", 2.0, 2.0, 1),
     # RH above ~80% starts to risk condensation on anything metal in the
     # room — unambiguous on its own: nothing but a dedicated environmental
@@ -874,10 +871,8 @@ _BUILTIN_RULES = [
     ("trap_critical", "Critical SNMP trap received", "trap", "", 2, "trap_forwarded", None, None, 1),
     ("trap_cold_start", "Device cold start trap", "trap", "coldStart", 4, "trap_forwarded", None, None, 1),
     ("trap_link_down_unmanaged", "Link-down trap from an unmanaged device", "trap", "linkDown", 3, "trap_forwarded", None, None, 1),
-    # 5.32.0: any of the fault notifications CISCO-STACKWISE-MIB defines
-    # (trapdecode.KIND_BY_OID "stackPower", ...500.0.0.9-18) -- the plain
-    # link/oper-status-changed pair (...500.0.0.7/8, kind "stackPowerStatus")
-    # is informational by the MIB's own text and has no rule of its own.
+    # Matches kind "stackPower" (...500.0.0.9-18); the informational
+    # link/oper-status pair (...500.0.0.7/8, kind "stackPowerStatus") has no rule.
     ("stack_power_trap", "Stack Power fault trap", "trap", "stackPower", 4, "trap_forwarded", None, None, 1),
     ("syslog_critical", "Critical syslog message", "syslog", "", 2, "trap_forwarded", None, None, 1),
     ("ipam_new_conflict", "New IPAM address conflict", "ipam", "", 4, "trap_forwarded", None, None, 1),
@@ -1017,6 +1012,7 @@ _BUILTIN_AUTO_RESOLVE_S = {
     "ipam_new_conflict": 604800,
     "wireless_ap_rebooted": 86400,
     "wireless_radio_channel_changed": 86400,
+    "stack_power_trap": 86400,
     # Both of these report a CONDITION through repeated events rather than
     # through a state with a clear, so last_ts is what says whether it is
     # still happening: while the condition holds the events keep arriving and

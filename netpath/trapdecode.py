@@ -1074,7 +1074,8 @@ KIND_BY_OID = {
 KINDS = ["coldStart", "warmStart", "linkDown", "linkUp",
          "authenticationFailure", "egpNeighborLoss", "newRoot",
          "topologyChange", "bgpEstablished", "bgpBackwardTransition",
-         "upsOnBattery", "enterpriseSpecific", "encrypted"]
+         "upsOnBattery", "stackPower", "stackPowerStatus",
+         "enterpriseSpecific", "encrypted"]
 
 # Longest prefix wins; the decoder re-sorts after appending user rules.
 # The scale is syslog's, deliberately: 0 emergency … 7 debug. A future
@@ -1098,20 +1099,21 @@ DEFAULT_SEVERITY_RULES = [
     ("1.3.6.1.4.1.9.9.117.2.0.2", 2),  # cefcPowerStatusChange                -> critical
     ("1.3.6.1.4.1.9.9.117.2.0.4", 3),  # cefcFRURemoved                       -> error
     ("1.3.6.1.4.1.9.9.117.2.0.3", 5),  # cefcFRUInserted                      -> notice
-    # CISCO-STACKWISE-MIB (5.32.0) -- severities as specified for the
-    # release, not derived from the MIB text.
+    # CISCO-STACKWISE-MIB (5.32.0) -- capped at error(3), never critical(2):
+    # trap_critical (alertsdb) matches every severity-2 trap, and
+    # stack_power_trap is meant to be the one alert these raise.
     ("1.3.6.1.4.1.9.9.500.0.0.7",  5),  # cswStackPowerPortLinkStatusChanged -> notice
     ("1.3.6.1.4.1.9.9.500.0.0.8",  5),  # cswStackPowerPortOperStatusChanged -> notice
     ("1.3.6.1.4.1.9.9.500.0.0.9",  4),  # cswStackPowerVersionMismatch       -> warning
     ("1.3.6.1.4.1.9.9.500.0.0.10", 3),  # cswStackPowerInvalidTopology       -> error
     ("1.3.6.1.4.1.9.9.500.0.0.11", 4),  # cscwStackPowerBudgetWarrning       -> warning
-    ("1.3.6.1.4.1.9.9.500.0.0.12", 2),  # cswStackPowerInvalidInputCurrent   -> critical
-    ("1.3.6.1.4.1.9.9.500.0.0.13", 2),  # cswStackPowerInvalidOutputCurrent  -> critical
+    ("1.3.6.1.4.1.9.9.500.0.0.12", 3),  # cswStackPowerInvalidInputCurrent   -> error
+    ("1.3.6.1.4.1.9.9.500.0.0.13", 3),  # cswStackPowerInvalidOutputCurrent  -> error
     ("1.3.6.1.4.1.9.9.500.0.0.14", 3),  # cswStackPowerUnderBudget           -> error
     ("1.3.6.1.4.1.9.9.500.0.0.15", 4),  # cswStackPowerUnbalancedPowerSupplies -> warning
-    ("1.3.6.1.4.1.9.9.500.0.0.16", 2),  # cswStackPowerInsufficientPower     -> critical
+    ("1.3.6.1.4.1.9.9.500.0.0.16", 3),  # cswStackPowerInsufficientPower     -> error
     ("1.3.6.1.4.1.9.9.500.0.0.17", 4),  # cswStackPowerPriorityConflict      -> warning
-    ("1.3.6.1.4.1.9.9.500.0.0.18", 2),  # cswStackPowerUnderVoltage          -> critical
+    ("1.3.6.1.4.1.9.9.500.0.0.18", 3),  # cswStackPowerUnderVoltage          -> error
 ]
 
 # The shortest OID that can be a table column here (1.3.6.1.2.1.x.y.1.z is

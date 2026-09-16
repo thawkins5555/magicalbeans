@@ -176,9 +176,7 @@ class DeviceState:
         # scalars count down), or the room sensor is pinned hot.
         self.on_battery = bool(knobs.get("on_battery", False))
         self.temp_hot = bool(knobs.get("temp_hot", False))
-        # stack_cable_down SPECIALS knob: one power stack cable's link goes
-        # down(2) on both ends -- see _build_cisco_access's CISCO-STACKWISE-MIB
-        # entries.
+        # stack_cable_down SPECIALS knob: one power stack cable's link goes down(2) on both ends.
         self.stack_cable_down = bool(knobs.get("stack_cable_down", False))
         self.v3 = knobs.get("v3")                       # None|"noauth"|"sha"
         self.v3_user = knobs.get("v3_user", "poller")
@@ -1291,15 +1289,11 @@ def _build_cisco_access(wrap32: bool, ports: int, vlan: str | None) -> dict:
         cisco_extension=True))
     entries.update(dot1d_stp(priority=32768, root_cost=4, root_port=uplink_if))
     entries.update(dot1d_stp_ports({port: 5 for port in port_to_if}))  # forwarding
-    # CISCO-STACKWISE-MIB (5.32.0): a 3-member ring power stack, redundant
-    # mode, 30 A cables. entPhysicalIndex 1001/2001/3001 sit well outside
-    # this persona's own (~50-port) entPhysicalIndex range, so they can
-    # never collide with the entity_sensors/sfp_cages entries above.
+    # CISCO-STACKWISE-MIB (5.32.0): 3-member ring, redundant mode, 30 A cables;
+    # entPhysicalIndex 1001/2001/3001 sit outside this persona's ~50-port range.
     stack_switches = {1001: 1, 2001: 2, 3001: 3}
     ring = [1001, 2001, 3001]
-    # PORT-1 faces the previous switch in the ring, PORT-2 the next one --
-    # switch 2's PORT-2 and switch 3's PORT-1 are therefore the same cable,
-    # the one the stack_cable_down knob (SPECIALS index 30) takes down.
+    # switch 2's PORT-2 and switch 3's PORT-1 are the same cable (down_ports).
     neighbor_of = {}
     for i, ent in enumerate(ring):
         neighbor_of[(ent, 1)] = stack_switches[ring[i - 1]]

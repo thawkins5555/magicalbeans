@@ -5647,7 +5647,7 @@ def get_nodes_device_stack_power(service, params, body, device_id) -> dict:
             # nodepoll._poll_stack_power's docstring for why state alone
             # (0 up-or-disabled, 2 down) is the only fact a disabled port
             # ever publishes here.
-            "link_text": "down" if state == 2 else "up",
+            "link_text": "" if admin == 2 else ("down" if state == 2 else "up"),
             "state": state, "state_text": state_text,
             "limit_a": limit_row["last_value"] if limit_row else None,
             "last_ts": row["last_ts"],

@@ -584,6 +584,10 @@ down_rule = alerts.rule_by_key("device_down")
 assert down_rule["auto_resolve_after_s"] is None, dict(down_rule)
 ok("a recovery notice ships with a one-hour lifetime; an outage ships with none")
 
+trap_rule = alerts.rule_by_key("stack_power_trap")
+assert trap_rule["auto_resolve_after_s"] == 86400, dict(trap_rule)
+ok("a stack power fault trap ships with a 24-hour lifetime")
+
 nodes.record_device_event(did, "up", "responding again")
 nodes.record_device_event(did, "rebooted", "uptime went backwards")
 engine._tick()
@@ -658,6 +662,7 @@ conn.commit(); conn.close()
 upgraded = AlertsDatabase(legacy_path)
 assert upgraded.rule_by_key("poll_overrun")["auto_resolve_after_s"] == 3600
 assert upgraded.rule_by_key("device_up")["auto_resolve_after_s"] == 120
+assert upgraded.rule_by_key("stack_power_trap")["auto_resolve_after_s"] == 86400
 ok("upgrading seeds the shipped intervals and leaves an operator's own alone")
 upgraded.close()
 

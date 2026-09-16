@@ -73,8 +73,7 @@ STACK_POWER_BASE = "1.3.6.1.4.1.9.9.500.0.0."
 STACK_POWER_SEVERITY = {
     7: 5, 8: 5,            # link/oper status changed -> notice
     9: 4, 11: 4, 15: 4, 17: 4,     # version mismatch/budget warn/unbalanced/priority -> warning
-    10: 3, 14: 3,          # invalid topology/under budget -> error
-    12: 2, 13: 2, 16: 2, 18: 2,    # input/output current, insufficient power, under voltage -> critical
+    10: 3, 14: 3, 12: 3, 13: 3, 16: 3, 18: 3,  # topology/budget/current/power/voltage -> error
 }
 for n, want in STACK_POWER_SEVERITY.items():
     oid = STACK_POWER_BASE + str(n)

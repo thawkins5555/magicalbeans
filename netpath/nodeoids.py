@@ -1359,12 +1359,9 @@ PSU_TABLES = {
 }
 
 # ---------------------------------------------------------------------------
-# Cisco Stack Power (5.32.0) -- CISCO-STACKWISE-MIB, ciscoMgmt 500, arc 9
-# only. Resolved from the MIB text the same way SENSOR_TABLES/PSU_TABLES
-# above were; nodepoll._poll_stack_power is the only reader, so this is a
-# flat OID list rather than another declarative table -- the port/stack/
-# switch tables have three different index shapes and none of them fit
-# SensorTable or PsuTable's single-index, single-state-column shape.
+# Cisco Stack Power (5.32.0) -- CISCO-STACKWISE-MIB, arc 9 only. A flat OID
+# list, not a SensorTable/PsuTable: the port/stack/switch tables below have
+# three different index shapes.
 
 # cswStackPowerPortInfoTable, INDEX entPhysicalIndex.cswStackPowerPortIndex.
 CSW_STACK_POWER_PORT_OPER_STATUS = "1.3.6.1.4.1.9.9.500.1.3.2.1.2"
