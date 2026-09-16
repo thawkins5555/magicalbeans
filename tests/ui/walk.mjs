@@ -1432,6 +1432,15 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
           + `not seeded after ${state.waited_s}s, poll-now included`;
       }
 
+      // The canvas was drawn from the fetch made when the tab opened; the
+      // facts above may have landed since, so redraw from a fresh fetch.
+      await Promise.all([
+        page.waitForResponse((res) => /\/api\/mapper\/maps\/\d+$/.test(
+          new URL(res.url()).pathname) && res.request().method() === 'GET',
+        { timeout: 20000 }).catch(() => {}),
+        page.click('#mp-refresh'),
+      ]);
+      await settle(page, 1000);
       await page.check('#mp-fiberview');
       await page.waitForSelector('#mp-canvas[data-fiberview="1"]', { timeout: 10000 });
       await settle(page, 800);
@@ -1484,6 +1493,13 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       assert(stpVlans === '30',
         `expected acc-sw-005's end to read stp_vlans "30", got ${JSON.stringify(stpVlans)}`);
 
+      await Promise.all([
+        page.waitForResponse((res) => /\/api\/mapper\/maps\/\d+$/.test(
+          new URL(res.url()).pathname) && res.request().method() === 'GET',
+        { timeout: 20000 }).catch(() => {}),
+        page.click('#mp-refresh'),
+      ]);
+      await settle(page, 1000);
       const linkId = String(link.id);
       const hasBlockingPath = await page.evaluate((id) =>
         [...document.querySelectorAll(`#mp-svg path.mp-link[data-link-id="${id}"]`)]
