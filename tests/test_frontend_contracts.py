@@ -801,6 +801,17 @@ check('id="mp-drag-pans"' in INDEX_HTML and 'data-requires-write' not in
       "the Drag pans checkbox exists and is not a write control")
 check("if (view.dragPans) {" in MAPPER and "localStorage.getItem('mapper.dragPans')" in MAPPER,
       "left-drag pans when the box is ticked and the choice is remembered per browser")
+check('id="mp-fiberview"' in INDEX_HTML and 'data-requires-write' not in
+      INDEX_HTML[INDEX_HTML.index('id="mp-fiberview"') - 120:INDEX_HTML.index('id="mp-fiberview"')],
+      "the FiberView checkbox exists and is not a write control")
+check("localStorage.getItem('mapper.fiberView')" in MAPPER and "dataset.fiberview" in MAPPER,
+      "FiberView is remembered per browser and toggles #mp-canvas's data attribute")
+check("classList.add('fiber')" in MAPPER,
+      "drawLink/wireOne tags a link.fiber link with the .fiber class")
+check("--mp-link-w" in MAPPER,
+      "wireOne carries plan.width onto the fiber link's --mp-link-w custom property")
+check("'filter'" in MAPPER,
+      "the PNG export inlines the fiber glow's filter property")
 check("NAME_SOURCES" in MAPPER and "node.name_source" in MAPPER,
       "the node tooltip names the source of the displayed name")
 
@@ -4222,6 +4233,22 @@ check(len(_reveal_blocks) > 0 and len(_reveal_blocks) == _reveal_count,
       "(%d blocks, %d --reveal declarations)" % (len(_reveal_blocks), _reveal_count))
 check("table.grid tr.revealed td" in read("app.css"),
       "app.css styles table.grid tr.revealed td off --reveal")
+
+# ---------------------------------------------------------------------------
+# 92. FiberView (mp-fiberview): --fiber defined once per themed :root block,
+#     app.css keys the glow/pulse off #mp-canvas[data-fiberview] .mp-link.fiber.
+_fiber_blocks = re.findall(r':root\[data-theme="[a-z]+"\] \{.*?\n\}', TOKENS91, re.S)
+_fiber_count = sum(block.count("--fiber:") for block in _fiber_blocks)
+check(len(_fiber_blocks) > 0 and len(_fiber_blocks) == _fiber_count,
+      "--fiber is defined once in every :root[data-theme=] block of tokens.css "
+      "(%d blocks, %d --fiber declarations)" % (len(_fiber_blocks), _fiber_count))
+APP_CSS92 = read("app.css")
+check(".mp-link.fiber" in APP_CSS92 and "@keyframes mp-fiber-pulse" in APP_CSS92
+      and "prefers-reduced-motion" in APP_CSS92,
+      "app.css glows/pulses a fiber link, opt-in on no-preference like the "
+      "other MAPPER/alert-row animations")
+check("stroke-width: max(5px, calc(var(--mp-link-w, 1.5) * 1.6px));" in APP_CSS92,
+      "a fiber link's bold stroke never draws thinner than its own plan.width")
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))

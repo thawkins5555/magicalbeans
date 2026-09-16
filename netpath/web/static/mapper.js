@@ -107,6 +107,7 @@
     linkLabelEls: new Map(),   // link id -> its port/VLAN labels, drawn above every link
     frameEls: new Map(),       // frame id -> its <g>
     dragPans: false,           // the Drag pans checkbox: left-drag on empty canvas pans
+    fiberView: false,          // the FiberView checkbox: glow every link.fiber link
     settings: {},        // mapperdb.DEFAULTS shape, refreshed with every maps/settings fetch
     candidates: { devices: [], neighbours: [] },
 
@@ -995,6 +996,12 @@
     return MAP_STYLES.includes(view.settings.map_style) ? view.settings.map_style : 'modern';
   }
 
+  // A rendering preference, not a map edit: toggling it never refetches or
+  // redraws, it just flips the data attribute app.css keys off.
+  function applyFiberView() {
+    App.el('mp-canvas').dataset.fiberview = view.fiberView ? '1' : '0';
+  }
+
   // One <pattern>+<rect>, not one <line> per step: a 6,000-unit map at the
   // default 20-unit grid drew 600 hit-testable line elements, re-laid-out
   // every redraw. .mp-grid-line still names the stroke for app.css.
@@ -1064,6 +1071,12 @@
       if (extraClass) path.classList.add(extraClass);
       if (selected) path.classList.add('selected');
       if (dimmed) path.classList.add('dimmed');
+      if (link.fiber === true) {
+        path.classList.add('fiber');
+        // So the glow's own stroke-width (app.css) can never draw a
+        // VLAN-heavy trunk thinner than its normal plan.width.
+        path.style.setProperty('--mp-link-w', String(plan.width));
+      }
       path.dataset.linkId = link.id;
       // A non-focusable strand still gets role="img" + aria-label, not no
       // role at all — a screen reader's browse/scan cursor (unlike Tab) can
@@ -1690,6 +1703,7 @@
     const svg = App.el('mp-svg');
     const canvas = App.el('mp-canvas');
     canvas.dataset.mapStyle = currentMapStyle();
+    applyFiberView();
     // Replacing the <g> a drag captured means its release never arrives.
     view.nodeDrag = null;
     view.frameDrag = null;
@@ -2848,7 +2862,7 @@
     const cloneEls = cloneRoot.querySelectorAll('*');
     const props = ['fill', 'stroke', 'color', 'stop-color', 'stroke-width', 'paint-order', 'stroke-linejoin',
       'font-family', 'font-size', 'font-weight', 'text-anchor', 'letter-spacing',
-      'opacity', 'fill-opacity', 'stroke-opacity', 'stroke-dasharray', 'dominant-baseline'];
+      'opacity', 'fill-opacity', 'stroke-opacity', 'stroke-dasharray', 'dominant-baseline', 'filter'];
     // Only the CLONE is touched — the live, on-screen canvas must come out
     // of an export exactly as it went in, background included.
     cloneRoot.style.background = getComputedStyle(App.el('mp-canvas')).backgroundColor;
@@ -3028,6 +3042,14 @@
     App.el('mp-drag-pans').onchange = (event) => {
       view.dragPans = event.target.checked;
       try { localStorage.setItem('mapper.dragPans', view.dragPans ? '1' : '0'); } catch (error) { /* per-browser convenience only */ }
+    };
+    try { view.fiberView = localStorage.getItem('mapper.fiberView') === '1'; } catch (error) { view.fiberView = false; }
+    App.el('mp-fiberview').checked = view.fiberView;
+    applyFiberView();
+    App.el('mp-fiberview').onchange = (event) => {
+      view.fiberView = event.target.checked;
+      try { localStorage.setItem('mapper.fiberView', view.fiberView ? '1' : '0'); } catch (error) { /* per-browser convenience only */ }
+      applyFiberView();
     };
     App.el('mp-snap').onchange = async (event) => {
       await App.post('/api/settings', { scope: 'mapper', values: { snap_to_grid: event.target.checked } });
