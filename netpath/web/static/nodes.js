@@ -3293,8 +3293,8 @@
       const gw = (view.detail && view.detail.default_gateway) || '';
       const gwSource = (view.detail && view.detail.default_gateway_source) || '';
       App.setText(gateway, !gw ? 'Default gateway: not published by this device.'
-                  : gwSource === 'configrx' ? `Default gateway: ${escape(gw)} (from ConfigRX backup)`
-                  : `Default gateway: ${escape(gw)}`);
+                  : gwSource === 'configrx' ? `Default gateway: ${gw} (from ConfigRX backup)`
+                  : `Default gateway: ${gw}`);
     }
     const rows = (view.detail && view.detail.addresses) || [];
     table.innerHTML = '<caption class="sr-only">Addresses this device answers on</caption>' +

@@ -221,12 +221,8 @@ _HASH_END_RE = re.compile(r"#\s*$")
 _STILL_WORKING_RE = re.compile(r"building configuration|^\s*\.{2,}\s*$",
                                re.IGNORECASE)
 
-# The default gateway a Layer-2 switch configures itself, rather than
-# learns over SNMP -- nodepoll._refresh_default_gateway's ConfigRX fallback
-# for a box whose route tables are empty or unimplemented. `ip
-# default-gateway` is tried first, a default static route second; whichever
-# matches first wins, and an address that does not parse is treated as no
-# match at all.
+# The default gateway a Layer-2 switch configures itself, rather than learns
+# over SNMP. `ip default-gateway` is tried first, then a default static route.
 _DEFAULT_GATEWAY_RE = re.compile(r"^ip default-gateway (\S+)", re.MULTILINE)
 _DEFAULT_ROUTE_RE = re.compile(r"^ip route 0\.0\.0\.0 0\.0\.0\.0 (\S+)", re.MULTILINE)
 
@@ -1151,10 +1147,8 @@ class ConfigRxWorker(Worker):
         previous_size = self.db.latest_backup_size(device_id)
         backup_id, _digest = self.db.add_backup(
             device_id, cleaned, redacted=not store_secrets)
-        # SNMP's own default-gateway read (nodepoll._refresh_default_gateway)
-        # takes precedence in the API; this is only the fallback for a
-        # Layer-2 switch whose route tables answer nothing. Stored on every
-        # capture, changed or not, so a box backed up once still has it.
+        # SNMP's own default-gateway read takes precedence in the API; this
+        # is only the fallback for a switch whose route tables answer nothing.
         self.db.set_config_gateway(device_id, _config_gateway(cleaned))
         # Only when a key was actually stored, and said once: the note used to
         # be appended to every backup, because the accepted key was thrown

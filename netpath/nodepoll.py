@@ -280,14 +280,8 @@ _DOTTED_IPV4_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
 
 def _inet_address_text(value) -> str:
     """An InetAddress (RFC 4001) IPv4 value as dotted text, or "" for
-    anything not a plain 4-byte address -- inetCidrRouteNextHop is this
-    type, and snmppoll already turns a non-printable OCTET STRING into
-    space-separated hex ("0A 00 00 01") rather than raw bytes by the time it
-    reaches here. Dotted text and real bytes are accepted too, for whatever
-    already-decoded shape a caller has. IPv6 (16 bytes) and anything else
-    return "" -- only IPv4 next hops are stored. See fortipoll._format_ip
-    for the same hex-pair decoding against a different InetAddress column.
-    """
+    anything not a plain 4-byte address (accepts raw bytes, dotted text,
+    or space-separated hex)."""
     if isinstance(value, (bytes, bytearray)):
         raw = bytes(value)
     else:
@@ -1720,10 +1714,8 @@ class NodePoller(Worker):
         self._vendor_sensor_read: dict[int, float] = {}
         # (device_id, PsuTable.state) -> static PSU columns, _SENSOR_REFRESH_S TTL.
         self._vendor_psu_static: dict[tuple, dict] = {}
-        # (device_id, PsuTable.state) -> the indices the last COMPLETE walk
-        # of that column returned, so a FRU tray/supply pulled between polls
-        # is noticed even though the walk simply stops mentioning it rather
-        # than reporting it gone. See _mark_vendor_rows_absent.
+        # (device_id, PsuTable.state) -> indices the last COMPLETE walk
+        # returned. See _mark_vendor_rows_absent.
         self._vendor_psu_seen: dict[tuple[int, str], set[str]] = {}
         # device_id -> last CISCO-STACKWISE-MIB walk time / capable flag (1/0/absent=unknown).
         self._stack_power_read: dict[int, float] = {}
@@ -1736,19 +1728,15 @@ class NodePoller(Worker):
         self._mau_read: dict[int, float] = {}
         self._mau_capable: dict[int, bool] = {}
         # device_id -> when the ENTITY-MIB cage scan was last tried/whether
-        # entPhysicalClass answered, same probe-once-remember shape as
-        # _mau_read/_mau_capable -- lets _poll_environment keep trying the
-        # SFP cage scan for a device that answers no ENTITY-SENSOR-MIB
-        # rows at all, without paying for the walk every cadence once it
-        # is confirmed to have none.
+        # entPhysicalClass answered, probe-once-remember like _mau_read.
         self._cage_read: dict[int, float] = {}
         self._cage_capable: dict[int, bool] = {}
         # device_id -> when a sensor-diagnostic event was last written for
         # it. See _log_sensor_diag.
         self._sensor_diag_ts: dict[int, float] = {}
-        # device_id -> when a media (SFP/DOM) diagnostic event was last
-        # written for it. See _log_media_diag.
-        self._media_diag_ts: dict[int, float] = {}
+        # (device_id, cause) -> when a media (SFP/DOM) diagnostic event was
+        # last written for it. See _log_media_diag.
+        self._media_diag_ts: dict[tuple[int, str], float] = {}
         # device_id -> the GETBULK repetition count that last worked for it.
         # A device that answers "tooBig" is retried at half as many rows, and
         # remembering that means the next walk starts where the last one
@@ -2761,7 +2749,7 @@ class NodePoller(Worker):
                       self._mau_read, self._mau_capable,
                       self._cage_read, self._cage_capable,
                       self._stack_power_read, self._stack_power_capable,
-                      self._sensor_diag_ts, self._media_diag_ts, self._snmp_backoff,
+                      self._sensor_diag_ts, self._snmp_backoff,
                       self._snmp_failing_count, self._get_batch,
                       self._poll_cost):
             for device_id in [k for k in list(cache) if k not in keep]:
@@ -2773,6 +2761,9 @@ class NodePoller(Worker):
         for cache_key in [k for k in list(self._vendor_psu_seen)
                           if k[0] not in keep]:
             self._vendor_psu_seen.pop(cache_key, None)
+        for cache_key in [k for k in list(self._media_diag_ts)
+                          if k[0] not in keep]:
+            self._media_diag_ts.pop(cache_key, None)
         # Sets rather than dicts, so not in the loop above: the "logged
         # once" memory for a device that answers no ARP table, the stagger,
         # and the four per-device verdicts whose whole purpose is to make
@@ -5627,34 +5618,28 @@ class NodePoller(Worker):
         raw = (device["sys_object_id"] if "sys_object_id" in keys else "") or ""
         return str(raw).startswith(self._CISCO_ENTERPRISE_PREFIX)
 
-    def _walk_sensor_columns(self, device, config: dict) -> tuple[str, dict, list]:
-        """(source, columns, tables tried) — whichever sensor table this
-        device actually populates, walked once for every caller.
-
-        Falls back to CISCO-ENTITY-SENSOR-MIB only when ENTITY-SENSOR-MIB's
-        value column comes back empty AND _cisco_sensor_table_plausible():
-        the two are never merged, since gear that answers both would show
-        every reading twice with no way to tell the duplicates apart.
-
-        `columns` holds values/types/scales/precisions/statuses/units keyed
-        by index suffix; `tried` names the tables, for the diagnostics
-        event log.
+    def _walk_sensor_columns(self, device, config: dict) -> tuple[str, dict, list, bool]:
+        """(source, columns, tables tried, whether the value-column walk
+        reached the end) — whichever sensor table this device actually
+        populates, walked once for every caller. A caller that goes on to
+        treat an empty result as "no DOM here" needs that last flag: an
+        empty result from a walk that merely timed out is not that.
         """
         tried = ["ENTITY-SENSOR-MIB"]
         source = "ENTITY-SENSOR-MIB"
-        values = self._walk_column(device, config, self._ENT_SENSOR_VALUE)
+        values, complete = self._walk_column_status(device, config, self._ENT_SENSOR_VALUE)
         siblings = (self._ENT_SENSOR_TYPE, self._ENT_SENSOR_SCALE,
                     self._ENT_SENSOR_PRECISION, self._ENT_SENSOR_STATUS,
                     self._ENT_SENSOR_UNITS)
         if not values and self._cisco_sensor_table_plausible(device):
             tried.append("CISCO-ENTITY-SENSOR-MIB")
             source = "CISCO-ENTITY-SENSOR-MIB"
-            values = self._walk_column(device, config, self._CISCO_SENSOR_VALUE)
+            values, complete = self._walk_column_status(device, config, self._CISCO_SENSOR_VALUE)
             siblings = (self._CISCO_SENSOR_TYPE, self._CISCO_SENSOR_SCALE,
                         self._CISCO_SENSOR_PRECISION, self._CISCO_SENSOR_STATUS,
                         None)
         if not values:
-            return "", {}, tried
+            return "", {}, tried, complete
         type_oid, scale_oid, precision_oid, status_oid, units_oid = siblings
         cols = {
             "values": values,
@@ -5665,7 +5650,7 @@ class NodePoller(Worker):
             "units": self._walk_column(device, config, units_oid)
                      if units_oid else {},
         }
-        return source, cols, tried
+        return source, cols, tried, complete
 
     def read_dom(self, device_id: int, if_index: int) -> list[dict]:
         """Live on-demand read of one interface's sensors — DOM/DDM data on
@@ -5761,7 +5746,7 @@ class NodePoller(Worker):
                 continue
             direct[entity] = if_index
         if contained_in is None:
-            contained_in = self._entity_contained_in(device, config)
+            contained_in, _complete = self._entity_contained_in(device, config)
 
         resolved: dict[int, int] = {}
 
@@ -5797,48 +5782,32 @@ class NodePoller(Worker):
                 seen += 1
         return resolved, len(alias)
 
-    def _entity_contained_in(self, device, config: dict) -> dict[int, int]:
-        """entPhysicalIndex -> the entity holding it, both ends parsed to
-        int. Its own method because two passes over one device need the
-        containment tree and neither may pay for a second walk of it."""
+    def _entity_contained_in(self, device, config: dict) -> tuple[dict[int, int], bool]:
+        """(entPhysicalIndex -> the entity holding it, both ends parsed to
+        int; whether the walk reached the end). Its own method because two
+        passes over one device need the containment tree and neither may
+        pay for a second walk of it."""
         parents: dict[int, int] = {}
-        for suffix, value in _int_keyed(self._walk_column(
-                device, config, self._ENT_PHYSICAL_CONTAINED_IN)).items():
+        raw, complete = self._walk_column_status(
+            device, config, self._ENT_PHYSICAL_CONTAINED_IN)
+        for suffix, value in _int_keyed(raw).items():
             try:
                 parents[suffix] = int(value)
             except (TypeError, ValueError):
                 continue
-        return parents
+        return parents, complete
 
     def _sfp_slot_media(self, device, config: dict, port_map: dict[int, int],
                         contained_in: dict[int, int], descrs: dict) -> tuple:
         """({ifIndex: 'sfp' | 'sfp_empty' | 'copper'}, whether every walk it
-        made finished, how many entPhysicalClass rows the device answered
-        at all -- _poll_environment's own probe-once-remember signal for
-        whether ENTITY-MIB is worth trying again (_cage_capable) -- and a
-        list of "<column> walk cut short (<reason>)" diagnostic lines for
-        whichever of the two walks below did not finish) for the
-        transceiver cages this device describes. The DOM scan cannot see
-        these: a cage with nothing in it, or holding a transceiver that
-        reports no sensors, has no sensor row to be found by, and until
-        5.2.0 an SFP slot like that was indistinguishable from a copper
-        port.
-
-        'sfp' is an entity whose own entPhysical text names a transceiver
-        (the module plugged into a cage, or a port an agent puts that text
-        on directly); 'copper' is the same, except the text ALSO names a
-        copper form factor (_COPPER_TEXT) -- a BASE-T SFP is still a
-        transceiver, just not an optical one; 'sfp_empty' is a container(5)
-        that says it is a transceiver cage and holds nothing that does. A
-        container that names nothing is left alone rather than guessed at:
-        some platforms give every copper port one too, and a copper port
-        must never wear an SFP badge from text alone (see _poll_environment
-        for the MAU-MIB proof that can still badge one).
-
-        The completeness flag is the caller's to act on, and it must: a walk
-        cut short answers with what it had reached, which reads as a cage
-        that is not there or a module that is not in one. See
-        _poll_environment, which will not overwrite a stored badge on one.
+        made finished, entPhysicalClass row count for _cage_capable, and a
+        list of "<column> walk cut short (<reason>)" diagnostics) for the
+        transceiver cages this device describes -- the DOM scan cannot see
+        an empty or sensorless cage. 'copper' additionally names a copper
+        form factor (_COPPER_TEXT) in the entPhysical text; an unnamed
+        container is left as-is rather than guessed at. A walk cut short
+        must not be read as a cage or module that is not there — see
+        _poll_environment, which acts on the completeness flag.
         """
         raw_classes, complete, class_reason = self._walk_column_detail(
             device, config, self._ENT_PHYSICAL_CLASS)
@@ -5935,7 +5904,7 @@ class NodePoller(Worker):
         own shape, and prefers entPhysicalName over entPhysicalDescr for
         `label` where an agent populates it -- see _ENT_PHYSICAL_NAME.
         """
-        source, cols, tried = self._walk_sensor_columns(device, config)
+        source, cols, tried, _complete = self._walk_sensor_columns(device, config)
         if not cols:
             self._log_sensor_diag(
                 device, f"No sensor rows from {device['ip']}: "
@@ -6016,16 +5985,15 @@ class NodePoller(Worker):
         self._sensor_diag_ts[device_id] = now
         self.log.add(NODES, message, target=device["ip"])
 
-    def _log_media_diag(self, device, message: str) -> None:
+    def _log_media_diag(self, device, message: str, cause: str) -> None:
         """Same shape as _log_sensor_diag, but rate-limited to once per
-        _SENSOR_REPROBE_S per device rather than once a minute: a badge
-        gap is a standing condition, not a transient one, so there is
-        nothing to gain from repeating it every poll interval."""
+        _SENSOR_REPROBE_S per (device, cause): several independent causes
+        in one pass must each get their own event, not just the first."""
         now = time.time()
-        device_id = device["id"]
-        if now - self._media_diag_ts.get(device_id, 0.0) < self._SENSOR_REPROBE_S:
+        key = (device["id"], cause)
+        if now - self._media_diag_ts.get(key, 0.0) < self._SENSOR_REPROBE_S:
             return
-        self._media_diag_ts[device_id] = now
+        self._media_diag_ts[key] = now
         self.log.add(NODES, message, target=device["ip"])
 
     # entPhySensorType -> device-metric keys and prefixes read_hardware's
@@ -6460,9 +6428,10 @@ class NodePoller(Worker):
             return
         self._sensor_read[device_id] = now
         try:
-            _source, cols, _tried = self._walk_sensor_columns(device, config)
+            _source, cols, _tried, sensor_complete = self._walk_sensor_columns(device, config)
         except SnmpError:
             cols = {}
+            sensor_complete = False
         if cols:
             if not capable:
                 # None (never probed) and 0 (probed, answered nothing) both
@@ -6476,23 +6445,14 @@ class NodePoller(Worker):
             statuses = cols["statuses"]
             units = cols["units"]
         else:
-            # No sensor answer at all and an outright SnmpError are folded
-            # together on purpose here, same as _poll_poe/_poll_stp do for
-            # their own tables: either way this poll learned nothing from
-            # the per-sensor DOM read. sensor_capable's own latch is about
-            # THAT alone, though — a switch with no DOM-capable optics can
-            # still have ENTITY-MIB cages worth badging (5.35.0: switches
-            # whose only optics have no DOM never got a badge at all), so
-            # this no longer returns here. It falls through with empty
-            # sensor columns and lets the cage scan below decide for
-            # itself whether ENTITY-MIB is worth trying, on its own
-            # probe-once-remember latch (_cage_capable/_cage_read, same
-            # shape as _mau_capable/_mau_read).
+            # No sensor answer (empty or SnmpError) still falls through to the
+            # cage scan below: a switch with no DOM-capable optics can still
+            # have ENTITY-MIB cages worth badging.
             if capable is None:
                 self.db.set_sensor_capable(device_id, False)
             cage_capable = self._cage_capable.get(device_id)
             cage_due = now - self._cage_read.get(device_id, 0.0) >= self._SENSOR_REPROBE_S
-            if cage_capable is False and not cage_due:
+            if not cage_capable and not cage_due:
                 return
             self._cage_read[device_id] = now
             sensor_values = types = scales = precisions = statuses = units = {}
@@ -6515,10 +6475,12 @@ class NodePoller(Worker):
             if not names_done:
                 media_reasons.append(f"entPhysicalName walk cut short ({names_reason})")
             if_by_name = self._if_index_by_name(interfaces)
-        contained_in = self._entity_contained_in(device, config)
+        contained_in, contained_complete = self._entity_contained_in(device, config)
         port_map, alias_rows = self._entity_port_map(
             device, config, names, if_by_name, contained_in)
         if not port_map:
+            if not alias_rows and not contained_in and contained_complete:
+                self._cage_capable[device_id] = False
             # Nothing mapped to a port means a walk that answered nothing
             # useful; the two ENTITY-MIB columns the cage scan needs would
             # be two more dead walks. Diagnosed only when there was some
@@ -6531,7 +6493,7 @@ class NodePoller(Worker):
                     device, f"SFP scan on {device['ip']}: no entity mapped "
                             f"to a port — entAliasMappingIdentifier had "
                             f"{alias_rows} row(s), entPhysicalName matched "
-                            f"no stored ifDescr")
+                            f"no stored ifDescr", "no_entity_mapped")
             sfp_slots, slots_complete = {}, True
         else:
             sfp_slots, slots_complete, class_rows, slot_reasons = self._sfp_slot_media(
@@ -6551,7 +6513,7 @@ class NodePoller(Worker):
             for reason in media_reasons:
                 self._log_media_diag(
                     device, f"SFP scan on {device['ip']}: {reason}, "
-                            f"stored badges kept")
+                            f"stored badges kept", reason)
 
         # MAU-MIB: the module text's copper proof, checked against the wire.
         # Gated like the cage scan (empty port_map); probe-once-remember'd
@@ -6675,7 +6637,8 @@ class NodePoller(Worker):
         if port_map and unmapped_sensor_rows:
             self._log_media_diag(
                 device, f"SFP scan on {device['ip']}: "
-                        f"{unmapped_sensor_rows} sensor row(s) mapped to no port")
+                        f"{unmapped_sensor_rows} sensor row(s) mapped to no port",
+                "unmapped_sensor_rows")
 
         self._poll_published_thresholds(device_id, device, config, threshold_roots,
                                         scales, precisions, now)
@@ -6747,18 +6710,18 @@ class NodePoller(Worker):
                        for i, m in sfp_slots.items()}
         media_by_if.update({if_index: "optic" for if_index in optic_ports})
         media_by_if.update({if_index: "copper" for if_index in copper_ports})
-        if not slots_complete:
+        if not slots_complete or not sensor_complete:
             # A walk cut short is not evidence of anything: a cage it never
             # reached reads as absent, and a module it never reached reads
             # as an empty cage, so the pass would strip or downgrade every
-            # SFP/copper badge on a device that is merely slow -- and
+            # SFP/copper/optic badge on a device that is merely slow -- and
             # restore them next cadence, flickering the list every five
             # minutes. Only a port THIS poll's own sensors or MAU-MIB proved
             # is optic/copper may overwrite what is stored.
             for row in interfaces:
                 stored = row["media"] if "media" in row.keys() else None
                 if_index = row["if_index"]
-                if (stored in ("sfp", "sfp_empty", "copper")
+                if (stored in ("sfp", "sfp_empty", "copper", "optic")
                         and if_index not in optic_ports
                         and if_index not in copper_ports):
                     media_by_if[if_index] = stored
@@ -6854,10 +6817,7 @@ class NodePoller(Worker):
 
         metrics_rows = self.db.metrics(device_id)
         existing = {row["key"] for row in metrics_rows}
-        # key -> stored label, for _mark_vendor_rows_absent's ABSENT row on
-        # an idx that vanishes from a complete walk entirely. Defensive for
-        # a metrics() stand-in with no label column, the same "in .keys()"
-        # idiom device[...] reads elsewhere in this file use.
+        # key -> stored label, for _mark_vendor_rows_absent's ABSENT row.
         existing_labels = {}
         for row in metrics_rows:
             row_keys = row.keys() if hasattr(row, "keys") else row
@@ -6906,12 +6866,8 @@ class NodePoller(Worker):
         if fan_tables:
             primary, fallback = fan_tables
             fan_rows, fan_complete = self._vendor_psu_rows(device, config, primary, now)
-            # Primary's own vanish check runs on primary's own rows/keys
-            # BEFORE any fallback below can reassign fan_rows to the OTHER
-            # table's: each table's absence tracking is keyed on its own
-            # state OID and driven only by its own walk, so a device that
-            # falls back to the other table this poll (because primary
-            # answered empty) never reads as primary's whole tray vanishing.
+            # Runs before any fallback reassigns fan_rows, so a device that
+            # falls back this poll never reads as primary's tray vanishing.
             self._mark_vendor_rows_absent(device_id, primary.state, "fan_state",
                                           fan_rows, fan_complete, existing,
                                           existing_labels, samples, now)
@@ -7039,7 +6995,9 @@ class NodePoller(Worker):
                 static_complete = static_complete and names_done
             else:
                 names = {}
-            if static_complete:
+            if all(m for col, m in ((table.class_col, class_map),
+                                    (table.skip_when_col, skip_map),
+                                    (table.name, names)) if col):
                 self._vendor_psu_static[cache_key] = {
                     "class_map": class_map, "skip_map": skip_map, "names": names, "ts": now}
         rows: dict[str, dict] = {}
@@ -7078,22 +7036,9 @@ class NodePoller(Worker):
     def _mark_vendor_rows_absent(self, device_id: int, table_state: str, family: str,
                                  rows: dict, complete: bool, existing: set,
                                  labels: dict, samples: list, now: float) -> None:
-        """Appends `(<family>.<idx>, label, "state", "gauge", now,
-        _PSU_STATE_ABSENT)` to `samples` for every idx a PREVIOUS complete
-        walk of `table_state` produced that THIS one did not — the FRU
-        fan tray or power supply that vanishes from the walk entirely
-        rather than reporting notPresent in it, so a stale reading (and an
-        open alert built on it) never goes stale forever.
-
-        Only when `key in existing` (a bay this device has reported a
-        reading for before) and only for a COMPLETE walk: a walk cut short
-        (timeout, row cap) is not evidence anything is gone, so it leaves
-        the remembered set untouched rather than treating everything it
-        did not reach as pulled. The remembered set is per (device_id,
-        table_state) — Cisco's fan primary/fallback tables, or ENVMON vs.
-        the FRU PSU table, are two different OIDs and two different keys
-        here, so a device switching which one answers never marks the
-        other's indices absent.
+        """Marks a bay ABSENT (state gauge sample) once a COMPLETE walk of
+        `table_state` no longer produces it. A walk cut short leaves the
+        remembered set untouched; the set is keyed per (device_id, table_state).
         """
         seen_key = (device_id, table_state)
         if not complete:

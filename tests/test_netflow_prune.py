@@ -403,6 +403,29 @@ def test_8_size_cap_respects_the_minute_watermark() -> None:
           f"({unsummarised_left} of {unsummarised_before})")
     check(db.cap_held_back > 0,
           f"and the trim counts what it held back ({db.cap_held_back})")
+
+    # A cut that never reaches the watermark should not touch the counter
+    # or log, even though the ceiling itself is still returned.
+    ceiling_id = db._conn.execute(
+        "SELECT MIN(id) AS id FROM flows WHERE ts_end >= ? AND ts_end < ?",
+        (watermark_bucket, time.time() + 3600)).fetchone()["id"]
+    db.cap_held_back = 0
+    records: list[logging.LogRecord] = []
+
+    class Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    flowdb_log = logging.getLogger("netpath.flowdb")
+    handler = Capture()
+    flowdb_log.addHandler(handler)
+    try:
+        returned = db._trim_id_ceiling(ceiling_id - 1)
+    finally:
+        flowdb_log.removeHandler(handler)
+    check(returned == ceiling_id and db.cap_held_back == 0 and not records,
+          f"a cut below the watermark leaves cap_held_back at 0 and logs "
+          f"nothing ({db.cap_held_back}, {len(records)} log record(s))")
     db.close()
 
 

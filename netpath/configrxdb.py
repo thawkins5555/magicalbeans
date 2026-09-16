@@ -368,11 +368,8 @@ class ConfigRxDatabase(SqliteStore):
         self.set_enable_secret(device_id, None)
 
     def set_config_gateway(self, device_id: int, text: str) -> None:
-        """The default gateway parsed out of this device's latest capture
-        (configrx._config_gateway), stored on every backup so a device
-        backed up once still has one. "" clears it (no such line found).
-        The device_detail API fallback (api.py) reads this only when SNMP's
-        own default_gateway column is empty."""
+        """The default gateway parsed from this device's latest capture.
+        "" clears it (no such line found)."""
         with self._lock:
             self._ensure_row(device_id)
             self._conn.execute(

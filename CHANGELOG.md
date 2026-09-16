@@ -276,24 +276,29 @@ Files: `netpath/configrx.py`, `netpath/configrx_stanza.py`,
 Verification: `tests/test_configrx_stanza.py` and
 `tests/test_configrx_stanza_route.py` are extended for the indented-header
 passes and the new `searched`/`headers` response fields.
-`tests/test_configrx_gateway.py` and `tests/test_default_gateway.py` are
-new/extended for the `inetCidrRouteTable` walk and the ConfigRX
-fallback, including a stub agent that answers only that table.
+`tests/test_configrx_gateway.py` is new and `tests/test_default_gateway.py`
+is extended for the `inetCidrRouteTable` walk and the ConfigRX fallback,
+using an in-process `walk_by_oid` fake rather than a stub agent.
 `tests/test_netflow_prune.py` is extended for the size cap's hold-back
-behaviour against a lagging minute rollup. `tests/test_psu_report.py` is
-new — the per-member rules, the StackPower coverage exclusion and its
-counter, a device with two members producing two rows, and group
-narrowing — alongside `tests/test_report_routes.py` for the JSON and CSV
-routes and a `reportsched` test for the new `psu` schedule kind.
-`tests/test_psu_state.py` and `tests/test_sensor_snapshot.py` are
-extended for a FRU row present on one poll and gone from a complete walk
-on the next, a cut-short walk changing nothing, and the alert this opens.
-`tests/test_sfp_media.py` is new and `tests/test_sensor_tables.py` is
-extended for a device with no sensor rows still getting cage-scanned, a
-cut-short name walk keeping stored badges, and the new diagnostic event
-text. `tests/test_frontend_contracts.py` pins the new interface-dialog
-hint text, the gateway source line, and the SINGLE PSU report's markup,
-routes and CSV header against `report.py`'s own.
+behaviour against a lagging minute rollup, adding the size-cap watermark
+test and a check that a trim cut below the watermark leaves
+`cap_held_back` at 0. `tests/test_psu_report.py` is new — the per-member
+rules, the StackPower coverage exclusion and its counter, a device with
+two members producing two rows, group narrowing, and the PSU JSON/CSV
+report routes and the new `psu` schedule kind (`tests/test_report_routes.py`
+was not touched — that coverage lives in `test_psu_report.py`).
+`tests/test_psu_state.py` and
+`tests/test_sensor_snapshot.py` are extended for a FRU row present on one
+poll and gone from a complete walk on the next, vanish-detection cases
+including "class walk cut short changes nothing", and the alert this
+opens. `tests/test_sfp_media.py` is extended, not new, for a device with
+no sensor rows still getting cage-scanned, a cut-short name walk keeping
+stored badges, and the new diagnostic event text — the cage-scan cases
+now live there; `tests/test_sensor_tables.py` and
+`tests/test_stack_power.py` only had their walker stubs re-pointed at
+`_walk_column_detail`. `tests/test_frontend_contracts.py` pins the new
+interface-dialog hint text, the gateway source line, and the SINGLE PSU
+report's markup, routes and CSV header against `report.py`'s own.
 
 ### 5.34.0 — Mapper FiberView: fiber links draw bold and glowing blue
 

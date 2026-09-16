@@ -672,11 +672,11 @@ own subtabs.
   probe-once-remember schedule. Separately, a name walk cut short by a
   timeout or row cap can no longer strip a badge a previous, complete
   pass had already written — it only ever keeps what is stored. **The
-  Nodes event log now explains, once an hour per device, exactly why a
-  switch could not be badged** when the scan read sensor data it could
-  not place on a port: an empty port map (naming the row counts behind
-  it), a walk that did not finish and why, or sensor rows that read fine
-  but matched no port at all.
+  Nodes event log now explains, once an hour per device and cause,
+  exactly why a switch could not be badged** when the scan read sensor
+  data it could not place on a port: an empty port map (naming the row
+  counts behind it), a walk that did not finish and why, or sensor rows
+  that read fine but matched no port at all.
 - **A device inherits its settings from a "polling profile"** (a group) —
   credentials, poll interval, timeout, retries, which of ping/SNMP are
   enabled, how many ping probes to send and how long to wait for them,

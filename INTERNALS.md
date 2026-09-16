@@ -377,32 +377,38 @@ day-based retention prunes for each module,
 `AppDatabase.prune_asn_cache()` for the ASN/owner cache.
 
 **A subclass can cap how far `trim_to_size` is allowed to delete, from
-5.35.0 (`sqlitebase.py`, `flowdb.py`).** `SqliteStore._trim_id_ceiling()`
-is a new hook, returning `None` by default (no ceiling — the existing
-behaviour, unchanged for every store but flowdb). `trim_to_size`'s own
-delete-batch call now clamps its computed cut point (`low + want`) down
-to whatever `_trim_id_ceiling()` returns, when that is lower; if the
-clamp leaves nothing above the floor to delete this pass, it sets
-`deletable = 0` and moves straight to reclaiming rather than deleting
-zero rows and looping. `flowdb.FlowDatabase._trim_id_ceiling` is the one
-override: it reads `rollup_bounds(60)` (the minute tier's own watermark
-— the same query `prune()`'s row-cap stage has used since 5.23.0 to stop
-the row cap deleting past it) and returns the lowest id with `ts_end` at
-or past that watermark, so the size cap's first stage now shares the
-row cap's own protection against outrunning a summariser that has
-fallen behind. It also sets `self.cap_held_back` and logs a warning
-whenever it actually holds something back, the same counter and log
-line `prune()`'s row-cap stage already writes, so the two causes are not
-told apart on screen — either one reads as "the minute rollup is behind
-and flows are being held back for it," which is the fact that matters
-from an operator's chair. Before this, a `max_flow_db_mb` pass had no
-such floor: a minute-rollup stall lasting longer than it took the size
-cap to work through its own backlog could delete a block of
-never-summarised flows outright, with nothing recorded to show it had
-happened — unlike the row cap, which has had this exact protection
-since 5.23.0. `tests/test_netflow_prune.py` covers a size trim with the
-watermark held behind, asserting the unsummarised tail survives and
-`cap_held_back` reports it.
+5.35.0 (`sqlitebase.py`, `flowdb.py`).** `SqliteStore._trim_id_ceiling
+(cut)` is a new hook, taking the cut point `trim_to_size` intended to
+delete up to (`low + want`) and returning `None` by default (no ceiling
+— the existing behaviour, unchanged for every store but flowdb).
+`trim_to_size`'s own delete-batch call now clamps that computed cut
+point down to whatever `_trim_id_ceiling(cut)` returns, when that is
+lower; if the clamp leaves nothing above the floor to delete this pass,
+it sets `deletable = 0` and moves straight to reclaiming rather than
+deleting zero rows and looping. `flowdb.FlowDatabase._trim_id_ceiling` is
+the one override: it reads `rollup_bounds(60)` (the minute tier's own
+watermark — the same query `prune()`'s row-cap stage has used since
+5.23.0 to stop the row cap deleting past it) and, **only when that
+watermark's ceiling id sits below the cut point it was handed**, returns
+the lowest id with `ts_end` at or past the watermark, sets
+`self.cap_held_back` to the difference (cut minus ceiling), and logs the
+warning — the same counter and log line `prune()`'s row-cap stage
+already writes, so the two causes are not told apart on screen, either
+one reading as "the minute rollup is behind and flows are being held
+back for it," which is the fact that matters from an operator's chair.
+A trim whose intended cut never reaches the watermark — the rollup is
+caught up, or comfortably ahead of what this pass would delete anyway —
+returns `None` and leaves `prune()`'s own `cap_held_back` counter alone,
+rather than zeroing it out on every size-cap pass that has nothing to
+hold back. Before this, a `max_flow_db_mb` pass had no such floor: a
+minute-rollup stall lasting longer than it took the size cap to work
+through its own backlog could delete a block of never-summarised flows
+outright, with nothing recorded to show it had happened — unlike the row
+cap, which has had this exact protection since 5.23.0.
+`tests/test_netflow_prune.py` covers a size trim with the watermark held
+behind, asserting the unsummarised tail survives and `cap_held_back`
+reports it, and a trim whose cut point falls below the watermark,
+asserting `cap_held_back` stays at 0.
 
 `web/service.py`'s module-level **`STORES`** is the one list of what those
 databases are: per store a `name` (the prefix its keys carry in the storage
@@ -1332,8 +1338,10 @@ like `update_interface_poe`): `'optic'` for every port a sensor resolved to
 — whatever it read and whatever its status, since a failed optic is still an
 optic — and `NULL` for every other row of that device that currently names a
 medium. It is reached only after the walk answered, so a timeout never
-strips the badge; the early return for an empty `cols` covers that. This is
-the only media signal the app has, because IF-MIB has none, and it is what
+strips the badge — the early return for an *incomplete* walk covers that
+(from 5.35.0, a walk that completes with zero rows no longer early-returns
+at all; see the cage-scan section below). This is the only media signal
+the app has, because IF-MIB has none, and it is what
 `nodes.js`'s `sfpBadge` renders. The device dialog additionally patches the
 rows it fetched with the `if_index` set from its own `/dom` read, in the
 dialog's own closure, so whichever of the two fetches lands second paints
@@ -1476,14 +1484,22 @@ used to `return` the moment `_walk_sensor_columns` came back empty —
 before 5.35.0 that meant a switch whose optics carry no DOM/light-level
 data at all (real hardware, correctly identified, just nothing to read
 sensor-wise) never reached the ENTITY-MIB cage scan either, so it never
-earned a badge on any port. The empty-`cols` branch now falls through
-instead of returning: `sensor_values`/`types`/`scales`/`precisions`/
-`statuses`/`units` are set to empty dicts and the rest of the pass —
-`entPhysicalDescr`, the port map, `_sfp_slot_media`, MAU-MIB — runs
-exactly as it would with a real sensor answer, just with nothing to add
-to `per_port`. `sensor_capable`'s own latch (`self.db.
-set_sensor_capable`) is unaffected either way — it is still about
-whether the DOM/sensor tables themselves answer, nothing else.
+earned a badge on any port. `_walk_sensor_columns` now also reports
+whether the sensor value walk itself finished, and the empty-`cols`
+branch splits on that: a **clean** empty table — the walk completed and
+there is genuinely nothing in it, a plain host or an all-copper switch —
+falls through instead of returning, `sensor_values`/`types`/`scales`/
+`precisions`/`statuses`/`units` set to empty dicts, and the rest of the
+pass — `entPhysicalDescr`, the port map, `_sfp_slot_media`, MAU-MIB —
+runs and badges the device off the cage scan alone, exactly as it would
+with a real sensor answer, just with nothing to add to `per_port`. An
+**incomplete** walk — a timeout or row cap, not a real "nothing here"
+answer — still takes the old early return, so stored `'optic'` badges
+are preserved right alongside `'sfp'`/`'sfp_empty'`/`'copper'`: a slow
+device must not read as one that lost its optics. `sensor_capable`'s own
+latch (`self.db.set_sensor_capable`) is unaffected either way — it is
+still about whether the DOM/sensor tables themselves answer, nothing
+else.
 
 Falling through to a real ENTITY-MIB walk on *every* poll for a device
 that has genuinely never answered it — a plain host, a PDU with no
@@ -1491,18 +1507,24 @@ optics at all — would cost every non-switch in the fleet a dead walk
 every `_SENSOR_REFRESH_S` (300 s). A new probe-once-remember pair,
 `self._cage_read`/`self._cage_capable` (`dict[int, float]`/`dict[int,
 bool]`, same shape as `_mau_read`/`_mau_capable`), gates that: when the
-sensor branch is the empty one, the cage scan below is skipped unless
-`_cage_capable.get(device_id)` is not `False` (never probed, or probed
-and it answered) or `_SENSOR_REPROBE_S` (3600 s) has passed since
-`_cage_read[device_id]`. `_cage_capable` is set `True` the moment
-`_sfp_slot_media` reports any `entPhysicalClass` rows at all — from
-either code path, sensor-answered or not — and set `False` only on a
-*complete* cage walk that answered zero rows (a clean `noSuchObject`
+sensor branch is the clean-empty one, the cage scan below is skipped
+unless `_cage_capable.get(device_id)` is not `False` (never probed, or
+probed and it answered) or `_SENSOR_REPROBE_S` (3600 s) has passed since
+`_cage_read[device_id]` — in practice, a device is probed once, then
+re-probed hourly until it is proven capable, and every cadence
+(`_SENSOR_REFRESH_S`) after that. `_cage_capable` is set `True` the
+moment `_sfp_slot_media` reports any `entPhysicalClass` rows at all —
+from either code path, sensor-answered or not — and set `False` only on
+a *complete* cage walk that answered zero rows (a clean `noSuchObject`
 verdict: this device has no ENTITY-MIB); a walk cut short with zero rows
-so far proves nothing and leaves the latch as it was. `_reset_device_caches`
-drops `_cage_read` alongside `_mau_read` on a device removed or
-re-identified, so a fresh probe is not stuck behind a stale hour-old
-timestamp.
+so far proves nothing and leaves the latch as it was. `poll_now`
+(`nodepoll.py`) drops `_cage_read` alongside `_mau_read`/`_sensor_read`
+on a manual poll, so a fresh probe is not stuck behind a stale hour-old
+timestamp; `_cage_capable` is left untouched there, consistent with
+`_mau_capable` — the capability latch outlives a single poll, since an
+operator's retry proves nothing either way about whether ENTITY-MIB
+exists on the box. (There is no `_reset_device_caches` method — the pop
+is one line inside `poll_now` itself.)
 
 **`_sfp_slot_media` now returns four values, not two**: `(media,
 complete, class_rows, reasons)`. `class_rows` is the raw
@@ -1524,11 +1546,15 @@ advisory-only, the same "keep whatever is already stored" doctrine
 quietly downgrade or clear a badge a complete pass had already written.
 
 **`_log_media_diag(device, message)`** writes one line to the Nodes
-event log, rate-limited per device to `_SENSOR_REPROBE_S` (an hour) — a
-badge gap is a standing condition, not a transient one, so nothing is
-gained by repeating it every `_SENSOR_REFRESH_S` poll the way
-`_log_sensor_diag` does for its own, faster-changing diagnostics. Three
-call sites, each naming a distinct cause:
+event log, rate-limited per `(device, cause)` to `_SENSOR_REPROBE_S` (an
+hour) — a badge gap is a standing condition, not a transient one, so
+nothing is gained by repeating it every `_SENSOR_REFRESH_S` poll the way
+`_log_sensor_diag` does for its own, faster-changing diagnostics. Rating
+the limit per cause rather than per device alone means a device hitting
+two distinct problems in the same hour — say an empty port map and a
+walk that did not finish — logs both, rather than the second cause going
+silent because the device already logged once. Three call sites, each
+naming a distinct cause:
 
 - **Empty port map.** When `port_map` comes back empty, the cage scan
   and MAU walk are skipped entirely (unchanged from before — two more
@@ -4505,10 +4531,23 @@ exactly as it was forever — the live ENVMON read in the device dialog
 (`read_hardware`) did see the removal, since it polls fresh every time
 the dialog opens, which is why the two disagreed.
 
-**`_vendor_psu_rows` now returns `(rows, complete)`** — `complete` from
-the state column's own `_walk_column_status`, the same completeness
-signal `_sfp_slot_media` already threads through for the badge scan. A
-new per-poll helper, `_mark_vendor_rows_absent(device_id, table_state,
+**`_vendor_psu_rows` now returns `(rows, complete)`** — `complete` is no
+longer the state column's `_walk_column_status` alone; it now also folds
+in whether the columns the table filters and labels rows by
+(`entPhysicalClass`, the skip predicate, the name column) themselves
+walked to completion, the same completeness signal `_sfp_slot_media`
+already threads through for the badge scan. Before this, a class walk
+cut short — one that answered zero rows because it timed out, not
+because the tray is genuinely empty — still let a complete state-column
+walk read as `complete`, and a table with nothing left to filter by then
+looked exactly like a fully-answered, genuinely-empty table: every index
+this device had ever reported looked like it vanished on the same poll.
+Folding the filter columns into `complete` means a class walk cut short
+now leaves `complete` `False`, and `_mark_vendor_rows_absent` returns
+immediately without touching the remembered set — the same guard that
+already protects against a cut-short state walk.
+
+A new per-poll helper, `_mark_vendor_rows_absent(device_id, table_state,
 family, rows, complete, existing, labels, samples, now)`, is called once
 per table (`psu_state` against each `PSU_TABLES` entry; `fan_state`
 against `FAN_TABLES`' primary *and*, separately, its fallback — never the
@@ -4534,10 +4573,12 @@ a manual retry, a device removed, or the fallback fan table's own OID
 reset only seeds the set rather than comparing against nothing and
 marking every bay absent on discovery. `tests/test_psu_state.py` covers
 a fan row present on poll one and gone from a complete poll two (→
-`3.0`), the same row missing from a poll cut short (→ unchanged), and
-the equivalent PSU FRU case; `tests/test_sensor_snapshot.py` covers a
-`0` baseline followed by a `3` opening the alert exactly as any other
-changed reading would.
+`3.0`), the same row missing from a poll cut short on the state column
+(→ unchanged), the equivalent PSU FRU case, and "class walk cut short
+changes nothing" — a cut-short `entPhysicalClass` walk with a complete
+state column still leaves `complete` `False` and the remembered set
+untouched; `tests/test_sensor_snapshot.py` covers a `0` baseline followed
+by a `3` opening the alert exactly as any other changed reading would.
 
 ### Sensor Snapshot: `sensor_baselines`, `BASELINE_FAMILIES` and the threshold skip/resolve path (`nodesdb.py`, `alertrules.py`, `alertengine.py`, `web/api.py`, `web/server.py`, `nodes.js`) — 5.33.0
 

@@ -3836,11 +3836,11 @@ check("const gateway = App.el('nd-addr-gateway');" in NODES
       "view.detail.default_gateway")
 check("!gw ? 'Default gateway: not published by this device.'" in NODES,
       "the gateway line says plainly when the device published nothing")
-check("`Default gateway: ${escape(gw)} (from ConfigRX backup)`" in NODES,
+check("`Default gateway: ${gw} (from ConfigRX backup)`" in NODES,
       "a gateway sourced from a ConfigRX backup (SNMP left the column "
-      "empty) names where it came from, and the address goes through escape()")
-check("`Default gateway: ${escape(gw)}`" in NODES,
-      "a gateway SNMP itself published is shown plain, still through escape()")
+      "empty) names where it came from")
+check("`Default gateway: ${gw}`" in NODES,
+      "a gateway SNMP itself published is shown plain")
 check("default_gateway_source" in NODES,
       "drawAddressesTable reads the source api.py's device detail tags "
       "the gateway with")

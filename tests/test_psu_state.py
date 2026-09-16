@@ -392,6 +392,34 @@ check("...and the fallback table's own key was never even seeded by it",
       (23, fan_fallback.state) not in poller_fc._vendor_psu_seen,
       poller_fc._vendor_psu_seen)
 
+# --- PSU: state column intact but the class column times out on a poll
+# that is NOT cached (5.35.0 review fix) -- must not read as "no rows
+# survived class-filtering" and wipe the seen set with ABSENT(3.0)s.
+poller_ctx = new_poller()
+ctx_cols = {fru.state: {"10": 2}, fru.name: {"10": "PSU-0"}, fru.class_col: {"10": 6}}
+poller_ctx._walk_column_detail = table_walker(ctx_cols)
+dev_ctx = device(CISCO_OID, id=25)
+poller_ctx._poll_vendor_sensors(25, dev_ctx, CONFIG, 1_700_000_000.0)
+poller_ctx._forget_vendor_psu_static(25)   # force the class walk to run again
+
+
+def fake_class_timeout(device, config, oid, raise_on_timeout=False, deadline=None):
+    if oid == fru.class_col:
+        return {}, False, "cut short"
+    return dict(ctx_cols.get(oid, {})), True, ""
+
+
+poller_ctx._walk_column_detail = fake_class_timeout
+poller_ctx.db.sample_calls.clear()
+poller_ctx._poll_vendor_sensors(25, dev_ctx, CONFIG, 1_700_000_060.0)
+check("class-column timeout, state intact: no ABSENT sample is written",
+      not any(s[0] == "psu_state.10" for _did, samples in poller_ctx.db.sample_calls
+              for s in samples if _did == 25),
+      poller_ctx.db.sample_calls)
+check("...and the seen set is left exactly as poll 1 left it",
+      poller_ctx._vendor_psu_seen.get((25, fru.state)) == {"10"},
+      poller_ctx._vendor_psu_seen)
+
 print()
 if FAILS:
     print(f"{len(FAILS)} check(s) failed: {', '.join(FAILS)}")
