@@ -814,6 +814,9 @@ check("'mp-link fiber'" in MAPPER,
       "the strands-mode fiber underlay is one lone path (no wireOne) beneath the VLAN-coloured strands")
 check("'dominant-baseline', 'filter']" in MAPPER,
       "the PNG export inlines the fiber glow's filter property")
+check("function fanOffsets(" in MAPPER and "view.linkFan" in MAPPER,
+      "draw() computes one fan offset per link (parallel cables between the "
+      "same two nodes), and drawLink reads it from view.linkFan")
 check("NAME_SOURCES" in MAPPER and "node.name_source" in MAPPER,
       "the node tooltip names the source of the displayed name")
 
@@ -3642,11 +3645,11 @@ check("${result.dom_count} DOM · ${result.sfp_count} SFP · ${result.copper_cou
       in NODES80,
       "the SFP report summary line counts copper ports alongside DOM/SFP")
 check("['device_id', 'name', 'ip', 'if_index', 'port', 'alias', 'kind',\n"
-      "    'medium', 'media', 'oper_status', 'admin_status', 'speed_bps', "
-      "'last_seen_ts', 'device']" in NODES80,
+      "    'medium', 'optic_mode', 'media', 'oper_status', 'admin_status', "
+      "'speed_bps',\n    'last_seen_ts', 'device']" in NODES80,
       "the client SFP_CSV_HEADER mirrors the server's CSV header order -- "
-      "kind, medium, media")
-check("r.alias, r.kind, r.medium, r.media, r.oper_status" in NODES80,
+      "kind, medium, optic_mode, media")
+check("r.alias, r.kind, r.medium, r.optic_mode, r.media, r.oper_status" in NODES80,
       "exportSfpReportCsv's row values are built in the same order as "
       "SFP_CSV_HEADER")
 
@@ -4275,6 +4278,11 @@ _fiber_count = sum(block.count("--fiber:") for block in _fiber_blocks)
 check(len(_fiber_blocks) > 0 and len(_fiber_blocks) == _fiber_count,
       "--fiber is defined once in every :root[data-theme=] block of tokens.css "
       "(%d blocks, %d --fiber declarations)" % (len(_fiber_blocks), _fiber_count))
+_fiber_sm_count = sum(block.count("--fiber-sm:") for block in _fiber_blocks)
+check(len(_fiber_blocks) > 0 and len(_fiber_blocks) == _fiber_sm_count,
+      "--fiber-sm (single-mode FiberView) is defined once in every "
+      ":root[data-theme=] block of tokens.css, beside --fiber "
+      "(%d blocks, %d --fiber-sm declarations)" % (len(_fiber_blocks), _fiber_sm_count))
 APP_CSS92 = read("app.css")
 check(".mp-link.fiber" in APP_CSS92 and "@keyframes mp-fiber-pulse" in APP_CSS92
       and "prefers-reduced-motion" in APP_CSS92,
@@ -4284,6 +4292,10 @@ check("stroke-width: var(--mp-fiber-w, 5px);" in APP_CSS92,
       "a fiber link's bold stroke width comes from JS's own --mp-fiber-w, not a CSS calc()")
 check(".mp-link.fiber.selected" in APP_CSS92,
       "a selected fiber link keeps brightness(1.35) alongside its glow")
+check(".mp-link.fiber.fiber-mismatch" in APP_CSS92 and ".mp-link.fiber.fiber-sm" in APP_CSS92,
+      "FiberView colours single-mode links dark yellow and an SM/MM mismatch dotted red")
+check(".mp-link.blocking { stroke-dasharray: 2 6; }" in APP_CSS92,
+      "an STP-blocked link draws dotted in both normal view and FiberView")
 
 # ---------------------------------------------------------------------------
 # 93. Interface dialog RUNNING CONFIGURATION tile: an unmatched search names

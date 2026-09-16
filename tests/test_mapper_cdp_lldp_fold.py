@@ -249,6 +249,80 @@ check("two name-only rows facing different devices are not folded together",
       len(links_nm_other) == 2, links_nm_other)
 
 
+# --------------------------------------------- port_index (one line per cable)
+
+# The LAG case again, but this time each row's port_id names the FAR port and
+# a port_index resolver can turn that text into a real if_index -- evidence,
+# not a guess (see link_identity's own note on this route). Each of the two
+# real cables now resolves from BOTH sides to the same frozenset key, so the
+# four rows fold to two links instead of standing apart as four.
+def port_index_lag(device_id, port_text):
+    return {
+        (2, "GigabitEthernet0/21"): 21, (1, "GigabitEthernet0/11"): 11,
+        (2, "GigabitEthernet0/22"): 22, (1, "GigabitEthernet0/12"): 12,
+    }.get((device_id, port_text))
+
+
+rows_lag_named = [
+    cdp_row(1, 11, device_id_text="core-sw", matched_device_id=2,
+            port_id="GigabitEthernet0/21", rem_index="11.1"),
+    cdp_row(1, 12, device_id_text="core-sw", matched_device_id=2,
+            port_id="GigabitEthernet0/22", rem_index="12.1"),
+    cdp_row(2, 21, device_id_text="edge-sw", matched_device_id=1,
+            port_id="GigabitEthernet0/11", rem_index="21.1"),
+    cdp_row(2, 22, device_id_text="edge-sw", matched_device_id=1,
+            port_id="GigabitEthernet0/12", rem_index="22.1"),
+]
+links_lag_resolved, _ = assemble_links(rows_lag_named, port_vlans={}, port_label=label_of,
+                                       on_map=all_on_map, now=NOW,
+                                       port_index=port_index_lag)
+check("a port_index resolver turns the LAG's four CDP rows into its two real cables",
+      len(links_lag_resolved) == 2, links_lag_resolved)
+if len(links_lag_resolved) == 2:
+    check("...each with both far-end if_indexes resolved, not left None",
+          all(link["a_if_index"] is not None and link["b_if_index"] is not None
+              for link in links_lag_resolved), links_lag_resolved)
+    check("...and both ports labelled from port_label, not the raw CDP string",
+          all(link["a_port"].startswith("dev") and link["b_port"].startswith("dev")
+              for link in links_lag_resolved), links_lag_resolved)
+
+# A port_id the resolver cannot place falls back to the old per-row key --
+# port_index is tried, but a miss must not break the existing behaviour.
+rows_unresolvable = [
+    cdp_row(1, 30, device_id_text="edge-sw", matched_device_id=2,
+            port_id="Unresolvable0/99", rem_index="30.1"),
+]
+links_unresolved, _ = assemble_links(rows_unresolvable, port_vlans={}, port_label=label_of,
+                                     on_map=all_on_map, now=NOW,
+                                     port_index=lambda device_id, port_text: None)
+check("a port_id the resolver cannot place falls back to the old per-row key",
+      len(links_unresolved) == 1 and links_unresolved[0]["b_if_index"] is None,
+      links_unresolved)
+
+# An LLDP row already MAC-matched, and a CDP row for the same cable that only
+# resolves through port_index -- both must land on the identical frozenset
+# key and fold to one link, the same as two MAC-matched rows would.
+def port_index_pair(device_id, port_text):
+    return {(2, "GigabitEthernet0/40"): 40}.get((device_id, port_text))
+
+
+rows_lldp_and_resolved_cdp = [
+    lldp_row(1, 15, chassis_mac="aa:11:22:33:44:55", matched_device_id=2,
+             matched_if_index=40, rem_index="0.15.1"),
+    cdp_row(1, 15, device_id_text="core-sw", matched_device_id=2,
+            port_id="GigabitEthernet0/40", rem_index="15.1"),
+]
+links_lldp_cdp, _ = assemble_links(rows_lldp_and_resolved_cdp, port_vlans={}, port_label=label_of,
+                                   on_map=all_on_map, now=NOW,
+                                   port_index=port_index_pair)
+check("an LLDP MAC-matched link and a CDP row resolved through port_index "
+      "fold to one link for the same cable",
+      len(links_lldp_cdp) == 1, links_lldp_cdp)
+if len(links_lldp_cdp) == 1:
+    check("...carrying both protocols",
+          links_lldp_cdp[0]["protocols"] == ["cdp", "lldp"], links_lldp_cdp[0])
+
+
 # ------------------------------------------- one chassis MAC, many interfaces
 
 def _fanout_rows():

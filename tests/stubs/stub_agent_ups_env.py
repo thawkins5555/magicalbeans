@@ -90,7 +90,10 @@ Modes:
              by a fiber arc with no sensor, a combo port a real Rx dBm
              sensor wins over copper text, and a MAU row under the wrong
              OID prefix that must be ignored. See SFP_MEDIA_TABLE and
-             SFP_MAU_TABLE.
+             SFP_MAU_TABLE. Plus, for optic_mode (5.36.0): if 16 an
+             occupied MM cage (GLC-SX-MMD) with no DOM, and if 17 a DOM-lit
+             port with no entPhysicalClass row at all, proving the
+             optic_ports fallback scan finds SM/MM too.
   sfp_media_no_class
              `sfp_media`, except that every request into the
              entPhysicalClass column goes unanswered -- the flaky device
@@ -691,6 +694,33 @@ SFP_MEDIA_TABLE = {
     "1.3.6.1.2.1.47.1.1.1.1.2.315": ("str", "SFP-GE-T"),
     "1.3.6.1.2.1.47.1.1.1.1.5.315": ("int", 9),
     "1.3.6.1.2.1.47.1.1.1.1.4.315": ("int", 215),
+
+    # --- if 16: an occupied cage, a multimode module (GLC-SX-MMD), no DOM
+    # sensor -- optic_mode from the cage/occupant scan (5.36.0)
+    "1.3.6.1.2.1.47.1.1.1.1.2.216": ("str", "SFP+ container"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.216": ("int", 5),                # container
+    "1.3.6.1.2.1.47.1.1.1.1.2.266": ("str", "GigabitEthernet1/0/16"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.266": ("int", 10),
+    "1.3.6.1.2.1.47.1.1.1.1.4.266": ("int", 216),
+    "1.3.6.1.2.1.47.1.3.2.1.2.266.1": ("str", "1.3.6.1.2.1.2.2.1.1.16"),
+    "1.3.6.1.2.1.47.1.1.1.1.2.316": ("str", "1000Base-SX SFP"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.316": ("int", 9),                # module
+    "1.3.6.1.2.1.47.1.1.1.1.4.316": ("int", 216),
+    "1.3.6.1.2.1.47.1.1.1.1.13.316": ("str", "GLC-SX-MMD"),
+
+    # --- if 17: a DOM-lit port with NO entPhysicalClass row at all (like if
+    # 13) -- proves optic_mode's fallback scan for optic_ports finds SM/MM
+    # from module text even when the cage/occupant scan never visits it
+    "1.3.6.1.2.1.47.1.1.1.1.2.217": ("str", "1000BASE-T/SFP-10G-SR combo"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.217": ("int", 10),
+    "1.3.6.1.2.1.47.1.3.2.1.2.217.1": ("str", "1.3.6.1.2.1.2.2.1.1.17"),
+    "1.3.6.1.2.1.47.1.1.1.1.2.417": ("str", "Gi1/0/17 Receive Power"),
+    "1.3.6.1.2.1.47.1.1.1.1.4.417": ("int", 217),
+    "1.3.6.1.2.1.99.1.1.1.1.417": ("int", 14),
+    "1.3.6.1.2.1.99.1.1.1.2.417": ("int", 9),
+    "1.3.6.1.2.1.99.1.1.1.3.417": ("int", 1),
+    "1.3.6.1.2.1.99.1.1.1.4.417": ("int", -70),                # -7.0 dBm
+    "1.3.6.1.2.1.99.1.1.1.5.417": ("int", 1),
 }
 
 # MAU-MIB ifMauType rows (ifIndex.mauIndex -> an OID whose last arc is a

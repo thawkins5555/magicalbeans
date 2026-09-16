@@ -22,6 +22,7 @@ from netpath.mapper import (
     VLAN_PALETTE_SIZE,
     assemble_links,
     detect_role,
+    fiber_mode,
     link_csv_rows,
     link_identity,
     link_is_fiber,
@@ -431,6 +432,25 @@ check("...and every end's port mode and native VLAN have their own columns",
       all(name in LINK_CSV_HEADER for name in
           ("A Port Mode", "A Native VLAN", "B Port Mode", "B Native VLAN")),
       LINK_CSV_HEADER)
+check("...and Fiber Mode/STP are the last two columns",
+      LINK_CSV_HEADER[-2:] == ["Fiber Mode", "STP"], LINK_CSV_HEADER)
+
+FIBER_COL = LINK_CSV_HEADER.index("Fiber Mode")
+STP_COL = LINK_CSV_HEADER.index("STP")
+fiber_stp_link = dict(links[0], fiber_mode="mismatch", a_stp="blocking", b_stp="forwarding")
+fiber_stp_row = link_csv_rows([fiber_stp_link], device_name)[0]
+check("a link's fiber_mode writes straight into the Fiber Mode column",
+      fiber_stp_row[FIBER_COL] == "mismatch", fiber_stp_row)
+check("STP names which end is blocking",
+      fiber_stp_row[STP_COL] == "blocking on A", fiber_stp_row)
+both_blocking_row = link_csv_rows(
+    [dict(links[0], fiber_mode=None, a_stp="blocking", b_stp="blocking")], device_name)[0]
+check("...both ends blocking names both",
+      both_blocking_row[STP_COL] == "blocking on A, blocking on B", both_blocking_row)
+check("...and a link with neither key set (a manual line) leaves both columns blank",
+      link_csv_rows([links[0]], device_name)[0][FIBER_COL] == ""
+      and link_csv_rows([links[0]], device_name)[0][STP_COL] == "",
+      links[0])
 
 check("LINK_PROTOCOLS is exactly lldp and cdp", LINK_PROTOCOLS == ("lldp", "cdp"))
 
@@ -497,6 +517,21 @@ for a_media, b_media, expected, why in (
 ):
     got = link_is_fiber(a_media, b_media)
     check(f"link_is_fiber({a_media!r}, {b_media!r}) is {expected} -- {why}",
+          got == expected, got)
+
+# ----------------------------------------------------------------- fiber_mode
+
+for a_mode, b_mode, expected, why in (
+    ("mm", "mm", "mm", "both ends multimode"),
+    ("sm", "sm", "sm", "both ends single-mode"),
+    ("sm", "mm", "mismatch", "single-mode one end, multimode the other"),
+    ("mm", "sm", "mismatch", "the same mismatch, sides swapped"),
+    ("mm", None, "mm", "only the A end known"),
+    (None, "sm", "sm", "only the B end known"),
+    (None, None, None, "neither end known -- FiberView's plain-blue default"),
+):
+    got = fiber_mode(a_mode, b_mode)
+    check(f"fiber_mode({a_mode!r}, {b_mode!r}) is {expected!r} -- {why}",
           got == expected, got)
 
 # --------------------------------------------------------------- detect_role

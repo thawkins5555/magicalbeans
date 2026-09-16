@@ -362,12 +362,13 @@ try:
     # address-matched B-D one, with no media on either end, should not.
     service.nodes_db.update_interface_media(dev_a, [{"if_index": 1, "media": "optic"}])
 
-    check("interface_media_for_devices([]) returns {} for no ids",
-          service.nodes_db.interface_media_for_devices([]) == {}, "")
-    media_direct = service.nodes_db.interface_media_for_devices([dev_a, dev_a, dev_b])
-    check("duplicate ids collapse to one entry per (device_id, if_index), a NULL-media "
+    check("interface_link_facts_for_devices([]) returns {} for no ids",
+          service.nodes_db.interface_link_facts_for_devices([]) == {}, "")
+    media_direct = service.nodes_db.interface_link_facts_for_devices([dev_a, dev_a, dev_b])
+    check("duplicate ids collapse to one entry per (device_id, if_index), a NULL-everything "
           "interface (B's) is absent, and the seeded row reads back as optic",
-          media_direct == {(dev_a, 1): "optic"}, media_direct)
+          media_direct == {(dev_a, 1): {"media": "optic", "optic_mode": None,
+                                        "stp_state": None}}, media_direct)
 
     status, payload = call("GET", f"/api/mapper/maps/{map_id}", token=admin)
     links = payload.get("links", []) if status == 200 else []
@@ -381,6 +382,32 @@ try:
     check("a link with no media on either end reports fiber False",
           ip_link is not None and ip_link.get("fiber") is False, ip_link)
 
+    # ---------------------------------------------- 6d. SM/MM mode and STP
+    #
+    # B's own end of the A-B link (if_index 2, "Gi0/2") carries a
+    # single-mode optic and a blocking STP port; A's end has no
+    # optic_mode/stp_state at all, so fiber_mode reads as B's mode alone
+    # (not a mismatch -- only one end is known) and blocking is True.
+    service.nodes_db.update_interface_media(dev_b, [{"if_index": 2, "optic_mode": "sm"}])
+    service.nodes_db.update_interface_stp(dev_b, [{"if_index": 2, "stp_state": "blocking"}])
+
+    status, payload = call("GET", f"/api/mapper/maps/{map_id}", token=admin)
+    links = payload.get("links", []) if status == 200 else []
+    ab_link = next((l for l in links
+                    if {l.get("a_device_id"), l.get("b_device_id")} == {dev_a, dev_b}), None)
+    check("every FiberView/STP key is present on a discovered link",
+          ab_link is not None and {"a_optic_mode", "b_optic_mode", "fiber_mode",
+                                   "a_stp", "b_stp", "blocking"} <= set(ab_link),
+          ab_link)
+    check("fiber_mode reads the one end that is known, not a mismatch",
+          ab_link is not None and ab_link.get("a_optic_mode") is None
+          and ab_link.get("b_optic_mode") == "sm" and ab_link.get("fiber_mode") == "sm",
+          ab_link)
+    check("blocking is True from B's stp_state alone",
+          ab_link is not None and ab_link.get("a_stp") is None
+          and ab_link.get("b_stp") == "blocking" and ab_link.get("blocking") is True,
+          ab_link)
+
     # ------------------------------------------------------ 7. export.csv
 
     status, payload = call("GET", f"/api/mapper/maps/{map_id}/export.csv", token=admin)
@@ -391,6 +418,15 @@ try:
           (status, csv_rows[:1] if csv_rows else payload))
     check("...with one data row per link (A-B, plus the address-matched "
           "B-D link added just above)", len(csv_rows) == 3, csv_rows)
+    fiber_col = mapper_mod.LINK_CSV_HEADER.index("Fiber Mode")
+    stp_col = mapper_mod.LINK_CSV_HEADER.index("STP")
+    a_id_col = mapper_mod.LINK_CSV_HEADER.index("A Device ID")
+    b_id_col = mapper_mod.LINK_CSV_HEADER.index("B Device ID")
+    ab_row = next((r for r in csv_rows[1:]
+                   if {r[a_id_col], r[b_id_col]} == {str(dev_a), str(dev_b)}), None)
+    check("the CSV row for the A-B link names its fiber mode and STP state",
+          ab_row is not None and ab_row[fiber_col] == "sm"
+          and ab_row[stp_col] == "blocking on B", ab_row)
 
     # -------------------------------------------------- 7b. manual links (D2)
     #
@@ -432,11 +468,18 @@ try:
           "client that reads them blind does not throw",
           manual is not None and {"a_port", "b_port", "a_if_index", "b_if_index",
                                   "vlans", "native_vlan", "seen_ts", "plan",
-                                  "a_media", "b_media", "fiber"}
+                                  "a_media", "b_media", "fiber",
+                                  "a_optic_mode", "b_optic_mode", "fiber_mode",
+                                  "a_stp", "b_stp", "blocking"}
           <= set(manual), manual)
     check("...with FiberView's keys defaulted (no media on a manual line)",
           manual is not None and manual["a_media"] is None
           and manual["b_media"] is None and manual["fiber"] is False, manual)
+    check("...and the SM/MM and STP keys defaulted the same way",
+          manual is not None and manual["a_optic_mode"] is None
+          and manual["b_optic_mode"] is None and manual["fiber_mode"] is None
+          and manual["a_stp"] is None and manual["b_stp"] is None
+          and manual["blocking"] is False, manual)
 
     status, payload = call("POST", f"/api/mapper/maps/{map_id}/links",
                            {"a_node_id": node_b, "b_node_id": node_peer, "label": ""},
@@ -891,17 +934,17 @@ try:
     service.nodes_db.replace_vlan_ports(
         dev_b, [{"if_index": 2, "mode": "access", "native_vlan": 20}])
 
-    # Give the far end (B) a resolvable if_index too: the original A-B
-    # neighbour row matches by sysName alone (chassis_id ""), which
-    # assemble_links can only label from the raw remote port_id string
-    # (matched_if_index stays None -- see mapper.assemble_links) -- exactly
-    # the "no b_if_index to look vlan_ports up by" case get_mapper_map's
-    # b_port_mode/b_native_vlan legitimately reports as None for. Adding a
-    # chassis-MAC match alongside the existing sysName one (both now agree
-    # on dev_b, so matched_device_id/matched_device_name are unchanged) is
-    # what lets the far end's OWN if_index resolve, so its vlan_ports row is
-    # the one this checks. The still-unmatched peer row is repeated
-    # unchanged so it does not age out from this same replace_neighbors call.
+    # The A-B neighbour row matches by sysName alone (chassis_id ""), and
+    # since Part C get_mapper_map's port_index resolver already turns its
+    # own remote port_id text ("Gi0/2") into dev_b's real if_index without
+    # any chassis-MAC match at all (mapper.assemble_links's port_index
+    # kwarg). Adding a chassis-MAC row for the same cable (both now agree
+    # on dev_b, so matched_device_id/matched_device_name are unchanged)
+    # exercises the stronger MAC-matched path on top of that same result,
+    # so the far end's OWN if_index -- however it resolved -- is the one
+    # its vlan_ports row is checked against below. The still-unmatched peer
+    # row is repeated unchanged so it does not age out from this same
+    # replace_neighbors call.
     service.nodes_db.replace_interfaces(dev_b, [
         {"if_index": 2, "descr": "Gi0/2", "alias": "to-a", "phys_addr": "aa:bb:cc:00:00:02",
          "admin_status": "up", "oper_status": "up"}])
@@ -926,7 +969,8 @@ try:
     ab_link = next((l for l in payload.get("links", [])
                     if l.get("a_device_id") == dev_a and l.get("b_device_id") == dev_b),
                    None) if status == 200 else None
-    check("the A-B link now resolves a b_if_index (chassis-MAC match added)",
+    check("the A-B link's far end resolves a b_if_index (port_index, "
+          "confirmed here by the chassis-MAC match too)",
           ab_link is not None and ab_link.get("b_if_index") == 2, (status, ab_link))
     check("the A-B link carries A's own vlan_ports mode/native VLAN",
           ab_link is not None and ab_link.get("a_port_mode") == "trunk"

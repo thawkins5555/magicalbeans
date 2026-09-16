@@ -44,7 +44,9 @@ PORTS = [{"if_index": 1, "descr": "GigabitEthernet1/0/1"},
          {"if_index": 12, "descr": "GigabitEthernet1/0/12"},
          {"if_index": 13, "descr": "GigabitEthernet1/0/13"},
          {"if_index": 14, "descr": "GigabitEthernet1/0/14"},
-         {"if_index": 15, "descr": "GigabitEthernet1/0/15"}]
+         {"if_index": 15, "descr": "GigabitEthernet1/0/15"},
+         {"if_index": 16, "descr": "GigabitEthernet1/0/16"},
+         {"if_index": 17, "descr": "GigabitEthernet1/0/17"}]
 
 IF_MAU_TYPE = "1.3.6.1.2.1.26.2.1.1.3"
 
@@ -171,6 +173,21 @@ try:
           "'copper'",
           media.get(15) == "copper", media)
 
+    optic_mode = {r["if_index"]: r["optic_mode"] for r in db.interfaces(did)}
+    check("if 2's module text (10Gbase-LR SFP+ / SFP-10G-LR) reads 'sm' "
+          "through the cage/occupant scan",
+          optic_mode.get(2) == "sm", optic_mode)
+    check("an occupied cage naming a multimode module (GLC-SX-MMD), no "
+          "DOM, reads 'mm' the same way",
+          media.get(16) == "sfp" and optic_mode.get(16) == "mm", optic_mode)
+    check("a DOM-lit port with no entPhysicalClass row at all still reads "
+          "'mm' off its own module text (SFP-10G-SR) -- the optic_ports "
+          "fallback scan, not the cage/occupant one",
+          media.get(17) == "optic" and optic_mode.get(17) == "mm", optic_mode)
+    check("copper ports never carry an optic_mode",
+          optic_mode.get(8) is None and optic_mode.get(9) is None
+          and optic_mode.get(10) is None, optic_mode)
+
     metrics = {m["key"]: m["last_value"] for m in db.metrics(did)}
     check("a copper module's temperature sensor is still recorded -- "
           "copper only changes the badge, not what gets measured",
@@ -253,16 +270,20 @@ try:
     db = new_nodes_db("media_partial")
     did = device_against(db, "flaky-sw")
     db.replace_interfaces(did, PORTS)
-    db.update_interface_media(did, [{"if_index": 2, "media": "sfp"},
-                                    {"if_index": 3, "media": "sfp_empty"}])
+    db.update_interface_media(did, [
+        {"if_index": 2, "media": "sfp", "optic_mode": "sm"},
+        {"if_index": 3, "media": "sfp_empty"}])
     poller = NodePoller(db)
     device = db.device(did)
     poller._poll_environment(did, device, db.effective_config(device), set(),
                              time.time())
     media = {r["if_index"]: r["media"] for r in db.interfaces(did)}
+    optic_mode = {r["if_index"]: r["optic_mode"] for r in db.interfaces(did)}
     check("a device whose entPhysicalClass walk times out keeps its SFP "
           "badges rather than flickering them off for one cadence",
           (media.get(2), media.get(3)) == ("sfp", "sfp_empty"), media)
+    check("...and keeps the stored optic_mode exactly as it keeps media",
+          optic_mode.get(2) == "sm", optic_mode)
     check("...while the ports this poll's sensors did answer for are badged "
           "from it as usual: a cut-short walk stops nothing else",
           media.get(1) == "optic", media)
@@ -513,6 +534,19 @@ for text in COPPER_POSITIVES:
 for text in FIBER_NEGATIVES:
     check(f"_COPPER_TEXT does not match laser part {text!r}",
           not _COPPER_TEXT.search(text))
+
+# --------------------------------- § 6 _optic_mode, real Cisco part numbers
+_optic_mode = nodepoll_mod._optic_mode
+OPTIC_MODE_TABLE = [
+    ("GLC-SX-MMD", "mm"), ("GLC-LH-SMD", "sm"), ("GLC-EX-SMD", "sm"),
+    ("GLC-ZX-SMD", "sm"), ("GLC-BX-U", "sm"), ("SFP-10G-SR", "mm"),
+    ("SFP-10G-LR", "sm"), ("SFP-10G-ER", "sm"), ("SFP-10G-LRM", "mm"),
+    ("SFP-25G-SR-S", "mm"), ("QSFP-40G-SR4", "mm"), ("QSFP-100G-LR4", "sm"),
+    ("GLC-T", None), ("SFP-H10GB-CU1M", None),
+]
+for text, expected in OPTIC_MODE_TABLE:
+    check(f"_optic_mode({text!r}) is {expected!r}",
+          _optic_mode(text) == expected, _optic_mode(text))
 
 print()
 print("FAILURES:", FAILS if FAILS else "none")

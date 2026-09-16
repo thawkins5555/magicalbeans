@@ -1340,10 +1340,12 @@ class NodesDatabase(SqliteStore):
         # text or MAU-MIB proves it, and that proof outranks a DOM reading),
         # 'sfp_empty' for a cage with nothing in it, else NULL. Written by
         # _poll_environment — IF-MIB has no media column of its own.
+        # optic_mode: 'sm'/'mm' from the transceiver's own type text for an
+        # 'sfp'/'optic' port, else NULL.
         self.ensure_columns("interfaces", {
             "poe_admin": "TEXT", "poe_detect_status": "TEXT",
             "stp_state": "TEXT", "poe_power_mw": "INTEGER",
-            "media": "TEXT",
+            "media": "TEXT", "optic_mode": "TEXT",
         })
 
         # The device's own default-route next hop(s) — see
@@ -2265,22 +2267,29 @@ class NodesDatabase(SqliteStore):
         """interface_port_labels_for_devices for one device."""
         return self.interface_port_labels_for_devices([device_id])
 
-    def interface_media_for_devices(self, device_ids) -> dict[tuple[int, int], str | None]:
-        """(device_id, if_index) -> media for every interface of the named
-        devices that has a non-NULL media -- MAPPER's FiberView badge."""
+    def interface_link_facts_for_devices(self, device_ids) -> dict[tuple[int, int], dict]:
+        """(device_id, if_index) -> {"media", "optic_mode", "stp_state"} for
+        every interface of the named devices with at least one of the three
+        non-NULL -- MAPPER's FiberView badge, SM/MM colour and STP-blocked
+        dotted line."""
         ids = list(dict.fromkeys(int(d) for d in device_ids))
         if not ids:
             return {}
-        media: dict[tuple[int, int], str | None] = {}
+        facts: dict[tuple[int, int], dict] = {}
         with self._lock:
             for chunk in _id_chunks(ids, self._IDS_PER_QUERY):
                 marks = ",".join("?" * len(chunk))
                 for row in self._conn.execute(
-                        "SELECT device_id, if_index, media FROM interfaces"
-                        f" WHERE device_id IN ({marks}) AND media IS NOT NULL",
+                        "SELECT device_id, if_index, media, optic_mode, stp_state"
+                        " FROM interfaces WHERE device_id IN ({})"
+                        " AND (media IS NOT NULL OR optic_mode IS NOT NULL"
+                        " OR stp_state IS NOT NULL)".format(marks),
                         chunk).fetchall():
-                    media[(row["device_id"], row["if_index"])] = row["media"]
-        return media
+                    facts[(row["device_id"], row["if_index"])] = {
+                        "media": row["media"], "optic_mode": row["optic_mode"],
+                        "stp_state": row["stp_state"],
+                    }
+        return facts
 
     def device_summaries(self) -> list[sqlite3.Row]:
         """The seven columns a device picker needs, not devices()'s
@@ -3302,7 +3311,8 @@ class NodesDatabase(SqliteStore):
                 "SELECT d.id AS device_id, d.name AS name, d.sys_name AS sys_name,"
                 " d.display_name_source AS display_name_source, d.ip AS ip,"
                 " d.vendor AS vendor, i.if_index AS if_index, i.descr AS descr,"
-                " i.alias AS alias, i.media AS media, i.oper_status AS oper_status,"
+                " i.alias AS alias, i.media AS media, i.optic_mode AS optic_mode,"
+                " i.oper_status AS oper_status,"
                 " i.admin_status AS admin_status, i.speed_bps AS speed_bps,"
                 " i.last_seen_ts AS last_seen_ts"
                 " FROM interfaces i JOIN devices d ON d.id = i.device_id"
@@ -4405,17 +4415,18 @@ class NodesDatabase(SqliteStore):
                 raise
 
     def update_interface_media(self, device_id: int, rows: list[dict]) -> None:
-        """Per-port media kind ('optic', 'sfp', 'sfp_empty' or None), batched
-        the way update_interface_poe batches its own poll. A row for a port
-        this device no longer has updates nothing, same as there."""
+        """Per-port media kind ('optic', 'sfp', 'sfp_empty' or None) and
+        optic mode ('sm'/'mm' or None), batched the way update_interface_poe
+        batches its own poll. A row for a port this device no longer has
+        updates nothing, same as there."""
         if not rows:
             return
-        params = [(row.get("media"), device_id, row["if_index"])
+        params = [(row.get("media"), row.get("optic_mode"), device_id, row["if_index"])
                   for row in rows]
         with self._lock:
             try:
                 self._conn.executemany(
-                    "UPDATE interfaces SET media=?"
+                    "UPDATE interfaces SET media=?, optic_mode=?"
                     " WHERE device_id=? AND if_index=?", params)
                 self._conn.commit()
             except sqlite3.DatabaseError:

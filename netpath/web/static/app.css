@@ -1872,6 +1872,10 @@ body.kiosk .card.strip > .hint { overflow: visible; white-space: normal; }
    #mp-legend spells it out in words for a viewer who cannot rely on the
    visual alone. */
 .mp-link.unknown { stroke-dasharray: 5 4; }
+/* STP-blocked port, either view: round caps turn this tight dash into dots,
+   distinct from .unknown's own dash -- comes after .unknown so a link that
+   is both wins the dotted read. */
+.mp-link.blocking { stroke-dasharray: 2 6; }
 .mp-link.manual { stroke: var(--canvas-muted); stroke-dasharray: 6 4; }   /* operator-drawn, not discovered */
 /* A VLAN picked in the table dims every strand that is not it rather than
    hiding them outright, so the rest of the topology stays legible while
@@ -1899,6 +1903,24 @@ body.kiosk .card.strip > .hint { overflow: visible; white-space: normal; }
   #mp-canvas[data-fiberview="1"] .mp-link.fiber {
     animation: mp-fiber-pulse 1.4s ease-in-out infinite alternate;
   }
+}
+/* Single-mode and SM/MM-mismatch fiber links: higher specificity than the
+   plain .fiber rule above (three classes, not two), so these always win on
+   colour whichever order the rules are read in. */
+#mp-canvas[data-fiberview="1"] .mp-link.fiber.fiber-sm {
+  stroke: var(--fiber-sm);
+  filter: drop-shadow(0 0 3px var(--fiber-sm)) drop-shadow(0 0 8px var(--fiber-sm));
+}
+#mp-canvas[data-fiberview="1"] .mp-link.fiber.fiber-sm.selected {
+  filter: brightness(1.35) drop-shadow(0 0 3px var(--fiber-sm)) drop-shadow(0 0 8px var(--fiber-sm));
+}
+#mp-canvas[data-fiberview="1"] .mp-link.fiber.fiber-mismatch {
+  stroke: var(--fail);
+  stroke-dasharray: 2 6;
+  filter: drop-shadow(0 0 3px var(--fail)) drop-shadow(0 0 8px var(--fail));
+}
+#mp-canvas[data-fiberview="1"] .mp-link.fiber.fiber-mismatch.selected {
+  filter: brightness(1.35) drop-shadow(0 0 3px var(--fail)) drop-shadow(0 0 8px var(--fail));
 }
 .mp-link-label { fill: var(--canvas-muted); font-family: var(--mono); font-size: var(--fs-2xs);
   paint-order: stroke; stroke: var(--canvas); stroke-width: 3px; stroke-linejoin: round; }

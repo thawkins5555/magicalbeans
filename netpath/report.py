@@ -547,6 +547,7 @@ class SfpRow:
     alias: str
     kind: str
     medium: str
+    optic_mode: str
     media: str
     oper_status: str
     admin_status: str
@@ -558,8 +559,8 @@ class SfpRow:
 
 
 SFP_CSV_HEADER = ["device_id", "name", "ip", "if_index", "port", "alias", "kind",
-                  "medium", "media", "oper_status", "admin_status", "speed_bps",
-                  "last_seen_ts", "device"]
+                  "medium", "optic_mode", "media", "oper_status", "admin_status",
+                  "speed_bps", "last_seen_ts", "device"]
 
 
 @dataclass
@@ -603,11 +604,15 @@ def sfp_inventory(nodesdb, device_ids: list[int] | None = None,
         label, _name_source = device_label(row, dns_names or {})
         device = label if label == ip else f"{label} ({ip})"
         port = row["descr"] or row["alias"] or f"port {row['if_index']}"
+        optic_mode = row["optic_mode"] or ""
+        medium = MEDIA_MEDIUM.get(row["media"], "")
+        if medium == "Laser" and optic_mode:
+            medium = f"Laser · {optic_mode.upper()}"
         rows.append(SfpRow(
             device_id=row["device_id"], name=label, ip=ip, device=device,
             if_index=row["if_index"], port=port, alias=row["alias"] or "",
             kind=_MEDIA_KIND.get(row["media"], row["media"] or ""),
-            medium=MEDIA_MEDIUM.get(row["media"], ""),
+            medium=medium, optic_mode=optic_mode,
             media=row["media"] or "", oper_status=row["oper_status"] or "",
             admin_status=row["admin_status"] or "",
             speed_bps=row["speed_bps"], last_seen_ts=row["last_seen_ts"]))

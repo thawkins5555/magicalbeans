@@ -108,6 +108,7 @@
     frameEls: new Map(),       // frame id -> its <g>
     dragPans: false,           // the Drag pans checkbox: left-drag on empty canvas pans
     fiberView: false,          // the FiberView checkbox: glow every link.fiber link
+    linkFan: new Map(),        // link id -> px offset, draw()'s fanOffsets() (parallel cables)
     settings: {},        // mapperdb.DEFAULTS shape, refreshed with every maps/settings fetch
     candidates: { devices: [], neighbours: [] },
 
@@ -1048,6 +1049,14 @@
     const to = edgePoint(pb.x, pb.y, NODE_W / 2, NODE_H / 2, -dx, -dy);
     const len = Math.max(Math.hypot(dx, dy), 1e-6);
     const nx = -dy / len, ny = dx / len;
+    // One line per cable between the same two nodes: draw() fills
+    // view.linkFan before this runs, so every strand/label/underlay below
+    // shifts together, off the pair's shared centre line.
+    const fanOffset = (view.linkFan && view.linkFan.get(link.id)) || 0;
+    if (fanOffset) {
+      from.x += nx * fanOffset; from.y += ny * fanOffset;
+      to.x += nx * fanOffset; to.y += ny * fanOffset;
+    }
     const plan = link.plan || { mode: 'plain', width: 1.5, known: false, strands: [], vlans: [] };
     const selected = view.selectedLinkId === link.id;
     const dimmed = view.selectedVlan !== null
@@ -1129,6 +1138,9 @@
         });
         underlay.style.setProperty('--mp-fiber-w', `${span + 4}px`);
         if (dimmed) underlay.classList.add('dimmed');
+        if (link.fiber_mode === 'sm') underlay.classList.add('fiber-sm');
+        else if (link.fiber_mode === 'mismatch') underlay.classList.add('fiber-mismatch');
+        if (link.blocking) underlay.classList.add('blocking');
         layer.appendChild(underlay);
       }
       plan.strands.forEach((strand, i) => {
@@ -1141,6 +1153,7 @@
           // this one. See tokens.css's --canvas-vlan-* comment.
           stroke: `var(--canvas-vlan-${strand.color_index + 1})`, 'stroke-width': plan.width,
         });
+        if (link.blocking) path.classList.add('blocking');
         wireOne(path, null, i === 0
           ? { focusable: true, ariaLabel: linkAriaLabel(link), tooltip: () => linkTooltip(link) }
           : {
@@ -1176,7 +1189,10 @@
     if (link.fiber === true) {
       path.classList.add('fiber');
       path.style.setProperty('--mp-fiber-w', `${Math.max(5, plan.width * 1.6)}px`);
+      if (link.fiber_mode === 'sm') path.classList.add('fiber-sm');
+      else if (link.fiber_mode === 'mismatch') path.classList.add('fiber-mismatch');
     }
+    if (link.blocking) path.classList.add('blocking');
     if (plan.mode === 'collapsed' && view.settings.show_vlan_labels) {
       const mx = (from.x + to.x) / 2, my = (from.y + to.y) / 2;
       labelLayer.appendChild(App.svgNode('text', {
@@ -1244,7 +1260,12 @@
       else if (vlans.length <= 16) vlanText = `${vlans.length} VLAN(s): ${vlans.map(vlanDisplay).join(', ')}`;
       else vlanText = `${vlans.length} VLANs — open the link for the full list`;
     }
-    return `Link, ${a} to ${b}, ${vlanText}.`;
+    let text = `Link, ${a} to ${b}, ${vlanText}.`;
+    const fiberText = fiberModeText(link, a, b);
+    if (fiberText) text += ` ${fiberText}.`;
+    const stpText = stpBlockingText(link, a, b);
+    if (stpText) text += ` ${stpText}.`;
+    return text;
   }
 
   // '' for a port whose mode nothing reported — an unmanaged peer has no
@@ -1252,6 +1273,29 @@
   // port to ask about, so this is blank far more often than it is wrong.
   function portMode(mode) {
     return mode === 'trunk' || mode === 'access' ? ` · ${mode}` : '';
+  }
+
+  // Fiber-mode (netpath.mapper.fiber_mode) and STP-blocking text, shared by
+  // the tooltip, aria-label and detail pane -- `a`/`b` are already the
+  // device names the caller wants shown (escaped, for the detail pane's
+  // HTML); `esc` lets the detail pane escape the port text too, and
+  // defaults to plain text for the tooltip/aria-label callers.
+  function fiberModeText(link, a, b) {
+    if (!link.fiber_mode) return null;
+    const abbrev = (mode) => (mode === 'sm' ? 'SM' : 'MM');
+    const full = (mode) => (mode === 'sm' ? 'single-mode' : 'multimode');
+    if (link.fiber_mode === 'mismatch') {
+      return `Fiber: ${abbrev(link.a_optic_mode)} on ${a}, ${abbrev(link.b_optic_mode)} on ${b} — mismatched`;
+    }
+    if (link.a_optic_mode && link.b_optic_mode) return `Fiber: ${full(link.fiber_mode)} both ends`;
+    return `Fiber: ${full(link.fiber_mode)} (${link.a_optic_mode ? 'A' : 'B'} end known)`;
+  }
+  function stpBlockingText(link, a, b, esc = (x) => x) {
+    if (!link.blocking) return null;
+    const who = [];
+    if (link.a_stp === 'blocking') who.push(`${a} (${esc(link.a_port || '—')})`);
+    if (link.b_stp === 'blocking') who.push(`${b} (${esc(link.b_port || '—')})`);
+    return `STP: blocking on ${who.join(', ')}`;
   }
 
   // How many VLANs a hover/detail-pane screen names before "N more".
@@ -1296,6 +1340,10 @@
     } else if (hasB) {
       lines.push(`Native VLAN ${natB}`);
     }
+    const fiberText = fiberModeText(link, a, b);
+    if (fiberText) lines.push(fiberText);
+    const stpText = stpBlockingText(link, a, b);
+    if (stpText) lines.push(stpText);
     return lines.join('\n');
   }
 
@@ -1711,6 +1759,51 @@
     el.style.display = '';
   }
 
+  // Every cable between the same two nodes its own line: parallel LLDP
+  // links already fold onto distinct frozenset keys (mapper.py) but used to
+  // land on identical coordinates. Groups view.links by the unordered pair
+  // of node ids, spaces each group's members off the shared centre line,
+  // and returns link.id -> offset (px, along the link's own normal) for
+  // drawLink to apply. A pair with only one link needs no offset at all.
+  function fanOffsets() {
+    const groups = new Map();
+    for (const link of view.links) {
+      const a = linkNodeA(link), b = linkNodeB(link);
+      if (!a || !b) continue;
+      const key = a.id < b.id ? `${a.id}:${b.id}` : `${b.id}:${a.id}`;
+      let group = groups.get(key);
+      if (!group) { group = []; groups.set(key, group); }
+      group.push(link);
+    }
+    const fan = new Map();
+    for (const group of groups.values()) {
+      if (group.length < 2) continue;
+      group.sort((x, y) => String(x.id).localeCompare(String(y.id)));
+      let widest = 0;
+      for (const link of group) {
+        const plan = link.plan || {};
+        let span = plan.width || 1.5;
+        if (plan.mode === 'strands' && plan.strands.length) {
+          const offsets = plan.strands.map((strand) => strand.offset);
+          span = (Math.max(...offsets) - Math.min(...offsets)) + plan.width;
+        }
+        if (span > widest) widest = span;
+      }
+      const spacing = Math.max(18, widest + 8);
+      const start = -spacing * (group.length - 1) / 2;
+      group.forEach((link, i) => {
+        const a = linkNodeA(link), b = linkNodeB(link);
+        // Sign flipped when this link's own A node is the larger of the
+        // pair, so both ends' drawLink calls (whichever one reported it)
+        // shift the cable the same way in world space -- see drawLink's
+        // (nx, ny), which itself flips with a link's a/b order.
+        const flip = a.id > b.id ? -1 : 1;
+        fan.set(link.id, flip * (start + i * spacing));
+      });
+    }
+    return fan;
+  }
+
   function draw() {
     const svg = App.el('mp-svg');
     const canvas = App.el('mp-canvas');
@@ -1771,6 +1864,7 @@
     group.append(gridLayer, frameLayer, linkLayer, nodeLayer, labelLayer);
     if (shouldDrawGrid() && bounds) drawGrid(gridLayer, bounds);
     for (const frame of view.frames) view.frameEls.set(frame.id, drawFrame(frameLayer, frame));
+    view.linkFan = fanOffsets();
     // Own <g> per link: redrawDragged refills just the ones that moved.
     for (const link of view.links) {
       const holder = App.svgNode('g');
@@ -1833,10 +1927,17 @@
   function drawLegend() {
     const threshold = Number(view.settings.vlan_collapse_threshold) || 8;
     const hasUnknown = view.links.some((l) => l.plan && l.plan.known === false);
+    const hasBlocking = view.links.some((l) => l.blocking);
+    const hasFiber = view.links.some((l) => l.fiber);
     const hasLinks = view.links.length > 0;
     let text = `Trunks of ${threshold}+ VLANs draw as one thick line, scaled by count; ` +
       'fewer draw as one coloured strand per VLAN.';
     if (hasUnknown) text += ' A dashed line means no VLAN data at all, not "one VLAN".';
+    if (hasBlocking) text += ' A dotted line is a spanning-tree-blocked port.';
+    if (view.fiberView && hasFiber) {
+      text += ' FiberView: blue = multimode, dark yellow = single-mode, ' +
+        'dotted red = single/multimode mismatch.';
+    }
     if (view.nodes.length && !hasLinks) {
       text = 'No CDP/LLDP adjacency was found between the devices placed here — ' +
         'that is information, not an error; add neighbours once they report one.';
@@ -2156,6 +2257,9 @@
         lines.push(`<button data-show-all-vlans>Show all ${vlans.length}</button>`);
       }
     }
+    const fiberText = fiberModeText(link, escape(a.name), escape(b.name));
+    const stpText = stpBlockingText(link, escape(a.name), escape(b.name), escape);
+    if (fiberText || stpText) lines.push('', ...[fiberText, stpText].filter(Boolean));
     lines.push('', `Last seen   ${escape(App.ago(link.seen_ts))}`);
     return lines.join('\n');
   }
@@ -3066,6 +3170,7 @@
       view.fiberView = event.target.checked;
       try { localStorage.setItem('mapper.fiberView', view.fiberView ? '1' : '0'); } catch (error) { /* per-browser convenience only */ }
       applyFiberView();
+      drawLegend();
     };
     App.el('mp-snap').onchange = async (event) => {
       await App.post('/api/settings', { scope: 'mapper', values: { snap_to_grid: event.target.checked } });

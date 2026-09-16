@@ -296,7 +296,11 @@ def link_identity(device_id, if_index, matched_id, matched_if_index) -> object:
     separate lines is the ambiguous remainder: two or more name-only rows on
     either side of the same device pair (a LAG, or a pair of switches
     cross-connected twice), where any pairing would still be the guess this
-    key exists to avoid."""
+    key exists to avoid. A third route to this same frozenset shape: where a
+    caller passes `assemble_links` a `port_index` resolver, a name-matched
+    row whose neighbour reported its OWN port name or description can
+    resolve straight to the far end's if_index without ever touching this
+    function — the neighbour naming its own port is evidence, not a guess."""
     if matched_if_index is not None:
         return frozenset({(device_id, if_index), (matched_id, matched_if_index)})
     return ("name-match", device_id, if_index)
@@ -408,7 +412,10 @@ def _fold_reciprocal_name_matched(links_by_key: dict) -> None:
     links by the unordered device pair they sit between; where that pair has
     exactly ONE link reported from each side, there is one cable with one
     port at each end and both ends have named it, so nothing is being
-    guessed. Two or more from either side is the LAG / cross-connected case
+    guessed. A row `assemble_links`'s own `port_index` resolver already
+    turned into a frozenset key never joins this pool at all, since only a
+    row that resolver could not resolve falls back to the name-only shape
+    this function works on. Two or more from either side is the LAG / cross-connected case
     `link_identity` refuses to guess at — the rows say "A has two ports
     facing B" and nothing says which faces which — and a pair heard from
     only one side has no reciprocal row to fold with at all; both are left
@@ -452,7 +459,8 @@ def _fold_reciprocal_name_matched(links_by_key: dict) -> None:
 
 
 def assemble_links(neighbour_rows, *, port_vlans, port_label, on_map, now,
-                   stale_after_s=None, peer_name=None) -> tuple[list[dict], list[dict]]:
+                   stale_after_s=None, peer_name=None,
+                   port_index=None) -> tuple[list[dict], list[dict]]:
     """Turn raw LLDP/CDP neighbour rows into the links and peers one map
     draws.
 
@@ -462,6 +470,14 @@ def assemble_links(neighbour_rows, *, port_vlans, port_label, on_map, now,
     first, so an unmanaged peer's name agrees with what Neighbours and
     Reports would call the same address. Kept optional and passed in
     rather than imported, so this module never depends on api.py.
+
+    `port_index`, if given, is a callable(device_id, port_text) -> if_index
+    or None, tried on a matched row whose `matched_if_index` is NULL --
+    first against `row["port_id"]`, then `row["port_descr"]` -- so a CDP-only
+    row still resolves the far end's real port from the name the neighbour
+    itself sent, and keys the link on the same frozenset shape a MAC-matched
+    row would (see `link_identity`'s own note on this route). A miss falls
+    back to the existing per-row key untouched.
 
     Processing order per row matters and is deliberate:
       1. protocol / present / staleness filters drop rows that should not
@@ -550,13 +566,22 @@ def assemble_links(neighbour_rows, *, port_vlans, port_label, on_map, now,
         matched_if_index = _get(row, "matched_if_index")
 
         if matched_id is not None:
-            key = link_identity(device_id, if_index, matched_id, matched_if_index)
-            b_device_id = matched_id
-            b_if_index = matched_if_index
-            if matched_if_index is not None:
-                b_port = port_label(matched_id, matched_if_index)
+            resolved_if_index = None
+            if matched_if_index is None and port_index is not None:
+                resolved_if_index = (port_index(matched_id, row["port_id"])
+                                     or port_index(matched_id, row["port_descr"]))
+            if resolved_if_index is not None:
+                key = link_identity(device_id, if_index, matched_id, resolved_if_index)
+                b_if_index = resolved_if_index
+                b_port = port_label(matched_id, resolved_if_index)
             else:
-                b_port = row["port_id"] or row["port_descr"] or ""
+                key = link_identity(device_id, if_index, matched_id, matched_if_index)
+                b_if_index = matched_if_index
+                if matched_if_index is not None:
+                    b_port = port_label(matched_id, matched_if_index)
+                else:
+                    b_port = row["port_id"] or row["port_descr"] or ""
+            b_device_id = matched_id
             b_peer_key = ""
             b_map_id = matched_id
             unmanaged = False
@@ -765,9 +790,20 @@ def link_is_fiber(a_media, b_media) -> bool:
     return a_media == "sfp" or b_media == "sfp"
 
 
+def fiber_mode(a_mode, b_mode) -> str | None:
+    """FiberView's colour class for a fiber link's two ends' optic modes
+    ('sm'/'mm', from ENTITY-MIB transceiver text): 'mismatch' when both ends
+    are known and disagree, else whichever end IS known, else None when
+    neither end is known -- FiberView's plain-blue default."""
+    if a_mode and b_mode and a_mode != b_mode:
+        return "mismatch"
+    return a_mode or b_mode
+
+
 LINK_CSV_HEADER = ["A Device", "A Device ID", "A Port", "A Port Mode", "A Native VLAN",
                    "B Device", "B Device ID", "B Port", "B Port Mode", "B Native VLAN",
-                   "Protocols", "VLAN Count", "VLANs", "Native VLAN", "Seen"]
+                   "Protocols", "VLAN Count", "VLANs", "Native VLAN", "Seen",
+                   "Fiber Mode", "STP"]
 
 
 def link_csv_rows(links, device_name) -> list[list]:
@@ -805,6 +841,12 @@ def link_csv_rows(links, device_name) -> list[list]:
             value = link.get(key)
             return "" if value is None else value
 
+        stp_parts = []
+        if link.get("a_stp") == "blocking":
+            stp_parts.append("blocking on A")
+        if link.get("b_stp") == "blocking":
+            stp_parts.append("blocking on B")
+
         rows.append([
             a_name, a_id, link["a_port"],
             cell("a_port_mode"), cell("a_native_vlan"),
@@ -815,5 +857,6 @@ def link_csv_rows(links, device_name) -> list[list]:
             ";".join(str(vlan) for vlan in link["vlans"]),
             link["native_vlan"] if link["native_vlan"] is not None else "",
             link["seen_ts"],
+            cell("fiber_mode"), ", ".join(stp_parts),
         ])
     return rows

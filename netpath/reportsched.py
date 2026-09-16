@@ -234,8 +234,8 @@ def _render_sfp(service, params: dict, now: float):
     body = "\n".join(lines) + "\n"
 
     csv_rows = [[r.device_id, r.name, r.ip, r.if_index, r.port, r.alias, r.kind,
-                r.medium, r.media, r.oper_status, r.admin_status, r.speed_bps,
-                r.last_seen_ts, r.device] for r in report.rows]
+                r.medium, r.optic_mode, r.media, r.oper_status, r.admin_status,
+                r.speed_bps, r.last_seen_ts, r.device] for r in report.rows]
     return subject, body, csvout.csv_text(reportmod.SFP_CSV_HEADER, csv_rows)
 
 

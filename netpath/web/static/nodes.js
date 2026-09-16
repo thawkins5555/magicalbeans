@@ -1377,14 +1377,22 @@
   // on, SFP only says there is a laser cage there, COP says the cage (or
   // fixed port) is copper — no light levels ever apply.
   function sfpBadge(r) {
+    // optic_mode ('sm'/'mm') only ever accompanies media 'optic'/'sfp' --
+    // never copper or an empty cage -- so no extra guard is needed here.
+    const modeSuffix = r.optic_mode === 'mm' ? '·MM'
+      : r.optic_mode === 'sm' ? '·SM' : '';
+    const modeNote = r.optic_mode === 'mm' ? '; multimode (SX/SR class)'
+      : r.optic_mode === 'sm' ? '; single-mode (LX/LR class)' : '';
     if (r.media === 'optic') {
       return '<span class="badge badge-dom" title="Optical transceiver ' +
-        'reporting DOM sensors (light levels, temperature)">DOM</span> ';
+        'reporting DOM sensors (light levels, temperature)' + modeNote +
+        '">DOM' + modeSuffix + '</span> ';
     }
     if (r.media === 'sfp' || r.media === 'sfp_empty') {
       return '<span class="badge badge-sfp" title="' + (r.media === 'sfp_empty'
         ? 'SFP cage, nothing plugged into it'
-        : 'Optical transceiver, reporting no DOM sensors') + '">SFP</span> ';
+        : 'Optical transceiver, reporting no DOM sensors' + modeNote) +
+        '">SFP' + (r.media === 'sfp_empty' ? '' : modeSuffix) + '</span> ';
     }
     if (r.media === 'copper') {
       return '<span class="badge badge-cop" title="Copper transceiver ' +
@@ -4524,7 +4532,8 @@
   }
 
   const SFP_CSV_HEADER = ['device_id', 'name', 'ip', 'if_index', 'port', 'alias', 'kind',
-    'medium', 'media', 'oper_status', 'admin_status', 'speed_bps', 'last_seen_ts', 'device'];
+    'medium', 'optic_mode', 'media', 'oper_status', 'admin_status', 'speed_bps',
+    'last_seen_ts', 'device'];
 
   function exportSfpReportCsv() {
     const report = view.repSfp;
@@ -4533,8 +4542,8 @@
       return;
     }
     const rows = report.rows.map((r) => [r.device_id, r.name, r.ip, r.if_index, r.port,
-      r.alias, r.kind, r.medium, r.media, r.oper_status, r.admin_status, r.speed_bps,
-      r.last_seen_ts, r.device]);
+      r.alias, r.kind, r.medium, r.optic_mode, r.media, r.oper_status, r.admin_status,
+      r.speed_bps, r.last_seen_ts, r.device]);
     saveReportCsv(`sfp-${App.isoLocal(report.generated_ts).slice(0, 10)}.csv`,
       SFP_CSV_HEADER, rows);
   }

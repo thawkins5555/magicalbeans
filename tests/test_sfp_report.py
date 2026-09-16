@@ -33,8 +33,8 @@ PORTS = [{"if_index": 1, "descr": "GigabitEthernet1/0/1"},
         {"if_index": 5, "descr": "TenGigabitEthernet1/0/5"}]
 
 SFP_CSV_HEADER_ROW = ["device_id", "name", "ip", "if_index", "port", "alias",
-                      "kind", "medium", "media", "oper_status", "admin_status",
-                      "speed_bps", "last_seen_ts", "device"]
+                      "kind", "medium", "optic_mode", "media", "oper_status",
+                      "admin_status", "speed_bps", "last_seen_ts", "device"]
 
 
 # ============================================================ 1. report.py
@@ -47,8 +47,8 @@ gid = db.ensure_default_group()
 sw1 = db.add_device("10.60.0.1", "acc-sw-01", group_id=gid)
 db.replace_interfaces(sw1, PORTS)
 db.update_interface_media(sw1, [
-    {"if_index": 1, "media": "optic"},
-    {"if_index": 2, "media": "sfp"},
+    {"if_index": 1, "media": "optic", "optic_mode": "sm"},
+    {"if_index": 2, "media": "sfp", "optic_mode": "mm"},
     {"if_index": 3, "media": "sfp_empty"},
     # if_index 4 stays NULL -- a copper port, no cage at all.
     {"if_index": 5, "media": "copper"},
@@ -71,10 +71,14 @@ check("a plain sfp port is a row",
       (sw1, 2) in by_key and by_key[(sw1, 2)].kind == "SFP", by_key.get((sw1, 2)))
 check("a copper port is a row with kind 'COP'",
       (sw1, 5) in by_key and by_key[(sw1, 5)].kind == "COP", by_key.get((sw1, 5)))
-check("medium is Laser for DOM/SFP, Copper for COP",
-      by_key[(sw1, 1)].medium == "Laser" and by_key[(sw1, 2)].medium == "Laser"
+check("medium spells out the optic mode when known, Copper for COP",
+      by_key[(sw1, 1)].medium == "Laser · SM" and by_key[(sw1, 2)].medium == "Laser · MM"
       and by_key[(sw1, 5)].medium == "Copper",
       {k: r.medium for k, r in by_key.items()})
+check("optic_mode is carried through as its own column",
+      by_key[(sw1, 1)].optic_mode == "sm" and by_key[(sw1, 2)].optic_mode == "mm"
+      and by_key[(sw1, 5)].optic_mode == "",
+      {k: r.optic_mode for k, r in by_key.items()})
 check("port label falls back to descr", by_key[(sw1, 1)].port == "GigabitEthernet1/0/1",
       by_key[(sw1, 1)].port)
 check("alias is carried through separately from port",
@@ -119,8 +123,8 @@ check("to_dict() is JSON-shaped all the way down",
       isinstance(payload["rows"], list) and isinstance(payload["rows"][0], dict)
       and set(payload["rows"][0]) == {
           "device_id", "name", "ip", "device", "if_index", "port", "alias",
-          "kind", "medium", "media", "oper_status", "admin_status", "speed_bps",
-          "last_seen_ts"},
+          "kind", "medium", "optic_mode", "media", "oper_status", "admin_status",
+          "speed_bps", "last_seen_ts"},
       payload["rows"][0])
 
 db.close()
@@ -247,8 +251,8 @@ check("the server-side CSV route answers a csv/filename/count payload",
       status == 200 and payload["count"] == 3
       and payload["filename"].endswith(".csv")
       and payload["csv"].splitlines()[0].lstrip("﻿") ==
-      "device_id,name,ip,if_index,port,alias,kind,medium,media,oper_status,"
-      "admin_status,speed_bps,last_seen_ts,device",
+      "device_id,name,ip,if_index,port,alias,kind,medium,optic_mode,media,"
+      "oper_status,admin_status,speed_bps,last_seen_ts,device",
       (status, payload))
 check("...and honours include_empty too",
       call("GET", "/api/nodes/reports/sfp/export.csv?include_empty=1",

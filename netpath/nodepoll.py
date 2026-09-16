@@ -165,6 +165,32 @@ _COPPER_TEXT = re.compile(
     r"\b(?:\d+g?base-?tx?|glc-te?|sfp-?(?:10g|1ge?|ge)?-?t(?:-s|-x)?|rj-?45"
     r"|copper|cat[56][ae]?)\b", re.I)
 
+# Multimode (SX/SR/LRM class, 850nm) and single-mode (LX/LH/EX/ZX/BX/LR/ER/
+# ZR class, 1310/1550nm) proof out of the same transceiver text. Copper/DAC/
+# AOC text never matches either.
+_OPTIC_MM_TEXT = re.compile(
+    r"\b(?:sx|sr|sr4|csr4|esr4|lrm|mm[df]?)\b|base-?(?:sx|sr|lrm)"
+    r"|glc-sx|-sr(?:4|-s|-x)?\b|850\s?nm", re.I)
+_OPTIC_SM_TEXT = re.compile(
+    r"\b(?:lx|lh|ex|zx|bx[ud]?|lr|er|zr|lr4|er4|zr4|psm4|cwdm4?|dwdm|sm[df]?)\b"
+    r"|base-?(?:lx|lh|ex|zx|bx|lr|er|zr)|glc-(?:lh|ex|zx|bx)"
+    r"|-(?:lr|er|zr|lx|zx|ex)(?:4|-s|-x)?\b|1310\s?nm|1550\s?nm", re.I)
+
+
+def _optic_mode(*texts) -> str | None:
+    """'sm', 'mm', or None from transceiver text, checking MM before SM on
+    each text in the order given -- first hit wins."""
+    for text in texts:
+        text = str(text or "")
+        if not text:
+            continue
+        if _OPTIC_MM_TEXT.search(text):
+            return "mm"
+        if _OPTIC_SM_TEXT.search(text):
+            return "sm"
+    return None
+
+
 # ifMauType's value OID's last arc is a dot3MauType (RFC 3636/4836); a
 # device that answers it gets the last say over ambiguous/wrong text.
 # Copper dot3MauTypes: 10/100/1000BASE-T(X)/-FD, 1000BASE-CX(-FD), 10GBASE-CX4/T.
@@ -5789,15 +5815,18 @@ class NodePoller(Worker):
 
     def _sfp_slot_media(self, device, config: dict, port_map: dict[int, int],
                         contained_in: dict[int, int], descrs: dict) -> tuple:
-        """(media map, complete flag, class row count, cut-short diagnostics):
-        a walk cut short must never read as a cage that is not there."""
+        """(media map, complete flag, class row count, cut-short diagnostics,
+        optic mode map, entPhysicalModelName column): a walk cut short must
+        never read as a cage that is not there. The model column is handed
+        back so a caller scanning DOM-lit ports for their mode too does not
+        pay for a second walk of it."""
         raw_classes, complete, class_reason = self._walk_column_detail(
             device, config, self._ENT_PHYSICAL_CLASS)
         classes = _int_keyed(raw_classes)
         reasons = [] if complete else [
             f"entPhysicalClass walk cut short ({class_reason})"]
         if not classes:
-            return {}, complete, len(classes), reasons
+            return {}, complete, len(classes), reasons, {}, {}
         raw_models, models_done, model_reason = self._walk_column_detail(
             device, config, self._ENT_PHYSICAL_MODEL_NAME)
         complete = complete and models_done
@@ -5826,7 +5855,11 @@ class NodePoller(Worker):
                 depth += 1
             return found
 
+        def entity_texts(entity: int) -> tuple:
+            return by_descr.get(entity), models.get(entity)
+
         media: dict[int, str] = {}
+        mode: dict[int, str] = {}
         for entity, klass in sorted(classes.items()):
             try:
                 klass = int(klass)
@@ -5836,8 +5869,12 @@ class NodePoller(Worker):
                 # The cage's own text names it either way, so only something
                 # OTHER than the container proves one is occupied.
                 if names_transceiver(entity) and entity in port_map:
-                    media[port_map[entity]] = (
+                    if_index = port_map[entity]
+                    media[if_index] = (
                         "copper" if names_copper(entity) else "sfp")
+                    found_mode = _optic_mode(*entity_texts(entity))
+                    if found_mode:
+                        mode[if_index] = found_mode
                 continue
             if not names_transceiver(entity):
                 continue
@@ -5853,9 +5890,14 @@ class NodePoller(Worker):
                 copper = names_copper(entity) or any(
                     names_copper(child) for child in occupants)
                 media[if_index] = "copper" if copper else "sfp"
+                occupant_texts = [text for child in occupants
+                                  for text in entity_texts(child)]
+                found_mode = _optic_mode(*entity_texts(entity), *occupant_texts)
+                if found_mode:
+                    mode[if_index] = found_mode
             else:
                 media.setdefault(if_index, "sfp_empty")
-        return media, complete, len(classes), reasons
+        return media, complete, len(classes), reasons, mode, models
 
     @staticmethod
     def _if_index_for_name(name, if_by_name: dict) -> int | None:
@@ -6465,9 +6507,10 @@ class NodePoller(Worker):
                             f"to a port — entAliasMappingIdentifier had "
                             f"{alias_rows} row(s), entPhysicalName matched "
                             f"no stored ifDescr", "no_entity_mapped")
-            sfp_slots, slots_complete = {}, True
+            sfp_slots, slots_complete, sfp_mode, ent_models = {}, True, {}, {}
         else:
-            sfp_slots, slots_complete, class_rows, slot_reasons = self._sfp_slot_media(
+            (sfp_slots, slots_complete, class_rows, slot_reasons, sfp_mode,
+             ent_models) = self._sfp_slot_media(
                 device, config, port_map, contained_in, descrs)
             media_reasons.extend(slot_reasons)
             if class_rows:
@@ -6676,6 +6719,39 @@ class NodePoller(Worker):
                        for i, m in sfp_slots.items()}
         media_by_if.update({if_index: "optic" for if_index in optic_ports})
         media_by_if.update({if_index: "copper" for if_index in copper_ports})
+        # optic_mode from _sfp_slot_media's cage/occupant scan covers most
+        # ports; a DOM-lit port the cage scan never classified as a
+        # container (optic_ports) gets its own scan here, over the same
+        # entPhysicalModelName column that walk already fetched -- reusing
+        # `ent_models` rather than walking it again.
+        optic_mode_by_if: dict[int, str] = dict(sfp_mode)
+        missing_mode = optic_ports - set(optic_mode_by_if)
+        if missing_mode:
+            by_descr = _int_keyed(descrs)
+            entities_by_if: dict[int, list[int]] = {}
+            for entity, idx in port_map.items():
+                entities_by_if.setdefault(idx, []).append(entity)
+            children: dict[int, list[int]] = {}
+            for entity, parent in contained_in.items():
+                children.setdefault(parent, []).append(entity)
+            for if_index in missing_mode:
+                texts = []
+                for entity in sorted(entities_by_if.get(if_index, ())):
+                    texts += [by_descr.get(entity), ent_models.get(entity)]
+                    hop, seen = contained_in.get(entity, 0), 0
+                    while hop and seen < 2:
+                        texts += [by_descr.get(hop), ent_models.get(hop)]
+                        hop = contained_in.get(hop, 0)
+                        seen += 1
+                    queue, depth = list(children.get(entity, ())), 0
+                    while queue and depth < 4:
+                        for child in queue:
+                            texts += [by_descr.get(child), ent_models.get(child)]
+                        queue = [c for parent in queue for c in children.get(parent, ())]
+                        depth += 1
+                found_mode = _optic_mode(*texts)
+                if found_mode:
+                    optic_mode_by_if[if_index] = found_mode
         if not slots_complete or not sensor_complete:
             # A walk cut short is not evidence of anything: a cage it never
             # reached reads as absent, and a module it never reached reads
@@ -6691,9 +6767,16 @@ class NodePoller(Worker):
                         and if_index not in optic_ports
                         and if_index not in copper_ports):
                     media_by_if[if_index] = stored
-        media_rows = [{"if_index": if_index, "media": media}
+                    stored_mode = row["optic_mode"] if "optic_mode" in row.keys() else None
+                    if stored_mode:
+                        optic_mode_by_if[if_index] = stored_mode
+                    else:
+                        optic_mode_by_if.pop(if_index, None)
+        media_rows = [{"if_index": if_index, "media": media,
+                       "optic_mode": (optic_mode_by_if.get(if_index)
+                                      if media in ("sfp", "optic") else None)}
                       for if_index, media in sorted(media_by_if.items())]
-        media_rows += [{"if_index": row["if_index"], "media": None}
+        media_rows += [{"if_index": row["if_index"], "media": None, "optic_mode": None}
                        for row in interfaces
                        if row["if_index"] not in media_by_if
                        and ("media" in row.keys() and row["media"])]

@@ -4412,6 +4412,28 @@ def _neighbor_local_port_labeler(service, prefetch_ids=None):
     return label
 
 
+def _mapper_port_index(service, device_ids):
+    """A (device_id, port_text) -> if_index resolver for
+    mapper.assemble_links's `port_index` kwarg. One prefetch read, keyed on
+    each on-map device's own interface name/descr reduced through
+    nodepoll._canonical_if_name -- the same reduction a neighbour-reported
+    port string (`row["port_id"]`/`row["port_descr"]`) is put through before
+    the lookup, so "Te1/1/1" and "TenGigabitEthernet1/1/1" resolve to the
+    same port."""
+    index: dict[int, dict[str, int]] = {}
+    for row in service.nodes_db.interface_port_labels_for_devices(device_ids):
+        by_name = index.setdefault(row["device_id"], {})
+        for text in (row["name"], row["descr"]):
+            if text:
+                by_name[nodepoll._canonical_if_name(text)] = row["if_index"]
+
+    def port_index(device_id, port_text):
+        if not port_text:
+            return None
+        return index.get(device_id, {}).get(nodepoll._canonical_if_name(port_text))
+    return port_index
+
+
 def _neighbor_json(row, local_port: str = "") -> dict:
     keys = row.keys()
     return {
@@ -6431,6 +6453,7 @@ def get_nodes_device_interfaces(service, params, body, device_id) -> dict:
          "poe_power_mw": (r["poe_power_mw"] if "poe_power_mw" in keys else None),
          "stp_state": (r["stp_state"] if "stp_state" in keys else None),
          "media": (r["media"] if "media" in keys else None),
+         "optic_mode": (r["optic_mode"] if "optic_mode" in keys else None),
          "priority": r["if_index"] in priority}
         for r in rows]}
 
@@ -6458,7 +6481,7 @@ def get_nodes_device_interfaces_export(service, params, body, device_id) -> dict
              "admin_status", "oper_status", "in_bps", "out_bps",
              "in_error_rate", "out_error_rate", "last_in_errors", "last_out_errors",
              "last_seen_ts", "poe_admin", "poe_detect_status", "poe_power_mw",
-             "stp_state", "media", "Priority"]
+             "stp_state", "media", "optic_mode", "Priority"]
     csv_rows = [[i.get(key) for key in header[:-1]] +
                 ["yes" if i.get("priority") else "no"] for i in interfaces]
     return _csv_response("interfaces", header, csv_rows)
@@ -10238,20 +10261,23 @@ def get_mapper_map(service, params, body, map_id) -> dict:
     # exactly the cost this route's report measured (12.4s at 10k rows).
     neighbour_rows = _apply_ip_matches(
         service, service.nodes_db.neighbours_for_devices(device_ids))
+    port_index = _mapper_port_index(service, device_ids)
     links, peers = mapper.assemble_links(
         neighbour_rows, port_vlans=port_vlans,
         port_label=port_label, on_map=on_map, now=now,
         stale_after_s=stale_after_s,
-        peer_name=_mapper_peer_name(service, neighbour_rows))
+        peer_name=_mapper_peer_name(service, neighbour_rows),
+        port_index=port_index)
 
     color_overrides = service.mapper_db.vlan_colors()
     threshold = int(settings.get("vlan_collapse_threshold", 8))
     max_strands = int(settings.get("max_strand_vlans", 30))
     width_min = float(settings.get("link_width_min", 1.5))
     width_max = float(settings.get("link_width_max", 14.0))
-    # FiberView: one read for every on-map device's per-port media, then a
-    # pure lookup per link -- mapper.link_is_fiber never touches the db.
-    media_by_port = service.nodes_db.interface_media_for_devices(device_ids)
+    # FiberView + STP: one read for every on-map device's per-port media,
+    # optic mode and STP state, then a pure lookup per link -- neither
+    # mapper.link_is_fiber nor mapper.fiber_mode ever touches the db.
+    link_facts = service.nodes_db.interface_link_facts_for_devices(device_ids)
     for link in links:
         # Each end's own vlan_ports row (never the far end's -- same
         # locality rule _mapper_vlan_ports' docstring gives port_vlans):
@@ -10269,14 +10295,27 @@ def get_mapper_map(service, params, body, map_id) -> dict:
             b_info = vlan_ports.get((link["b_device_id"], link["b_if_index"]))
         link["b_port_mode"] = b_info["mode"] if b_info else None
         link["b_native_vlan"] = b_info["native_vlan"] if b_info else None
-        a_media = media_by_port.get((link["a_device_id"], link["a_if_index"])) \
+        a_facts = link_facts.get((link["a_device_id"], link["a_if_index"])) \
             if link["a_if_index"] is not None else None
-        b_media = None
+        b_facts = None
         if link["b_device_id"] is not None and link["b_if_index"] is not None:
-            b_media = media_by_port.get((link["b_device_id"], link["b_if_index"]))
+            b_facts = link_facts.get((link["b_device_id"], link["b_if_index"]))
+        a_media = a_facts["media"] if a_facts else None
+        b_media = b_facts["media"] if b_facts else None
         link["a_media"] = a_media
         link["b_media"] = b_media
         link["fiber"] = mapper.link_is_fiber(a_media, b_media)
+        a_optic_mode = a_facts["optic_mode"] if a_facts else None
+        b_optic_mode = b_facts["optic_mode"] if b_facts else None
+        link["a_optic_mode"] = a_optic_mode
+        link["b_optic_mode"] = b_optic_mode
+        link["fiber_mode"] = (mapper.fiber_mode(a_optic_mode, b_optic_mode)
+                              if link["fiber"] else None)
+        a_stp = a_facts["stp_state"] if a_facts else None
+        b_stp = b_facts["stp_state"] if b_facts else None
+        link["a_stp"] = a_stp
+        link["b_stp"] = b_stp
+        link["blocking"] = a_stp == "blocking" or b_stp == "blocking"
         link["plan"] = mapper.render_plan(
             link, threshold=threshold, max_strands=max_strands,
             width_min=width_min, width_max=width_max,
@@ -10359,6 +10398,8 @@ def get_mapper_map(service, params, body, map_id) -> dict:
             "a_port_mode": None, "a_native_vlan": None,
             "b_port_mode": None, "b_native_vlan": None,
             "a_media": None, "b_media": None, "fiber": False,
+            "a_optic_mode": None, "b_optic_mode": None, "fiber_mode": None,
+            "a_stp": None, "b_stp": None, "blocking": False,
             "label": row["label"], "protocols": ["manual"], "vlans": [],
             "native_vlan": None,
             "unmanaged": a_node["device_id"] is None or b_node["device_id"] is None,
