@@ -5,6 +5,76 @@ grouped by the version that carries it. This is a working record for the
 operator — the full story of each change is in `CHANGELOG.md`, and this file
 does not replace it.
 
+## 5.30.0 / 5.31.0 / 5.32.0 — Device link + Address tab fixes, Mapper search/select-all/frames, Cisco Stack Power (planned)
+
+**Operator prompt:**
+"-Clicking a device name link should not only take you to the node ->
+Devices -> Device Details page for that device but it should also
+'Clear' the 'Find' field on the Nodes -> Devices page and highlight
+the selected Device.
+-Need a way to search the MAPPER module for nodes.
+-Need a way to 'Select all' on the Add Device dialog in MAPPER.
+-Should be able to draw frames on MAPPER around nodes.
+-All alert emails should include the severity level in brackets at
+the start of the subject line and every recovery alert email should
+say [RECOVER]
+-Need to implement Cisco Stack Power into the power supply alert
+logic - Start by showing Stack Power info on the Nodes -> Devices ->
+Device Details pop up dialog. There should also be an alert added
+that triggers on any degradation or failure of a Stack Power cables -
+if thresholds exist for stack power pull them from the device.
+-the Node -> Devices -> Device Details -> Address should show the
+devices IP Default Gateway if possible. It also appears the
+'interface' column lists an odd ID number instead of listing the
+VLAN or Interface name that the IP address belongs to."
+
+**Planning answers:**
+1. Alert subjects — every per-alert email/text/webhook already leads
+   with `[SEVERITY]` and recoveries with `[RECOVER]` through the
+   editable templates; only the roll-up digest subjects and any
+   operator-edited template lacked it. Answer: "Reset my templates to
+   the built-ins" — subjects reset once, and digests pick up a
+   worst-severity tag.
+2. Cisco Stack Power — the MIB gives per-port link up/down and
+   enabled/disabled, an over-current threshold in amperes, and no
+   live current reading; faults arrive as traps. Answer: "Cable down +
+   power traps" — a critical per-port alert on a cable going down, a
+   warning alert on the power-fault traps (which also force a
+   re-read), and the threshold shown on the dialog.
+3. Device link when other Nodes -> Devices filters still hide the
+   target row: "Clear those filters too."
+4. Mapper frames when dragged: "Decoration only" — devices never move
+   with a frame.
+
+**Notes:** six requests, split into three releases by how independent
+and how risky each piece is.
+
+**5.30.0 — Device link, Addresses tab, alert subject reset**
+Scope: the device-name link on Nodes -> Devices now clears the Find
+field and every other active filter, then highlights the selected row
+after routing to Device Details; the Addresses subtab resolves the
+numeric interface index to the actual VLAN/interface name and adds the
+device's IP default gateway where SNMP exposes one; every alert
+template (email/SMS/webhook) is reset to the built-in subject line
+carrying `[SEVERITY]` / `[RECOVER]`, and the digest roll-up subject
+gains a worst-severity tag.
+**Outcome:** _pending — to be filled in at push._
+
+**5.31.0 — Mapper find, select-all, frames**
+Scope: a node search/find box added to the Mapper module; a
+"Select all" control added to Mapper's Add Device dialog; freehand
+frames drawable around groups of nodes on the Mapper canvas, decoration
+only — dragging a frame never moves the devices inside it.
+**Outcome:** _pending — to be filled in at push._
+
+**5.32.0 — Cisco Stack Power**
+Scope: Stack Power info (per-port link state, enabled/disabled,
+over-current threshold read from the device) added to the Device
+Details dialog; a new alert set added — critical on a stack power
+cable going down, warning on a stack power fault trap, with the fault
+trap also forcing an immediate re-read of stack power state.
+**Outcome:** _pending — to be filled in at push._
+
 ## 5.29.0 — Discovery addresses removed: interfaces and ARP only
 
 **Operator prompt:**
