@@ -1321,6 +1321,38 @@ high_warn`, any low at or above any high) or a dBm figure outside
 nothing a scale misread lands in) discards that whole `(ifIndex, root)` row,
 with one rate-limited event-log line naming it.
 
+**5.38.0: `other(1)` is no longer a flat drop when two of them land on one
+side.** `other(1)` still names no band on its own — the decoding table
+above is unchanged — but a reading whose `side` (low/high) resolved and
+whose `band` did not is now collected into `unbanded[target][side]`
+rather than skipped outright (`if side is None: continue` replaces the
+old `if side is None or band is None: continue`). After the ordinary
+severity-keyed pass, any `target` that still has no bands at all is
+checked against `unbanded`: two or more levels on the same side are
+sorted (descending for `high`, ascending for `low`) and the more extreme
+one becomes that side's `_alarm`, the next its `_warn` — read off the
+numbers' own relationship, never the severity text, which is exactly
+what `other(1)` failed to supply. A `target` that already has a real
+banded reading from the ordinary pass is left alone (`if bands.get
+(target): continue`), so `other(1)` levels never override a value a
+platform separately published with a real severity. A single `other(1)`
+level on a side, with nothing to compare it against, is still discarded —
+inventing a limit from one number would be a guess, not a read.
+
+**5.38.0 also names a cut-short walk instead of returning silently.**
+Where the three-column completeness check used to `return` with no
+explanation, it now builds `short`, the subset of `("value", "severity",
+"relation")` whose own walk did not finish, and calls `_log_media_diag`
+with a line naming it ("Published-threshold walk on `<ip>` was cut short
+(`<column>` column); stored limits are kept and it is retried shortly").
+It also pulls the device's `_sensor_threshold_read` stamp forward to
+`now - _SENSOR_THRESHOLD_REFRESH_S + _SENSOR_REFRESH_S`, so the next
+ordinary sensor pass (300 s, not the threshold walk's own hour) retries
+it — a device whose threshold walk keeps getting cut short no longer
+reads as "publishes nothing" for up to an hour at a stretch. Stored
+limits are untouched either way; only the retry timing and the log line
+are new.
+
 `interface_thresholds` is its own table rather than twenty columns on
 `interfaces`: four bands × five roots is a matrix only optic ports have any
 use for, this is poller-learned physical fact rather than operator config,
@@ -2247,6 +2279,45 @@ time and is `None` only when auto-sizing is off or `start()` never
 ran — which is how `tests/test_poll_write_path.py` drives `_note_saturation`,
 and why the gate reads poller state rather than the database.
 
+### A draining pool still counts towards capacity: `_draining`, `_pool_capacity` (`nodepoll.py`) — 5.38.0
+
+**The busy/queued line's denominator was wrong the moment a shrink
+happened.** `pool_state()` read `workers` straight off
+`self._executor._max_workers` — the *live* pool only. `_apply_pool_size`
+(above) calls `shutdown(wait=False)` on the pool it replaces, and that
+call does not cancel a future already running: the old pool's own
+in-flight polls keep executing at its old width for as long as they take
+to finish. Between a resize and the last of those polls finishing,
+`busy`/`queued` (both counted off `self._started`/`self._queued`, which
+are pool-agnostic) could genuinely include work still running on the
+drained pool, while `workers` only ever named the new, smaller one —
+exactly the shape of "120 busy and 142 queued of 80 worker(s)" on a
+fleet whose pool had just been cut from something larger.
+
+`self._draining: list[ThreadPoolExecutor]` is a new list `_apply_pool_size`
+appends the outgoing pool to, right after calling its `shutdown(wait=
+False)`, instead of simply discarding the reference. `_pool_capacity()`
+is the new single source `pool_state()`'s `workers` reads: the live
+pool's own `_max_workers` plus, for every pool still in `_draining`, the
+count of its own `_threads` whose `is_alive()` is still true — a
+`ThreadPoolExecutor` internal, the same one `_max_workers` itself already
+was, not a new dependency. A drained pool whose threads have all exited
+is removed from `_draining` right there, inside the same pass — the only
+place that list is ever pruned, so it cannot grow without bound across
+repeated resizes. `stop()` also walks `_draining` under the lock and
+calls `shutdown(wait=False, cancel_futures=True)` on each before clearing
+the list, so a shutdown mid-drain does not leave threads the process
+never waits for.
+
+This changes only what `pool_state()["workers"]` reports and what
+`_pool_capacity()` computes from — `_apply_pool_size`'s own resize
+decision, `busy`, `queued` and `saturated` are all unchanged; a fleet
+that was never resized mid-poll sees `_draining` stay empty and
+`_pool_capacity()` degenerates to the old `_max_workers` read exactly.
+`tests/test_poll_autoscale.py` covers a shrink keeping the old pool's
+worker count in the reported total until its threads actually exit, and
+that `poller._draining` empties itself once they do.
+
 ### A down device backs off SNMP, never ping (`nodepoll.py`) — 5.5.0
 
 A device that is not answering costs about thirty times one that is — every
@@ -2522,6 +2593,23 @@ to rows that resolved to a port, the device-wide counterpart of
 `server.py`), read by the device dialog's HARDWARE SENSORS and DOM / SFP
 SENSORS sections (`nodes.js`); both walk only while that dialog is open,
 same reasoning as `read_dom`.
+
+**`_read_cisco_envmon` keys each section on the union of its columns, not
+the description column — 5.38.0.** Each of the three ENVMON sections
+(supply, fan, temperature) used to build its rows by iterating the
+description column's own dict (`for suffix, descr in descrs.items()`),
+so an index that answered `ciscoEnvMonFanState` but no
+`ciscoEnvMonFanDescr` row — a real shape on some Cisco fan trays — was
+never iterated at all and dropped out of the list, even though the device
+had told the poller exactly how that tray was doing. The new
+`_envmon_rows(*columns)` takes every column a section reads (descr,
+state, and for temperature also value) and returns the union of every
+index any of them answered for, numerically sorted by
+`_envmon_sort_key`; each row then reads its own label from the
+description dict with `.get(suffix)`, falling back to `f"fan {suffix}"`
+(etc.) exactly as before when there genuinely is none. This is a pure
+widening of which indexes get a row — the state/label lookup for an index
+that does have a description is unchanged.
 
 **Cisco's own sensor table, and why both sections were empty on Cisco
 gear — 5.0.1.** Cisco switches populate CISCO-ENTITY-SENSOR-MIB
@@ -4310,6 +4398,97 @@ calls it for the same decrypt it always did, and `reportsched.run_due`
 answer can never drift from what Alerts' own notification path already
 checks for the identical settings.
 
+### Spanning-tree blocking alerts: `update_interface_stp` records the event, two rules read it (`nodesdb.py`, `alertrules.py`, `alertsdb.py`, `nodepoll.py`) — 5.38.0
+
+**A blocking transition is an interface event, not a new table.** Per-port
+STP state has been polled and stored since 5.x, and per-VLAN detail since
+5.37.0; what was missing was a record of *change*. `update_interface_stp`
+now reads each row's prior `stp_state` (`_stp_state_before`, a plain
+`SELECT ... WHERE device_id = ? AND if_index IN (...)` chunked through
+`_id_chunks`, run **before** the `UPDATE` that would overwrite it) and,
+after the state write commits — a second write, deliberately outside the
+same transaction, because the state itself is the write that must land —
+compares `before` against the poll's `now_state` per port.
+`STP_BLOCKED_STATES = ("blocking", "discarding")` is the one place that
+decides which words count as blocked: RSTP's `discarding` counts the same
+as classic STP's `blocking`; `listening`/`learning` (transient, coming
+up) and `disabled`/`broken` (the port is off, not held down) do not. A
+port with no prior reading at all (`was is None`, the first poll that has
+ever seen it) records nothing — there is no "before" to compare against —
+and a port whose blocked-ness did not change (`blocked_before ==
+blocked_now`, even if the specific state word changed, e.g.
+`blocking`→`discarding`) records nothing either. When it does change,
+`record_interface_event` is called with kind `"stp_blocking"` or
+`"stp_unblocked"` and a detail line naming the port, both state words,
+and — only when newly blocked and the row carries VLAN detail —
+`(VLAN <ids>)`, the same `stp_blocking_vlans` string the Nodes STP column
+already renders.
+
+**Two built-in rules, not a rewrite of `interface_down`/`interface_up`.**
+`alertsdb._BUILTIN_RULES` gains `stp_blocking` (`interface_event`,
+severity 4, template `event_notice`) and `stp_unblocked` (severity 6,
+template `device_up`, `_BUILTIN_AUTO_RESOLVE_S["stp_unblocked"] = 3600`).
+`alertrules.CLEARS[("interface_event", "stp_unblocked")] = "stp_blocking"`
+names the pairing, the same shape `("interface_event", "link_up"):
+"interface_down"` already uses — but naming the pairing is not what
+resolves the alert; that happens in `AlertEngine._drain_interface_events`,
+which reads `CLEARS`. A dedicated rule pair rather than folding into the
+existing link rules because the two say different things: a topology
+change (a redundant path taken away or handed back) versus a link
+outage, and an operator may want to route or mute one without the other.
+
+**Review fix: the drain only ever consulted `CLEARS` for `link_up`.**
+`_drain_interface_events` had `if row["kind"] == "link_up":` guarding the
+whole clear lookup, a leftover from before any other interface-event kind
+had a `CLEARS` entry to read. Adding `stp_unblocked`'s entry to the map
+did nothing on its own: unblocking never reached the lookup at all, so
+the blocking alert stayed open until an operator closed it by hand — and
+because `open_or_increment`'s dedup key still matched that still-open
+row, the *second* and every later blocking of the same port raised
+nothing, silently. The guard is now `clears_key = ("interface_event",
+row["kind"]); if clears_key in CLEARS:` — generic over whichever kind the
+map names, the same shape the device-event and wireless-event drains
+already used, so `link_up`/`interface_down` and `stp_unblocked`/
+`stp_blocking` are one code path rather than one kind hard-coded and
+every later one an opt-in somebody has to remember.
+
+**Review fix: STP transitions must never count as link flapping.**
+`recent_interface_events_for` — the flapping rule's only caller, counting
+rows in the trailing window — selected every row for the interface with
+no `kind` filter. Once `stp_blocking`/`stp_unblocked` rows landed in the
+same `interface_events` table, a redundant uplink re-converging twice
+inside the ten-minute window would have read as three-plus transitions
+and raised **Interface flapping** for a port whose link never moved.
+`NodesDatabase.FLAP_EVENT_KINDS = ("link_up", "link_down")` is now the
+query's `AND kind IN (...)` filter — the one and only place that decides
+what counts as a flap, so a future interface-event kind needs no
+flapping-side change unless it is added to this tuple on purpose.
+
+**A blocked port's link itself flapping is unaffected, but says so.**
+`_poll_interfaces`' own `link_up`/`link_down` detail-line branch now
+checks whether the port's *prior* `stp_state` (read off the same
+`interfaces` row the oper-status comparison already has open, via
+`"stp_state" in prior.keys() and prior["stp_state"] in
+NodesDatabase.STP_BLOCKED_STATES`) was blocked, and appends `" (spanning
+tree blocked)"` to the existing detail text when it was — no new rule,
+no new event kind, just naming the fact on the event that already fires,
+so a blocked port's link flap and an ordinary one's are never confused
+for the same thing by someone reading the log without the STP column
+open beside it.
+
+`tests/test_stp_alerts.py` is new: no event on a first-ever reading or an
+unchanged one, one `stp_blocking`/`stp_unblocked` event and its detail
+text on a real transition, the VLAN suffix on a blocking event that
+carries per-VLAN detail, `discarding` counting as blocked the same as
+`blocking`, the two built-in rules' `(source, source_kind, severity)`,
+and the `CLEARS` pairing. `tests/test_alert_engine.py` section C4 is the
+end-to-end check against a live `AlertEngine`, both review fixes above:
+unblocking actually resolves the open `stp_blocking` alert (not just that
+`CLEARS` names the pair), a second blocking of the same port re-alerts
+once it does — proving the dedup key is not left stuck against a row the
+first fix failed to close — and a blocking/unblocking/blocking burst
+inside the flap window raises no `interface_flapping` row.
+
 ### Per-port running config: `configrx_stanza.py` and the interface config route (`configrx_stanza.py`, `web/api.py`, `web/server.py`, `nodesdb.py`) — 5.33.0
 
 **Extraction (`configrx_stanza.interface_stanza`).** Pure text in, text or
@@ -6095,6 +6274,68 @@ one), the `fiber-sm`/`fiber-mismatch`/`blocking` CSS presence checks,
 and a check that `mapper.js` defines `fanOffsets()` and reads
 `view.linkFan`.
 
+### The media-code table replaces two hand-written mode regexes (`nodepoll.py`) — 5.38.0
+
+**Why FX fell through.** `_OPTIC_MM_TEXT` and `_OPTIC_SM_TEXT` (5.36.0)
+were each one hand-written alternation of the PMD suffixes somebody had
+thought to list — `sx|sr|sr4|csr4|esr4|lrm|srl|mm[df]?` for multimode,
+a longer equivalent for single-mode — and FX was never added to either
+one, so a 100Base-FX module matched neither the mode regexes nor, at the
+transceiver-detection level, `_TRANSCEIVER_TEXT`'s own separate
+`base-?(sx|lx|...)` alternation: it still earned the generic `SFP` badge
+(proven a transceiver by its `glc-`/`sfp-` prefix), just with no mode.
+Two more hand-maintained lists meant FX was one missing entry away from
+being wrong twice.
+
+**One table, `_MEDIA_MODE`, replaces all three alternations.** It maps
+every standard PMD suffix — `sx`, `fx`, `sr`/`sr4`/`csr4`/`esr4`, `srl`,
+`lrm`, `lx4`, `sw`, `mm`/`mmf` to `"mm"`; `lx`/`lx10`, `lh`, `fb`, `ex`,
+`zx`, `lr`/`lr4`/`lr10`, `er`/`er4`/`er4l`, `zr`/`zr4`, `lw`, `psm4`,
+`cwdm`/`cwdm4`, `dwdm`, `sm`/`smf` to `"sm"` — plus a separate `_BIDI_CODE`
+pattern (`bx\d*[ud]?`) for BiDi's own reach/direction suffix (`BX10-U`,
+`BX20-D`, `BX40`), since BiDi is always single-mode but carries a number
+and letter no fixed table entry can spell. `_media_codes(mode, bare=)`
+turns the table into a `|`-joined alternation, longest code first
+(`sorted(..., key=len, reverse=True)`) — the reason **LRM matches before
+LR** and **LX4 before LX**, so a multimode LRM/LX4 part is never read as
+the single-mode LR/LX class its prefix resembles. `_BARE_UNSAFE`
+(`sw`, `lw`, `fb`) drops those three codes from the *bare*-token form
+only — `sw` alone is at least as often "switch" as it is 10GBASE-SW, so it
+only counts wrapped in `BASE-`/part-suffix form or with a speed prefix.
+
+**`_media_pattern(mode)` builds the regex in the three shapes a module
+actually spells a code in**: a bare token (optionally speed-prefixed,
+`10gbase-sr` as well as `sr`), the `BASE-` form a description uses
+(`100Base-FX`), and the part-number suffix a model name uses
+(`GLC-FE-100FX`, `SFP-10G-SR-S`) — the `-[sx]` optional tail on the last
+form is the `-S`/`-X` reach-variant suffix some vendors append.
+`_OPTIC_MM_TEXT`/`_OPTIC_SM_TEXT` are now `_media_pattern("mm")`/`"sm"`
+plus their existing wavelength fallback (850 nm; 1270–1610 nm, widened
+from the old fixed 1310/1550 nm pair to cover CWDM/DWDM channels a
+bare-wavelength module might quote), and `_BIDI_CODE` is added to both
+the SM regex and, separately, to `_TRANSCEIVER_TEXT`'s own alternation —
+which is itself now built from `_media_codes('mm')`/`_media_codes('sm')`
+rather than its own third hand-written list, so a module that names a
+mode-specific code but no generic SFP/GBIC/XFP word is still recognised
+as a transceiver at all, not only classified once recognised. The
+decoding these feed (`_optic_mode`, `_sfp_slot_media`'s mode-by-if pass)
+is unchanged; only what the two regexes match is wider and table-driven.
+
+`tests/test_sfp_media.py` §6b adds a table of real and synthetic codes in
+all three written shapes, including `100Base-FX`/`GLC-FE-100FX`, the
+LRM-vs-LR and LX4-vs-LX longest-match cases, a BiDi part, a CWDM/DWDM
+part, the `sw`-as-abbreviation bare-token non-match beside `10GBASE-SW`
+matching, and the wavelength fallback. `demo/personas.py`'s
+`_build_cisco_access` gains a 100Base-FX cage (`GLC-FE-100FX`) on the
+demo access-switch persona so the fix is visible on the interface list
+without reading code. **Review fix:** the cage's own port also had to
+stop answering `dot3MauType` arc 30 (1000BASE-T) from the persona's
+fixed-copper range — a copper MAU arc outranks module text in
+`_sfp_slot_media`'s precedence (see the copper-medium discussion above),
+so the FX cage would have badged copper regardless of what its
+description said. It now answers arc 12 (100BASE-FX) instead, so the
+fixture actually exercises the fix it was added to demonstrate.
+
 ### Per-VLAN spanning-tree state — 5.37.0
 
 **`_cisco_vlan_stp(device, config, port_map)`** (`nodepoll.py:7621`) is
@@ -6221,6 +6462,164 @@ fragment in `mapper.js`. `tests/test_mapper_api.py` checks the map JSON's
 `a_stp_vlans`/`b_stp_vlans` keys, `None` on a manual link, and the CSV
 row's VLAN suffix.
 
+### Notes: `map_notes` (`mapperdb.py`, `web/api.py`, `mapper.js`, `app.css`) — 5.38.0
+
+**Storage and validation are the Frame idiom (5.31.0, above), copied for
+a note's own fields.** `map_notes` is its own table for the same reason
+`map_frames` is — a note's `x`/`y` is a top-left corner, not a device
+placement — with one addition a frame never needed: `node_id INTEGER`,
+`FOREIGN KEY ... REFERENCES map_nodes(id) ON DELETE SET NULL` rather than
+`CASCADE`. Removing the node a note is anchored to orphans the note back
+to free-floating, it does not take the note down with it — a comment
+about a device that got removed from the map is still worth keeping.
+`NOTE_TEXT_MAX = 500` sits beside `FRAME_LABEL_MAX`; `_validate_note_
+fields` is `_validate_frame_fields`'s shape exactly, checking `text`
+(trimmed, length-capped) in place of a frame's `label`, and reusing
+`FRAME_MIN_SIZE`/`FRAME_COLOR_MAX` unchanged for `width`/`height`/`color`
+— a note is sized and coloured exactly like a frame, it just holds a
+longer thought. `add_note`'s `node_id` is checked once, at creation
+(`SELECT id FROM map_nodes WHERE id = ? AND map_id = ?`), and never
+revisited: `update_note`'s allowed-field set
+(`text`/`x`/`y`/`width`/`height`/`color`) does not include it, so an
+anchor cannot be moved from one device to another after the fact — only
+removed and redrawn.
+
+**Routes are the three-route Frame shape**, gated `mapper` write except
+the list itself (`get_mapper_map` now also returns `notes`, read the
+same list-comprehension-over-`mapper_db.notes()` way `frames` already
+is): `POST .../maps/<id>/notes` (`x`/`y`/`width`/`height` required,
+`text`/`color`/`node_id` optional; `add_note`'s own `ValueError` on a bad
+size/colour/text/anchor surfaces unchanged as the route's 400), `PUT
+.../notes/<nid>` (`_NOTE_UPDATE_FIELDS`, any subset, empty body is a
+400), `DELETE .../notes/<nid>`. A position-only `PUT` is not audited, a
+text or colour change is (`mapper.note.update`) — the identical split
+`put_mapper_map_frame` already draws.
+
+**Rendering: a thought-bubble shape drawn above everything, not below
+like a frame.** `noteLayer` is appended last in `draw()`'s scene group
+(`gridLayer, frameLayer, linkLayer, nodeLayer, labelLayer, noteLayer`) —
+a note is commentary read *over* whatever it annotates, the opposite of a
+frame's backdrop role. Each note is one `<g class="mp-note mp-note-cN">`
+of six children in a fixed order — fill, stroke, text, two tail circles,
+resize handle — with `updateNoteElement` the one function repositioning
+all six from `liveNoteRect(note)` (the `liveFrameRect` equivalent,
+resolving an in-flight `view.noteDrag`, a pending `view.
+pendingNotePatches` entry, or the row itself), shared by the initial draw
+and every drag/resize redraw. `wrapNoteLines` greedily word-wraps the
+note's text against the bubble's own inner width (measured with the same
+`measureLabel` a link label uses), caps output to however many lines the
+bubble's inner height fits, and marks a truncated last line with a
+trailing ellipsis rather than dropping text silently — re-run on every
+resize, since how much text fits depends on the bubble's own current
+size.
+
+**The tail points at its anchor's live position, or a fixed offset with
+none.** `noteTail(note, r)` computes a unit vector from the bubble's own
+base point (its lower-left corner) toward `noteAnchorNode(note)`'s
+current `livePos()` when anchored, or a fixed down-left point when not,
+guarding the zero-length case (an anchor that lands exactly on the base
+point) with `|| 1`; two circles are placed 10px and 20px along that
+vector, shrinking, the classic thought-bubble trail. `redrawDragged` —
+already the function that repositions a dragged node and the links
+touching it — now also walks `view.notesByNode.get(id)` for each dragged
+node and calls `updateNoteElement` on any note anchored to it, so an
+anchored note's tail visibly follows the node during the drag itself, not
+only after the debounced write lands. `notesByNode` is built once per
+`rebuildLookups()` call, a `Map<map_nodes id, note[]>`, the same
+`linksByNode` shape.
+
+**Selection, keyboard reach, debounced writes and the detail pane are
+the Frame idiom too.** `selectNote`/`selectNoteInPlace` mirror
+`selectFrame`/`selectFrameInPlace` exactly (the in-place variant toggles
+`.selected` on existing DOM rather than forcing a full redraw mid-drag,
+for the same pointer-capture reason); a note's `<g>` carries `tabindex="0"`,
+`role="button"` and its own keydown handler (Enter/Space selects, Delete/
+Backspace removes, calling the same `removeNote`/`App.confirmDestructive`
+confirmation a Remove button in the pane does); a move or resize queues
+through `pendingNotePatches`/`noteWriteTimers`/`noteWriteRetryTimers` —
+a note's own set of the same debounce/retry timers a frame's `pendingFramePatches`
+uses, kept separate because each write is its own `PUT` (there is no
+batched notes route). `noteDetailHtml`/`noteSwatchesHtml` give the
+detail pane its text box and the same six-swatch picker a frame's pane
+already draws with. `contentBounds()` (Fit, and the PNG export's own
+framing) folds every note's live rect into the bounds the same way it
+already folds frames', through `liveNoteRect`; the empty-canvas gate now
+also checks `view.notes.length` and `view.noting` so a note can be drawn
+on a brand-new, devices-less map exactly as a frame can.
+
+**CSS.** `.mp-note-c0`..`-c5` set `--mp-note-color` off the same six
+`--canvas-vlan-1`..`-6` tokens `.mp-frame-c0`..`-c5` already use, so a
+note needs no palette of its own to stay correct in every theme. The
+fill (`.mp-note-fill`) is the canvas colour at 92% opacity (100% while
+selected) rather than transparent — a note is meant to sit legibly over
+whatever it annotates, unlike a frame's see-through interior — and the
+stroke, text, tail and resize-handle rules each read `--mp-note-color`
+the same way a frame's own rules read `--mp-frame-color`.
+
+`tests/test_mapper_api.py` extends for the three note routes: create
+(with and without a valid anchor), position/text/colour updates, delete,
+`node_id` rejected on update, and a bad size/colour/text-length 400.
+`tests/test_frontend_contracts.py` §88h pins the drawing/detail-pane
+function names, the fixed six-child append order, the Tab/keyboard reach,
+`wrapNoteLines`, `redrawDragged`'s `notesByNode` pass, and the shared
+`--canvas-vlan-N` swatch classes. `tests/ui/walk.mjs` adds an end-to-end
+Mapper check: draw a note, select it, edit its text, confirm the write,
+remove it and confirm the DOM element is gone.
+
+### Four smaller drawing fixes — 5.38.0
+
+**Toolbar brackets (`index.html`, `app.css`).** The Snap / Drag pans /
+FiberView `<label>`s are each now wrapped in their own `<span
+class="mp-bracket">`; `.mp-bracket` is one rule, a hairline border and
+tight padding, so each caption visually belongs to the checkbox beside it
+rather than reading as a caption for whichever checkbox happened to sit
+next in the DOM.
+
+**Wider parallel-link fan-out (`mapper.js`).** `fanOffsets()`'s own
+spacing floor moved from `Math.max(18, widest + 8)` to `Math.max(30,
+widest + 16)` — both the fixed floor and the per-link margin went up, so
+two cables between the same node pair sit further apart at a map's
+normal zoom level. Nothing about the grouping, centring or sign-flip
+logic changed, only the numbers that decide how far apart the group
+spreads.
+
+**Higher-resolution PNG export (`mapper.js`).** `exportPng`'s canvas
+scale used to be `Math.min(devicePixelRatio || 1, 2)` — the screen's own
+density, capped at 2x. It now targets 4x
+(`Math.max(dprScale, Math.min(4, guardScale))`), backed off only by a
+canvas-size guard computed from two conservative browser limits
+(`MAX_CANVAS_SIDE = 16384`, `MAX_CANVAS_AREA = 268000000`) — `guardScale`
+is the largest scale that keeps both sides under the side limit and the
+total area under the area limit, and the export takes the *smaller* of
+4x and that guard, but never drops below the old dpr-capped `dprScale`
+floor. A modest map renders at a flat 4x; a very large one degrades
+toward (never below) the resolution it rendered at before 5.38.0, rather
+than asking the browser to allocate a canvas it would simply refuse.
+
+**Bigger frame labels (`app.css`).** `.mp-frame-label`'s `font-size` moved
+from `var(--fs-2xs)` to `var(--fs-xs)`, with the label's own baseline
+(`updateFrameElement`'s `y = r.y + 17` in place of `+ 16`) nudged one
+pixel to keep the now-larger text sitting inside the frame's own top
+edge rather than the frame.
+
+`tests/test_frontend_contracts.py` §88i–88l pin all four: the bracket
+markup and its CSS rule, the new `fanOffsets` spacing constant, the 4x/
+guard-scale export logic and its two size constants, and the frame-label
+font size.
+
+### FiberView recolour: `--fiber`/`--fiber-sm` (`tokens.css`, `app.css`, `mapper.js`) — 5.38.0
+
+An operator-requested contrast change, not a mechanism change: `--fiber`
+(multimode) and `--fiber-sm` (single-mode) are redefined in all eight
+themed blocks of `tokens.css` — dark orange (`#C2560A`, lightened to
+`#E07B2A` on Contrast's dark canvas) in place of the old blue, and a
+brighter yellow (`#D4A017`, lightened to `#F2D648`) in place of the old
+dark yellow — plus the one hard-coded `app.css` comment describing the
+pulse colour and the two `drawLegend()` strings in `mapper.js` that spell
+the key out in words. Every rule that reads the two custom properties —
+the glow, the `.selected` brightness multiplier, `.fiber-mismatch`'s own
+override — is unchanged; only what the two tokens resolve to moved.
+
 ---
 
 ## Alerts
@@ -6237,14 +6636,15 @@ occurrence increments one alert instead of opening a duplicate" behavior
 lives in the database's own conflict resolution, not in application code
 that could race between a read and a write.
 
-72 built-in rules (5.10.0 adds `wireless_ap_rebooted`,
+74 built-in rules (5.10.0 adds `wireless_ap_rebooted`,
 `wireless_radio_channel_changed` and `netpath_https_down`; the middle one
-ships disabled via `_BUILTIN_DISABLED` and is the only rule of the 72 that
+ships disabled via `_BUILTIN_DISABLED` and is the only rule of the 74 that
 does — every other built-in ships enabled; 5.23.0 adds
 `priority_interface_down`, sharing `interface_down`'s `(kind,
 source_kind)` and gated by `PRIORITY_ONLY_RULES` — see Priority ports,
 under Nodes; 5.33.0 adds `fan_warning`/`fan_failed` — see Cisco fan state,
-under Nodes) and 6 built-in templates are
+under Nodes; 5.38.0 adds `stp_blocking`/`stp_unblocked` — see Spanning-tree
+blocking alerts, below) and 6 built-in templates are
 seeded via `INSERT OR IGNORE` keyed on each row's unique `key`, run on
 every open — idempotent,
 so a re-open never duplicates, and an admin's edit to a built-in rule's
@@ -10762,6 +11162,77 @@ request) `"radio:<id>:clients"` and `"radio:<id>:power"`. That shared
 shape is what lets `wireless.js` draw both charts with the exact same
 `App.drawSeriesChart`/`App.attachChartZoom` every other history chart in
 the application uses, rather than a bespoke renderer for this one pane.
+
+### AP web tunnel: `WebRelayRegistry.open_target`, `ap_id`/`subject` (`webrelay.py`, `wirelessdb.py`, `web/api.py`, `web/server.py`, `wireless.js`) — 5.38.0
+
+**The relay itself gained one new entry point, not a second relay.**
+`WebRelayRegistry.open_device_relay` (a Nodes device) resolved its
+target and then called a private `_open(...)`; `_open` is now that same
+body taking the target directly, and `open_target(target_ip, scheme,
+target_port, ..., ap_id=, subject=)` is a second, thin caller for a
+target the caller has already resolved — an access point's own address —
+so every downstream behaviour (the bind, the caps, the client-IP allow
+list, the sign-out/idle/permission watchdogs, `WebRelaySession` itself)
+is the identical code path a device tunnel already runs, not a parallel
+implementation to keep in step. `WebRelaySession` gained `ap_id: int |
+None` and `subject: str` alongside its existing `device_id`, both
+defaulted so a device-opened session is unaffected; `subject` is what
+names the relay in the audit trail and the NODES log when there is no
+device row to read a name from (`_audit`'s `f" ({self.subject})"` suffix
+on both the open and close headline), and `device_id is not None` now
+gates the call to `record_device_event` — an AP has no device event list
+of its own to raise it against, and must not raise one of Nodes' own
+module alerts just because a tunnel opened.
+
+**The route is Wireless-shaped, the permission is not.**
+`post_wireless_ap_relay(service, params, body, ap_id)` looks up the AP,
+refuses (400, operator-readable) an AP with no IP its controller has
+reported, reads `ap_web_scheme`/`ap_web_port` off
+`service.wireless_settings` (falling back to `"https"` if the stored
+scheme is not in `webrelay.WEB_SCHEMES`, and to
+`webrelay.DEFAULT_WEB_PORTS[scheme]` if no port is stored), and calls
+`open_target` with `ap_id=ap["id"]`, `subject=ap["name"] or
+ap["wtp_id"]` — nothing the caller sends can steer the target address or
+port, exactly the same "the device's own record decides, not the
+request body" rule a Nodes device relay already enforces. `web/server.py`
+routes `POST /api/wireless/aps/<id>/relay` to it gated `("web", W)`, not
+`("wireless", W)` — opening a listening port on this host is the `web`
+permission's business regardless of which module's button asked for it,
+matching `post_web_device_relay`'s own gate. The existing `GET
+/api/web/relays` and `DELETE /api/web/relays/<session_id>` routes are
+unchanged and already answer an AP-opened session: its `ap_id` rides
+alongside `device_id` (null) in the session's own `as_dict()`.
+
+**Settings: one scheme and port for the whole module, not per AP.**
+`wirelessdb.DEFAULTS` gains `ap_web_scheme` ("https") and `ap_web_port`
+(443) — FortiOS's own default management port — alongside the module's
+existing settings; unlike a Nodes device's per-device `web_scheme`/
+`web_port` override, a FortiAP has no such field of its own to read, so
+one setting covers every AP a controller reports. **Review fix:**
+`ap_web_port` was accepted with no server-side bound, matching only the
+browser's own `min="1" max="65535"` on the number input; `web/api.py`'s
+`_SCOPE_SETTINGS_RANGES["wireless"]` now carries `"ap_web_port": (1,
+65535)` alongside `history_days`/`history_sample_s`, so a settings save
+made past the browser (a direct API call, say) is clamped the same way
+every other numeric wireless setting already is.
+
+**`wireless.js` mirrors `nodes.js`'s own WEB button wiring, matched by
+`ap_id` instead of `device_id`.** `loadApWebRelays()` fetches `GET
+/api/web/relays` on selecting an AP (throttled by `apWebRelaysFor`, the
+same one-fetch-per-selection idiom `nodes.js`'s own relay load uses) and
+`drawApWebStatus()` finds this AP's own relay by `r.ap_id ===
+view.selected` to draw the "Tunnel: port … → reopen · Close" line.
+`webAp()` opens the popup window **before** the `POST` and points its
+`location` at the answer afterward — a `window.open` issued after an
+`await` no longer runs inside the click that caused it, and every
+browser's popup blocker eats it, the same ordering `nodes.js`'s device
+WEB button already uses. The WEB button itself
+(`App.el('wl-web-ap').hidden = !(ap && ap.ip && App.canWrite('web'))`) is
+gated on `web` write directly in code rather than through the
+declarative `data-requires-write` attribute most controls use, because
+`drawApActions` already owns this button's `.hidden` per selection and an
+AP with no IP has nowhere for a tunnel to reach regardless of
+permission.
 
 ---
 

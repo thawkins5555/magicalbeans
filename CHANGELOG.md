@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.38.0 — FortiAP web tunnel, spanning-tree blocking alerts, Mapper notes, and a round of SFP/fan/FiberView fixes](#5380--fortiap-web-tunnel-spanning-tree-blocking-alerts-mapper-notes-and-a-round-of-sfpfanfiberview-fixes)
 - [5.37.0 — Spanning-tree state per VLAN: blocked links on PVST switches](#5370--spanning-tree-state-per-vlan-blocked-links-on-pvst-switches)
 - [5.36.0 — Optic single/multimode per port, FiberView by mode, STP-blocked and parallel Mapper links](#5360--optic-singlemultimode-per-port-fiberview-by-mode-stp-blocked-and-parallel-mapper-links)
 - [5.35.0 — Interface stanzas by indent, default gateways from ConfigRX, a single-PSU report, sensor vanish alerts, and SFP badges restored fleet-wide](#5350--interface-stanzas-by-indent-default-gateways-from-configrx-a-single-psu-report-sensor-vanish-alerts-and-sfp-badges-restored-fleet-wide)
@@ -170,6 +171,171 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.38.0 — FortiAP web tunnel, spanning-tree blocking alerts, Mapper notes, and a round of SFP/fan/FiberView fixes
+
+Thirteen items from one operator prompt, all shipped together in this
+release; `PROMPT-LOG.md` carries the full request and the planning answers
+given for it.
+
+**A WEB button now reaches a FortiAP's own web GUI**, the same relay a
+Nodes device's WEB button already opens. Selecting an access point with a
+reported IP shows a WEB button in its detail pane; clicking it opens the
+AP's own management page in a new window through the same short-lived
+tunnel a device uses — the same client-IP allow list, sign-out and idle
+watchdogs, and the same `web` permission (not `wireless`), since opening a
+listening port on this host is that permission's business regardless of
+which module asks for it. `webrelay.WebRelayRegistry` gained `open_target`,
+a second way in for a target the caller has already resolved — an AP's own
+address — so nothing about the relay itself is FortiAP-specific. Where it
+reaches is set once per WIRELESS module, in two new settings, **Scheme**
+and **Port** (Settings → AP WEB TUNNEL), defaulting to https/443 — a
+FortiAP carries no per-device override the way a Nodes device does, so one
+scheme and port covers the whole fleet. An AP with no IP reported by its
+controller has nowhere for a tunnel to reach and the button stays hidden.
+
+**The poll pool's busy/queued status line could read more workers busy
+than the pool actually had** — "120 busy and 142 queued of 80 worker(s)"
+on a fleet whose pool had just been shrunk. `_apply_pool_size` swaps in a
+smaller pool and lets the old one drain (`shutdown(wait=False)`, which
+does not cancel work already running), so the old pool's own in-flight
+polls kept running at its old width while the line's denominator counted
+only the new, smaller pool. A draining pool's worker threads now count
+towards capacity until they actually finish, so the reported worker count
+matches what is genuinely out there polling.
+
+**A Cisco switch with three fan modules only ever listed two of them.**
+The HARDWARE SENSORS reader built each CISCO-ENVMON-MIB section (power
+supply, fan, temperature) by looping over the description column, so a
+fan tray that answered its state row but not its description row — real
+on some Cisco hardware — never made the list at all. Every section is now
+keyed on the union of whatever its columns actually answered for, so an
+unnamed tray lists by its own index, with its real status, instead of
+dropping out silently.
+
+**A 100Base-FX SFP kept the plain SFP badge instead of SFP·MM/DOM·MM.**
+The single/multimode classifier (5.36.0) matched two hand-written lists of
+media codes, and neither one named FX. It is now built from one table of
+the standard PMD media codes — the same suffix IEEE 802.3 and the SFF/MSA
+part numbers use, SX/SR/LRM/LX/ZR and the rest — matched in all three
+shapes a module actually spells them in: a bare token, the BASE- form a
+description uses (`100Base-FX`), and the part-number suffix a model name
+uses (`GLC-FE-100FX`), longest match first so LRM (multimode) is never
+mistaken for LR (single-mode) and LX4 (multimode, despite the LX) is never
+mistaken for LX. A module that names no PMD code at all still falls back
+to the 850/1310/1550 nm wavelength read exactly as before. Because the
+table is the standard's own naming rather than a list of part numbers
+anyone has happened to see, a part number nobody has listed yet still
+classifies correctly.
+
+**Some DOM SFPs weren't pulling any alert threshold at all.** A platform
+that reports an optic's whole limit band at `entSensorThresholdSeverity`
+`other(1)` — a value this app has always dropped, since it names no
+alarm/warning band by itself — ended up with no published limits
+whatsoever, so optical power alerting was silently off for that port. Two
+`other(1)` levels on the same side (both low, or both high) are now
+banded from the levels themselves: the more extreme one is the alarm, the
+other the warning — read off the numbers, never guessed. A single
+`other(1)` level with nothing to compare it against is still dropped
+rather than invent a limit. Separately, a published-threshold walk that a
+slow device cuts short now says which column came up short in the Nodes
+event log and is retried on the very next sensor pass, instead of a port
+sitting unexplained — and unretried — for up to an hour.
+
+**Spanning tree moving a port into or out of blocking now raises an
+alert.** A port's STP state changing between blocking/discarding and
+forwarding writes an interface event the moment it is polled, and two new
+built-in rules read it: **Spanning tree blocking a port** (severity 4)
+and **Spanning tree port unblocked** (severity 6), which clears the
+blocking alert the same way `link_up` already clears interface-down. A
+blocked port's link itself going up or down is unaffected — it still
+raises the existing Interface down/up rules exactly as before, with the
+alert's own detail line now naming that the port was spanning-tree
+blocked at the time, so the two kinds of event read distinctly rather
+than looking like the same thing twice. STP transitions are deliberately
+never counted towards **Interface flapping** — a redundant uplink
+re-converging is spanning tree doing its job, not a port bouncing, so
+that rule still reads only `link_up`/`link_down`.
+
+**Mapper Notes: a thought-bubble annotation, dropped anywhere on the
+canvas, free-floating or anchored to one device.** Click **Note**, then
+drag on empty canvas to draw one — the same gesture Frames already use —
+and a small speech-bubble shape appears, tail trailing off its corner.
+Selecting it offers a text box (up to 500 characters, word-wrapped to the
+bubble's own size) and the same six-colour palette a Frame or a VLAN
+strand already draws with. Selecting exactly one device before clicking
+Note anchors the bubble to it; the tail then points at that device and
+follows it wherever it is later dragged, so a note reading "core uplink —
+do not touch" stays pointed at the right box. Notes draw above everything
+else on the map, so nothing is ever hidden behind one; they're included
+in **Fit** and the PNG export, and deliberately left out of the CSV
+export, which lists links rather than drawing decoration — the same
+treatment Frames already get.
+
+**Four smaller Mapper drawing fixes.** The Snap / Drag pans / FiberView
+checkboxes each now sit inside their own hairline bracket, so a caption
+reads as belonging to the box beside it rather than to whichever box
+happened to follow it. Two parallel cables between the same pair of
+devices now space further apart at normal zoom — easier to read as two
+distinct lines rather than one slightly blurred one. **Export PNG** now
+targets four times the resolution rather than the screen's own pixel
+density (capped at 2x) — same framing and crop as before, just sharper
+when the file is zoomed into — automatically backed off on a very large
+map so the browser is never asked to rasterize a canvas it would refuse.
+And a frame's label text reads slightly larger.
+
+**FiberView's link colours changed, an operator-requested contrast
+adjustment.** A multimode fiber link now draws dark orange rather than
+blue, and a single-mode link a brighter yellow rather than dark yellow, in
+all eight colour themes; a single/multimode mismatch is still dotted red.
+
+**Demo:** the access-switch persona gains a 100Base-FX SFP (`GLC-FE-
+100FX`) and a three-tray Cisco fan fixture — two trays named, one not —
+so both fixes above are visible in the browser walk, not only in the
+code.
+
+Files: `demo/personas.py`, `netpath/alertengine.py`, `netpath/alertrules.py`,
+`netpath/alertsdb.py`, `netpath/mapperdb.py`, `netpath/nodepoll.py`,
+`netpath/nodesdb.py`, `netpath/web/api.py`, `netpath/web/server.py`,
+`netpath/web/static/app.css`, `netpath/web/static/app.js`,
+`netpath/web/static/index.html`, `netpath/web/static/mapper.js`,
+`netpath/web/static/tokens.css`, `netpath/web/static/wireless.js`,
+`netpath/webrelay.py`, `netpath/wirelessdb.py`.
+
+Verification: `tests/test_stp_alerts.py` is new — the interface events
+`update_interface_stp` records on a blocking/unblocking transition (and
+none on an unchanged or first-ever reading), the VLANs named in a
+blocking event's detail, discarding counting as blocked the same as
+blocking, and the two new built-in rules and their clear pairing.
+`tests/test_alert_engine.py` section C4 covers the engine end to end:
+unblocking actually resolves the blocking alert rather than leaving it
+for an operator to close by hand (the same dedup key would otherwise
+swallow every later blocking of that port silently), a second blocking
+of the same port re-alerts once it does, and a burst of STP transitions
+inside the flap window raises no **Interface flapping**.
+`tests/test_web_relay.py` extends for `open_target`/the AP relay route:
+answered 200 with `device_id` null and `ap_id` set, a GET through the
+tunnel read byte for byte, the NODES log and audit trail naming the AP by
+address rather than raising a device event, an AP with no IP refused 400,
+and the same permission/client-IP watchdogs a device relay already has.
+`tests/test_poll_autoscale.py` extends for `_draining`/`_pool_capacity`:
+a shrink keeps the old pool's workers counted until its threads exit, and
+`pool_state()["workers"]` never reports fewer than are truly outstanding.
+`tests/test_hardware_dom_sensors.py` extends its Cisco ENVMON fixture to
+a three-tray fan case, two described and one not, and checks all three
+list with the unnamed one's real status. `tests/test_sfp_media.py` adds a
+table of PMD media codes in all three written shapes, including
+100Base-FX/GLC-FE-100FX, LRM-vs-LR and LX4-vs-LX, and the wavelength
+fallback. `tests/test_optic_published_thresholds.py` extends for the
+`other(1)`-severity two-level banding and the single-level drop.
+`tests/test_mapper_api.py` extends for the three note routes (create,
+update, remove), validation of text length/size/colour/anchor, and that
+notes are absent from the CSV export. `tests/test_frontend_contracts.py`
+section 88 gains sub-checks 88h–88l pinning the note drawing/detail-pane
+functions, the toolbar bracket markup, the wider parallel-link spacing
+constant, the 4x PNG export scale and its canvas-size guard, and the
+larger frame-label font size. `tests/ui/walk.mjs` adds a Mapper check
+that draws a note, edits its text, and removes it.
 
 ### 5.37.0 — Spanning-tree state per VLAN: blocked links on PVST switches
 

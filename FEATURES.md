@@ -687,6 +687,18 @@ own subtabs.
   whose text names neither class keeps the plain `DOM`/`SFP` badge, same
   as before nothing is guessed. The mode survives a cut-short walk the
   same way the badge itself does.
+- **From 5.38.0, that read is built from the standard's own list of media
+  codes, not a hand-picked few — so a 100Base-FX module reads `SFP·MM`
+  instead of the plain, generic `SFP` badge it used to keep.** Every
+  standard PMD suffix (SX, SR, LRM, FX, LX, LH, EX, ZX, BX, LR, ER, ZR and
+  the rest) is matched in the three shapes a module actually spells one
+  in — a bare code, the `BASE-` form a description uses (`100Base-FX`),
+  and the part-number suffix a model name uses (`GLC-FE-100FX`) — longest
+  match first, so LRM reads multimode despite looking like LR, and LX4
+  reads multimode despite looking like LX (it runs on multimode fiber). A
+  part number nobody at this site has plugged in yet still classifies
+  correctly, because the table is the standard's naming, not a list of
+  parts somebody has seen.
 - **A device inherits its settings from a "polling profile"** (a group) —
   credentials, poll interval, timeout, retries, which of ping/SNMP are
   enabled, how many ping probes to send and how long to wait for them,
@@ -728,7 +740,12 @@ own subtabs.
   is the one case that needs a person. An upgrade takes the install's
   existing **Poll worker threads** setting as the floor, so no fleet can end up with
   fewer threads than it already had, and that setting still decides the size
-  outright for anyone who switches auto-sizing off.
+  outright for anyone who switches auto-sizing off. **From 5.38.0, the
+  Dashboard's busy/queued worker count can no longer read more workers
+  busy than the pool has** — a pool that has just been shrunk keeps its
+  old, larger pool's polls running until they finish, and those are now
+  counted towards the total the busy/queued figures are read against,
+  instead of only the new, smaller pool.
 - **A device that is down stops costing the pool so much.** A device that is
   not answering is about thirty times more expensive to poll than one that
   is — every ping timeout plus every SNMP timeout times its retries — and a
@@ -1342,6 +1359,11 @@ polled CPU/memory/temperature figures, a live whole-device
 ENTITY-SENSOR-MIB walk (every sensor the device answers, not one port's
 worth), and — on Cisco gear — CISCO-ENVMON-MIB's own power-supply, fan and
 temperature status for hardware old enough to predate ENTITY-SENSOR-MIB.
+**From 5.38.0, a fan tray (or power supply, or temperature sensor) that
+answers a state reading but no name is still listed**, by its own index
+with its real status, rather than dropping out of the section entirely —
+a three-fan Cisco chassis that names only two of its trays used to show
+only two fans in HARDWARE SENSORS.
 DOM / SFP SENSORS is the same device-wide walk's optic readings, grouped by
 port, so a transceiver problem is visible without opening every interface
 in turn; the per-interface dialog's own DOM section (below) shows the same
@@ -1349,7 +1371,15 @@ rows for one port. From 5.3.0 both carry a **Limits** column — the low
 alarm, low warning, high warning and high alarm this port's own transceiver
 publishes, with an em-dash for each band it does not — and say underneath
 when a light-level reading has no published band at all, because that is
-exactly when optical power alerting is off for that port.
+exactly when optical power alerting is off for that port. **From 5.38.0,
+a platform that publishes an optic's whole band at the generic "other"
+severity — which used to mean no band at all — has its two levels on one
+side read as alarm and warning from the levels themselves** (the more
+extreme one is the alarm), so a transceiver that names no ordinary
+alarm/warning split still gets one; a single such level alone still shows
+no band rather than guess which one it is. See *Optical power alerts come
+from the optic itself* under Alerts, below, for the alert-rule side of
+this.
 Both walk only while the dialog is open, the same as the OID browser and
 MAC table, and a device that answers nothing for a section shows that
 plainly rather than an error — pointing at the Nodes event log, which from
@@ -2362,11 +2392,12 @@ alerts and optionally emailing about them.
 
 ### Rules
 
-- **72 built-in rules ship, 71 of them enabled**: a device not responding, a
+- **74 built-in rules ship, 73 of them enabled**: a device not responding, a
   device recovering, a device rebooting, SNMP authentication failing, a
   device needing unsupported SNMPv3 privacy, a poll running longer than its
   own interval, a device whose vendor MIB is missing, an interface going
-  down/up/flapping, a **priority-flagged** interface going down (below),
+  down/up/flapping, a **priority-flagged** interface going down (below), a
+  port moving into or out of spanning-tree blocking (from 5.38.0, below),
   twenty-three CPU/memory/interface-utilization/
   error-and-discard-rate/disk/ping-latency/packet-loss/UPS/
   environmental thresholds, a critical or cold-start SNMP trap, a
@@ -2438,6 +2469,17 @@ alerts and optionally emailing about them.
   alarm, so it is not additionally suppressed by an outage the way the
   alarm half is — the same trade **Chassis temperature high** already
   makes behind **Chassis temperature critical**.
+
+  **From 5.38.0, a platform that publishes an optic's whole band at the
+  generic `other(1)` severity is no longer read as publishing nothing.**
+  That value used to mean no band was learned at all, so every one of
+  these eight rules stayed silent on a port like that. Two `other(1)`
+  levels on the same side (both low, or both high) are now read as alarm
+  and warning off the levels themselves — the more extreme figure is the
+  alarm — so a real limit the transceiver published is no longer thrown
+  away for not naming its own severity in the usual words. A lone
+  `other(1)` level with nothing to compare it against still publishes no
+  band, rather than guess which one it is.
 - **Priority interface down, from 5.23.0.** A second, dedicated rule on
   the same link-down event the existing **Interface down** rule already
   watches, gated to only the ports an operator has ticked **Priority
@@ -2451,6 +2493,19 @@ alerts and optionally emailing about them.
   it. A port coming back up (**link_up**) clears both the plain and the
   priority alert for it at once — an operator never has to close two
   alerts for the same one event.
+- **Spanning tree blocking a port, from 5.38.0.** Two rules read a port's
+  STP state moving between blocking/discarding and forwarding: **Spanning
+  tree blocking a port** (severity 4) the moment a port is newly blocked,
+  and **Spanning tree port unblocked** (severity 6) when it forwards
+  again — which clears the blocking alert the same way **link_up**
+  already clears **Interface down**. This is a topology change, not a
+  link outage, so it is deliberately its own pair of rules rather than
+  reusing Interface down/up: a redundant path being taken away or handed
+  back is worth knowing about even on a port whose link itself never
+  drops. A blocked port's link still going down or up keeps the ordinary
+  **Interface down**/**Interface up** rules exactly as before, and that
+  alert's own detail line now says the port was spanning-tree blocked at
+  the time, so the two kinds of event read distinctly.
 - **An interface threshold names the port, from 5.1.0.** The six
   interface rules (inbound/outbound utilization, error rate, discard
   rate) used to read the device-level *busiest port* value, so the alert
@@ -3970,6 +4025,18 @@ reports on all of them in one SNMP walk.
   bounded so a controller carrying a rack of APs cannot stretch a cycle.
   An AP that does not answer ICMP shows blank rather than 0 ms, and an
   offline AP is not probed at all. **IP** is available as a column too.
+- **From 5.38.0, a WEB button opens an AP's own management page**, the
+  same short-lived tunnel Nodes' own WEB button already opens to a
+  device — this server binds a listening port that talks to the AP's
+  address, and only your own browser can reach it. It shows only for an
+  AP with a reported IP and only to an account holding the **web**
+  permission (not **wireless** — opening a port on this host is that
+  permission's business no matter which module asks), and it carries the
+  same client-IP allow list, sign-out and idle-timeout watchdogs a
+  device's own WEB tunnel does. Where it reaches is one scheme and port
+  for the whole fleet, set in Settings → **AP WEB TUNNEL** (defaulting to
+  https/443) — a FortiAP has no per-device override the way a Nodes
+  device does.
 - **Sort by any column** — click its heading, the same way every other
   table in the app sorts.
 - **Settings → Radio tx power** forces dBm or the percentage reading where
@@ -4441,7 +4508,12 @@ like any other module.
   directly rather than left to a stylesheet that never travels with it.
   The PNG is also rendered at the screen's own pixel density (capped at
   2x) instead of a flat one-pixel-per-point image, so it reads sharp on
-  a HiDPI display instead of soft.
+  a HiDPI display instead of soft. **From 5.38.0, that target is four
+  times the resolution rather than the screen's own density** — the same
+  framing and crop as before, just sharper once the file is zoomed into
+  for a ticket or a print — automatically backed off toward the old,
+  lower target on a very large map, so a big site's map is never handed
+  to the browser as a canvas it would refuse to draw.
 - **Connect** draws a line between two devices by hand. Select exactly
   two nodes on the map and **Connect** enables in the toolbar — an
   optional label, up to 60 characters — for the cases discovery finds
@@ -4486,7 +4558,10 @@ like any other module.
   — for an operator who spends more time moving around a big map than
   selecting things on it. It is a view preference remembered per browser,
   not written to the map itself, and Space+drag and the middle button
-  still pan regardless of how it's set.
+  still pan regardless of how it's set. **From 5.38.0, Snap, Drag pans and
+  FiberView each sit inside their own hairline bracket**, so each caption
+  reads as belonging to the checkbox beside it rather than to whichever
+  one happened to follow it in the toolbar.
 - **From 5.18.0, port and VLAN labels draw above node boxes and links,
   not underneath them.** Labels were still drawn into a layer beneath the
   boxes and links themselves, so a node or a later-drawn strand kept
@@ -4550,7 +4625,27 @@ like any other module.
   disabled Mapper control. A position edit (a drag or a resize) saves
   debounced, the same way a node move already does; renaming or
   recolouring a frame is audited, moving one is not, the same split
-  already drawn between a node's position and its name.
+  already drawn between a node's position and its name. **From 5.38.0, a
+  frame's label text reads slightly larger.**
+- **From 5.38.0, Notes: a thought-bubble annotation, free-floating or
+  anchored to one device.** Click **Note**, then drag on empty canvas the
+  same way you draw a Frame; a small speech-bubble shape appears, its tail
+  trailing off one corner. Select it to open a text box — up to 500
+  characters, wrapped to however much the bubble's own size fits — and
+  the same six-colour palette a Frame or a VLAN strand already draws
+  with. Selecting exactly one device before clicking Note anchors the
+  bubble to it: the tail then points at that device and follows it
+  wherever it is later dragged, so a note reading "core uplink — do not
+  touch" stays pointed at the right box; a note drawn with nothing
+  selected stays free-floating, its tail pointing a fixed distance off
+  its own corner. The anchor is set once, at creation, and cannot be
+  changed afterward — remove the note and draw a new one to re-anchor it.
+  Notes draw above every other layer on the map, so nothing is ever
+  hidden behind one, and they're reachable, selectable and removable by
+  keyboard the same way a Frame is (Tab, Enter/Space, Delete/Backspace).
+  They're included in **Fit** and the PNG export, and deliberately left
+  out of the CSV export, which lists links rather than drawing
+  decoration — the same treatment Frames get.
 - **From 5.33.0, double-clicking a device box opens that device's own
   Device Details dialog without leaving Mapper.** It is the exact same
   dialog a double-click on a Nodes row already opens — its identity,
@@ -4601,7 +4696,11 @@ like any other module.
   the SFP inventory report's Medium column (see Nodes, above). A link
   is coloured by whichever end's mode is actually known; it only reads
   as a mismatch when both ends are known and disagree, and stays plain
-  blue when neither end's mode is known.
+  blue when neither end's mode is known. **From 5.38.0, the two colours
+  themselves changed**: multimode now draws dark orange in place of blue,
+  and single-mode a brighter yellow in place of dark yellow, in all eight
+  colour themes — a contrast adjustment the operator asked for; a
+  mismatch is still dotted red.
 - **From 5.36.0, a spanning-tree-blocked link draws dotted, in normal
   view and FiberView alike**, read off the same BRIDGE-MIB port-state
   table the poller already polls — nothing new is polled for it. A link
@@ -4623,7 +4722,9 @@ like any other module.
   identical coordinates. Each line in the fan keeps its own strands,
   colour, dash pattern and labels, close enough together to read as one
   bundle but far enough apart that clicking, hovering or tabbing to one
-  reliably lands on that line and not its neighbour.
+  reliably lands on that line and not its neighbour. **From 5.38.0, that
+  fan spaces further apart at normal zoom**, easier to read as two
+  distinct lines rather than one that reads faintly blurred.
 
 ---
 
