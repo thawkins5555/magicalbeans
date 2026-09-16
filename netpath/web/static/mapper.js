@@ -1071,12 +1071,6 @@
       if (extraClass) path.classList.add(extraClass);
       if (selected) path.classList.add('selected');
       if (dimmed) path.classList.add('dimmed');
-      if (link.fiber === true) {
-        path.classList.add('fiber');
-        // So the glow's own stroke-width (app.css) can never draw a
-        // VLAN-heavy trunk thinner than its normal plan.width.
-        path.style.setProperty('--mp-link-w', String(plan.width));
-      }
       path.dataset.linkId = link.id;
       // A non-focusable strand still gets role="img" + aria-label, not no
       // role at all — a screen reader's browse/scan cursor (unlike Tab) can
@@ -1123,6 +1117,20 @@
       // discoverable by a screen reader's browse cursor even off the Tab
       // order) and its own mouse tooltip, so hovering a specific coloured
       // line — not just Tabbing to the link — names that one VLAN.
+      if (link.fiber === true) {
+        // Underneath every strand, not one of them: the strands keep their
+        // own VLAN colours, and this lone unfocusable path (no wireOne — no
+        // tooltip/dataset of its own) just glows behind the whole ribbon.
+        const offsets = plan.strands.map((strand) => strand.offset);
+        const span = (Math.max(...offsets) - Math.min(...offsets)) + plan.width;
+        const underlay = App.svgNode('path', {
+          d: `M ${from.x} ${from.y} L ${to.x} ${to.y}`,
+          class: 'mp-link fiber', 'pointer-events': 'none',
+        });
+        underlay.style.setProperty('--mp-fiber-w', `${span + 4}px`);
+        if (dimmed) underlay.classList.add('dimmed');
+        layer.appendChild(underlay);
+      }
       plan.strands.forEach((strand, i) => {
         const ox = nx * strand.offset, oy = ny * strand.offset;
         const path = App.svgNode('path', {
@@ -1165,6 +1173,10 @@
       d: `M ${from.x} ${from.y} L ${to.x} ${to.y}`, stroke: neutral, 'stroke-width': plan.width,
     });
     wireOne(path, link.manual ? 'manual' : (plan.known === false ? 'unknown' : null));
+    if (link.fiber === true) {
+      path.classList.add('fiber');
+      path.style.setProperty('--mp-fiber-w', `${Math.max(5, plan.width * 1.6)}px`);
+    }
     if (plan.mode === 'collapsed' && view.settings.show_vlan_labels) {
       const mx = (from.x + to.x) / 2, my = (from.y + to.y) / 2;
       labelLayer.appendChild(App.svgNode('text', {
@@ -2877,6 +2889,10 @@
         if (!value || value.startsWith('url(')) continue;
         cloneEls[i].style.setProperty(prop, value);
       }
+      // A fiber link mid-pulse could be caught at its dim end; the export
+      // always wants it at full glow, not whatever opacity happened to be
+      // on screen the instant Export PNG was clicked.
+      if (liveEls[i].classList.contains('fiber')) cloneEls[i].style.setProperty('stroke-opacity', '1');
     }
   }
 

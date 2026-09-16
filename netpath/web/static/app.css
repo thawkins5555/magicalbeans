@@ -1883,8 +1883,13 @@ body.kiosk .card.strip > .hint { overflow: visible; white-space: normal; }
    the two rules fighting over the same property. */
 #mp-canvas[data-fiberview="1"] .mp-link.fiber {
   stroke: var(--fiber);
-  stroke-width: max(5px, calc(var(--mp-link-w, 1.5) * 1.6px));
+  stroke-width: var(--mp-fiber-w, 5px);
   filter: drop-shadow(0 0 3px var(--fiber)) drop-shadow(0 0 8px var(--fiber));
+}
+/* .mp-link.selected's own brightness() (above) would otherwise be the last
+   rule and win over the fiber glow — this pairs both filters instead. */
+#mp-canvas[data-fiberview="1"] .mp-link.fiber.selected {
+  filter: brightness(1.35) drop-shadow(0 0 3px var(--fiber)) drop-shadow(0 0 8px var(--fiber));
 }
 @keyframes mp-fiber-pulse {
   from { stroke-opacity: 0.45; }

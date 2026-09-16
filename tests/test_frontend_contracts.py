@@ -807,10 +807,12 @@ check('id="mp-fiberview"' in INDEX_HTML and 'data-requires-write' not in
 check("localStorage.getItem('mapper.fiberView')" in MAPPER and "dataset.fiberview" in MAPPER,
       "FiberView is remembered per browser and toggles #mp-canvas's data attribute")
 check("classList.add('fiber')" in MAPPER,
-      "drawLink/wireOne tags a link.fiber link with the .fiber class")
-check("--mp-link-w" in MAPPER,
-      "wireOne carries plan.width onto the fiber link's --mp-link-w custom property")
-check("'filter'" in MAPPER,
+      "drawLink tags a link.fiber link (plain/collapsed path, strands underlay) with the .fiber class")
+check("--mp-fiber-w" in MAPPER,
+      "drawLink sets the fiber glow's bold width, in px, as --mp-fiber-w")
+check("'mp-link fiber'" in MAPPER,
+      "the strands-mode fiber underlay is one lone path (no wireOne) beneath the VLAN-coloured strands")
+check("'dominant-baseline', 'filter']" in MAPPER,
       "the PNG export inlines the fiber glow's filter property")
 check("NAME_SOURCES" in MAPPER and "node.name_source" in MAPPER,
       "the node tooltip names the source of the displayed name")
@@ -4247,8 +4249,10 @@ check(".mp-link.fiber" in APP_CSS92 and "@keyframes mp-fiber-pulse" in APP_CSS92
       and "prefers-reduced-motion" in APP_CSS92,
       "app.css glows/pulses a fiber link, opt-in on no-preference like the "
       "other MAPPER/alert-row animations")
-check("stroke-width: max(5px, calc(var(--mp-link-w, 1.5) * 1.6px));" in APP_CSS92,
-      "a fiber link's bold stroke never draws thinner than its own plan.width")
+check("stroke-width: var(--mp-fiber-w, 5px);" in APP_CSS92,
+      "a fiber link's bold stroke width comes from JS's own --mp-fiber-w, not a CSS calc()")
+check(".mp-link.fiber.selected" in APP_CSS92,
+      "a selected fiber link keeps brightness(1.35) alongside its glow")
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))
