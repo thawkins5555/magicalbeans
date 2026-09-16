@@ -1180,7 +1180,9 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
         const cell = await page.evaluate(() => {
           const cells = [...document.querySelectorAll('#nd-if-table td')];
           const match = cells.find((c) => c.textContent.includes('blocking · '));
-          return match ? { text: match.textContent, title: match.title } : null;
+          // The title sits on the coloured <span> stpStateText renders, not the <td>.
+          const titled = match && (match.querySelector('[title]') || match);
+          return match ? { text: match.textContent, title: titled.title } : null;
         });
         assert(cell, 'expected a "blocking · " cell in #nd-if-table for acc-sw-005');
         assert(cell.title.startsWith('Blocking in VLANs'),
