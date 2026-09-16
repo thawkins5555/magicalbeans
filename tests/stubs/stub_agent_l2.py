@@ -122,7 +122,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
 from netpath.snmppoll import decode_response
 from netpath.trapdecode import (
     PDU_GET, PDU_GETBULK, PDU_GETNEXT, PDU_RESPONSE, T_END_OF_MIB_VIEW,
-    T_NO_SUCH_OBJECT, T_SEQUENCE, V2C, _tlv, enc_int, enc_octets, enc_varbind,
+    T_NO_SUCH_OBJECT, T_NULL, T_SEQUENCE, V1, V2C, _tlv, enc_int, enc_octets,
+    enc_varbind,
 )
 
 GENERIC_SCALARS = {
@@ -477,11 +478,17 @@ def table_for(community="public"):
     if MODE == "no_stp":
         return {**GENERIC_SCALARS, **BRIDGE_PORTS}
     if MODE in ("pvst", "pvst-slow"):
-        table = {**GENERIC_SCALARS, **BRIDGE_PORTS, **STP_SCALARS, **PVST_PORT_STATE,
-                 **PVST_VTP}
+        # vtpVlanState is never walked in a per-VLAN context by real
+        # nodepoll code (_cisco_vlan_stp only scopes dot1dStpPortState
+        # there), and a real per-VLAN context doesn't answer it either --
+        # so dot1dStpPortState IS the last object of THAT context's view,
+        # same as the real device this stub models.
+        table = {**GENERIC_SCALARS, **BRIDGE_PORTS, **STP_SCALARS, **PVST_PORT_STATE}
         if "@" in community:
             vlan = community.split("@", 1)[1]
             table.update(PVST_PER_VLAN.get(vlan, {}))
+        else:
+            table.update(PVST_VTP)
         return table
     if MODE == "pvst_no_vtp":
         return {**GENERIC_SCALARS, **BRIDGE_PORTS, **STP_SCALARS, **PVST_PORT_STATE}
@@ -541,10 +548,11 @@ def encode_value(kind, value):
     return enc_int(value)
 
 
-def reply(request_id, body, community="public"):
-    pdu = _tlv(PDU_RESPONSE, enc_int(request_id) + enc_int(0) + enc_int(0) +
-              _tlv(T_SEQUENCE, body))
-    return _tlv(T_SEQUENCE, enc_int(V2C) + enc_octets(community) + pdu)
+def reply(request_id, body, community="public", *, version=V2C,
+         error_status=0, error_index=0):
+    pdu = _tlv(PDU_RESPONSE, enc_int(request_id) + enc_int(error_status) +
+              enc_int(error_index) + _tlv(T_SEQUENCE, body))
+    return _tlv(T_SEQUENCE, enc_int(version) + enc_octets(community) + pdu)
 
 
 def main():
@@ -604,6 +612,14 @@ def main():
         elif request.pdu_tag == PDU_GETNEXT:
             rk = oid_key(oids[0])
             nxt = next((k for k in keys if oid_key(k) > rk), None)
+            if nxt is None and MODE == "pvst" and request.version == V1:
+                # v1 has no endOfMibView; a real v1 agent answers a GETNEXT
+                # past its last object with noSuchName(2) (RFC 1157).
+                sock.sendto(reply(request.request_id,
+                                  enc_varbind(oids[0], _tlv(T_NULL, b"")),
+                                  community, version=V1, error_status=2,
+                                  error_index=1), addr)
+                continue
             body = (enc_varbind(oids[0], _tlv(T_END_OF_MIB_VIEW, b""))
                     if nxt is None else enc_varbind(nxt, encode_value(*table[nxt])))
         elif request.pdu_tag == PDU_GETBULK:

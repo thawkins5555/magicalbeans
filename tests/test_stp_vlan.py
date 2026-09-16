@@ -10,6 +10,7 @@ from _paths import spawn_stub, tmpdir
 TMP = tmpdir("stp_vlan_")
 
 import netpath.nodepoll as nodepoll_mod
+from netpath import nodeoids
 from netpath.nodesdb import NodesDatabase
 from netpath.nodepoll import NodePoller
 
@@ -397,6 +398,46 @@ try:
           ifaces[2]["stp_state"] is not None, ifaces[2])
     check("...and blocks nowhere",
           ifaces[2]["stp_blocking_vlans"] == "", ifaces[2])
+    db.close()
+finally:
+    stub.kill()
+
+# --------------------------- v1: noSuchName at the column's last row
+
+stub, port = spawn_stub("stub_agent_l2.py", "pvst")
+nodepoll_mod.DEFAULT_SNMP_PORT = port
+try:
+    db = new_db("pvst_v1")
+    did = device_against(db, port, "v1-sw")
+    two_ports(db, did)
+    mark_cisco(db, did)
+    poller = NodePoller(db)
+    device = db.device(did)
+    config = {**db.effective_config(device), "snmp_version": 0}
+
+    poller._poll_stp(did, device, config)
+
+    ifaces = {i["if_index"]: dict(i) for i in db.interfaces(did)}
+    check("a v1 device's noSuchName at dot1dStpPortState's last row still "
+          "lands the per-VLAN detail (RFC 1157, not a PAN-OS-style refusal)",
+          ifaces[2]["stp_blocking_vlans"] == "20", ifaces[2])
+    check("...and the VLAN count",
+          ifaces[2]["stp_vlan_count"] == 2, ifaces[2])
+
+    # Direct check of _walk_column_status itself, against the "@20" context
+    # where dot1dStpPortState really is the view's last object: v1 rows
+    # already accepted before noSuchName is the table end; none accepted
+    # is still a real error (the PAN-OS case _error_status_reason covers).
+    scoped = {**config, "community": f"{config['community']}@20"}
+    values, complete = poller._walk_column_status(
+        device, scoped, nodeoids.DOT1D_STP_PORT_STATE)
+    check("v1, rows accepted before noSuchName: complete=True",
+          complete is True and values, (complete, values))
+
+    _, complete_empty = poller._walk_column_status(
+        device, scoped, nodeoids.DOT1D_STP_PORT_STATE + ".7")
+    check("v1, noSuchName with zero rows accepted: complete=False",
+          complete_empty is False, complete_empty)
     db.close()
 finally:
     stub.kill()

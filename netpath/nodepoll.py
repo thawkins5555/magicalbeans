@@ -5370,6 +5370,12 @@ class NodePoller(Worker):
                         self._remember_repetitions(device, max_repetitions)
                     continue
                 if response.error_status:
+                    if (snmp_version_of(config) == 0 and response.error_status == 2
+                            and values):
+                        # v1 GETNEXT past a MIB's last object answers
+                        # noSuchName(2) (RFC 1157) — with rows already
+                        # accepted, that IS the table end, not a refusal.
+                        break
                     complete = False
                     reason = _error_status_reason(response, base_oid)
                     break
