@@ -2218,6 +2218,41 @@ const App = (() => {
     return Boolean(wrap) && !wrap.hidden;
   }
 
+  // wireless.js has no help topics of its own yet, so this one — the
+  // WIRELESS module's own WEB button — is registered here rather than
+  // opening a new registerHelp call there for a single entry.
+  registerHelp({
+    'wireless.ap.web': {
+      title: 'WEB',
+      html: `
+        <p><b>WEB</b> opens the selected access point's own web interface,
+        the same short-lived <b>tunnel</b> Nodes' own WEB button opens for a
+        device: your browser talks to this machine, and this machine talks
+        to the AP.</p>
+        <p><b>Where it goes.</b> The address is the AP's own IP, exactly as
+        its controller reports it — nothing a browser sends can change it.
+        The scheme and port come from the WIRELESS module's own Settings,
+        one pair for the whole fleet rather than a per-device field, and
+        ship as <code>https</code> on 443, which FortiAPs are managed on by
+        default.</p>
+        <p><b>How long it lasts.</b> The same rules as Nodes': admits only
+        the address you are browsing from, closes after 15 minutes with no
+        traffic (or sooner, if your sign-in's idle timeout is shorter),
+        after a minute if nothing ever connects, when you sign out, and the
+        moment your <b>web</b> permission is taken away. <b>Close</b> beside
+        the button ends it at once.</p>
+        <p><b>What is recorded.</b> An access point has no event list of its
+        own the way a Nodes device does, so the open and the close each get
+        one line in the NODES log instead, naming the AP, with how many
+        bytes crossed in each direction — never what they were.</p>
+        <p><b>Needs the <code>web</code> permission</b> — opening a
+        listening port on this host is that module's business, not
+        WIRELESS's. On its default <code>https</code>, the tunnel carries
+        the AP's traffic unread, byte for byte, the same as any
+        <code>https</code> device's own tunnel does.</p>`,
+    },
+  });
+
   /* --------------------------------------------------------------- search
 
      "/" opens one search across devices, MACs/interfaces, alerts, NetPath

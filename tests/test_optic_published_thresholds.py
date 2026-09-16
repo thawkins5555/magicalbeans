@@ -248,6 +248,19 @@ try:
           "the supply-voltage sensor publishes only those two, so it gets "
           "no row",
           (1, "sfp_volt") not in limits, sorted(limits))
+    # 5.38.0: a sensor whose WHOLE band is severity other(1) used to end up
+    # with no limits at all, while the sensor beside it on the same switch
+    # had four. Two levels on one side say which is which without the
+    # severity column: the outer one is the alarm, the inner the warning.
+    outlet = limits[(2001, "temp_sensor_c")]
+    check("a sensor publishing a PAIR of levels on one side, every one of "
+          "them severity other(1), is banded from the levels themselves",
+          (outlet["high_alarm"], outlet["high_warn"]) == (70.0, 60.0),
+          dict(outlet))
+    check("...and that sensor's other side stays NULL -- nothing was "
+          "published there to derive from",
+          (outlet["low_alarm"], outlet["low_warn"]) == (None, None),
+          dict(outlet))
     bias = limits[(1, "sfp_bias_ma")]
     check("the same band quoted twice keeps the level that alerts EARLIER: "
           "0.002 A and 0.003 A both low_warn, the higher one wins",

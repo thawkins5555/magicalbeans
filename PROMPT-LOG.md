@@ -5,6 +5,46 @@ grouped by the version that carries it. This is a working record for the
 operator — the full story of each change is in `CHANGELOG.md`, and this file
 does not replace it.
 
+## 5.38.0 — FortiAP web tunnel, spanning-tree blocking alerts, Mapper notes, and a round of SFP/fan/FiberView fixes
+
+**Operator prompt, thirteen items:**
+- Add a web tunnel on the FortiAP module so an AP's own web GUI can be
+  reached from inside the app.
+- Bracket the Mapper Snap / Drag pans / FiberView checkboxes so it's
+  clear which checkbox belongs to which setting.
+- The poll-pool status line can show more workers "busy" than the pool
+  actually has (e.g. 120 busy out of 80 workers).
+- Cisco devices with three known fan modules only list T1 and T2 in
+  their hardware list; T3 is missing.
+- Not all SFPs are labelled correctly — 100Base-FX shows as plain "SFP"
+  instead of "SFP-MM"/"DOM-MM" (FX is multimode; LX and BX are
+  single-mode). The fix should read the SFP type itself rather than
+  match a list of spelled-out part numbers.
+- Alert when a spanning-tree-blocked link comes up, goes down, unblocks,
+  or when a link newly goes into blocking.
+- More separation between the two lines Mapper draws for a dual link
+  between two devices.
+- Mapper's PNG export is low quality — it pixelates when zoomed in.
+- Some DOM SFPs aren't pulling their alert thresholds.
+- Let notes be added to the Mapper canvas as a graphical thought bubble.
+- Make Mapper's frame label text slightly bigger.
+- Multimode FiberView colour: blue to dark orange.
+- Single-mode FiberView colour: dark yellow to a slightly brighter
+  yellow.
+
+**Planning answers.** Mapper notes are free-floating on the canvas with
+an optional link to one specific device, not pinned to a fixed spot on
+the map; they're a map-only feature and are left out of the CSV export.
+The FortiAP web tunnel defaults to HTTPS on port 443, set once per
+FortiAP module rather than per AP. The PNG export fix is resolution
+only — it keeps today's framing and crop and just renders sharper.
+Spanning-tree alerting covers both entering and leaving blocking; rather
+than add a new alert rule, the STP state is named in the detail text of
+the existing interface up/down alerts. Demo fixtures are being added so
+the fan (T3) and SFP-labelling fixes actually show up in the browser
+walk, not just in the code. All thirteen items ship together as one
+release: 5.38.0.
+
 ## 5.37.0 — Spanning-tree state per VLAN: blocked links on PVST switches
 
 **Operator prompt, verbatim:**

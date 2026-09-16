@@ -589,6 +589,33 @@ for text, expected in OPTIC_MODE_TABLE:
     check(f"_optic_mode({text!r}) is {expected!r}",
           _optic_mode(text) == expected, _optic_mode(text))
 
+# ------------------------- § 6b the media code itself, not the part number
+# 5.38.0: the classifier reads the IEEE/MSA PMD suffix out of whatever text
+# a device offers, so a module whose part number nobody has listed is still
+# classified. FX was the gap that prompted this -- a 100Base-FX module read
+# as a bare 'SFP' badge because no pattern named FX.
+MEDIA_CODE_TABLE = [
+    ("100BaseFX SFP", "mm"), ("100Base-FX", "mm"), ("GLC-FE-100FX", "mm"),
+    ("1000Base-SX SFP", "mm"), ("1000Base-LX SFP", "sm"),
+    ("100Base-BX10-U", "sm"), ("1000Base-BX-D", "sm"),
+    # LRM reads like LR and is multimode; LX4 reads like LX and runs on MMF.
+    ("10GBASE-LRM", "mm"), ("10GBASE-LX4", "mm"),
+    ("QSFP-40G-CSR4", "mm"), ("QSFP-100G-PSM4", "sm"),
+    ("CWDM SFP 1530", "sm"), ("DWDM-SFP10G-C", "sm"),
+    # Wavelength is the fallback for a module that quotes its optics and
+    # not its PMD at all.
+    ("SFP module, 850nm", "mm"), ("SFP module, 1310nm", "sm"),
+    ("SFP module, 1550 nm", "sm"),
+    # A code too short to trust bare: "sw" names 10GBASE-SW, and also every
+    # switch an operator ever abbreviated.
+    ("sw-core-01 uplink", None), ("10GBASE-SW", "mm"),
+]
+for text, expected in MEDIA_CODE_TABLE:
+    check(f"_optic_mode({text!r}) is {expected!r}",
+          _optic_mode(text) == expected, _optic_mode(text))
+check("a 100Base-FX cage counts as a transceiver on its text alone",
+      bool(nodepoll_mod._TRANSCEIVER_TEXT.search("100Base-FX")))
+
 print()
 print("FAILURES:", FAILS if FAILS else "none")
 raise SystemExit(1 if FAILS else 0)

@@ -1742,6 +1742,33 @@ def post_web_device_relay(service, params, body, device_id) -> dict:
     return relay
 
 
+def post_wireless_ap_relay(service, params, body, ap_id) -> dict:
+    """Open a relay to one FortiAP's own web interface — the WIRELESS
+    module's WEB button, gated on `web` rather than `wireless` for the
+    same reason post_web_device_relay is: opening a listening port on this
+    host is that module's business. The target is the AP's own IP, as its
+    controller reports it, and the scheme/port from the wireless module's
+    settings; nothing a caller sends can name a different address."""
+    ap = _require(service.wireless_db.access_point(int(ap_id)), "access point")
+    if not ap["ip"]:
+        raise ValueError(
+            "This access point has no IP address reported by its "
+            "controller, so there is nowhere for a web tunnel to reach.")
+    scheme = service.wireless_settings.get("ap_web_scheme", "https")
+    if scheme not in webrelay.WEB_SCHEMES:
+        scheme = "https"
+    port = int(service.wireless_settings.get("ap_web_port")
+              or webrelay.DEFAULT_WEB_PORTS[scheme])
+    relay = service.web_relays.open_target(
+        ap["ip"], scheme, port, params.get("_username", ""),
+        params.get("_client", ""), params.get("_token", ""),
+        params.get("_host", ""), ap_id=ap["id"], subject=ap["name"] or ap["wtp_id"])
+    _audit(service, params, "web.relay.open", target=f"ap:{ap['ip']}",
+          detail=f"port {relay['port']} -> {ap['ip']}:{port} ({scheme}), "
+                 f"admitting {relay['client_ip']} only")
+    return relay
+
+
 def get_web_relays(service, params, body) -> dict:
     """Every relay this account has open. An administrator sees all of
     them, since they answer for a port being open on this host; everyone
@@ -10427,6 +10454,13 @@ def get_mapper_map(service, params, body, map_id) -> dict:
          "added_ts": row["added_ts"]}
         for row in service.mapper_db.frames(map_id)]
 
+    # Canvas-only, like frames: never fed to mapper.link_csv_rows/the CSV export.
+    notes = [
+        {"id": row["id"], "node_id": row["node_id"], "text": row["text"],
+         "x": row["x"], "y": row["y"], "width": row["width"], "height": row["height"],
+         "color": row["color"], "added_ts": row["added_ts"]}
+        for row in service.mapper_db.notes(map_id)]
+
     return {
         "map": _mapper_map_json(map_row),
         "nodes": nodes,
@@ -10434,6 +10468,7 @@ def get_mapper_map(service, params, body, map_id) -> dict:
         "peers": peers,
         "vlans": _mapper_vlans_json(service, links, device_ids, color_overrides),
         "frames": frames,
+        "notes": notes,
         "settings": settings,
     }
 
@@ -10584,6 +10619,69 @@ def delete_mapper_map_frame(service, params, body, map_id, frame_id) -> dict:
     if ok:
         _audit(service, params, "mapper.frame.remove", target=str(map_id),
               detail=f"frame_id={frame_id}")
+    return {"ok": ok}
+
+
+_NOTE_UPDATE_FIELDS = ("text", "x", "y", "width", "height", "color")
+
+
+def post_mapper_map_notes(service, params, body, map_id) -> dict:
+    """A thought-bubble annotation dropped on the map for operator commentary
+    only -- decoration, never a device placement, same as a frame -- with an
+    optional node_id anchor: the operator's own choice at creation (exactly
+    one node selected), never re-derived here. add_note itself raises
+    ValueError, with an operator-readable message, for a bad size/color/
+    text/anchor; left to surface unchanged."""
+    _require(service.mapper_db.map_row(map_id), "map")
+    text = body.get("text", "")
+    if text is not None and not isinstance(text, str):
+        raise ValueError("Note text must be text.")
+    node_id = body.get("node_id")
+    if node_id is not None:
+        try:
+            node_id = int(node_id)
+        except (TypeError, ValueError):
+            raise ValueError("node_id must be an integer.")
+    try:
+        x, y = float(body.get("x")), float(body.get("y"))
+        width, height = float(body.get("width")), float(body.get("height"))
+        color = body.get("color", 0) or 0
+        if isinstance(color, bool) or not isinstance(color, (int, float)):
+            raise ValueError  # not a number at all
+        if isinstance(color, float):
+            if not math.isfinite(color) or not color.is_integer():
+                raise ValueError  # e.g. 2.9, nan, inf
+            color = int(color)
+    except (TypeError, ValueError):
+        raise ValueError("x, y, width, height and color must be numbers.")
+    note_id = service.mapper_db.add_note(
+        map_id, x=x, y=y, width=width, height=height,
+        text=(text or ""), color=color, node_id=node_id)
+    _audit(service, params, "mapper.note", target=str(map_id),
+          detail=f"note_id={note_id}")
+    return {"id": note_id}
+
+
+def put_mapper_map_note(service, params, body, map_id, note_id) -> dict:
+    """Position/size writes happen on every drag and are not audited, same
+    as put_mapper_map_frame; a text or color change is audited. The anchor
+    itself is never accepted here -- see post_mapper_map_notes' docstring."""
+    _require(service.mapper_db.map_row(map_id), "map")
+    fields = _pick(body, _NOTE_UPDATE_FIELDS)
+    if not fields:
+        raise ValueError("No note fields to update.")
+    ok = service.mapper_db.update_note(map_id, note_id, **fields)
+    if ok and ("text" in fields or "color" in fields):
+        _audit(service, params, "mapper.note.update", target=str(map_id),
+              detail=f"note_id={note_id}")
+    return {"ok": ok}
+
+
+def delete_mapper_map_note(service, params, body, map_id, note_id) -> dict:
+    ok = service.mapper_db.delete_note(map_id, note_id)
+    if ok:
+        _audit(service, params, "mapper.note.remove", target=str(map_id),
+              detail=f"note_id={note_id}")
     return {"ok": ok}
 
 

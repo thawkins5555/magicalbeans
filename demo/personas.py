@@ -1308,6 +1308,12 @@ def _build_cisco_access(wrap32: bool, ports: int, vlan: str | None) -> dict:
         access - 1: (names[access - 2], "1000BaseT SFP", "GLC-T"),
         access: (names[access - 1], "10GBase-T SFP+", "SFP-10G-T-S"),
     }))
+    # A 100Base-FX module (5.38.0): a multimode optic whose media code is
+    # neither SX nor SR, so the badge it gets proves the classifier reads
+    # the PMD suffix rather than a list of part numbers.
+    entries.update(sfp_cages(populated={
+        access - 2: (names[access - 3], "100Base-FX SFP", "GLC-FE-100FX"),
+    }))
     entries.update(entity_sensors({access: [DOM_SENSORS[0]]}))
     # Every fixed copper port answers arc 30 too, as a real Catalyst does.
     entries.update(if_mau_type({**{i: 30 for i in range(1, access - 1)},
@@ -1324,6 +1330,14 @@ def _build_cisco_access(wrap32: bool, ports: int, vlan: str | None) -> dict:
             T_OCTET_STRING,
             "flash:/c2960x-universalk9-mz.152-7.E3/"
             "c2960x-universalk9-mz.152-7.E3.bin"),
+        # CISCO-ENVMON-MIB fan trays (5.38.0): three of them, and -- as real
+        # Cisco gear does -- only two carry a ciscoEnvMonFanDescr row. The
+        # hardware list used to show the two that were named.
+        "1.3.6.1.4.1.9.9.13.1.4.1.2.1": (T_OCTET_STRING, "T1"),
+        "1.3.6.1.4.1.9.9.13.1.4.1.3.1": (T_INTEGER, 1),
+        "1.3.6.1.4.1.9.9.13.1.4.1.2.2": (T_OCTET_STRING, "T2"),
+        "1.3.6.1.4.1.9.9.13.1.4.1.3.2": (T_INTEGER, 1),
+        "1.3.6.1.4.1.9.9.13.1.4.1.3.3": (T_INTEGER, 1),
     }))
     entries["1.3.6.1.2.1.47.1.1.1.1.10.1"] = (     # entPhysicalSoftwareRev.1
         T_OCTET_STRING, "15.2(7)E3")

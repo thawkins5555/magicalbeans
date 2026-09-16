@@ -367,6 +367,10 @@ CLEARS = {
     # mib_missing exactly the way up pairs with down.
     ("device_event", "mib_present"): "mib_missing",
     ("interface_event", "link_up"): "interface_down",
+    # A port leaving blocking for forwarding closes the alert its blocking
+    # opened: the redundant path is back, which is the same "it is over"
+    # statement link_up makes about a down port.
+    ("interface_event", "stp_unblocked"): "stp_blocking",
     # ap_returned is recorded whenever upsert_ap inserts a brand-new AP
     # row — including one that was previously aged out and reappeared. A
     # genuinely new AP resolves nothing (no matching open alert), so the

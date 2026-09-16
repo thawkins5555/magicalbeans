@@ -781,10 +781,11 @@ check(not mapper_ungated,
 # 5.18.0: the label layer moved above the node layer too, so a label is
 #      never painted under a node box.
 INDEX_HTML = read("index.html")
-check("group.append(gridLayer, frameLayer, linkLayer, nodeLayer, labelLayer)" in MAPPER,
+check("group.append(gridLayer, frameLayer, linkLayer, nodeLayer, labelLayer, noteLayer)" in MAPPER,
       "the label layer paints above both links and node boxes; frameLayer "
       "(5.31.0) sits between the grid and the links so a frame paints under "
-      "both")
+      "both; noteLayer sits above everything, last, so a note reads over "
+      "whatever it annotates")
 check("function drawLink(layer, link, labelLayer = layer)" in MAPPER
       # 3: the per-strand VLAN number, the collapsed-trunk VLAN count, and
       # (5.23.0, D2) a manual line's own label.
@@ -1221,12 +1222,13 @@ check("  function renderDetail()" in MAPPER_JS
 #      aria-label advertises did nothing at all after a click on the map.
 check("function focusCanvas()" in MAPPER_JS,
       "a press on the map moves focus to #mp-canvas itself")
-check(MAPPER_JS.count("focusCanvas();") == 7,
+check(MAPPER_JS.count("focusCanvas();") == 9,
       "the four presses that preventDefault — a node, a pan, a Drag-pans pan and "
       "a rubber band — still focus the canvas, so the keyboard controls its "
       "aria-label promises are live straight after a click; 5.31.0 adds three "
       "more (the framing drag, a frame press in onFramePointerDown, and "
-      "centerOn's Find)")
+      "centerOn's Find), and notes add two more of their own (the noting "
+      "drag, a note press in onNotePointerDown)")
 check("canvas.focus({ preventScroll: true })" in MAPPER_JS,
       "and it does not scroll the page to the canvas that is already under the "
       "pointer")
@@ -1594,7 +1596,8 @@ ALLOWED_BARE_FIELDS = {
                  "ev.walk.objects", "f.id", "g.id", "ids.length", "names.length", "owned.length",
                  "p.row", "r.caveats.length", "r.matched_device_id", "r.override_count",
                  "row.override_count"},
-    "wireless.js": {"c.id", "s.poll_interval_s", "s.history_days", "s.history_sample_s"},
+    "wireless.js": {"c.id", "s.poll_interval_s", "s.history_days", "s.history_sample_s",
+                    "s.ap_web_port"},
 }
 # mapper_upstream.js carries the upstream-suggestions dialog cut out of mapper.js.
 ALLOWED_BARE_FIELDS["mapper_upstream.js"] = ALLOWED_BARE_FIELDS["mapper.js"]
@@ -4164,15 +4167,17 @@ check("for (const frame of view.frames) {" in _CONTENT_BOUNDS88
 # Scoped to draw() (not contentBounds, which shares this exact substring in
 # its own null-bounds guard): the empty-canvas branch must check frames too
 # (5.31.1 fix), or a frames-only, no-devices map draws as empty. It must
-# also fall through while the Frame tool is armed (5.32.0 fix), or a
-# brand-new empty map can never draw its first frame.
+# also fall through while the Frame or Note tool is armed (5.32.0 fix,
+# extended for notes), or a brand-new empty map can never draw its first
+# frame or note.
 _DRAW88F = MAPPER88[MAPPER88.index("  function draw() {"):
                     MAPPER88.index("  function emptyCanvas(svg, canvas, message)")]
 check("if (!view.nodes.length && !view.frames.length) {" not in _DRAW88F
-      and "if (!view.nodes.length && !view.frames.length && !view.framing) {" in _DRAW88F,
-      "an all-frames, no-devices map still has content to fit, rather than "
-      "reading as empty, and an armed Frame tool keeps the real canvas up "
-      "on a wholly empty map")
+      and "if (!view.nodes.length && !view.frames.length && !view.notes.length "
+          "&& !view.framing && !view.noting) {" in _DRAW88F,
+      "an all-frames/all-notes, no-devices map still has content to fit, "
+      "rather than reading as empty, and an armed Frame or Note tool keeps "
+      "the real canvas up on a wholly empty map")
 check("requestDraw();" in MAPPER88[MAPPER88.index("App.el('mp-add-frame').onclick"):
                                     MAPPER88.index("App.el('mp-refresh').onclick")],
       "arming or disarming the Frame tool redraws, so the placeholder and "
@@ -4209,6 +4214,90 @@ check("ArrowLeft" not in _DRAW_FRAME88G and "ArrowRight" not in _DRAW_FRAME88G
       and "ArrowUp" not in _DRAW_FRAME88G and "ArrowDown" not in _DRAW_FRAME88G,
       "no arrow-key nudging: a node's own keydown handler does not nudge "
       "either, so a frame does not gain a capability nodes lack")
+
+# ---------------------------------------------------------------------------
+# 88h. MAPPER: Notes — a thought-bubble annotation, the frame idiom (88a-g
+#      above) applied to operator commentary, with an optional node_id
+#      anchor set once at creation.
+check('("POST", r"^/api/mapper/maps/(\\d+)/notes$", api.post_mapper_map_notes, ("mapper", W)),'
+      in SERVER_PY
+      and '("PUT", r"^/api/mapper/maps/(\\d+)/notes/(\\d+)$", api.put_mapper_map_note, '
+          '("mapper", W)),' in SERVER_PY
+      and '("DELETE", r"^/api/mapper/maps/(\\d+)/notes/(\\d+)$",' in SERVER_PY,
+      "the three note routes exist, gated on mapper write like a frame's own")
+check('id="mp-add-note" data-requires-write="mapper"' in INDEX_HTML,
+      "the Note button exists and is gated on mapper write")
+check(INDEX_HTML.index('id="mp-add-frame"') < INDEX_HTML.index('id="mp-add-note"'),
+      "Note sits right after Frame in the action bar")
+check("['mp-add-note', !canWrite || !hasMap]," in MAPPER88,
+      "Note is disabled with no map selected or no write access, the same "
+      "gate Frame uses")
+check("function drawNote(layer, note)" in MAPPER88
+      and "function updateNoteElement(g, note)" in MAPPER88
+      and "function noteAnchorNode(note)" in MAPPER88
+      and "function noteTail(note, r)" in MAPPER88,
+      "the note drawing functions exist, mirroring drawFrame/"
+      "updateFrameElement/liveFrameRect")
+_DRAW_NOTE88H = MAPPER88[MAPPER88.index("  function drawNote(layer, note)"):
+                         MAPPER88.index("  // `bounds`/size come from draw()")]
+check("g.append(fill, stroke, text, tail1, tail2, handle);" in _DRAW_NOTE88H,
+      "a note's children append in a fixed order -- fill, stroke, text, the "
+      "two tail circles, resize handle -- the same 'one place decides the "
+      "order' shape drawFrame's own comment documents")
+check("g.tabIndex = 0;" in _DRAW_NOTE88H and "g.setAttribute('role', 'button');" in _DRAW_NOTE88H,
+      "a note's <g> is a Tab stop with role=button, the same reach a frame's own <g> has")
+_NOTE_KEYDOWN88H = _DRAW_NOTE88H[_DRAW_NOTE88H.index("g.addEventListener('keydown'"):]
+check("selectNote(note);" in _NOTE_KEYDOWN88H and "removeNote(note.id);" in _NOTE_KEYDOWN88H,
+      "Enter/Space selects a focused note, Delete/Backspace removes it -- "
+      "the same keyboard reach a frame has")
+check("function wrapNoteLines(text, innerWidth, maxLines, font)" in MAPPER88,
+      "note text wraps to the bubble's own width, capped to however many "
+      "lines its height fits")
+check("for (const note of view.notesByNode.get(id) || []) {" in MAPPER88[
+    MAPPER88.index("  function redrawDragged()"):MAPPER88.index("  // The frame-drag analogue")],
+      "redrawDragged also repositions any note anchored to a dragged node, "
+      "so its tail follows the node it points at")
+check(".mp-note-c0 { --mp-note-color: var(--canvas-vlan-1); }" in APP_CSS
+      and ".mp-note-c5 { --mp-note-color: var(--canvas-vlan-6); }" in APP_CSS,
+      "a note shares a frame's six-swatch --canvas-vlan-1..6 palette")
+check("Notes are canvas-only" not in MAPPER88,   # documented in mapperdb.py/api.py, not restated in JS
+      "the map CSV export is untouched by notes (mapper.py, out of scope here)")
+check("function noteDetailHtml(note)" in MAPPER88 and "function noteSwatchesHtml(note, canWrite)"
+      in MAPPER88,
+      "notes get their own detail-pane editor beside a frame's (text + colour), "
+      "reusing the frame's six-swatch idiom")
+
+# 88i. The toolbar checkbox brackets (Snap/Drag pans/FiberView): each caption
+#      now reads as belonging to the box inside its own bracket rather than
+#      to whichever box follows it (the caption used to sit before its box).
+check(INDEX_HTML.count('<span class="mp-bracket"><label') == 3,
+      "Snap, Drag pans and FiberView are each wrapped in their own bracket span")
+check(".mp-bracket {" in APP_CSS, "app.css styles the bracket (hairline border, tight padding)")
+
+# 88j. Parallel links space further apart at normal zoom (5.3x): fanOffsets'
+#      own spacing floor and node-pair margin both went up.
+check("const spacing = Math.max(30, widest + 16);" in MAPPER,
+      "parallel cables between the same two nodes space out enough to read "
+      "as two lines, not one blurred one, at normal zoom")
+
+# 88k. Export PNG targets a higher raster (4x), backed off only by a
+#      conservative canvas-size guard, never below the old dpr-capped floor.
+_EXPORT88K = MAPPER[MAPPER.index("function exportPng("):MAPPER.index("function exportCsvClick(")]
+check("Math.min(window.devicePixelRatio || 1, 2)" in _EXPORT88K,
+      "the old dpr-capped scale is still computed, as the export's floor")
+check("Math.max(dprScale, Math.min(4, guardScale))" in _EXPORT88K,
+      "the export targets 4x, backed off toward the canvas guard, never "
+      "below the old dpr-capped floor")
+check("MAX_CANVAS_SIDE = 16384" in _EXPORT88K and "MAX_CANVAS_AREA = 268000000" in _EXPORT88K,
+      "the canvas guard matches the spec: no side over 16384px, area under ~268 Mpx")
+
+# 88l. A frame's label reads slightly larger (fs-2xs -> fs-xs), baseline
+#      nudged so it still sits inside the frame.
+check("font-size: var(--fs-xs);" in APP_CSS[APP_CSS.index(".mp-frame-label {"):
+                                             APP_CSS.index(".mp-frame-handle")],
+      "the frame label's font-size moved up a step")
+check("label.setAttribute('y', r.y + 17);" in MAPPER,
+      "updateFrameElement's label baseline nudged down to match")
 
 # ---------------------------------------------------------------------------
 # 89. The device dialog's STACK POWER section (Cisco StackPower/StackWise
@@ -4293,7 +4382,7 @@ check("stroke-width: var(--mp-fiber-w, 5px);" in APP_CSS92,
 check(".mp-link.fiber.selected" in APP_CSS92,
       "a selected fiber link keeps brightness(1.35) alongside its glow")
 check(".mp-link.fiber.fiber-mismatch" in APP_CSS92 and ".mp-link.fiber.fiber-sm" in APP_CSS92,
-      "FiberView colours single-mode links dark yellow and an SM/MM mismatch dotted red")
+      "FiberView colours single-mode links a bright yellow and an SM/MM mismatch dotted red")
 check(".mp-link.blocking { stroke-dasharray: 2 6; }" in APP_CSS92,
       "an STP-blocked link draws dotted in both normal view and FiberView")
 
@@ -4323,6 +4412,30 @@ check("r.stp_state === 'blocking' &&" in NODES94,
 MAPPER94 = read("mapper.js")
 check("(VLANs " in MAPPER94,
       "the Mapper's STP tooltip/aria/detail text appends the blocking end's VLAN list")
+
+# ---------------------------------------------------------------------------
+# 95. WIRELESS's own WEB tunnel (FortiAP), mirroring Nodes' WEB button.
+INDEX95 = read("index.html")
+_WL_WEB_BUTTON = re.search(r'<button id="wl-web-ap"([^>]*)>', INDEX95)
+check(_WL_WEB_BUTTON is not None, "index.html has the wl-web-ap button")
+check(_WL_WEB_BUTTON is not None
+      and "data-requires-write" not in _WL_WEB_BUTTON.group(1),
+      "wl-web-ap carries no data-requires-write -- like wl-oos and "
+      "wl-remove-ap, drawApActions owns its .hidden per selection, not the "
+      "disable-only write gate")
+check(r'r"^/api/wireless/aps/(\d+)/relay$", api.post_wireless_ap_relay, ("web", W)'
+      in SERVER_PY,
+      "server.py routes POST .../aps/<id>/relay to post_wireless_ap_relay, "
+      "gated on web write -- opening a port on this host is that module's "
+      "business, not wireless's")
+WIRELESS95 = read("wireless.js")
+check("App.el('wl-web-ap').hidden = !(ap && ap.ip && App.canWrite('web'))"
+      in WIRELESS95,
+      "drawApActions shows wl-web-ap only for a selected AP with a "
+      "reported ip and an operator holding web write")
+APP95 = read("app.js")
+check("'wireless.ap.web': {" in APP95,
+      "app.js registers the wireless.ap.web help topic")
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))

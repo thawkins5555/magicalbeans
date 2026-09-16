@@ -153,15 +153,23 @@ try:
           "requests than the non-Cisco run needed)",
           cisco_requests > after - before, (cisco_requests, after - before))
 
+    fans = [row for row in cisco_result["envmon"] if row["kind"] == "fan"]
+    check("every fan tray the STATE column answers for is listed, not only "
+          "the ones with a description row -- a 3-tray chassis that names "
+          "two of them used to show two fans",
+          [row["label"] for row in fans]
+          == ["Fan tray 1", "Fan tray 2", "fan 3"], fans)
+    check("...and the unnamed tray still carries its own state",
+          fans[2]["status"] == "normal", fans[2])
     envmon = {row["kind"]: row for row in cisco_result["envmon"]}
     check("supply status decodes descr + the shared state enum",
           envmon.get("supply") == {"kind": "supply", "label": "PSU 1",
                                    "value": None, "unit": "", "status": "normal"},
           envmon.get("supply"))
     check("fan status the same way, a different state",
-          envmon.get("fan") == {"kind": "fan", "label": "Fan tray 1",
-                                "value": None, "unit": "", "status": "warning"},
-          envmon.get("fan"))
+          fans[0] == {"kind": "fan", "label": "Fan tray 1",
+                      "value": None, "unit": "", "status": "warning"},
+          fans[0])
     check("temperature status also carries value/threshold",
           envmon.get("temperature") == {
               "kind": "temperature", "label": "Hot spot", "value": 55,

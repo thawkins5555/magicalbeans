@@ -4580,16 +4580,29 @@ class NodesDatabase(SqliteStore):
                 " WHERE priority = 1").fetchall()
         return {(row["device_id"], row["if_index"]) for row in rows}
 
+    # The port states this application treats as "not forwarding this
+    # link" -- dot1dStpPortState's blocking(2), and RSTP's discarding, which
+    # some agents report in its place. listening/learning are transient
+    # stages of coming up, not a blocked link, and disabled/broken are the
+    # port being off rather than spanning tree holding it down.
+    STP_BLOCKED_STATES = ("blocking", "discarding")
+
     def update_interface_stp(self, device_id: int, rows: list[dict]) -> None:
         """update_interface_poe's own counterpart for per-port STP state.
         stp_blocking_vlans/stp_vlan_count COALESCE rather than overwrite: a
         global-only or cut-short row carries neither key, and must leave
-        stored per-VLAN detail alone."""
+        stored per-VLAN detail alone.
+
+        A port that changes into or out of a blocked state also records an
+        interface event, the same channel link_up/link_down use, so the
+        alert rules can see a topology change without polling this table.
+        """
         if not rows:
             return
         params = [(row.get("stp_state"), row.get("stp_blocking_vlans"),
                   row.get("stp_vlan_count"), device_id, row["if_index"])
                   for row in rows]
+        prior = self._stp_state_before(device_id, [row["if_index"] for row in rows])
         with self._lock:
             try:
                 self._conn.executemany(
@@ -4601,6 +4614,42 @@ class NodesDatabase(SqliteStore):
             except sqlite3.DatabaseError:
                 self._conn.rollback()
                 raise
+        # After the commit, not inside it: an event is a second write, and
+        # the state is the thing that must land.
+        for row in rows:
+            was = prior.get(row["if_index"])
+            if was is None:
+                continue   # a port whose state was never read has not changed
+            before, interface_id, descr = was
+            now_state = row.get("stp_state")
+            if not now_state or before is None or before == now_state:
+                continue
+            blocked_before = before in self.STP_BLOCKED_STATES
+            blocked_now = now_state in self.STP_BLOCKED_STATES
+            if blocked_before == blocked_now:
+                continue
+            vlans = row.get("stp_blocking_vlans")
+            detail = f"{descr or row['if_index']}: {before} -> {now_state}"
+            if blocked_now and vlans:
+                detail += f" (VLAN {vlans})"
+            self.record_interface_event(
+                interface_id, "stp_blocking" if blocked_now else "stp_unblocked",
+                detail)
+
+    def _stp_state_before(self, device_id: int, if_indexes: list) -> dict:
+        """{if_index: (stp_state, interfaces.id, descr)} for the ports about
+        to be written, read before the UPDATE overwrites them."""
+        out: dict = {}
+        with self._lock:
+            for chunk in _id_chunks(if_indexes):
+                marks = ",".join("?" * len(chunk))
+                for row in self._conn.execute(
+                        "SELECT if_index, stp_state, id, descr FROM interfaces"
+                        f" WHERE device_id = ? AND if_index IN ({marks})",
+                        [device_id, *chunk]).fetchall():
+                    out[row["if_index"]] = (row["stp_state"], row["id"],
+                                            row["descr"])
+        return out
 
     def replace_interfaces(self, device_id: int, rows: list[dict],
                            allow_delete: bool = True) -> dict:

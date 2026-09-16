@@ -151,13 +151,57 @@ _SFP_METRICS = {
     "sfp_temp_c": ("optic temperature", "°C"),
 }
 
+# Standard PMD media codes -- the IEEE 802.3 clause suffix a module names
+# itself by, which the SFF/MSA part numbers copy -- and the fiber each runs
+# on. The alphabet the classifier reads, so a part number nobody has listed
+# still classifies. Matched longest-first: LRM is MULTIMODE despite reading
+# like LR, and LX4 is the mode-conditioned variant that runs on MMF.
+_MEDIA_MODE = {
+    "sx": "mm", "fx": "mm", "sr": "mm", "srl": "mm", "sr4": "mm",
+    "csr4": "mm", "esr4": "mm", "lrm": "mm", "lx4": "mm", "sw": "mm",
+    "mm": "mm", "mmf": "mm",
+    "lx": "sm", "lx10": "sm", "lh": "sm", "fb": "sm", "ex": "sm",
+    "zx": "sm", "lr": "sm", "lr4": "sm", "lr10": "sm", "er": "sm",
+    "er4": "sm", "er4l": "sm", "zr": "sm", "zr4": "sm", "lw": "sm",
+    "psm4": "sm", "cwdm": "sm", "cwdm4": "sm", "dwdm": "sm",
+    "sm": "sm", "smf": "sm",
+}
+# BiDi is single-mode and carries its own reach/direction suffix (BX10-U,
+# BX20-D, BX40), so it is a pattern rather than a table key.
+_BIDI_CODE = r"bx\d*[ud]?"
+# Codes too short to trust bare: "sw" is how half a fleet abbreviates
+# "switch". They still count in the BASE- and part-suffix forms.
+_BARE_UNSAFE = frozenset({"sw", "lw", "fb"})
+
+
+def _media_codes(mode: str, bare: bool = False) -> str:
+    """_MEDIA_MODE's codes for one fiber type as a regex alternation,
+    longest first so LRM wins over LR and LX4 over LX."""
+    codes = [code for code, value in _MEDIA_MODE.items() if value == mode
+             and not (bare and code in _BARE_UNSAFE)]
+    return "|".join(sorted(codes, key=len, reverse=True))
+
+
+def _media_pattern(mode: str) -> str:
+    """The three shapes a media code is written in, for one fiber type: a
+    bare token, the BASE- form a description uses (100Base-FX), and the
+    part-number suffix a model name uses (GLC-LH-SMD, SFP-10G-SR-S). The
+    optional speed in front of the code is what makes Cisco's glued
+    spelling -- GLC-FE-100FX -- read the same as the spaced one."""
+    speed = r"\d*(?:g|gb)?"
+    return (rf"\b{speed}(?:{_media_codes(mode, bare=True)})\b"
+            rf"|base-?(?:{_media_codes(mode)})\b"
+            rf"|-{speed}(?:{_media_codes(mode)})(?:-[sx])?\b")
+
+
 # A cage, and what is in it: entPhysicalDescr/ModelName/VendorType text that
 # names a transceiver. Deliberately not "1000BaseT" and friends on their own
 # -- a fixed copper port describes itself that way and is not an SFP slot --
 # so only an optical media suffix or a form factor counts.
 _TRANSCEIVER_TEXT = re.compile(
     r"\b(?:[cq]?sfp\d*|xfp|x2|gbic|xcvr|transceiver)\b|\bglc-|\bsfp-"
-    r"|base-?(?:sx|lx|lh|zx|sr|lr|er|zr|bx)\b", re.I)
+    rf"|base-?(?:{_media_codes('mm')}|{_media_codes('sm')}|{_BIDI_CODE})\b",
+    re.I)
 
 # Copper proof for text _TRANSCEIVER_TEXT already matched: BASE-T(X), the
 # GLC-T[E]/SFP-*-T part-number families, and copper/RJ45/catX words.
@@ -165,17 +209,34 @@ _COPPER_TEXT = re.compile(
     r"\b(?:\d+g?base-?tx?|glc-te?|sfp-?(?:10g|1ge?|ge)?-?t(?:-s|-x)?|rj-?45"
     r"|copper|cat[56][ae]?)\b", re.I)
 
-# Multimode (SX/SR/LRM class, 850nm) and single-mode (LX/LH/EX/ZX/BX/LR/ER/
-# ZR class, 1310/1550nm) proof out of the same transceiver text. Copper/DAC/
-# AOC text never matches either.
-_OPTIC_MM_TEXT = re.compile(
-    r"\b(?:sx|sr|sr4|csr4|esr4|lrm|srl|mm[df]?)\b|base-?(?:sx|sr|lrm)"
-    r"|glc-sx|-sr(?:4|-s|-x)?\b|850\s?nm", re.I)
+# Multimode (850 nm) and single-mode (1270-1610 nm) proof out of the same
+# transceiver text, built from _MEDIA_MODE. Copper/DAC/AOC text matches
+# neither; the wavelength arm catches a module that quotes no PMD at all.
+_OPTIC_MM_TEXT = re.compile(_media_pattern("mm") + r"|850\s?nm", re.I)
 _OPTIC_SM_TEXT = re.compile(
-    r"\b(?:lx|lx10|lh|ex|zx|bx\d*[ud]?|lr|er|er4l|zr|lr4|er4|zr4|psm4|cwdm4?"
-    r"|dwdm|sm[df]?)\b"
-    r"|base-?(?:lx|lh|ex|zx|bx|lr|er|zr)|glc-(?:lh|ex|zx|bx)"
-    r"|-(?:lr|er|er4l|zr|lx|zx|ex)(?:4|-s|-x)?\b|1310\s?nm|1550\s?nm", re.I)
+    _media_pattern("sm") + rf"|\b{_BIDI_CODE}\b|base-?{_BIDI_CODE}\b"
+    rf"|-{_BIDI_CODE}\b|\b1[2-6]\d{{2}}\s?nm\b", re.I)
+
+
+def _envmon_rows(*columns) -> list[str]:
+    """Every index any of a CISCO-ENVMON table's columns answered for, in
+    index order. Keyed on the union rather than on the description column:
+    a fan tray whose ciscoEnvMonFanDescr row is absent still has a state row
+    saying whether it is spinning, and a device with three trays and two
+    descriptions used to list two fans.
+    """
+    suffixes = set()
+    for column in columns:
+        suffixes.update(column)
+    return sorted(suffixes, key=lambda s: (_envmon_sort_key(s), s))
+
+
+def _envmon_sort_key(suffix: str) -> tuple:
+    parts = suffix.split(".")
+    try:
+        return tuple(int(part) for part in parts)
+    except ValueError:
+        return (float("inf"),)
 
 
 def _optic_mode(*texts) -> str | None:
@@ -1659,6 +1720,9 @@ class NodePoller(Worker):
         # the setting, because verified is the shipped default.
         self._verify_replies = True
         self._executor: ThreadPoolExecutor | None = None
+        # Pools _apply_pool_size has swapped out and left to drain. They
+        # still hold worker threads, so they still count towards capacity.
+        self._draining: list[ThreadPoolExecutor] = []
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._queued: dict[int, float] = {}
@@ -2016,6 +2080,10 @@ class NodePoller(Worker):
             job.cancel()
         if self._executor:
             self._executor.shutdown(wait=False, cancel_futures=True)
+        with self._lock:
+            for pool in self._draining:
+                pool.shutdown(wait=False, cancel_futures=True)
+            self._draining.clear()
         if self._mac_executor:
             self._mac_executor.shutdown(wait=False, cancel_futures=True)
             self._mac_executor = None
@@ -2128,6 +2196,32 @@ class NodePoller(Worker):
         self.stop()
         self.drain(max(drain_s, self._inflight_budget_s()))
 
+    def _pool_capacity(self) -> int:
+        """Worker threads that could be running a poll right now.
+
+        The live pool plus every pool _apply_pool_size swapped out and left
+        to drain: shutdown(wait=False) does not cancel, so a shrink from 128
+        workers to 80 leaves up to 128 old-pool polls still in flight.
+        Counting only the live pool reported them against the new size --
+        "120 busy and 142 queued of 80 worker(s)". A pool whose threads have
+        all exited is dropped here, which is the only place that list is
+        pruned.
+        """
+        with self._lock:
+            draining = list(self._draining)
+        alive = 0
+        for pool in draining:
+            live = sum(1 for thread in getattr(pool, "_threads", ())
+                       if thread.is_alive())
+            if live:
+                alive += live
+            else:
+                with self._lock:
+                    if pool in self._draining:
+                        self._draining.remove(pool)
+        workers = getattr(self._executor, "_max_workers", 0) if self._executor else 0
+        return workers + alive
+
     def pool_state(self) -> dict:
         """How much of the poll pool is in use right now.
 
@@ -2137,7 +2231,7 @@ class NodePoller(Worker):
         with self._lock:
             busy = len(self._started)
             queued = len(self._queued)
-        workers = getattr(self._executor, "_max_workers", 0) if self._executor else 0
+        workers = self._pool_capacity()
         return {"busy": busy, "queued": queued, "workers": workers,
                 "saturated": bool(workers and busy >= workers and queued),
                 # Added beside the original four, never in place of them.
@@ -2695,6 +2789,8 @@ class NodePoller(Worker):
             max_workers=workers)
         if previous is not None:
             previous.shutdown(wait=False)
+            with self._lock:
+                self._draining.append(previous)
 
     def _note_saturation(self, now: float) -> None:
         """Raise (and clear) a system alert when every poll worker is busy
@@ -3670,9 +3766,17 @@ class NodePoller(Worker):
                     if prior["oper_status"] and prior["oper_status"] != row.get("oper_status"):
                         kind = "link_up" if row.get("oper_status") == "up" else "link_down"
                         if row.get("oper_status") in ("up", "down"):
+                            # A blocked port flapping is a different event to
+                            # an ordinary one: it says the redundant path
+                            # moved. Same rule, so no new alert to tune --
+                            # the detail line names it.
+                            blocked = (
+                                "stp_state" in prior.keys()
+                                and prior["stp_state"] in NodesDatabase.STP_BLOCKED_STATES)
                             self.db.record_interface_event(
                                 interface_id, kind,
-                                f"{row.get('descr') or if_index}: {prior['oper_status']} -> {row.get('oper_status')}")
+                                f"{row.get('descr') or if_index}: {prior['oper_status']} -> {row.get('oper_status')}"
+                                + (" (spanning tree blocked)" if blocked else ""))
                 if interface_id is not None:
                     label = row.get("descr") or f"if{if_index}"
                     for suffix, unit, value in _INTERFACE_METRICS(
@@ -6089,17 +6193,19 @@ class NodePoller(Worker):
         rows = []
         descrs = self._walk_column(device, config, self._ENVMON_SUPPLY_DESCR)
         states = self._walk_column(device, config, self._ENVMON_SUPPLY_STATE)
-        for suffix, descr in descrs.items():
+        for suffix in _envmon_rows(descrs, states):
             rows.append({
-                "kind": "supply", "label": str(descr) or f"supply {suffix}",
+                "kind": "supply",
+                "label": str(descrs.get(suffix) or "") or f"supply {suffix}",
                 "value": None, "unit": "",
                 "status": self._ENVMON_STATE.get(
                     int(states.get(suffix) or 0), "unknown")})
         descrs = self._walk_column(device, config, self._ENVMON_FAN_DESCR)
         states = self._walk_column(device, config, self._ENVMON_FAN_STATE)
-        for suffix, descr in descrs.items():
+        for suffix in _envmon_rows(descrs, states):
             rows.append({
-                "kind": "fan", "label": str(descr) or f"fan {suffix}",
+                "kind": "fan",
+                "label": str(descrs.get(suffix) or "") or f"fan {suffix}",
                 "value": None, "unit": "",
                 "status": self._ENVMON_STATE.get(
                     int(states.get(suffix) or 0), "unknown")})
@@ -6107,12 +6213,13 @@ class NodePoller(Worker):
         values = self._walk_column(device, config, self._ENVMON_TEMP_VALUE)
         thresholds = self._walk_column(device, config, self._ENVMON_TEMP_THRESHOLD)
         states = self._walk_column(device, config, self._ENVMON_TEMP_STATE)
-        for suffix, descr in descrs.items():
+        for suffix in _envmon_rows(descrs, states, values):
+            descr = descrs.get(suffix)
             value = values.get(suffix)
             numeric = isinstance(value, (int, float))
             rows.append({
                 "kind": "temperature",
-                "label": str(descr) or f"temperature {suffix}",
+                "label": str(descr or "") or f"temperature {suffix}",
                 "value": value if numeric else None,
                 "unit": "°C" if numeric else "",
                 "threshold": thresholds.get(suffix),
@@ -6319,7 +6426,24 @@ class NodePoller(Worker):
                 # sensor on it. A slow device must not be able to say that.
                 # All three columns, because a severity row the walk never
                 # reached loses its band and drops a level just as silently.
+                # Said out loud, and retried on the next sensor pass: a
+                # chassis whose walk keeps being cut short used to look
+                # exactly like one that publishes no limits at all.
+                short = [name for name, done in (("value", complete),
+                                                 ("severity", sev_done),
+                                                 ("relation", rel_done))
+                         if not done]
+                self._sensor_threshold_read[device_id] = (
+                    now - self._SENSOR_THRESHOLD_REFRESH_S
+                    + self._SENSOR_REFRESH_S)
+                self._log_media_diag(
+                    device, f"Published-threshold walk on {device['ip']} was "
+                            f"cut short ({', '.join(short)} column); stored "
+                            f"limits are kept and it is retried shortly",
+                    "threshold_walk_short")
                 return
+            # target -> side -> the levels whose severity named no band.
+            unbanded: dict[tuple, dict[str, list]] = {}
             for suffix, raw in values.items():
                 entity, _, _index = suffix.partition(".")
                 target = threshold_roots.get(entity)
@@ -6329,7 +6453,7 @@ class NodePoller(Worker):
                     int(relations.get(suffix) or 0) or 0)
                 band = self._CISCO_THRESHOLD_BAND.get(
                     int(severities.get(suffix) or 0) or 0)
-                if side is None or band is None:
+                if side is None:
                     continue
                 # The threshold is quoted in the scale and precision of ITS
                 # OWN entity's reading, never the threshold row's index --
@@ -6343,12 +6467,32 @@ class NodePoller(Worker):
                     # limit left in the MIB's amperes would be a thousand
                     # times the metric it governs.
                     value *= self._BIAS_A_TO_MA
+                if band is None:
+                    unbanded.setdefault(target, {}).setdefault(
+                        side, []).append(value)
+                    continue
                 column = f"{side}_{band}"
                 existing = bands.setdefault(target, {}).get(column)
                 if existing is not None:
                     value = max(existing, value) if side == "low" \
                         else min(existing, value)
                 bands[target][column] = value
+            # entSensorThresholdSeverity other(1) names no band, and a
+            # platform that publishes an optic's whole band that way used to
+            # end with no limits at all. Two levels on one side say which is
+            # which without it: the outer is the alarm, the inner the
+            # warning. One level alone stays dropped -- guessing which of
+            # the two it is would invent a limit the device never published.
+            for target, sides in unbanded.items():
+                if bands.get(target):
+                    continue
+                for side, levels in sides.items():
+                    if len(levels) < 2:
+                        continue
+                    ordered = sorted(levels, reverse=(side == "high"))
+                    columns = bands.setdefault(target, {})
+                    columns[f"{side}_alarm"] = ordered[0]
+                    columns[f"{side}_warn"] = ordered[1]
         else:
             source = self._ARISTA_THRESHOLD_SOURCE
             try:

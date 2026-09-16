@@ -675,7 +675,7 @@ _RULE_EDITABLE = ("name", "severity", "enabled", "device_filter", "threshold",
                   "auto_resolve_after_s", "notify", "notify_sms")
 _RULE_CUSTOM_EDITABLE = _RULE_EDITABLE + ("kind", "source_kind")
 
-# 72 built-in rules: 10 device_event + 4 interface_event + 38 threshold +
+# 74 built-in rules: 10 device_event + 6 interface_event + 38 threshold +
 # 4 trap + 1 syslog + 1 ipam + 4 wireless_event + 1 dhcp_threshold +
 # 3 netpath_threshold + 1 netpath_event + 5 system. Each `template` name is a
 # templates.key —
@@ -719,6 +719,14 @@ _BUILTIN_RULES = [
     ("interface_up", "Interface recovered", "interface_event", "link_up", 6, "device_up", None, None, 1),
     ("interface_flapping", "Interface flapping", "interface_event", "flapping", 3, "event_notice", None, None, 1),
     ("priority_interface_down", "Priority interface down", "interface_event", "link_down", 2, "event_notice", None, None, 1),  # gated to flagged ports by alertrules.PRIORITY_ONLY_RULES
+    # Spanning tree moving a port into or out of blocking is a topology
+    # change: the redundant path an operator is relying on has just been
+    # taken away or handed back, and nothing else in the product says so.
+    # A port's link going up or down while blocked stays interface_down/
+    # interface_up -- the poller names the blocking in that event's detail
+    # rather than opening a rule nobody asked to tune.
+    ("stp_blocking", "Spanning tree blocking a port", "interface_event", "stp_blocking", 4, "event_notice", None, None, 1),
+    ("stp_unblocked", "Spanning tree port unblocked", "interface_event", "stp_unblocked", 6, "device_up", None, None, 1),
     ("cpu_high", "CPU utilization high", "threshold", "cpu_pct", 4, "threshold_breach", 90.0, 80.0, 2),
     ("mem_high", "Memory utilization high", "threshold", "mem_pct", 4, "threshold_breach", 90.0, 80.0, 2),
     ("if_in_util_high", "Interface inbound utilization high", "threshold", "if_in_util_pct", 4, "threshold_breach", 90.0, 80.0, 2),
@@ -1007,6 +1015,7 @@ _BUILTIN_AUTO_RESOLVE_S = {
     "poll_overrun": 3600,
     "interface_up": 3600,
     "interface_flapping": 1800,
+    "stp_unblocked": 3600,
     "trap_critical": 86400,
     "trap_cold_start": 3600,
     "trap_link_down_unmanaged": 86400,

@@ -438,6 +438,25 @@ class WebRelayRegistry:
         if device is None:
             raise ValueError("No such device")
         target_ip, scheme, target_port = device_web_target(device)
+        return self._open(target_ip, scheme, target_port, username, client_ip,
+                          token, host_header, device_id=device_id)
+
+    def open_target(self, target_ip: str, scheme: str, target_port: int,
+                    username: str, client_ip: str, token: str = "",
+                    host_header: str = "", *, ap_id: int | None = None,
+                    subject: str = "") -> dict:
+        """The same, for a target the caller has already resolved — a
+        wireless access point's own address, say — rather than a Nodes
+        device. `subject` names it in the audit trail and the NODES log,
+        since there is no device row for `_audit` to record an event
+        against."""
+        return self._open(target_ip, scheme, target_port, username, client_ip,
+                          token, host_header, ap_id=ap_id, subject=subject)
+
+    def _open(self, target_ip: str, scheme: str, target_port: int,
+              username: str, client_ip: str, token: str, host_header: str, *,
+              device_id: int | None = None, ap_id: int | None = None,
+              subject: str = "") -> dict:
         client_ip = udpsock.normalise_source(str(client_ip or ""))
         if not client_ip:
             raise ValueError(
@@ -464,10 +483,10 @@ class WebRelayRegistry:
                     f"open. Close one and try again.")
             listener, port = self._bind(bind_host, low, high)
             session = WebRelaySession(
-                self, listener, port, device_id=device_id, target_ip=target_ip,
-                target_port=target_port, scheme=scheme, username=username or "",
-                client_ip=client_ip, token=token or "",
-                host=url_host(host_header, "127.0.0.1"))
+                self, listener, port, device_id=device_id, ap_id=ap_id,
+                subject=subject, target_ip=target_ip, target_port=target_port,
+                scheme=scheme, username=username or "", client_ip=client_ip,
+                token=token or "", host=url_host(host_header, "127.0.0.1"))
             self._sessions[session.session_id] = session
         # Threads start outside the lock: a watchdog tick takes it to close.
         session.start()
@@ -568,15 +587,20 @@ class WebRelaySession:
     """
 
     def __init__(self, registry: WebRelayRegistry, listener: socket.socket,
-                 port: int, *, device_id: int, target_ip: str, target_port: int,
-                 scheme: str, username: str, client_ip: str, token: str,
-                 host: str):
+                 port: int, *, device_id: int | None, target_ip: str,
+                 target_port: int, scheme: str, username: str, client_ip: str,
+                 token: str, host: str, ap_id: int | None = None,
+                 subject: str = ""):
         self.registry = registry
         self.service = registry.service
         self.session_id = _SESSION_PREFIX + secrets.token_urlsafe(18)
         self.listener = listener
         self.port = port
         self.device_id = device_id
+        self.ap_id = ap_id
+        # Named in the audit trail and the NODES log when there is no
+        # device row to name it from — an access point, say.
+        self.subject = subject
         self.target_ip = target_ip
         self.target_port = target_port
         self.scheme = scheme
@@ -631,6 +655,7 @@ class WebRelaySession:
         return {
             "session_id": self.session_id, "url": self.url, "port": self.port,
             "scheme": self.scheme, "device_id": self.device_id,
+            "ap_id": self.ap_id,
             "device_ip": self.target_ip, "device_port": self.target_port,
             "username": self.app_user, "client_ip": self.client_ip,
             "opened_ts": self.opened_ts, "last_traffic_ts": self._last_traffic,
@@ -643,7 +668,9 @@ class WebRelaySession:
     # ----------------------------------------------------------------- start
 
     def start(self) -> None:
-        self._audit(f"Web tunnel opened by {self.app_user} on port {self.port}",
+        named = f" ({self.subject})" if self.subject else ""
+        self._audit(f"Web tunnel opened by {self.app_user} on port "
+                    f"{self.port}{named}",
                     f"To {self.target_ip}:{self.target_port} ({self.scheme}), "
                     f"reachable only from {self.client_ip}.")
         for target, name in ((self._accept_loop, "accept"), (self._watch, "watch")):
@@ -1005,11 +1032,14 @@ class WebRelaySession:
     # ----------------------------------------------------------------- audit
 
     def _audit(self, headline: str, detail: str) -> None:
-        """One line in both places a relay is recorded: the device's own
-        event list and the NODES log."""
+        """One line in the NODES log, and — for a relay opened against a
+        Nodes device — one in that device's own event list too. A relay
+        with no device_id (an access point, say) has no such list, and
+        must not raise one of its module's own alerts on every tunnel."""
         try:
-            self.service.nodes_db.record_device_event(self.device_id, "web",
-                                                      headline)
+            if self.device_id is not None:
+                self.service.nodes_db.record_device_event(self.device_id,
+                                                          "web", headline)
             self.service.log.add(NODES, headline, target=self.target_ip,
                                  detail=detail)
         except Exception:
@@ -1024,8 +1054,9 @@ class WebRelaySession:
             total = self.connections_total
         # Counts go in the headline, not just the log detail: how much
         # crossed is the only thing there is to say — no content is kept.
+        named = f" ({self.subject})" if self.subject else ""
         self._audit(
-            f"Web tunnel on port {self.port} closed after {spell}"
+            f"Web tunnel on port {self.port}{named} closed after {spell}"
             + (f" ({reason})" if reason else "")
             + f"; {total} connection(s), {to_device} bytes to the device and "
               f"{from_device} back",

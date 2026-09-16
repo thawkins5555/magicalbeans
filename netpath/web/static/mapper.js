@@ -90,6 +90,7 @@
     peersByKey: new Map(),
     vlans: [],
     frames: [],           // map_frames rows, x/y/width/height possibly overridden by an in-flight drag/resize
+    notes: [],            // map_notes rows, same shape of override as frames
     // Rebuilt with the payload in loadMapData; replaces an Array.find()
     // per lookup that made a 60-node/200-link map quadratic.
     nodeMap: new Map(),        // map_nodes id -> row
@@ -97,6 +98,8 @@
     vlanNameById: new Map(),   // vlan id -> its name on this map ('' when unnamed)
     linksByNode: new Map(),    // map_nodes id -> the links touching it
     frameMap: new Map(),       // frame id -> row
+    noteMap: new Map(),        // note id -> row
+    notesByNode: new Map(),    // map_nodes id -> notes anchored to it (their tail follows a drag)
 
     // The drawn SVG, kept so pan/zoom/drag can move it instead of
     // rebuilding (applyTransform, redrawDragged, drawRubber).
@@ -106,6 +109,7 @@
     linkEls: new Map(),        // link id -> the <g> holding that link's own elements
     linkLabelEls: new Map(),   // link id -> its port/VLAN labels, drawn above every link
     frameEls: new Map(),       // frame id -> its <g>
+    noteEls: new Map(),        // note id -> its <g>
     dragPans: false,           // the Drag pans checkbox: left-drag on empty canvas pans
     fiberView: false,          // the FiberView checkbox: glow every link.fiber link
     linkFan: new Map(),        // link id -> px offset, draw()'s fanOffsets() (parallel cables)
@@ -115,6 +119,7 @@
     selection: new Set(),    // selected node ids
     selectedLinkId: null,
     selectedFrameId: null,
+    selectedNoteId: null,
     selectedVlan: null,      // vlan id highlighted from the VLAN table
     detailShowAllVlans: false,   // the open link's VLAN list, past VLAN_DETAIL_CAP
 
@@ -123,9 +128,12 @@
     zoom: 1, needsFit: true, pan: { x: 0, y: 0 }, frame: null,
     panDrag: null, spaceHeld: false,
     nodeDrag: null,          // {ids, from:Map(id->{x,y}), dx, dy, moved}
-    rubber: null,            // {x0,y0,x1,y1, additive} or {..., drawFrame:true} while framing
+    rubber: null,            // {x0,y0,x1,y1, additive} or {..., drawFrame:true}/{..., drawNote:true} while arming one
     framing: false,          // Frame button armed: the next empty-canvas drag draws one
     frameDrag: null,         // {id, mode:'move'|'resize', startRect, dx, dy, moved}
+    noting: false,           // Note button armed: the next empty-canvas drag draws one
+    notingAnchorId: null,    // the one node selected when Note was armed, or null
+    noteDrag: null,          // {id, mode:'move'|'resize', startRect, dx, dy, moved}
 
     pendingPositions: new Map(),   // node id -> {x,y}, awaiting the debounced PUT
     writeTimer: null,
@@ -133,6 +141,9 @@
     pendingFramePatches: new Map(),   // frame id -> merged {x,y,width,height,label,color} patch
     frameWriteTimers: new Map(),      // frame id -> debounce timeout handle
     frameWriteRetryTimers: new Map(), // frame id -> retry timeout handle
+    pendingNotePatches: new Map(),    // note id -> merged {x,y,width,height,text,color} patch
+    noteWriteTimers: new Map(),       // note id -> debounce timeout handle
+    noteWriteRetryTimers: new Map(),  // note id -> retry timeout handle
 
     // findNode's own "same text, next hit" cycling state.
     findQuery: '', findIndex: -1,
@@ -263,7 +274,7 @@
   // pane resize) waits, which is the promise FEATURES.md makes for MAPPER's
   // auto-refresh.
   function gestureActive() {
-    return !!(view.nodeDrag || view.rubber || view.panDrag || view.frameDrag);
+    return !!(view.nodeDrag || view.rubber || view.panDrag || view.frameDrag || view.noteDrag);
   }
 
   function snapValue(v) {
@@ -492,6 +503,7 @@
     view.linkMap = new Map(view.links.map((l) => [l.id, l]));
     view.vlanNameById = new Map(view.vlans.map((v) => [v.vlan, v.name || '']));
     view.frameMap = new Map(view.frames.map((f) => [f.id, f]));
+    view.noteMap = new Map(view.notes.map((n) => [n.id, n]));
     view.linksByNode = new Map();
     for (const link of view.links) {
       const a = linkNodeA(link), b = linkNodeB(link);
@@ -501,13 +513,19 @@
         if (list) list.push(link); else view.linksByNode.set(node.id, [link]);
       }
     }
+    view.notesByNode = new Map();
+    for (const note of view.notes) {
+      if (note.node_id === null || note.node_id === undefined) continue;
+      const list = view.notesByNode.get(note.node_id);
+      if (list) list.push(note); else view.notesByNode.set(note.node_id, [note]);
+    }
   }
 
   async function loadMapData() {
     const generation = ++view.loadGen;
     if (view.mapId === null) {
       view.map = null; view.nodes = []; view.links = []; view.peersByKey = new Map(); view.vlans = [];
-      view.frames = [];
+      view.frames = []; view.notes = [];
       rebuildLookups();
       rebuildFindList();
       drawStatus(); draw(); drawDetail(); drawVlanTable(); drawLegend();
@@ -521,20 +539,24 @@
     view.peersByKey = new Map((payload.peers || []).map((p) => [p.peer_key, p]));
     view.vlans = payload.vlans || [];
     view.frames = payload.frames || [];
+    view.notes = payload.notes || [];
     rebuildLookups();
     rebuildFindList();
     // A reload landing mid-drag (a settings save) ends the drag: the payload
     // replaces the ids and positions it holds.
     if (view.nodeDrag) view.nodeDrag = null;
     if (view.frameDrag) view.frameDrag = null;
+    if (view.noteDrag) view.noteDrag = null;
     if (payload.settings) view.settings = payload.settings;
-    // A selection or a highlighted link/frame that no longer exists on the
-    // fresh payload (removed elsewhere) is dropped rather than left pointing
-    // at nothing — drawDetail below reads view.selection/selectedLinkId/
-    // selectedFrameId as ground truth for what to show.
+    // A selection or a highlighted link/frame/note that no longer exists on
+    // the fresh payload (removed elsewhere) is dropped rather than left
+    // pointing at nothing — drawDetail below reads view.selection/
+    // selectedLinkId/selectedFrameId/selectedNoteId as ground truth for
+    // what to show.
     for (const id of [...view.selection]) if (!nodeById(id)) view.selection.delete(id);
     if (view.selectedLinkId && !linkById(view.selectedLinkId)) view.selectedLinkId = null;
     if (view.selectedFrameId && !view.frameMap.has(view.selectedFrameId)) view.selectedFrameId = null;
+    if (view.selectedNoteId && !view.noteMap.has(view.selectedNoteId)) view.selectedNoteId = null;
     App.el('mp-map-name').textContent = view.map ? view.map.name : '';
     App.el('mp-snap').checked = !!view.settings.snap_to_grid;
     drawStatus();
@@ -948,6 +970,23 @@
       async (confirmed) => {
         if (!confirmed) return;
         if (view.selectedFrameId === id) view.selectedFrameId = null;
+        await loadMapData();
+      });
+  }
+
+  // The note analogue of removeFrame above.
+  function removeNote(id) {
+    if (!App.canWrite('mapper')) return;
+    const note = view.noteMap.get(id);
+    if (!note) return;
+    App.confirmDestructive('Remove note',
+      '<p>Remove this note? Nothing it points at is moved or affected — ' +
+      'only the note itself is removed.</p>',
+      'Remove',
+      () => App.del(`/api/mapper/maps/${view.mapId}/notes/${id}`),
+      async (confirmed) => {
+        if (!confirmed) return;
+        if (view.selectedNoteId === id) view.selectedNoteId = null;
         await loadMapData();
       });
   }
@@ -1565,8 +1604,29 @@
     };
   }
 
+  // The note analogue of liveFrameRect.
+  function liveNoteRect(note) {
+    const drag = view.noteDrag;
+    if (drag && drag.id === note.id) {
+      if (drag.mode === 'move') {
+        return { x: drag.startRect.x + drag.dx, y: drag.startRect.y + drag.dy,
+          width: drag.startRect.width, height: drag.startRect.height };
+      }
+      return { x: drag.startRect.x, y: drag.startRect.y,
+        width: Math.max(FRAME_MIN, drag.startRect.width + drag.dx),
+        height: Math.max(FRAME_MIN, drag.startRect.height + drag.dy) };
+    }
+    const pending = view.pendingNotePatches.get(note.id);
+    return {
+      x: (pending && pending.x !== undefined) ? pending.x : note.x,
+      y: (pending && pending.y !== undefined) ? pending.y : note.y,
+      width: (pending && pending.width !== undefined) ? pending.width : note.width,
+      height: (pending && pending.height !== undefined) ? pending.height : note.height,
+    };
+  }
+
   function contentBounds() {
-    if (!view.nodes.length && !view.frames.length) return null;
+    if (!view.nodes.length && !view.frames.length && !view.notes.length) return null;
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     for (const node of view.nodes) {
       const p = livePos(node);
@@ -1575,6 +1635,11 @@
     }
     for (const frame of view.frames) {
       const r = liveFrameRect(frame);
+      minX = Math.min(minX, r.x); maxX = Math.max(maxX, r.x + r.width);
+      minY = Math.min(minY, r.y); maxY = Math.max(maxY, r.y + r.height);
+    }
+    for (const note of view.notes) {
+      const r = liveNoteRect(note);
       minX = Math.min(minX, r.x); maxX = Math.max(maxX, r.x + r.width);
       minY = Math.min(minY, r.y); maxY = Math.max(maxY, r.y + r.height);
     }
@@ -1604,7 +1669,7 @@
       el.setAttribute('width', r.width); el.setAttribute('height', r.height);
     }
     label.setAttribute('x', r.x + 6);
-    label.setAttribute('y', r.y + 16);
+    label.setAttribute('y', r.y + 17);
     handle.setAttribute('x', r.x + r.width - FRAME_HANDLE);
     handle.setAttribute('y', r.y + r.height - FRAME_HANDLE);
   }
@@ -1650,6 +1715,143 @@
       }
     });
     updateFrameElement(g, frame);
+    layer.appendChild(g);
+    return g;
+  }
+
+  /* -------------------------------------------------------------- notes
+     A thought-bubble annotation, the frame idiom applied to operator
+     commentary instead of grouping: same debounced-drag/resize, same
+     six-swatch palette, same keyboard reach. The one thing a frame never
+     has is an anchor — note.node_id, set once at creation, points the
+     bubble's tail at a placed node and keeps it there as that node is
+     dragged (see redrawDragged's own notesByNode pass); with no anchor the
+     tail just points down-left, a fixed offset off the bubble itself. */
+  function noteColorClass(note) {
+    const idx = Number.isInteger(note.color) ? Math.max(0, Math.min(5, note.color)) : 0;
+    return `mp-note-c${idx}`;
+  }
+
+  function noteAnchorNode(note) {
+    return (note.node_id === null || note.node_id === undefined) ? null : nodeById(note.node_id);
+  }
+
+  // Two circles trailing off the bubble's lower-left toward whatever it
+  // points at — the anchor node's live position, or a fixed down-left
+  // offset with no anchor. Guarded against a zero-length direction (an
+  // anchor that lands exactly on the tail's own base point).
+  function noteTail(note, r) {
+    const base = { x: r.x + r.width * 0.22, y: r.y + r.height };
+    const anchor = noteAnchorNode(note);
+    const target = anchor ? livePos(anchor) : { x: base.x - 24, y: base.y + 24 };
+    let dx = target.x - base.x, dy = target.y - base.y;
+    const len = Math.hypot(dx, dy) || 1;
+    dx /= len; dy /= len;
+    return {
+      c1: { x: base.x + dx * 10, y: base.y + dy * 10, r: 5 },
+      c2: { x: base.x + dx * 20, y: base.y + dy * 20, r: 3 },
+    };
+  }
+
+  const NOTE_PAD_X = 8, NOTE_PAD_TOP = 14;
+
+  // Greedy word wrap against the bubble's own inner width, capped to
+  // however many lines its inner height fits — a long word alone can still
+  // overrun a line (no mid-word breaking), and text past the last line is
+  // marked with a trailing ellipsis rather than silently dropped.
+  function wrapNoteLines(text, innerWidth, maxLines, font) {
+    const words = String(text || '').trim().split(/\s+/).filter(Boolean);
+    if (!words.length) return [];
+    const lines = [];
+    let current = '';
+    let truncated = false;
+    for (const word of words) {
+      const attempt = current ? `${current} ${word}` : word;
+      if (!current || measureLabel(attempt, font).width <= innerWidth) {
+        current = attempt;
+        continue;
+      }
+      lines.push(current);
+      current = word;
+      if (lines.length >= maxLines) { truncated = true; current = ''; break; }
+    }
+    if (current) {
+      if (lines.length >= maxLines) truncated = true;
+      else lines.push(current);
+    }
+    if (truncated && lines.length) lines[lines.length - 1] += '…';
+    return lines;
+  }
+
+  // The note analogue of updateFrameElement: one place that repositions
+  // every child (and re-wraps the text, since the wrap depends on the
+  // bubble's own current size), shared by the initial draw and every
+  // drag/resize redraw.
+  function updateNoteElement(g, note) {
+    const r = liveNoteRect(note);
+    const fill = g.querySelector('.mp-note-fill');
+    const stroke = g.querySelector('.mp-note-stroke');
+    const text = g.querySelector('.mp-note-text');
+    const tail1 = g.querySelector('.mp-note-tail1');
+    const tail2 = g.querySelector('.mp-note-tail2');
+    const handle = g.querySelector('.mp-note-handle');
+    for (const el of [fill, stroke]) {
+      el.setAttribute('x', r.x); el.setAttribute('y', r.y);
+      el.setAttribute('width', r.width); el.setAttribute('height', r.height);
+    }
+    const font = labelFont();
+    const metrics = measureLabel('M', font);
+    const lineHeight = metrics.ascent + metrics.descent + 2;
+    const innerWidth = Math.max(10, r.width - NOTE_PAD_X * 2);
+    const innerHeight = Math.max(lineHeight, r.height - NOTE_PAD_TOP - NOTE_PAD_X);
+    const maxLines = Math.max(1, Math.floor(innerHeight / lineHeight));
+    text.textContent = '';
+    text.setAttribute('x', r.x + NOTE_PAD_X);
+    text.setAttribute('y', r.y + NOTE_PAD_TOP);
+    wrapNoteLines(note.text, innerWidth, maxLines, font).forEach((line, i) => {
+      text.appendChild(App.svgNode('tspan', { x: r.x + NOTE_PAD_X, dy: i === 0 ? 0 : lineHeight }, line));
+    });
+    const tail = noteTail(note, r);
+    tail1.setAttribute('cx', tail.c1.x); tail1.setAttribute('cy', tail.c1.y); tail1.setAttribute('r', tail.c1.r);
+    tail2.setAttribute('cx', tail.c2.x); tail2.setAttribute('cy', tail.c2.y); tail2.setAttribute('r', tail.c2.r);
+    handle.setAttribute('x', r.x + r.width - FRAME_HANDLE);
+    handle.setAttribute('y', r.y + r.height - FRAME_HANDLE);
+  }
+
+  function drawNote(layer, note) {
+    const selected = view.selectedNoteId === note.id;
+    const g = App.svgNode('g', { class: `mp-note ${noteColorClass(note)}${selected ? ' selected' : ''}` });
+    g.dataset.noteId = note.id;
+    // Children in a fixed order, the same shape drawFrame's own comment
+    // documents: fill, stroke, text, the two tail circles, resize handle.
+    const fill = App.svgNode('rect', { class: 'mp-note-fill', rx: 10, ry: 10, 'pointer-events': 'none' });
+    const stroke = App.svgNode('rect', { class: 'mp-note-stroke', rx: 10, ry: 10, 'pointer-events': 'stroke' });
+    // textContent only (App.svgNode's third argument, set per-tspan in
+    // updateNoteElement) — never innerHTML, so no escape() belongs here
+    // either; see drawFrame's own comment on its label for why.
+    const text = App.svgNode('text', { class: 'mp-note-text' });
+    const tail1 = App.svgNode('circle', { class: 'mp-note-tail mp-note-tail1' });
+    const tail2 = App.svgNode('circle', { class: 'mp-note-tail mp-note-tail2' });
+    const handle = App.svgNode('rect', {
+      class: 'mp-note-handle', width: FRAME_HANDLE, height: FRAME_HANDLE,
+    });
+    g.append(fill, stroke, text, tail1, tail2, handle);
+    stroke.addEventListener('pointerdown', (event) => onNotePointerDown(event, note, 'move'));
+    text.addEventListener('pointerdown', (event) => onNotePointerDown(event, note, 'move'));
+    handle.addEventListener('pointerdown', (event) => onNotePointerDown(event, note, 'resize'));
+    g.tabIndex = 0;
+    g.setAttribute('role', 'button');
+    g.setAttribute('aria-label', note.text ? `Note ${truncate(note.text, 60)}` : 'Note');
+    g.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        selectNote(note);
+      } else if (event.key === 'Delete' || event.key === 'Backspace') {
+        event.preventDefault();
+        removeNote(note.id);
+      }
+    });
+    updateNoteElement(g, note);
     layer.appendChild(g);
     return g;
   }
@@ -1701,7 +1903,8 @@
     dragPending = window.requestAnimationFrame(() => { dragPending = 0; redrawDragged(); });
   }
 
-  // Redraws only the dragged nodes and the links touching them.
+  // Redraws only the dragged nodes, the links touching them, and any
+  // note anchored to one of them (its tail follows the node it points at).
   function redrawDragged() {
     if (!view.nodeDrag || !view.nodeEls.size) { requestDraw(); return; }
     const touched = new Set();
@@ -1712,6 +1915,10 @@
       const pos = livePos(node);
       el.setAttribute('transform', `translate(${pos.x - NODE_W / 2},${pos.y - NODE_H / 2})`);
       for (const link of view.linksByNode.get(id) || []) touched.add(link);
+      for (const note of view.notesByNode.get(id) || []) {
+        const noteEl = view.noteEls.get(note.id);
+        if (noteEl) updateNoteElement(noteEl, note);
+      }
     }
     for (const link of touched) {
       const holder = view.linkEls.get(link.id);
@@ -1738,6 +1945,22 @@
     const el = drag && view.frameEls.get(drag.id);
     if (!frame || !el) { requestDraw(); return; }
     updateFrameElement(el, frame);
+  }
+
+  // The note-drag analogue of requestFrameDragDraw/redrawFrameDragged.
+  let noteDragPending = 0;
+
+  function requestNoteDragDraw() {
+    if (noteDragPending) return;
+    noteDragPending = window.requestAnimationFrame(() => { noteDragPending = 0; redrawNoteDragged(); });
+  }
+
+  function redrawNoteDragged() {
+    const drag = view.noteDrag;
+    const note = drag && view.noteMap.get(drag.id);
+    const el = drag && view.noteEls.get(drag.id);
+    if (!note || !el) { requestDraw(); return; }
+    updateNoteElement(el, note);
   }
 
   // Toggles a class in place: a full redraw at drag-start would replace
@@ -1796,7 +2019,7 @@
         }
         if (span > widest) widest = span;
       }
-      const spacing = Math.max(18, widest + 8);
+      const spacing = Math.max(30, widest + 16);
       const start = -spacing * (group.length - 1) / 2;
       group.forEach((link, i) => {
         const a = linkNodeA(link), b = linkNodeB(link);
@@ -1819,6 +2042,7 @@
     // Replacing the <g> a drag captured means its release never arrives.
     view.nodeDrag = null;
     view.frameDrag = null;
+    view.noteDrag = null;
     svg.innerHTML = '';
     view.sceneGroup = null;
     view.rubberEl = null;
@@ -1826,14 +2050,16 @@
     view.linkEls = new Map();
     view.linkLabelEls = new Map();
     view.frameEls = new Map();
+    view.noteEls = new Map();
 
     if (!view.mapId) {
       return emptyCanvas(svg, canvas, 'No map selected. Use Maps to create or pick one.');
     }
-    // The Frame tool needs the real canvas to draw the first frame on, so
-    // an armed Frame button falls through here even with nothing on the
-    // map yet — otherwise a brand-new map could never get its first frame.
-    if (!view.nodes.length && !view.frames.length && !view.framing) {
+    // The Frame/Note tools need the real canvas to draw the first one on,
+    // so either armed button falls through here even with nothing on the
+    // map yet — otherwise a brand-new map could never get its first frame
+    // or note.
+    if (!view.nodes.length && !view.frames.length && !view.notes.length && !view.framing && !view.noting) {
       return emptyCanvas(svg, canvas,
         `${view.map ? view.map.name : 'This map'} has no devices yet. Use Add device or Add neighbours.`);
     }
@@ -1865,10 +2091,13 @@
     const linkLayer = App.svgNode('g');
     const labelLayer = App.svgNode('g');
     const nodeLayer = App.svgNode('g');
+    const noteLayer = App.svgNode('g');
     // frameLayer sits between the grid and the links: a frame is
     // decoration an operator draws to group boxes visually, and must never
-    // sit over a link or a node it encloses.
-    group.append(gridLayer, frameLayer, linkLayer, nodeLayer, labelLayer);
+    // sit over a link or a node it encloses. noteLayer sits on top of
+    // everything else: a note is read over whatever it annotates, not
+    // grouped under it the way a frame is.
+    group.append(gridLayer, frameLayer, linkLayer, nodeLayer, labelLayer, noteLayer);
     if (shouldDrawGrid() && bounds) drawGrid(gridLayer, bounds);
     for (const frame of view.frames) view.frameEls.set(frame.id, drawFrame(frameLayer, frame));
     view.linkFan = fanOffsets();
@@ -1887,6 +2116,7 @@
     subFontCache = fontFor('--mono');
     const labelOffsets = placeLabels(view.nodes);
     for (const node of view.nodes) view.nodeEls.set(node.id, drawNode(nodeLayer, node, labelOffsets));
+    for (const note of view.notes) view.noteEls.set(note.id, drawNote(noteLayer, note));
 
     view.rubberEl = App.svgNode('rect', { class: 'mp-rubber' });
     group.appendChild(view.rubberEl);
@@ -1942,7 +2172,7 @@
     if (hasUnknown) text += ' A dashed line means no VLAN data at all, not "one VLAN".';
     if (hasBlocking) text += ' A dotted line is a spanning-tree-blocked port.';
     if (view.fiberView && hasFiber) {
-      text += ' FiberView: blue = multimode, dark yellow = single-mode, ' +
+      text += ' FiberView: dark orange = multimode, bright yellow = single-mode, ' +
         'dotted red = single/multimode mismatch.';
     }
     if (view.nodes.length && !hasLinks) {
@@ -1958,6 +2188,7 @@
     view.selection = ids;
     view.selectedLinkId = null;
     view.selectedFrameId = null;
+    view.selectedNoteId = null;
     requestDraw();
     drawDetail();
   }
@@ -1966,6 +2197,7 @@
     view.selectedLinkId = id;
     view.selection.clear();
     view.selectedFrameId = null;
+    view.selectedNoteId = null;
     // Each link opens on its capped VLAN list; "Show all" is a decision
     // about the link being read, not a mode the pane stays in.
     view.detailShowAllVlans = false;
@@ -1978,6 +2210,7 @@
     view.selectedFrameId = frame.id;
     view.selection = new Set();
     view.selectedLinkId = null;
+    view.selectedNoteId = null;
     requestDraw();
     drawDetail();
   }
@@ -1988,9 +2221,37 @@
     view.selectedFrameId = frame.id;
     view.selection = new Set();
     view.selectedLinkId = null;
+    view.selectedNoteId = null;
     if (!view.frameEls.size) { requestDraw(); return; }
     for (const [id, el] of view.frameEls) el.classList.toggle('selected', id === frame.id);
     for (const [, el] of view.nodeEls) el.classList.remove('selected');
+    for (const [, el] of view.noteEls) el.classList.remove('selected');
+    for (const [, holder] of view.linkEls) {
+      for (const path of holder.querySelectorAll('.mp-link')) path.classList.remove('selected');
+    }
+    drawDetail();
+  }
+
+  // The note analogue of selectFrame -- keyboard path only.
+  function selectNote(note) {
+    view.selectedNoteId = note.id;
+    view.selection = new Set();
+    view.selectedLinkId = null;
+    view.selectedFrameId = null;
+    requestDraw();
+    drawDetail();
+  }
+
+  // The note analogue of selectFrameInPlace.
+  function selectNoteInPlace(note) {
+    view.selectedNoteId = note.id;
+    view.selection = new Set();
+    view.selectedLinkId = null;
+    view.selectedFrameId = null;
+    if (!view.noteEls.size) { requestDraw(); return; }
+    for (const [id, el] of view.noteEls) el.classList.toggle('selected', id === note.id);
+    for (const [, el] of view.nodeEls) el.classList.remove('selected');
+    for (const [, el] of view.frameEls) el.classList.remove('selected');
     for (const [, holder] of view.linkEls) {
       for (const path of holder.querySelectorAll('.mp-link')) path.classList.remove('selected');
     }
@@ -2055,6 +2316,40 @@
       }
       const removeBtn = detail.querySelector('#mpf-remove');
       if (removeBtn) removeBtn.onclick = () => removeFrame(frame.id);
+      return;
+    }
+    if (view.selectedNoteId) {
+      const note = view.noteMap.get(view.selectedNoteId);
+      if (!note) { view.selectedNoteId = null; return renderDetail(); }
+      nameEl.textContent = 'NOTE';
+      detail.innerHTML = noteDetailHtml(note);
+      const saveBtn = detail.querySelector('#mpn-text-save');
+      if (saveBtn) saveBtn.onclick = async () => {
+        const text = detail.querySelector('#mpn-text').value.trim();
+        try {
+          await App.put(`/api/mapper/maps/${view.mapId}/notes/${note.id}`, { text });
+          note.text = text;
+          requestDraw();
+          drawDetail();
+        } catch (error) {
+          App.toast(`Could not update the note: ${error.message}`, 'fail');
+        }
+      };
+      for (const swatch of detail.querySelectorAll('[data-note-color]')) {
+        swatch.onclick = async () => {
+          const color = Number(swatch.dataset.noteColor);
+          try {
+            await App.put(`/api/mapper/maps/${view.mapId}/notes/${note.id}`, { color });
+            note.color = color;
+            requestDraw();
+            drawDetail();
+          } catch (error) {
+            App.toast(`Could not change the note's colour: ${error.message}`, 'fail');
+          }
+        };
+      }
+      const removeBtn = detail.querySelector('#mpn-remove');
+      if (removeBtn) removeBtn.onclick = () => removeNote(note.id);
       return;
     }
     if (view.selectedLinkId) {
@@ -2301,6 +2596,37 @@
     return lines.join('\n');
   }
 
+  // The note analogue of frameSwatchesHtml -- same six swatches, same palette.
+  function noteSwatchesHtml(note, canWrite) {
+    return Array.from({ length: 6 }, (_, i) => {
+      const selected = Number(note.color) === i;
+      return `<button class="mp-swatch${selected ? ' selected' : ''}" data-note-color="${i}" ` +
+        `data-requires-write="mapper"${canWrite ? '' : ' disabled'} ` +
+        `style="background:var(--canvas-vlan-${i + 1})" aria-label="Colour ${i + 1}"></button>`;
+    }).join('');
+  }
+
+  function noteDetailHtml(note) {
+    const canWrite = App.canWrite('mapper');
+    const gate = canWrite ? '' : ' disabled';
+    const anchor = noteAnchorNode(note);
+    const lines = [
+      `Text        <textarea id="mpn-text" maxlength="500" rows="3" ` +
+        `data-requires-write="mapper"${gate}>${escape(note.text || '')}</textarea> ` +
+        `<button id="mpn-text-save" data-requires-write="mapper"${gate}>Save</button>`,
+      '',
+      `Colour      ${noteSwatchesHtml(note, canWrite)}`,
+      '',
+    ];
+    if (anchor) lines.push(`Anchored to ${escape(resolveNode(anchor).name)}`, '');
+    lines.push(
+      `Added       ${escape(App.ago(note.added_ts))}`,
+      '',
+      `<button id="mpn-remove" class="danger" data-requires-write="mapper"${gate}>Remove</button>`,
+    );
+    return lines.join('\n');
+  }
+
   /* -------------------------------------------------------- pointer input */
 
   // null until draw() sets a frame — an empty map or a pre-paint pointer
@@ -2463,11 +2789,35 @@
     }
   }
 
+  // The same debounce/retry idiom, one timer per NOTE.
+  function queueNoteWrite(id, patch) {
+    view.pendingNotePatches.set(id, { ...view.pendingNotePatches.get(id), ...patch });
+    const existing = view.noteWriteTimers.get(id);
+    if (existing) clearTimeout(existing);
+    view.noteWriteTimers.set(id, setTimeout(() => flushNoteWrite(id), WRITE_DEBOUNCE_MS));
+  }
+
+  async function flushNoteWrite(id) {
+    view.noteWriteTimers.delete(id);
+    const patch = view.pendingNotePatches.get(id);
+    if (!patch || !view.mapId) return;
+    const mapId = view.mapId;
+    try {
+      await App.put(`/api/mapper/maps/${mapId}/notes/${id}`, patch);
+      if (view.pendingNotePatches.get(id) === patch) view.pendingNotePatches.delete(id);
+    } catch (error) {
+      App.toast(`Could not save the note: ${error.message}. Will retry.`, 'fail');
+      const retrying = view.noteWriteRetryTimers.get(id);
+      if (retrying) clearTimeout(retrying);
+      view.noteWriteRetryTimers.set(id, setTimeout(() => flushNoteWrite(id), WRITE_RETRY_MS));
+    }
+  }
+
   // Selecting a frame (the stroke, the label or the handle all start this)
   // clears whatever else was selected, same as onNodePointerDown does in
   // reverse; the handle starts a RESIZE, everything else starts a MOVE.
   function onFramePointerDown(event, frame, mode) {
-    if (event.button !== 0 || !event.isPrimary || view.spaceHeld || view.framing) return;
+    if (event.button !== 0 || !event.isPrimary || view.spaceHeld || view.framing || view.noting) return;
     event.preventDefault();
     event.stopPropagation();
     focusCanvas();
@@ -2530,6 +2880,71 @@
     target.addEventListener('pointercancel', cancel);
   }
 
+  // The note analogue of onFramePointerDown.
+  function onNotePointerDown(event, note, mode) {
+    if (event.button !== 0 || !event.isPrimary || view.spaceHeld || view.framing || view.noting) return;
+    event.preventDefault();
+    event.stopPropagation();
+    focusCanvas();
+    selectNoteInPlace(note);
+    if (!App.canWrite('mapper')) return;   // selection only: nothing to drag
+    const target = event.currentTarget;
+    target.setPointerCapture(event.pointerId);
+    const startRect = { x: note.x, y: note.y, width: note.width, height: note.height };
+    const rect = App.el('mp-svg').getBoundingClientRect();
+    const perPixelX = (view.frame.width / Math.max(rect.width, 1)) / view.zoom;
+    const perPixelY = (view.frame.height / Math.max(rect.height, 1)) / view.zoom;
+    const startClient = { x: event.clientX, y: event.clientY };
+    view.noteDrag = { id: note.id, mode, startRect, dx: 0, dy: 0, moved: false };
+    App.hideTooltip();
+    const move = (moveEvent) => {
+      if (!view.noteDrag) return;
+      const cdx = moveEvent.clientX - startClient.x, cdy = moveEvent.clientY - startClient.y;
+      if (!view.noteDrag.moved) {
+        if (Math.hypot(cdx, cdy) <= MOVE_THRESHOLD_PX) return;
+        view.noteDrag.moved = true;
+      }
+      view.noteDrag.dx = cdx * perPixelX;
+      view.noteDrag.dy = cdy * perPixelY;
+      requestNoteDragDraw();
+    };
+    const detach = () => {
+      target.removeEventListener('pointermove', move);
+      target.removeEventListener('pointerup', up);
+      target.removeEventListener('pointercancel', cancel);
+    };
+    const up = () => {
+      try {
+        if (view.noteDrag && view.noteDrag.moved) {
+          const snap = !!view.settings.snap_to_grid;
+          const r = liveNoteRect(note);
+          let patch;
+          if (mode === 'move') {
+            let x = r.x, y = r.y;
+            if (snap) { x = snapValue(x); y = snapValue(y); }
+            note.x = x; note.y = y;
+            patch = { x, y };
+          } else {
+            let width = r.width, height = r.height;
+            if (snap) { width = Math.max(FRAME_MIN, snapValue(width)); height = Math.max(FRAME_MIN, snapValue(height)); }
+            note.width = width; note.height = height;
+            patch = { width, height };
+          }
+          queueNoteWrite(note.id, patch);
+        }
+      } finally {
+        detach();
+        view.noteDrag = null;
+        requestDraw();
+        drawDetail();
+      }
+    };
+    const cancel = () => { detach(); view.noteDrag = null; requestDraw(); };
+    target.addEventListener('pointermove', move);
+    target.addEventListener('pointerup', up);
+    target.addEventListener('pointercancel', cancel);
+  }
+
   function onSvgPointerDown(event) {
     if (!event.isPrimary) return;
     if (event.button === 1 || (event.button === 0 && view.spaceHeld)) {
@@ -2558,6 +2973,17 @@
       focusCanvas();
       event.currentTarget.setPointerCapture(event.pointerId);
       view.rubber = { x0: p.x, y0: p.y, x1: p.x, y1: p.y, drawFrame: true };
+      return;
+    }
+    if (view.noting) {
+      // The Note tool's own armed drag — same rubber-band reuse as framing
+      // above, distinguished by `drawNote` instead of `drawFrame`.
+      const p = scenePoint(event);
+      if (!p) return;
+      event.preventDefault();
+      focusCanvas();
+      event.currentTarget.setPointerCapture(event.pointerId);
+      view.rubber = { x0: p.x, y0: p.y, x1: p.x, y1: p.y, drawNote: true };
       return;
     }
     if (view.dragPans) {
@@ -2609,6 +3035,17 @@
       if (width >= FRAME_MIN && height >= FRAME_MIN) createFrame(x, y, width, height);
       return;
     }
+    if (view.rubber && view.rubber.drawNote) {
+      const { x0, y0, x1, y1 } = view.rubber;
+      view.rubber = null;
+      drawRubber();
+      const anchorId = view.notingAnchorId;
+      disarmNoting();   // one shot: a click without drag disarms the same way
+      const x = Math.min(x0, x1), y = Math.min(y0, y1);
+      const width = Math.abs(x1 - x0), height = Math.abs(y1 - y0);
+      if (width >= FRAME_MIN && height >= FRAME_MIN) createNote(x, y, width, height, anchorId);
+      return;
+    }
     if (view.rubber) {
       const { x0, y0, x1, y1, additive } = view.rubber;
       const left = Math.min(x0, x1), right = Math.max(x0, x1), top = Math.min(y0, y1), bottom = Math.max(y0, y1);
@@ -2640,12 +3077,36 @@
     requestDraw();
   }
 
+  // The Note-tool analogue of disarmFraming.
+  function disarmNoting() {
+    view.noting = false;
+    view.notingAnchorId = null;
+    const btn = App.el('mp-add-note');
+    if (btn) btn.classList.remove('active');
+    const canvas = App.el('mp-canvas');
+    if (canvas) canvas.classList.remove('noting');
+    requestDraw();
+  }
+
   async function createFrame(x, y, width, height) {
     try {
       await App.post(`/api/mapper/maps/${view.mapId}/frames`, { x, y, width, height });
       await loadMapData();
     } catch (error) {
       App.toast(`Could not add the frame: ${error.message}`, 'fail');
+    }
+  }
+
+  // nodeId: the anchor captured when the Note tool was armed (exactly one
+  // node selected at that moment), or null for an unanchored note.
+  async function createNote(x, y, width, height, nodeId) {
+    try {
+      const body = { x, y, width, height };
+      if (nodeId !== null && nodeId !== undefined) body.node_id = nodeId;
+      await App.post(`/api/mapper/maps/${view.mapId}/notes`, body);
+      await loadMapData();
+    } catch (error) {
+      App.toast(`Could not add the note: ${error.message}`, 'fail');
     }
   }
 
@@ -2677,6 +3138,11 @@
     if ((event.key === 'Delete' || event.key === 'Backspace') && view.selectedFrameId) {
       event.preventDefault();
       removeFrame(view.selectedFrameId);
+      return;
+    }
+    if ((event.key === 'Delete' || event.key === 'Backspace') && view.selectedNoteId) {
+      event.preventDefault();
+      removeNote(view.selectedNoteId);
       return;
     }
     const panStep = 40 / view.zoom;
@@ -2730,6 +3196,17 @@
       if (!App.el('modal').hidden) return;
       view.rubber = null;
       disarmFraming();
+      drawRubber();
+    });
+  }
+
+  // The Note-tool analogue of wireFrameEscape.
+  function wireNoteEscape() {
+    window.addEventListener('keydown', (event) => {
+      if (event.key !== 'Escape' || App.state.tab !== 'mapper' || !view.noting) return;
+      if (!App.el('modal').hidden) return;
+      view.rubber = null;
+      disarmNoting();
       drawRubber();
     });
   }
@@ -2799,6 +3276,7 @@
       ['mp-add-device', !canWrite || !hasMap],
       ['mp-add-neighbours', !canWrite || !hasMap],
       ['mp-add-frame', !canWrite || !hasMap],
+      ['mp-add-note', !canWrite || !hasMap],
       ['mp-snap', !canWrite || !hasMap],
     ];
     for (const [id, disabled] of states) {
@@ -2806,8 +3284,9 @@
       if (button && button.disabled !== disabled) button.disabled = disabled;
     }
     // Write revoked (or the map changed out) mid-arm: nothing left to draw
-    // a frame onto, so the tool disarms rather than staying pressed.
+    // a frame or note onto, so the tool disarms rather than staying pressed.
     if (view.framing && (!canWrite || !hasMap)) disarmFraming();
+    if (view.noting && (!canWrite || !hasMap)) disarmNoting();
   }
 
   /* -------------------------------------------------------------- VLANs */
@@ -3019,11 +3498,19 @@
     const svgBlob = new Blob([xml], { type: 'image/svg+xml;charset=utf-8' });
     const url = URL.createObjectURL(svgBlob);
     const img = new Image();
-    // Rendered at device pixel ratio (capped at 2x) so the exported PNG is
-    // as crisp as the screen instead of a 1:1 canvas that looks blurry on
-    // any HiDPI display; drawImage still targets the CSS size, so the
-    // scale-up happens once, on the canvas backing store, not in the image.
-    const scale = Math.min(window.devicePixelRatio || 1, 2);
+    // Targets 4x for a crisp PNG at any zoom level -- drawImage still
+    // targets the CSS size, so the scale-up happens once, on the canvas
+    // backing store, not in the image -- backed off only as far as a
+    // conservative browser canvas guard (no side over 16384px, total area
+    // under ~268 Mpx) demands, and never below today's own
+    // Math.min(window.devicePixelRatio || 1, 2): a huge map degrades to the
+    // old resolution rather than to a canvas the browser refuses to paint.
+    const MAX_CANVAS_SIDE = 16384;
+    const MAX_CANVAS_AREA = 268000000;
+    const dprScale = Math.min(window.devicePixelRatio || 1, 2);
+    const guardScale = Math.min(MAX_CANVAS_SIDE / width, MAX_CANVAS_SIDE / height,
+      Math.sqrt(MAX_CANVAS_AREA / (width * height)));
+    const scale = Math.max(dprScale, Math.min(4, guardScale));
     img.onload = () => {
       const canvas = document.createElement('canvas');
       canvas.width = width * scale; canvas.height = height * scale;
@@ -3122,6 +3609,7 @@
     canvas.oncontextmenu = (event) => event.preventDefault();   // the middle/space pan owns the gesture
     wireSpaceModifier();
     wireFrameEscape();
+    wireNoteEscape();
     App.el('mp-find').addEventListener('keydown', onFindKeydown);
     App.el('mp-find').addEventListener('input', onFindInput);
     App.el('mp-find').addEventListener('blur', onFindBlur);
@@ -3130,12 +3618,24 @@
     document.addEventListener('pointerdown', onFindOutsideClick);
     App.el('mp-add-frame').onclick = () => {
       if (!App.canWrite('mapper') || !view.mapId) return;
+      if (view.noting) disarmNoting();
       view.framing = !view.framing;
       App.el('mp-add-frame').classList.toggle('active', view.framing);
       App.el('mp-canvas').classList.toggle('framing', view.framing);
       // Arming on an empty map swaps the placeholder for the real canvas
       // (see draw()'s gate above); disarming without drawing a frame must
       // bring the placeholder back the same way.
+      requestDraw();
+    };
+    App.el('mp-add-note').onclick = () => {
+      if (!App.canWrite('mapper') || !view.mapId) return;
+      if (view.framing) disarmFraming();
+      view.noting = !view.noting;
+      // The anchor is the operator's choice at THIS moment: exactly one
+      // node selected when the tool is armed, never re-derived later.
+      view.notingAnchorId = view.noting && view.selection.size === 1 ? [...view.selection][0] : null;
+      App.el('mp-add-note').classList.toggle('active', view.noting);
+      App.el('mp-canvas').classList.toggle('noting', view.noting);
       requestDraw();
     };
 
@@ -3190,7 +3690,7 @@
     window.addEventListener('blur', () => {
       if (!gestureActive() && !view.spaceHeld) return;
       view.nodeDrag = null; view.panDrag = null; view.rubber = null; view.spaceHeld = false;
-      view.frameDrag = null;
+      view.frameDrag = null; view.noteDrag = null;
       const svg = App.el('mp-svg');
       if (svg) svg.classList.remove('dragging');
       drawRubber();

@@ -12,6 +12,9 @@
     selected: null,
     controllerFilter: '',
     lastReportedTs: null,
+    // The WEB button's open tunnels, fetched the way nodes.js fetches
+    // its own — matched to the selected AP by ap_id.
+    webRelays: [],
     apSort: App.recallSort('wireless-aps', { key: 'name', descending: false }),
     // History (G, 5.23.0): which AP the two charts above the text detail
     // are currently drawn for, and the window -- `pinned` set by Custom…
@@ -190,11 +193,94 @@
       remove.hidden = false;
       oos.textContent = ap.out_of_service ? 'Return to service' : 'Mark out of service';
     }
+    // The WEB tunnel's own `web` permission, checked here rather than
+    // through data-requires-write — drawApActions already owns this
+    // button's .hidden per selection, and an AP with no reported IP has
+    // nowhere for a tunnel to reach.
+    App.el('wl-web-ap').hidden = !(ap && ap.ip && App.canWrite('web'));
     App.el('wl-detail-name').textContent = ap
       ? (ap.name || ap.wtp_id) : 'AP DETAIL';
+    drawApWebStatus();
+  }
+
+  /* A tunnel outlives the page that opened it, so a reload has to find one
+     that is already up rather than assume none is open. Mirrors nodes.js's
+     drawWebStatus, matched to the selected AP by ap_id rather than
+     device_id. */
+  function drawApWebStatus() {
+    const status = App.el('wl-web-status');
+    if (!status) return;
+    const relay = (view.webRelays || []).find((r) => r.ap_id === view.selected);
+    status.innerHTML = '';
+    if (!relay) return;
+    const minutes = Math.max(1, Math.round((relay.expires_s || 900) / 60));
+    status.append(`Tunnel: port ${relay.port} → ${relay.device_ip}:${relay.device_port} · `);
+    const open = document.createElement('a');
+    open.href = relay.url;
+    open.target = `web-ap-${relay.ap_id}`;
+    open.textContent = 'reopen';
+    open.title = `Closes after ${minutes} minute(s) with no traffic`;
+    status.append(open, ' · ');
+    const close = document.createElement('button');
+    close.className = 'linkish';
+    close.textContent = 'Close';
+    close.onclick = () => closeApWebRelay(relay.session_id);
+    status.append(close);
+  }
+
+  let apWebRelaysFor = null;
+
+  async function loadApWebRelays() {
+    if (!App.canWrite('web')) { view.webRelays = []; return; }
+    try {
+      view.webRelays = (await App.get('/api/web/relays')).relays || [];
+    } catch (error) {
+      view.webRelays = [];
+    }
+    drawApWebStatus();
+  }
+
+  async function closeApWebRelay(sessionId) {
+    try {
+      await App.del(`/api/web/relays/${sessionId}`, {});
+      App.toast('Tunnel closed', 'ok');
+    } catch (error) {
+      App.toast(`Could not close the tunnel: ${error.message}`, 'fail');
+    }
+    loadApWebRelays();
+  }
+
+  /* The window is opened BEFORE the POST and its location set afterwards:
+     a `window.open` after an `await` is no longer inside the click that
+     caused it, and every browser's popup blocker eats it. */
+  async function webAp() {
+    const ap = selectedAp();
+    if (!ap || !App.canWrite('web')) return;
+    const w = window.open('', `web-ap-${ap.id}`, 'width=1200,height=800');
+    if (w) w.opener = null;
+    try {
+      const relay = await App.post(`/api/wireless/aps/${ap.id}/relay`, {});
+      if (w) {
+        w.location = relay.url;
+        w.focus();
+      }
+      const minutes = Math.max(1, Math.round((relay.expires_s || 900) / 60));
+      App.toast(`Tunnel open on port ${relay.port} for ${minutes} minute(s) `
+                + 'of idle time', 'ok');
+      loadApWebRelays();
+    } catch (error) {
+      if (w) w.close();
+      App.toast(`Could not open a tunnel: ${error.message}`, 'fail');
+    }
   }
 
   function showDetail(row) {
+    // Fetched on selection, not on every refresh tick — the same throttle
+    // nodes.js's own loadWebRelays uses.
+    if (apWebRelaysFor !== row.id) {
+      apWebRelaysFor = row.id;
+      loadApWebRelays();
+    }
     const lines = [
       escape(row.name || row.wtp_id), '',
       // The name goes in a span rather than straight into the line: the
@@ -529,6 +615,18 @@
           radio reports above 30 dBm. The raw number is always shown in the AP detail
           pane either way.</p>
       </fieldset>
+      <fieldset><legend>AP WEB TUNNEL</legend>
+        <label>Scheme <select id="wl-web-scheme">
+          <option value="http" ${s.ap_web_scheme === 'http' ? 'selected' : ''}>http</option>
+          <option value="https" ${s.ap_web_scheme !== 'http' ? 'selected' : ''}>https</option>
+        </select></label>
+        <label>Port <input id="wl-web-port" type="number" min="1" max="65535"
+          value="${s.ap_web_port}"></label>
+        <p class="hint">Where the WIRELESS module's <b>WEB</b> button reaches: every
+          AP's own address, as its controller reports it, on this scheme and port —
+          the same one for the whole fleet, since a FortiAP carries no per-device
+          override the way a Nodes device does. FortiOS ships on https/443.</p>
+      </fieldset>
       <fieldset><legend>HISTORY</legend>
         <label>Keep AP/radio history for <input id="wl-hist-days" type="number"
           min="1" max="3650" value="${s.history_days}"></label> days
@@ -550,6 +648,8 @@
           poll_interval_s: Number(m.querySelector('#wl-interval').value),
           v3_verify_replies: m.querySelector('#wl-v3verify').checked,
           radio_power_unit: m.querySelector('#wl-power-unit').value,
+          ap_web_scheme: m.querySelector('#wl-web-scheme').value,
+          ap_web_port: Number(m.querySelector('#wl-web-port').value),
           history_days: Number(m.querySelector('#wl-hist-days').value),
           history_sample_s: Number(m.querySelector('#wl-hist-sample-s').value),
           table_columns: App.readColumnPicker(
@@ -678,6 +778,8 @@
     };
     App.wireToggle('wl-toggle', 'wireless', '/api/wireless/collector',
       () => App.refreshNow('wireless'));
+    App.el('wl-web-ap').onclick = webAp;
+    App.el('wl-web-help').innerHTML = App.helpLink('wireless.ap.web');
 
     // Last thing in init(): refresh() reads all three straight off the DOM,
     // so the first search already carries them.

@@ -12,6 +12,7 @@ hand, and the backoff is exercised through _poll_device with ping stubbed.
 import os
 import sqlite3
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -191,6 +192,50 @@ def saturation_is_sampled_every_pass():
           "...and the next burst starts a fresh clock rather than resuming")
     poller._started = {}
     poller._queued = {}
+    db.close()
+
+
+def a_shrink_counts_the_pool_still_draining():
+    """busy can never exceed workers.
+
+    _apply_pool_size swaps in a smaller pool and calls shutdown(wait=False)
+    on the old one, which does not cancel: its in-flight polls keep running
+    at the old width. Reporting them against the NEW pool's size is what
+    produced "120 busy and 142 queued of 80 worker(s)" -- an impossible
+    line an operator cannot act on.
+    """
+    db, poller, _ids = build(devices=10)
+    poller._apply_pool_size(16)
+    started = threading.Event()
+    release = threading.Event()
+
+    def hold():
+        started.set()
+        release.wait(5.0)
+
+    futures = [poller._executor.submit(hold) for _ in range(4)]
+    started.wait(5.0)
+    poller._apply_pool_size(4)   # the shrink, while four polls are in flight
+    state = poller.pool_state()
+    check(state["workers"] >= 4 + 4,
+          "a shrink with work in flight counts the draining pool's threads "
+          "as well as the new pool's (%r)" % state)
+    poller._started = {i: time.time() for i in range(8)}
+    busy_state = poller.pool_state()
+    check(busy_state["busy"] <= busy_state["workers"],
+          "...so busy never reads higher than workers (%r)" % busy_state)
+    release.set()
+    for future in futures:
+        future.result(5.0)
+    for _ in range(50):
+        if poller.pool_state()["workers"] == 4:
+            break
+        time.sleep(0.05)
+    check(poller.pool_state()["workers"] == 4,
+          "a pool that has finished draining is dropped, so the count goes "
+          "back to the live pool's own size")
+    check(poller._draining == [],
+          "...and nothing is kept for the drained pool")
     db.close()
 
 
@@ -423,6 +468,7 @@ def main() -> int:
     controller()
     bounds_and_damping()
     saturation_is_sampled_every_pass()
+    a_shrink_counts_the_pool_still_draining()
     auto_off_is_unchanged()
     upgrade_keeps_the_operators_number()
     clamps()

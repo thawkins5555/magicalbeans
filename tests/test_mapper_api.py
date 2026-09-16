@@ -634,6 +634,164 @@ try:
                            token=viewer)
     check("...nor delete one", status == 403, (status, payload))
 
+    # ---------------------------------------------------- 7d. notes (6.x)
+
+    status, payload = call("GET", f"/api/mapper/maps/{map_id}", token=admin)
+    check("a freshly built map's payload already carries an (empty) notes list",
+          status == 200 and payload.get("notes") == [], payload.get("notes"))
+
+    status, payload = call("POST", f"/api/mapper/maps/{map_id}/notes",
+                           {"x": 5, "y": 15, "width": 120, "height": 80,
+                            "text": "Uplink to the core", "color": 3, "node_id": node_a},
+                           token=admin)
+    check("adding a note anchored to a placed node is accepted",
+          status == 200 and "id" in payload, (status, payload))
+    note_id = payload["id"]
+
+    status, payload = call("GET", f"/api/mapper/maps/{map_id}", token=admin)
+    note = next((n for n in payload.get("notes", []) if n["id"] == note_id), None) \
+        if status == 200 else None
+    check("the note appears in the map payload with every field, anchor included",
+          note is not None and note["x"] == 5 and note["y"] == 15
+          and note["width"] == 120 and note["height"] == 80
+          and note["text"] == "Uplink to the core" and note["color"] == 3
+          and note["node_id"] == node_a, note)
+
+    status, payload = call("POST", f"/api/mapper/maps/{map_id}/notes",
+                           {"x": 0, "y": 0, "width": 60, "height": 60,
+                            "text": "no anchor"}, token=admin)
+    check("adding a note with no anchor is accepted", status == 200, (status, payload))
+    unanchored_note_id = payload["id"]
+    status, payload = call("GET", f"/api/mapper/maps/{map_id}", token=admin)
+    unanchored = next((n for n in payload["notes"] if n["id"] == unanchored_note_id), None)
+    check("...and its node_id is null", unanchored is not None
+          and unanchored["node_id"] is None, unanchored)
+
+    status, payload = call("PUT", f"/api/mapper/maps/{map_id}/notes/{note_id}",
+                           {"x": 40, "y": 45}, token=admin)
+    check("moving a note (position only) is accepted", status == 200 and payload["ok"],
+          (status, payload))
+    status, payload = call("GET", f"/api/mapper/maps/{map_id}", token=admin)
+    moved_note = next((n for n in payload["notes"] if n["id"] == note_id), None)
+    check("...and the move landed, text and anchor untouched",
+          moved_note is not None and moved_note["x"] == 40 and moved_note["y"] == 45
+          and moved_note["text"] == "Uplink to the core" and moved_note["node_id"] == node_a,
+          moved_note)
+
+    status, payload = call("PUT", f"/api/mapper/maps/{map_id}/notes/{note_id}",
+                           {"node_id": node_b}, token=admin)
+    check("PUT ignores node_id -- the anchor is set once, at creation",
+          status == 400, (status, payload))
+
+    status, payload = call("PUT", f"/api/mapper/maps/{map_id}/notes/{note_id}",
+                           {}, token=admin)
+    check("an empty PUT body is a 400", status == 400, (status, payload))
+
+    for bad_body, why in (
+        ({"x": None}, "PUT x: null"),
+        ({"x": "12"}, "PUT x: a numeric string"),
+        ({"x": True}, "PUT x: a boolean"),
+        ({"text": 123}, "PUT text: a non-string"),
+        ({"color": 2.0}, "PUT color: a float"),
+        ({"color": [1]}, "PUT color: a list"),
+    ):
+        status, payload = call("PUT", f"/api/mapper/maps/{map_id}/notes/{note_id}",
+                               bad_body, token=admin)
+        check(f"{why} is a 400", status == 400, (status, payload))
+
+    status, payload = call("POST", f"/api/mapper/maps/{map_id}/notes",
+                           {"x": 0, "y": 0, "width": 10, "height": 100}, token=admin)
+    check("width under 40 is a 400", status == 400, (status, payload))
+
+    status, payload = call("POST", f"/api/mapper/maps/{map_id}/notes",
+                           {"x": 0, "y": 0, "width": 100, "height": 100,
+                            "text": "x" * 501}, token=admin)
+    check("note text over 500 chars is a 400", status == 400, (status, payload))
+
+    status, payload = call("POST", f"/api/mapper/maps/{map_id}/notes",
+                           {"x": 0, "y": 0, "width": 100, "height": 100, "color": 9},
+                           token=admin)
+    check("an out-of-range color is a 400", status == 400, (status, payload))
+
+    status, payload = call("POST", f"/api/mapper/maps/{map_id}/notes",
+                           {"y": 0, "width": 100, "height": 100}, token=admin)
+    check("a missing x is a 400", status == 400, (status, payload))
+
+    for bad_body, why in (
+        ({"x": 0, "y": 0, "width": 100, "height": 100, "text": 123}, "POST text: a non-string"),
+        ({"x": 0, "y": 0, "width": 100, "height": 100, "color": 2.9}, "POST color: a non-integral float"),
+        ({"x": 0, "y": 0, "width": 100, "height": 100, "color": [1]}, "POST color: a list"),
+        ({"x": 0, "y": 0, "width": 100, "height": 100, "color": True}, "POST color: a boolean"),
+        ({"x": 0, "y": 0, "width": 100, "height": 100, "node_id": "not-a-number"}, "POST node_id: not an integer"),
+    ):
+        status, payload = call("POST", f"/api/mapper/maps/{map_id}/notes", bad_body, token=admin)
+        check(f"{why} is a 400", status == 400, (status, payload))
+
+    status, payload = call("POST", f"/api/mapper/maps/{map_id}/notes",
+                           {"x": 0, "y": 0, "width": 100, "height": 100, "node_id": 999999},
+                           token=admin)
+    check("a node_id not on this map is a 400", status == 400, (status, payload))
+
+    status, payload = call("POST", f"/api/mapper/maps/{map_id}/notes",
+                           {"x": 0, "y": 0, "width": 100, "height": 100, "color": 2.0},
+                           token=admin)
+    check("POST color: 2.0 (integral float) is accepted and stored as int",
+          status == 200 and "id" in payload, (status, payload))
+
+    status, payload = call("POST", "/api/mapper/maps/999999/notes",
+                           {"x": 0, "y": 0, "width": 100, "height": 100}, token=admin)
+    check("adding a note to a map that does not exist is a 404", status == 404,
+          (status, payload))
+
+    status, payload = call("POST", f"/api/mapper/maps/{map_id}/notes",
+                           {"x": 0, "y": 0, "width": 100, "height": 100,
+                            "text": "Doomed"}, token=admin)
+    doomed_note_id = payload["id"]
+    status, payload = call("DELETE",
+                           f"/api/mapper/maps/{map_id}/notes/{doomed_note_id}", token=admin)
+    check("deleting a note is accepted", status == 200 and payload["ok"], (status, payload))
+    status, payload = call("GET", f"/api/mapper/maps/{map_id}", token=admin)
+    check("...and it is gone from the map payload",
+          status == 200 and all(n["id"] != doomed_note_id for n in payload["notes"]), payload)
+    status, payload = call("DELETE",
+                           f"/api/mapper/maps/{map_id}/notes/{doomed_note_id}", token=admin)
+    check("deleting an already-gone note reports ok: false, not an error",
+          status == 200 and payload["ok"] is False, (status, payload))
+
+    # A note's anchor node removed from the map must clear the anchor, not
+    # orphan the note or take it down -- FK ON DELETE SET NULL on node_id.
+    dev_note_anchor = service.nodes_db.add_device("192.0.2.14", name="Switch Note Anchor",
+                                                  group_id=gid)
+    status, payload = call("POST", f"/api/mapper/maps/{map_id}/nodes",
+                           {"device_id": dev_note_anchor}, token=admin)
+    anchor_node_id = payload["id"]
+    status, payload = call("POST", f"/api/mapper/maps/{map_id}/notes",
+                           {"x": 0, "y": 0, "width": 60, "height": 60,
+                            "text": "anchored", "node_id": anchor_node_id}, token=admin)
+    surviving_note_id = payload["id"]
+
+    status, payload = call("DELETE", f"/api/mapper/maps/{map_id}/nodes/{anchor_node_id}",
+                           token=admin)
+    check("removing the anchor node is accepted", status == 200 and payload["ok"],
+          (status, payload))
+    status, payload = call("GET", f"/api/mapper/maps/{map_id}", token=admin)
+    surviving_note = next((n for n in payload.get("notes", []) if n["id"] == surviving_note_id),
+                          None) if status == 200 else None
+    check("...the note it anchored survives, not a 500", status == 200
+          and surviving_note is not None, (status, payload))
+    check("...with its anchor cleared rather than left dangling",
+          surviving_note is not None and surviving_note["node_id"] is None, surviving_note)
+
+    status, payload = call("POST", f"/api/mapper/maps/{map_id}/notes",
+                           {"x": 0, "y": 0, "width": 100, "height": 100}, token=viewer)
+    check("a read-only account cannot add a note", status == 403, (status, payload))
+    status, payload = call("PUT", f"/api/mapper/maps/{map_id}/notes/{note_id}",
+                           {"text": "Nope"}, token=viewer)
+    check("...nor move/edit one", status == 403, (status, payload))
+    status, payload = call("DELETE", f"/api/mapper/maps/{map_id}/notes/{note_id}",
+                           token=viewer)
+    check("...nor delete one", status == 403, (status, payload))
+
     # ---------------------------------------- 8. a device deleted from Nodes
 
     status, payload = call("POST", f"/api/mapper/maps/{map_id}/nodes",

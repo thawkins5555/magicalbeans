@@ -708,6 +708,10 @@ body.tiny .terms { display: none; }
    wrapped one word per line. It gives way like the pane titles above do:
    the full text stays in the title attribute the module already sets. */
 .bar > .hint { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* MAPPER's toolbar checkboxes (Snap/Drag pans/FiberView): a hairline
+   bracket around each caption+box pair, so a caption reads as belonging to
+   the box inside its own bracket rather than to whichever box follows it. */
+.mp-bracket { border: 1px solid var(--hairline); border-radius: var(--radius-sm); padding: 2px 6px; }
 .row { display: flex; gap: 6px; }
 /* Opt-in, like .bar.wrap: a dialog's button row wants to stay on one line
    even when it is tight, but a row of nine equal actions would rather take
@@ -1881,7 +1885,7 @@ body.kiosk .card.strip > .hint { overflow: visible; white-space: normal; }
    hiding them outright, so the rest of the topology stays legible while
    the chosen VLAN's path stands out from it. */
 .mp-link.dimmed { opacity: 0.22; }
-/* FiberView (mp-fiberview): every link.fiber link, bold and glowing blue.
+/* FiberView (mp-fiberview): every link.fiber link, bold and glowing orange.
    The pulse animates stroke-opacity, not opacity, so .dimmed's own opacity
    (above) still dims a fiber link under an active VLAN filter instead of
    the two rules fighting over the same property. */
@@ -1975,10 +1979,11 @@ body.kiosk .card.strip > .hint { overflow: visible; white-space: normal; }
 .mp-swatch.selected { outline: 2px solid var(--focus); outline-offset: 1px; }
 .mp-swatch-grid { display: flex; flex-wrap: wrap; gap: var(--space-sm); }
 
-/* Frame tool arm/disarm: the toolbar button reads pressed like button.primary
-   elsewhere, and the canvas gets a crosshair while a drag is expected. */
-#mp-add-frame.active { background: var(--accent); color: var(--bg); border-color: var(--accent); }
-#mp-canvas.framing #mp-svg { cursor: crosshair; }
+/* Frame/Note tool arm/disarm: the toolbar button reads pressed like
+   button.primary elsewhere, and the canvas gets a crosshair while a drag
+   is expected. */
+#mp-add-frame.active, #mp-add-note.active { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+#mp-canvas.framing #mp-svg, #mp-canvas.noting #mp-svg { cursor: crosshair; }
 
 /* Frames: a labelled rectangle under every link and node (see mapper.js's
    file-header comment on why nothing here moves a node). Six palette
@@ -2002,7 +2007,7 @@ body.kiosk .card.strip > .hint { overflow: visible; white-space: normal; }
 .mp-frame-label {
   fill: var(--mp-frame-color);
   font-family: var(--ui);
-  font-size: var(--fs-2xs);
+  font-size: var(--fs-xs);
   cursor: move;
   paint-order: stroke;
   stroke: var(--canvas);
@@ -2010,6 +2015,33 @@ body.kiosk .card.strip > .hint { overflow: visible; white-space: normal; }
   stroke-linejoin: round;
 }
 .mp-frame-handle { fill: var(--mp-frame-color); opacity: 0.8; cursor: nwse-resize; }
+
+/* Notes: a thought-bubble annotation, optionally anchored to a node (see
+   mapper.js's noteTail) -- the same six-swatch palette as a frame's, so
+   .mp-note-c0..5 mirror .mp-frame-c0..5 rather than defining their own. */
+.mp-note-c0 { --mp-note-color: var(--canvas-vlan-1); }
+.mp-note-c1 { --mp-note-color: var(--canvas-vlan-2); }
+.mp-note-c2 { --mp-note-color: var(--canvas-vlan-3); }
+.mp-note-c3 { --mp-note-color: var(--canvas-vlan-4); }
+.mp-note-c4 { --mp-note-color: var(--canvas-vlan-5); }
+.mp-note-c5 { --mp-note-color: var(--canvas-vlan-6); }
+.mp-note-fill { fill: var(--canvas); fill-opacity: 0.92; }
+.mp-note.selected .mp-note-fill { fill-opacity: 1; }
+.mp-note-stroke {
+  fill: none;
+  stroke: var(--mp-note-color);
+  stroke-width: 1.5;
+  cursor: move;
+}
+.mp-note.selected .mp-note-stroke { stroke-width: 2.5; }
+.mp-note-text {
+  fill: var(--canvas-text);
+  font-family: var(--ui);
+  font-size: var(--fs-2xs);
+  cursor: move;
+}
+.mp-note-tail { fill: var(--canvas); stroke: var(--mp-note-color); stroke-width: 1.5; }
+.mp-note-handle { fill: var(--mp-note-color); opacity: 0.8; cursor: nwse-resize; }
 
 /* #mp-find's suggestion dropdown: plain HTML, fixed and positioned from JS like .tooltip. */
 .mp-suggest {

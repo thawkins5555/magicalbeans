@@ -129,6 +129,11 @@ DEFAULTS = {
     # 1.4M -- see the module docstring risk note for the arithmetic.
     "history_days": 35,
     "history_sample_s": 300,
+    # The WEB button's tunnel target for an AP: FortiAPs are managed over
+    # https on 443 by default, unlike nodesdb's own per-device web_scheme/
+    # web_port, which an AP has none of — one scheme and port for the fleet.
+    "ap_web_scheme": "https",
+    "ap_web_port": 443,
 }
 
 CONTROLLER_EDITABLE = ("name", "ip", "enabled", "snmp_version", "community",

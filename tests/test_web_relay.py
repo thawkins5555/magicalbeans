@@ -898,6 +898,77 @@ try:
         "DELETE", f"/api/web/relays/{theirs['session_id']}", {}, token=token)
     check("an administrator may close it", status == 200, (status, payload))
 
+    # ----------------------------------------------------- a FortiAP's own web
+    print("wireless AP relay")
+    controller_id = service.wireless_db.add_controller("stub-controller", "127.0.0.1")
+    ap_id = service.wireless_db.upsert_ap(
+        controller_id, "WTP001", "", ip="127.0.0.1", name="FortiAP-Test",
+        status="online")
+    status, payload, _ = call("POST", "/api/settings", {"scope": "wireless", "values": {
+        "ap_web_scheme": "http", "ap_web_port": stub_port}}, token=token)
+    assert status == 200, (status, payload)
+
+    status, ap_relay, _ = call("POST", f"/api/wireless/aps/{ap_id}/relay",
+                               {}, token=token)
+    check("POST /api/wireless/aps/<id>/relay is answered 200", status == 200,
+          (status, ap_relay))
+    check("it carries no device_id -- an AP is not a Nodes device",
+          ap_relay.get("device_id") is None, ap_relay.get("device_id"))
+    check("its ap_id names the access point",
+          ap_relay.get("ap_id") == ap_id, ap_relay.get("ap_id"))
+
+    answer = fetch_through(ap_relay["port"])
+    check("a GET through the AP's tunnel comes back byte for byte",
+          BODY in answer, answer[:80])
+
+    before_events = len(service.nodes_db.device_events(
+        device_id=device_id, kinds=["web"]))
+    service.web_relays.close(ap_relay["session_id"], "test teardown")
+    after_events = len(service.nodes_db.device_events(
+        device_id=device_id, kinds=["web"]))
+    check("closing an AP's relay writes no device event -- there is no "
+          "device row, and ap_events is the alert engine's, not this",
+          after_events == before_events, (before_events, after_events))
+
+    nodes_log = [e for e in service.log.all() if e.category == "nodes"
+                and "FortiAP-Test" in e.message]
+    check("the NODES log names the AP on open and on close",
+          any("opened" in e.message for e in nodes_log)
+          and any("closed" in e.message for e in nodes_log),
+          [e.message for e in nodes_log])
+
+    status, payload, _ = call("GET", "/api/audit?limit=500", token=token)
+    audited = [(row.get("action"), row.get("target"))
+              for row in payload.get("events", [])]
+    check("the audit trail's web.relay.open names the AP by address, "
+          "not a device", ("web.relay.open", "ap:127.0.0.1") in audited,
+          audited[-5:])
+
+    no_ip_ap = service.wireless_db.upsert_ap(
+        controller_id, "WTP002", "", name="NoIpAP", status="online")
+    status, payload, _ = call("POST", f"/api/wireless/aps/{no_ip_ap}/relay",
+                              {}, token=token)
+    check("an AP with no reported IP is refused 400, operator-readable, "
+          "not a crash", status == 400 and "IP address" in str(payload.get("error", "")),
+          (status, payload))
+
+    wireless_only = make_user("wirelessonly", {"wireless": "write"})
+    status, payload, _ = call("POST", f"/api/wireless/aps/{ap_id}/relay",
+                              {}, token=wireless_only)
+    check("wireless:write with no web grant is refused 403 -- opening a "
+          "port on this host is the web permission's gate, not wireless's",
+          status == 403, (status, payload))
+
+    status, ap_relay2, _ = call("POST", f"/api/wireless/aps/{ap_id}/relay",
+                                {}, token=token)
+    assert status == 200, (status, ap_relay2)
+    live_ap = service.web_relays.get(ap_relay2["session_id"])
+    check("the client-IP watchdog admits the operator's own address",
+          live_ap._admit(("127.0.0.1", 51000)))
+    check("...and refuses any other, exactly as a device relay's does",
+          not live_ap._admit(("10.4.4.4", 51000)))
+    service.web_relays.close(ap_relay2["session_id"], "test teardown")
+
     # --------------------------------------------------------------- shutdown
     print("shutdown")
     status, lingering, _ = call("POST", f"/api/web/devices/{device_id}/relay",

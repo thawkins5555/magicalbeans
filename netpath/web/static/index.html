@@ -1008,6 +1008,11 @@
            only ever hides and cannot gate a control shown later. -->
       <button id="wl-oos" data-requires-write="wireless" hidden>Mark out of service</button>
       <button id="wl-remove-ap" data-requires-write="wireless" hidden>Remove</button>
+      <!-- Its own `web` permission, gated by drawApActions per selection
+           rather than data-requires-write — see wireless.js. -->
+      <button id="wl-web-ap" hidden>WEB</button>
+      <span id="wl-web-help"></span>
+      <span id="wl-web-status" class="hint"></span>
     </header>
     <div id="wl-hist" hidden>
       <div class="bar">
@@ -1220,10 +1225,11 @@
     <button id="mp-remove-node" data-requires-write="mapper">Remove</button>
     <button id="mp-connect" data-requires-write="mapper">Connect</button>
     <button id="mp-add-frame" data-requires-write="mapper" title="Draw a labelled frame: click, then drag on empty canvas">Frame</button>
+    <button id="mp-add-note" data-requires-write="mapper" title="Add a note: click, then drag on empty canvas. Anchors to the selected device, if exactly one is selected.">Note</button>
     <span class="grow"></span>
-    <label>Snap <input type="checkbox" id="mp-snap" data-requires-write="mapper"></label>
-    <label title="Left-drag on empty canvas pans the map instead of selecting devices">Drag pans <input type="checkbox" id="mp-drag-pans"></label>
-    <label title="Highlights links whose ports report an optical transceiver, bold and glowing: blue for multimode, dark yellow for single-mode, dotted red for a single/multimode mismatch">FiberView <input type="checkbox" id="mp-fiberview"></label>
+    <span class="mp-bracket"><label>Snap <input type="checkbox" id="mp-snap" data-requires-write="mapper"></label></span>
+    <span class="mp-bracket"><label title="Left-drag on empty canvas pans the map instead of selecting devices">Drag pans <input type="checkbox" id="mp-drag-pans"></label></span>
+    <span class="mp-bracket"><label title="Highlights links whose ports report an optical transceiver, bold and glowing: dark orange for multimode, bright yellow for single-mode, dotted red for a single/multimode mismatch">FiberView <input type="checkbox" id="mp-fiberview"></label></span>
     <button id="mp-align" data-requires-write="mapper">Align</button>
     <button id="mp-fit">Fit</button>
     <button id="mp-zoom-out">Zoom out</button>

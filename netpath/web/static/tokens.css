@@ -53,8 +53,8 @@
   --checked: #22304A;
   --checked-strong: #2E4470;
   --reveal: #5A4A00;  /* revealDevice() row highlight, amber (distinct from --selected/--checked) */
-  --fiber: #2F8CFF;  /* FiberView link highlight; #mp-canvas is white in every theme but Contrast, so this value is shared by all but that one below */
-  --fiber-sm: #B8860B;  /* FiberView single-mode links, dark yellow beside --fiber's blue for multimode */
+  --fiber: #C2560A;  /* FiberView link highlight; #mp-canvas is white in every theme but Contrast, so this value is shared by all but that one below */
+  --fiber-sm: #D4A017;  /* FiberView single-mode links, a brighter yellow beside --fiber's dark orange for multimode */
 
   /* Categorical: eight hues for stacked NetFlow series, chosen for separation under protanopia simulation too.
      A ninth series onwards is --data-neutral, not a ninth hue. */
@@ -200,8 +200,8 @@
   --checked: #22314F;
   --checked-strong: #2A3E66;
   --reveal: #6B5900;
-  --fiber: #6FB8FF;  /* lighter, for FiberView links on this theme's dark --canvas */
-  --fiber-sm: #E0B030;  /* single-mode counterpart, lighter the same way */
+  --fiber: #E07B2A;  /* lighter, for FiberView links on this theme's dark --canvas */
+  --fiber-sm: #F2D648;  /* single-mode counterpart, lighter the same way */
 
   /* The canvas follows this theme too: a white slab would be the largest glare source on a near-black ground. */
   --canvas: #0E1319;
@@ -266,8 +266,8 @@
   --checked: #D6E3F7;
   --checked-strong: #BFD3F2;
   --reveal: #FFF3A3;
-  --fiber: #2F8CFF;
-  --fiber-sm: #B8860B;
+  --fiber: #C2560A;
+  --fiber-sm: #D4A017;
   --shadow-pop: 0 12px 40px rgba(20, 30, 45, 0.25);
   --shadow-float: 0 6px 20px rgba(20, 30, 45, 0.2);
   --scrim: rgba(20, 30, 45, 0.45);
@@ -304,8 +304,8 @@
   --checked: #1B2C4A;
   --checked-strong: #25396A;
   --reveal: #4A3D00;
-  --fiber: #2F8CFF;
-  --fiber-sm: #B8860B;
+  --fiber: #C2560A;
+  --fiber-sm: #D4A017;
   /* Same eight roles as Dark: a NOC map already reads these hues as "series 3" or "series 6" and a
      theme swap should not retrain that, so only their background (implicitly, via --raised/--panel
      above) moves, not the hues themselves. */
@@ -352,8 +352,8 @@
   --checked: #3B4C68;
   --checked-strong: #48628C;
   --reveal: #5C4A1E;
-  --fiber: #2F8CFF;
-  --fiber-sm: #B8860B;
+  --fiber: #C2560A;
+  --fiber-sm: #D4A017;
   /* Nord's own eight named accents (frost + aurora), not a re-hue of Dark's set — Nord is
      recognised by these particular hues. */
   --cat-1: #81A1C1;
@@ -400,8 +400,8 @@
   --checked: #164753;
   --checked-strong: #1D5765;
   --reveal: #5C4400;
-  --fiber: #2F8CFF;
-  --fiber-sm: #B8860B;
+  --fiber: #C2560A;
+  --fiber-sm: #D4A017;
   /* Solarized's own eight accents, canonical hues (yellow/orange/cyan/blue/violet/red/magenta/
      green), reordered so the pair drawn on the same chart are never adjacent hues. */
   --cat-1: #268BD2;
@@ -445,8 +445,8 @@
   --checked: #CBDCF0;
   --checked-strong: #B4CDEA;
   --reveal: #F2E7A8;
-  --fiber: #2F8CFF;
-  --fiber-sm: #B8860B;
+  --fiber: #C2560A;
+  --fiber-sm: #D4A017;
   /* Dark's eight hues, darkened and saturated the same way the badge tones above are — light-on-
      dark does not survive the trip to a paper-coloured ground unless it goes dark-on-light too. */
   --cat-1: #2F5FC4;
@@ -487,8 +487,8 @@
   --checked: #23195A;
   --checked-strong: #2F2278;
   --reveal: #5A4700;
-  --fiber: #2F8CFF;
-  --fiber-sm: #B8860B;
+  --fiber: #C2560A;
+  --fiber-sm: #D4A017;
   --tube: 0 0 6px var(--tube-line), 0 0 16px color-mix(in srgb, var(--tube-line) 55%, transparent);
   --tube-text: 0 0 6px color-mix(in srgb, currentColor 80%, transparent), 0 0 14px color-mix(in srgb, currentColor 45%, transparent);
   /* The same series numbering as Dark, in the colours a sign comes in. */

@@ -96,6 +96,28 @@ CREATE TABLE IF NOT EXISTS map_frames (
 );
 CREATE INDEX IF NOT EXISTS ix_map_frames_map ON map_frames(map_id);
 
+-- A thought-bubble annotation carrying operator text, optionally anchored
+-- to one placed node so its tail follows that node when dragged --
+-- node_id ON DELETE SET NULL rather than CASCADE, since removing the
+-- anchor's placement should orphan the note back to an unanchored bubble,
+-- not take the note down with it (map_frames' own comment above explains
+-- why x/y here is a top-left corner, same convention).
+CREATE TABLE IF NOT EXISTS map_notes (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    map_id     INTEGER NOT NULL,
+    node_id    INTEGER,
+    text       TEXT NOT NULL DEFAULT '',
+    x          REAL NOT NULL,
+    y          REAL NOT NULL,
+    width      REAL NOT NULL,
+    height     REAL NOT NULL,
+    color      INTEGER NOT NULL DEFAULT 0,
+    added_ts   REAL NOT NULL,
+    FOREIGN KEY (map_id) REFERENCES maps(id) ON DELETE CASCADE,
+    FOREIGN KEY (node_id) REFERENCES map_nodes(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS ix_map_notes_map ON map_notes(map_id);
+
 CREATE TABLE IF NOT EXISTS vlan_colors (
     vlan         INTEGER PRIMARY KEY,
     color_index  INTEGER NOT NULL
@@ -187,6 +209,11 @@ FRAME_COLOR_MAX = 5
 FRAME_MIN_SIZE = 40.0
 FRAME_LABEL_MAX = 60
 
+# A note shares a frame's palette and minimum drawn size (FRAME_COLOR_MAX,
+# FRAME_MIN_SIZE) -- same six-swatch idiom, same shape of object -- but its
+# text runs much longer than a frame's label, so it gets its own cap.
+NOTE_TEXT_MAX = 500
+
 
 def _validate_frame_fields(fields: dict) -> None:
     """Checks only the keys present in `fields` (shared by add_frame, which
@@ -215,6 +242,35 @@ def _validate_frame_fields(fields: dict) -> None:
         if isinstance(color, bool) or not isinstance(color, int) \
                 or not (0 <= color <= FRAME_COLOR_MAX):
             raise ValueError(f"Frame color must be an integer between 0 and {FRAME_COLOR_MAX}.")
+
+
+def _validate_note_fields(fields: dict) -> None:
+    """The _validate_frame_fields idiom, for a note's `text` instead of a
+    frame's `label` (and NOTE_TEXT_MAX instead of FRAME_LABEL_MAX) -- x/y/
+    width/height/color are checked identically, against the same
+    FRAME_MIN_SIZE/FRAME_COLOR_MAX a frame is."""
+    if "text" in fields:
+        raw_text = fields["text"]
+        if raw_text is not None and not isinstance(raw_text, str):
+            raise ValueError("Note text must be text.")
+        text = (raw_text or "").strip()
+        if len(text) > NOTE_TEXT_MAX:
+            raise ValueError(f"Note text is limited to {NOTE_TEXT_MAX} characters.")
+        fields["text"] = text
+    for key in ("x", "y", "width", "height"):
+        if key in fields:
+            value = fields[key]
+            if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                    or not math.isfinite(value):
+                raise ValueError(f"Note {key} must be a finite number.")
+    for key in ("width", "height"):
+        if key in fields and fields[key] < FRAME_MIN_SIZE:
+            raise ValueError(f"Note {key} must be at least {FRAME_MIN_SIZE:g}.")
+    if "color" in fields:
+        color = fields["color"]
+        if isinstance(color, bool) or not isinstance(color, int) \
+                or not (0 <= color <= FRAME_COLOR_MAX):
+            raise ValueError(f"Note color must be an integer between 0 and {FRAME_COLOR_MAX}.")
 
 
 class MapperDatabase(SqliteStore):
@@ -513,6 +569,65 @@ class MapperDatabase(SqliteStore):
         with self._lock:
             cur = self._conn.execute(
                 "DELETE FROM map_frames WHERE id = ? AND map_id = ?", (frame_id, map_id))
+            if cur.rowcount:
+                self._touch_map(map_id)
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    # ----------------------------------------------------------------- notes
+
+    def notes(self, map_id: int) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM map_notes WHERE map_id = ? ORDER BY id",
+                (map_id,)).fetchall()
+
+    def add_note(self, map_id: int, x: float, y: float, width: float, height: float,
+                text: str = "", color: int = 0, node_id: int | None = None,
+                now: float | None = None) -> int:
+        fields = {"x": x, "y": y, "width": width, "height": height,
+                  "text": text, "color": color}
+        _validate_note_fields(fields)
+        now = time.time() if now is None else now
+        with self._lock:
+            if node_id is not None:
+                on_map = self._conn.execute(
+                    "SELECT id FROM map_nodes WHERE id = ? AND map_id = ?",
+                    (node_id, map_id)).fetchone()
+                if on_map is None:
+                    raise ValueError("A note's anchor node must be on this map.")
+            cur = self._conn.execute(
+                "INSERT INTO map_notes(map_id, node_id, text, x, y, width, height, color,"
+                " added_ts) VALUES (?,?,?,?,?,?,?,?,?)",
+                (map_id, node_id, fields["text"], fields["x"], fields["y"], fields["width"],
+                 fields["height"], fields["color"], now))
+            self._touch_map(map_id, now)
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def update_note(self, map_id: int, note_id: int, **fields) -> bool:
+        """Any of text/x/y/width/height/color -- the anchor itself (node_id)
+        is set once, at creation, and never patched. Same not-found-is-False
+        shape as update_frame."""
+        allowed = {k: v for k, v in fields.items()
+                  if k in ("text", "x", "y", "width", "height", "color")}
+        _validate_note_fields(allowed)
+        if not allowed:
+            return False
+        sets = [f"{col} = ?" for col in allowed]
+        vals = list(allowed.values()) + [note_id, map_id]
+        with self._lock:
+            cur = self._conn.execute(
+                f"UPDATE map_notes SET {', '.join(sets)} WHERE id = ? AND map_id = ?", vals)
+            if cur.rowcount:
+                self._touch_map(map_id)
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def delete_note(self, map_id: int, note_id: int) -> bool:
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM map_notes WHERE id = ? AND map_id = ?", (note_id, map_id))
             if cur.rowcount:
                 self._touch_map(map_id)
             self._conn.commit()

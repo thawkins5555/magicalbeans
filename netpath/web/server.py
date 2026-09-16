@@ -473,6 +473,10 @@ ROUTES = [
     ("PUT", r"^/api/mapper/maps/(\d+)/frames/(\d+)$", api.put_mapper_map_frame, ("mapper", W)),
     ("DELETE", r"^/api/mapper/maps/(\d+)/frames/(\d+)$",
      api.delete_mapper_map_frame, ("mapper", W)),
+    ("POST", r"^/api/mapper/maps/(\d+)/notes$", api.post_mapper_map_notes, ("mapper", W)),
+    ("PUT", r"^/api/mapper/maps/(\d+)/notes/(\d+)$", api.put_mapper_map_note, ("mapper", W)),
+    ("DELETE", r"^/api/mapper/maps/(\d+)/notes/(\d+)$",
+     api.delete_mapper_map_note, ("mapper", W)),
     # Matched before the "(\d+)" map route above would ever get the chance:
     # "candidates" and "export.csv" are not \d+, so there is no actual
     # ordering hazard, but this keeps every /maps/(\d+)/... sub-route
@@ -556,6 +560,10 @@ ROUTES = [
      api.get_wireless_ap_history_export, ("wireless", R)),
     ("POST", r"^/api/wireless/aps/(\d+)/service$", api.post_wireless_ap_service, ("wireless", W)),
     ("DELETE", r"^/api/wireless/aps/(\d+)$", api.delete_wireless_ap, ("wireless", W)),
+    # Gated on `web`, not `wireless`: opening a listening port on this host
+    # is the `web` permission's business, the same call the Nodes WEB
+    # button makes.
+    ("POST", r"^/api/wireless/aps/(\d+)/relay$", api.post_wireless_ap_relay, ("web", W)),
     ("POST", r"^/api/wireless/collector$", api.post_wireless_collector, ("wireless", W)),
     ("POST", r"^/api/ipam/worker$", api.post_ipam_worker, ("ipam", W)),
     ("GET", r"^/api/configrx/overview$", api.get_configrx_overview, ("configrx", R)),
