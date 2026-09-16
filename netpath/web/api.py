@@ -10253,14 +10253,24 @@ def post_mapper_map_frames(service, params, body, map_id) -> dict:
     add_frame itself raises ValueError, with an operator-readable message,
     for a bad size/color/label; left to surface unchanged."""
     _require(service.mapper_db.map_row(map_id), "map")
+    label = body.get("label", "")
+    if label is not None and not isinstance(label, str):
+        raise ValueError("Frame label must be text.")
     try:
         x, y = float(body.get("x")), float(body.get("y"))
         width, height = float(body.get("width")), float(body.get("height"))
+        color = body.get("color", 0) or 0
+        if isinstance(color, bool) or not isinstance(color, (int, float)):
+            raise ValueError  # not a number at all
+        if isinstance(color, float):
+            if not math.isfinite(color) or not color.is_integer():
+                raise ValueError  # e.g. 2.9, nan, inf
+            color = int(color)
     except (TypeError, ValueError):
-        raise ValueError("x, y, width and height are required.")
+        raise ValueError("x, y, width, height and color must be numbers.")
     frame_id = service.mapper_db.add_frame(
         map_id, x=x, y=y, width=width, height=height,
-        label=str(body.get("label", "") or ""), color=int(body.get("color", 0) or 0))
+        label=(label or ""), color=color)
     _audit(service, params, "mapper.frame", target=str(map_id),
           detail=f"frame_id={frame_id}")
     return {"id": frame_id}

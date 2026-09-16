@@ -466,6 +466,18 @@ try:
                            {}, token=admin)
     check("an empty PUT body is a 400", status == 400, (status, payload))
 
+    for bad_body, why in (
+        ({"x": None}, "PUT x: null"),
+        ({"x": "12"}, "PUT x: a numeric string"),
+        ({"x": True}, "PUT x: a boolean"),
+        ({"label": 123}, "PUT label: a non-string"),
+        ({"color": 2.0}, "PUT color: a float"),
+        ({"color": [1]}, "PUT color: a list"),
+    ):
+        status, payload = call("PUT", f"/api/mapper/maps/{map_id}/frames/{frame_id}",
+                               bad_body, token=admin)
+        check(f"{why} is a 400", status == 400, (status, payload))
+
     status, payload = call("POST", f"/api/mapper/maps/{map_id}/frames",
                            {"x": 0, "y": 0, "width": 10, "height": 100}, token=admin)
     check("width under 40 is a 400", status == 400, (status, payload))
@@ -483,6 +495,21 @@ try:
     status, payload = call("POST", f"/api/mapper/maps/{map_id}/frames",
                            {"y": 0, "width": 100, "height": 100}, token=admin)
     check("a missing x is a 400", status == 400, (status, payload))
+
+    for bad_body, why in (
+        ({"x": 0, "y": 0, "width": 100, "height": 100, "label": 123}, "POST label: a non-string"),
+        ({"x": 0, "y": 0, "width": 100, "height": 100, "color": 2.9}, "POST color: a non-integral float"),
+        ({"x": 0, "y": 0, "width": 100, "height": 100, "color": [1]}, "POST color: a list"),
+        ({"x": 0, "y": 0, "width": 100, "height": 100, "color": True}, "POST color: a boolean"),
+    ):
+        status, payload = call("POST", f"/api/mapper/maps/{map_id}/frames", bad_body, token=admin)
+        check(f"{why} is a 400", status == 400, (status, payload))
+
+    status, payload = call("POST", f"/api/mapper/maps/{map_id}/frames",
+                           {"x": 0, "y": 0, "width": 100, "height": 100, "color": 2.0},
+                           token=admin)
+    check("POST color: 2.0 (integral float) is accepted and stored as int",
+          status == 200 and "id" in payload, (status, payload))
 
     status, payload = call("POST", "/api/mapper/maps/999999/frames",
                            {"x": 0, "y": 0, "width": 100, "height": 100}, token=admin)

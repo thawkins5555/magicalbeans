@@ -250,6 +250,13 @@ for kwargs, why in (
     ({"x": 0, "y": 0, "color": -1, "width": 100, "height": 100}, "negative color"),
     ({"x": float("nan"), "y": 0, "width": 100, "height": 100}, "non-finite x"),
     ({"x": float("inf"), "y": 0, "width": 100, "height": 100}, "infinite x"),
+    ({"x": True, "y": 0, "width": 100, "height": 100}, "boolean x"),
+    ({"x": None, "y": 0, "width": 100, "height": 100}, "None x"),
+    ({"x": "12", "y": 0, "width": 100, "height": 100}, "string x"),
+    ({"x": 0, "y": 0, "color": True, "width": 100, "height": 100}, "boolean color"),
+    ({"x": 0, "y": 0, "color": 2.0, "width": 100, "height": 100}, "float color"),
+    ({"x": 0, "y": 0, "color": "2", "width": 100, "height": 100}, "string color"),
+    ({"x": 0, "y": 0, "label": 123, "width": 100, "height": 100}, "non-string label"),
 ):
     try:
         db.add_frame(map_id, **kwargs)
@@ -279,6 +286,18 @@ check("...the recognised key still landed",
 
 check("update_frame on a missing frame id returns False",
       db.update_frame(map_id, 999999, label="Nope") is False)
+
+check("update_frame(label=None) clears the label to ''",
+      db.update_frame(map_id, frame_id, label=None) is True)
+check("...it landed as ''",
+      next(r for r in db.frames(map_id) if r["id"] == frame_id)["label"] == "")
+
+try:
+    db.update_frame(map_id, frame_id, label=123)
+    check("update_frame rejects a non-string label", False)
+except ValueError as exc:
+    check("update_frame rejects a non-string label", True)
+    check("...with a readable message", len(str(exc)) > 0, str(exc))
 
 try:
     db.update_frame(map_id, frame_id, width=10)

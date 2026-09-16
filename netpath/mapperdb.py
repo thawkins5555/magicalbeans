@@ -194,7 +194,10 @@ def _validate_frame_fields(fields: dict) -> None:
     caller sent), raising ValueError with an operator-readable message.
     Mutates `fields["label"]` to its stripped form when present."""
     if "label" in fields:
-        label = (fields["label"] or "").strip()
+        raw_label = fields["label"]
+        if raw_label is not None and not isinstance(raw_label, str):
+            raise ValueError("Frame label must be text.")
+        label = (raw_label or "").strip()
         if len(label) > FRAME_LABEL_MAX:
             raise ValueError(f"Frame label is limited to {FRAME_LABEL_MAX} characters.")
         fields["label"] = label
