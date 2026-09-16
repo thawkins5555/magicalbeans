@@ -15,6 +15,7 @@ import http.client
 import io
 import json
 import os
+import time
 from urllib.parse import urlencode
 
 import _paths  # noqa: F401  (repo root + tests dir on sys.path)
@@ -22,6 +23,7 @@ import _paths  # noqa: F401  (repo root + tests dir on sys.path)
 from netpath.auth import DEFAULT_PASSWORD, DEFAULT_USER
 from netpath.nodesdb import NodesDatabase
 from netpath.web import Service, WebServer
+from netpath.web import api
 
 TMPDIR = _paths.tmpdir("device_address_search_")
 FAILS = []
@@ -105,6 +107,36 @@ check("it says the same as the per-device read",
       [r["ip"] for r in bulk[winner_id]]
       == [r["ip"] for r in db.device_addresses(winner_id)],
       [r["ip"] for r in db.device_addresses(winner_id)])
+
+print("2b. the interface column on an alias")
+db.record_device_addresses(
+    winner_id, ["10.20.9.60"], "ipAddrTable",
+    details={"10.20.9.60": {"if_index": 5}})
+db._conn.execute(
+    "INSERT INTO interfaces(device_id, if_index, descr, name, last_seen_ts)"
+    " VALUES (?, 5, 'GigabitEthernet0/5', 'Gi0/5', ?)", (winner_id, time.time()))
+db._conn.execute(
+    "INSERT INTO interfaces(device_id, if_index, descr, name, last_seen_ts)"
+    " VALUES (?, 6, NULL, 'Gi0/6', ?)", (winner_id, time.time()))
+db._conn.commit()
+names = {r["if_index"]: r for r in db.interfaces(winner_id)}
+built = {a["ip"]: a for a in api._device_addresses_json(
+    db.device(winner_id), db.device_addresses(winner_id), names)}
+check("descr wins when the interface has one",
+      built["10.20.9.60"]["interface"] == "GigabitEthernet0/5",
+      built["10.20.9.60"])
+check("the primary row carries an empty interface",
+      built[db.device(winner_id)["ip"]]["interface"] == "",
+      built[db.device(winner_id)["ip"]])
+check("an alias whose ifIndex is gone falls back to empty",
+      api._interface_label(names, 99) == "", api._interface_label(names, 99))
+check("no ifIndex at all is also empty",
+      api._interface_label(names, None) == "", api._interface_label(names, None))
+check("name is the fallback when descr is NULL",
+      api._interface_label(names, 6) == "Gi0/6", api._interface_label(names, 6))
+check("with no names map at all, every row's interface is empty",
+      all(a["interface"] == "" for a in api._device_addresses_json(
+          db.device(winner_id), db.device_addresses(winner_id))), None)
 db.close()
 
 # ---------------------------------------------------- what the operator sees

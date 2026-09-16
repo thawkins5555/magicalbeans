@@ -198,6 +198,14 @@ def duration_text(seconds) -> str:
     return f"{days} d {hours:02d} h"
 
 
+def severity_tag(severity: int) -> str:
+    """A bracketed, upper-case tag for the front of a subject line —
+    "[CRITICAL]" — so severity is legible in a notification preview
+    without opening the message."""
+    return "[{}]".format(
+        (SEVERITY_NAMES[severity] if 0 <= severity <= 7 else str(severity)).upper())
+
+
 def build_context(alert_row, rule_row, extra: dict | None = None) -> dict:
     """Every token available to every template — a superset, since a given
     template only uses the subset relevant to its own rule kind."""
@@ -212,11 +220,7 @@ def build_context(alert_row, rule_row, extra: dict | None = None) -> dict:
         "detail": alert_row["detail"] or "",
         "severity": severity,
         "severity_name": SEVERITY_NAMES[severity] if 0 <= severity <= 7 else str(severity),
-        # A bracketed, upper-case tag for the front of a subject line —
-        # "[CRITICAL]" — so severity is legible in a notification preview
-        # without opening the message.
-        "severity_tag": "[{}]".format(
-            (SEVERITY_NAMES[severity] if 0 <= severity <= 7 else str(severity)).upper()),
+        "severity_tag": severity_tag(severity),
         "count": alert_row["count"],
         "opened_time": _clock(alert_row["opened_ts"]),
         "last_time": _clock(alert_row["last_ts"]),

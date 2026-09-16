@@ -1331,6 +1331,12 @@ class NodesDatabase(SqliteStore):
             "media": "TEXT",
         })
 
+        # The device's own default-route next hop(s), comma-joined when more
+        # than one answers (ECMP or a tos-scoped pair) — see nodepoll.
+        # _refresh_addresses. "" once a read answers with no default route,
+        # NULL until the first successful read.
+        self.ensure_columns("devices", {"default_gateway": "TEXT"})
+
         # A sweep's reached addresses (JSON) and, if folded into another
         # result as the same box, that result's id.
         self.ensure_columns("discovery_results", {
@@ -4264,6 +4270,16 @@ class NodesDatabase(SqliteStore):
             self._conn.execute(
                 "UPDATE devices SET stp_capable = ? WHERE id = ?",
                 (None if capable is None else (1 if capable else 0), device_id))
+            self._conn.commit()
+
+    def set_default_gateway(self, device_id: int, text: str) -> None:
+        """The comma-joined next hop(s) _refresh_addresses read, or "" for
+        an answered read with no default route. A poll that could not read
+        either OID leaves the stored value alone rather than calling this."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE devices SET default_gateway = ? WHERE id = ?",
+                (text, device_id))
             self._conn.commit()
 
     # ------------------------------------------------------ UPS / sensors

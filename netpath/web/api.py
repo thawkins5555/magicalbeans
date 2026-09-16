@@ -3677,6 +3677,11 @@ def _device_json(row, reveal: bool = False) -> dict:
         "vendor_source": row["vendor_source"] or "",
         "vendor_oid": row["vendor_oid"] or "",
         "location_oid": row["location_oid"] or "",
+        # The device's own default-route next hop(s) — see nodepoll.
+        # _refresh_default_gateway — comma-joined when more than one, "" when
+        # unset or the last read found none.
+        "default_gateway": ((row["default_gateway"] or "")
+                            if "default_gateway" in row.keys() else ""),
         # sw_image_file is Cisco's boot image path, not a version.
         "sw_version": (row["sw_version"] if "sw_version" in row.keys() else None),
         "fw_version": (row["fw_version"] if "fw_version" in row.keys() else None),
@@ -4806,22 +4811,39 @@ def _address_json(row) -> dict:
             "netmask": row["netmask"] if "netmask" in keys else None}
 
 
-def _device_addresses_json(row, aliases) -> list[dict]:
+def _interface_label(names, if_index) -> str:
+    """The Addresses subtab's "interface" column: an alias's descr, falling
+    back to its name, or "" once the interface is gone or if_index unknown."""
+    if not names or if_index is None:
+        return ""
+    iface = names.get(if_index)
+    if iface is None:
+        return ""
+    return iface["descr"] or iface["name"] or ""
+
+
+def _device_addresses_json(row, aliases, names=None) -> list[dict]:
     """The device's primary address first, then every learned alias — the
     primary isn't stored in device_addresses, so it's added here. The alias
     rows are passed in rather than read here, so a whole page of devices can
-    be answered from one nodes_db.addresses_for_devices() read."""
+    be answered from one nodes_db.addresses_for_devices() read. `names` is
+    {if_index: interfaces row}, for the "interface" column — omitted where a
+    caller has no reason to pay for the interfaces read."""
     addresses = [{"ip": row["ip"], "source": "primary", "seen_ts": None,
-                  "if_index": None, "netmask": None, "primary": True}]
+                  "if_index": None, "netmask": None, "primary": True,
+                  "interface": ""}]
     for alias in aliases:
-        addresses.append({**_address_json(alias), "primary": False})
+        addr = _address_json(alias)
+        addresses.append({**addr, "primary": False,
+                          "interface": _interface_label(names, addr["if_index"])})
     return addresses
 
 
 def get_nodes_device_addresses(service, params, body, device_id) -> dict:
     row = _require(service.nodes_db.device(device_id), "device")
+    names = {r["if_index"]: r for r in service.nodes_db.interfaces(device_id)}
     return {"addresses": _device_addresses_json(
-        row, service.nodes_db.device_addresses(device_id))}
+        row, service.nodes_db.device_addresses(device_id), names)}
 
 
 # The same ceiling shape DEVICE_LIST_MAX_LIMIT uses. The pair count is
@@ -4950,8 +4972,9 @@ def get_nodes_device(service, params, body, device_id) -> dict:
     # ADDRESSES subtab is one short list the detail pane already has a
     # round trip for, and a second request per device selection to carry
     # three rows is a request nobody needs.
+    names = {r["if_index"]: r for r in service.nodes_db.interfaces(device_id)}
     device["addresses"] = _device_addresses_json(
-        row, service.nodes_db.device_addresses(device_id))
+        row, service.nodes_db.device_addresses(device_id), names)
     device.update(_identification_json(service, row))
     return {"device": device}
 

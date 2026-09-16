@@ -4268,6 +4268,33 @@ class NodePoller(Worker):
         addresses = [str(value) for value in rows.values() if value]
         self.db.record_device_addresses(device_id, addresses, nodesdb.CONFIGURED_SOURCE,
                                         details=details, complete=True)
+        self._refresh_default_gateway(device, config)
+
+    def _refresh_default_gateway(self, device, config: dict) -> None:
+        """The device's own default-route next hop(s): ipCidrRouteNextHop
+        under dest/mask 0.0.0.0, falling back to the older ipRouteNextHop.0.0.0.0
+        GET for a box that never filled the newer table. Left alone (not
+        stored as "") when neither read answers at all."""
+        device_id = device["id"]
+        try:
+            route_rows = self._walk_column(device, config,
+                                            nodeoids.IP_CIDR_ROUTE_NEXTHOP_DEFAULT)
+            walked = True
+        except SnmpError:
+            route_rows = {}
+            walked = False
+        if walked and route_rows:
+            hops = {str(v) for v in route_rows.values() if v and str(v) != "0.0.0.0"}
+            self.db.set_default_gateway(device_id, ", ".join(sorted(hops)))
+            return
+        try:
+            response = self._snmp_get(device, config, [nodeoids.IP_ROUTE_NEXTHOP_DEFAULT])
+        except SnmpError:
+            return
+        vb = next((v for v in response.varbinds
+                  if v["oid"] == nodeoids.IP_ROUTE_NEXTHOP_DEFAULT), None)
+        value = str(vb["value"]) if vb and vb["value"] else ""
+        self.db.set_default_gateway(device_id, "" if value == "0.0.0.0" else value)
 
     def _poll_vendor_health(self, device, config: dict, identity: dict,
                             already=()) -> list[tuple]:
