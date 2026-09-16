@@ -34,7 +34,7 @@ IMPORTANT — strict adherence:
 
 ## Planning and deployment
 
-Ask as many questions as necessary during planning. During deployment use all recommended answers to any questions you may have for me. Once deployment starts run until completion. Do not give unnecessary commentary while operating but do give high level status updates of what is happening.
+Ask as many questions as necessary during planning. During deployment use all recommended answers to any questions you may have for me. Once deployment starts try to run until completion. Do not give unnecessary commentary while operating but do give high level status updates of what is happening.
 
 ## Testy
 
@@ -116,7 +116,7 @@ Transform tasks into verifiable goals:
 
 - "Add validation" → "Write tests for invalid inputs, then make them pass"
 - "Fix the bug" → "Write a test that reproduces it, then make it pass"
-- "Refactor X" → "Ensure tests pass before and after"
+- "Refactor X" → "Ensure X tests pass before and after"
 
 For multi-step tasks, state a brief plan:
 
