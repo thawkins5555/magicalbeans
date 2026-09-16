@@ -75,6 +75,17 @@ over-current threshold read from the device) added to the Device
 Details dialog; a new alert set added — critical on a stack power
 cable going down, warning on a stack power fault trap, with the fault
 trap also forcing an immediate re-read of stack power state.
+**Javariius review pass, five fixes before push:** the rule-count
+sentence corrected to 70 built-in rules (69 enabled) in FEATURES and
+INTERNALS, both stale at the old 62/61; **Stack Power fault trap** now
+auto-resolves after 24 hours like the product's other trap rules; the
+four traps for invalid input/output current, insufficient power and
+under voltage moved from Critical to Error so a trap opens Stack Power
+fault trap without also opening the generic Critical SNMP trap alert;
+`stackPower` and `stackPowerStatus` added to the Trap Log's kind filter
+list; and the Link column in the STACK POWER table now shows a dash
+for an administratively disabled port instead of a wrong "up" — docs
+corrected to match in all four places.
 **Outcome:** _pending — to be filled in at push._
 
 ## 5.29.0 — Discovery addresses removed: interfaces and ARP only

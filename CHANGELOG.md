@@ -184,8 +184,9 @@ sits right after TEMPERATURE ALERTS: the power stack(s) on the switch (name,
 mode — power sharing or redundant, each with a strict variant — ring or
 star topology, member count), a table of each member switch's power budget,
 committed and allocated watts, and a per-port table (switch, port name,
-neighbour switch, admin enabled/disabled, link, the device's own
-over-current limit in amperes, status, last poll). A Cisco switch with no
+neighbour switch, admin enabled/disabled, link — a dash for a disabled
+port, which has no link state to report — the device's own over-current
+limit in amperes, status, last poll). A Cisco switch with no
 power stack cabling at all shows one hint line rather than an empty
 section; a non-Cisco device shows no section, the gate being the vendor
 already detected off `sysObjectID`, not a fresh probe. The existing
@@ -215,11 +216,19 @@ warning, invalid input or output current, under budget, unbalanced
 supplies, insufficient power, a priority conflict, under voltage, or a
 software version mismatch between stack members) — the plain link/oper
 status-changed pair is left out of this rule, the same "informational, not
-a fault" read the MIB's own text gives it. Both rules reach an upgraded
+a fault" read the MIB's own text gives it. Fault trap auto-resolves after
+24 hours of no further occurrence, the same as the product's other trap
+rules, so a one-off fault does not sit open on the alert list forever
+waiting for a click. Both rules reach an upgraded
 install exactly the way the PSU rules did: they are seeded in by key the
 next time the alerts database opens, so an existing install gains them
 without a migration step. Every one of the twelve Stack Power
-notifications is named and given a severity in the SNMP Trap Log; the two
+notifications is named and given a severity in the SNMP Trap Log — the
+four that report invalid input or output current, insufficient power or
+under voltage are capped at Error rather than Critical, so a trap opens
+Fault trap and not also the generic "Critical SNMP trap received" rule
+alongside it; the two are otherwise independent, and an operator who
+wants both can still raise the trap severity by hand. The two
 status-changed traps and every fault trap **except** the version-mismatch
 one — the MIB's own call on what is worth an on-demand walk — trigger an
 immediate re-read of the sending device (a 60-second debounce per

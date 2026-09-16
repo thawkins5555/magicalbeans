@@ -5191,9 +5191,10 @@ occurrence increments one alert instead of opening a duplicate" behavior
 lives in the database's own conflict resolution, not in application code
 that could race between a read and a write.
 
-62 built-in rules (5.10.0 adds `wireless_ap_rebooted`,
+70 built-in rules (5.10.0 adds `wireless_ap_rebooted`,
 `wireless_radio_channel_changed` and `netpath_https_down`; the middle one
-ships disabled via `_BUILTIN_DISABLED`; 5.23.0 adds
+ships disabled via `_BUILTIN_DISABLED` and is the only rule of the 70 that
+does — every other built-in ships enabled; 5.23.0 adds
 `priority_interface_down`, sharing `interface_down`'s `(kind,
 source_kind)` and gated by `PRIORITY_ONLY_RULES` — see Priority ports,
 under Nodes) and 6 built-in templates are
@@ -5818,7 +5819,13 @@ switch number recovered from its own `"Switch <n>"` label — the one
 value here still read off a label, since it is not a compound one) and
 `ports` (one row per `stack_power_port.<idx>`, its name/switch/neighbour
 read off `stack_power_port_admin`/`_switch`/`_neighbour` rather than
-parsed from `stack_power_port`'s own friendly label). `present` is true
+parsed from `stack_power_port`'s own friendly label). A port's
+`link_text` is the empty string when `stack_power_port_admin` reads
+disabled (2) rather than an invented "up" — the metric key alone cannot
+distinguish "link up" from "administratively off", so the API reports no
+link state at all for a disabled port and `nodes.js` renders that as a
+dash in the Link column rather than a real value it does not have.
+`present` is true
 the moment any `stack_power_*` key exists for the device, which is what
 the STACK POWER section and its Cisco-only, no-power-stack hint line key
 off. `_stack_power_numkey` sorts a stack/switch/port number as an
@@ -5835,7 +5842,11 @@ exactly the PSU/temperature treatment, described above.
 `alertsdb._BUILTIN_RULES` gains **Stack Power cable down**
 (`stack_power_cable_down`, threshold, source `stack_power_port`, >= 2.0,
 critical) and **Stack Power fault trap** (`stack_power_trap`, trap,
-source `stackPower`, warning); `alertrules.ROLLED_UP_BY` maps
+source `stackPower`, warning); the latter carries
+`_BUILTIN_AUTO_RESOLVE_S["stack_power_trap"] = 86400`, a 24-hour
+lifetime from the last occurrence — the same value `trap_critical`,
+`trap_link_down_unmanaged` and `syslog_critical` already carry.
+`alertrules.ROLLED_UP_BY` maps
 `stack_power_cable_down` to `device_down` — a cable-down alert rolls up
 directly under a device outage, the same as `psu_failed`, since a stack
 still carries power the other way around its ring or star while one
@@ -5856,12 +5867,22 @@ mismatch differently.
 the MIB, misspelling included
 (`cscwStackPowerBudgetWarrning`). `KIND_BY_OID` classes the link/oper
 status-changed pair (`.7`/`.8`) `"stackPowerStatus"` — informational by
-the MIB's own text — and the other ten `"stackPower"`.
+the MIB's own text — and the other ten `"stackPower"`; both kinds are
+also added to `trapdecode.KINDS`, the vocabulary that fills the Trap
+Log's kind filter dropdown (served to the browser as `trap_kinds` — see
+`/api/config`, below).
 `DEFAULT_SEVERITY_RULES` rates the status pair Notice(5), version
-mismatch Warning(4), invalid topology and under-budget Error(3), invalid
-input/output current, insufficient power and under-voltage Critical(2),
-and the rest Warning(4) — severities specified for this release, not
-derived from the MIB's own text. `snmptrapd.POWER_TRAP_OIDS` — the set
+mismatch Warning(4), and every other fault — invalid topology,
+under-budget, invalid input current, invalid output current,
+insufficient power and under-voltage — Error(3). The last four shipped
+Critical(2) through review, then were deliberately capped at Error(3):
+`trap_critical` (`alertsdb`'s **Critical SNMP trap received** rule)
+matches any trap of severity 2 regardless of kind, so a Critical rating
+on them would have opened that generic rule alongside **Stack Power
+fault trap** for the same event; capped at Error(3), a trap on any of
+the twelve OIDs opens Stack Power fault trap only.
+
+`snmptrapd.POWER_TRAP_OIDS` — the set
 `TrapCollector._power_trap_reread` checks before calling `poll_now` on
 the sending device, at most once per `POWER_TRAP_REREAD_S` (60 s) per
 device, the same hook the six PSU/ENVMON traps already use — grows by

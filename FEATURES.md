@@ -1325,10 +1325,11 @@ belongs to (name, whether it runs power sharing or redundant, each with a
 member count), a table of each member switch's power budget, committed
 and allocated watts, and a table of every Stack Power port — which
 switch, its name, the switch on the other end of that cable, whether it
-is administratively enabled, its link state, the over-current limit in
-amperes the device itself publishes for that port, and a plain-English
-status that calls out a downed cable by the rule that alerts on it. A
-Cisco switch with no power stack at all shows one line saying so instead
+is administratively enabled, its link state (a dash for an
+administratively disabled port, which has no link state to report), the
+over-current limit in amperes the device itself publishes for that port,
+and a plain-English status that calls out a downed cable by the rule
+that alerts on it. A Cisco switch with no power stack at all shows one line saying so instead
 of an empty section; every other vendor shows no section. The existing
 per-sensor table also marks a Stack Power port `(stack power)`, the same
 way it already marks a power-supply row `(power supply)`.
@@ -2187,7 +2188,7 @@ alerts and optionally emailing about them.
 
 ### Rules
 
-- **62 built-in rules ship, 61 of them enabled**: a device not responding, a
+- **70 built-in rules ship, 69 of them enabled**: a device not responding, a
   device recovering, a device rebooting, SNMP authentication failing, a
   device needing unsupported SNMPv3 privacy, a poll running longer than its
   own interval, a device whose vendor MIB is missing, an interface going
@@ -2394,7 +2395,12 @@ alerts and optionally emailing about them.
   output current, under budget, unbalanced supplies, insufficient power,
   a priority conflict, under voltage, or a version mismatch between stack
   members. All twelve Stack Power notifications are named and given a
-  default severity in the SNMP Trap Log; the plain link/oper
+  default severity in the SNMP Trap Log, capped at **error** even for the
+  four current/power/voltage faults that would otherwise read critical —
+  so a trap opens **Stack Power fault trap** without also opening the
+  generic **Critical SNMP trap received** rule alongside it. **Stack Power
+  fault trap** auto-resolves after 24 hours of no further occurrence, the
+  same as the other trap rules. The plain link/oper
   status-changed pair (informational, not a fault) and every fault trap
   except the version-mismatch one trigger the same immediate re-read the
   PSU traps do, at most once a minute per device. The over-current limit
