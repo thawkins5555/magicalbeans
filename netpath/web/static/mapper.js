@@ -1321,19 +1321,27 @@
   const LABEL_STEP_CAP = 6;
   const labelMeasureCtx = document.createElement('canvas').getContext('2d');
   let labelFontCache = '';
+  let subFontCache = '';
+  function fontFor(familyToken) {
+    const root = getComputedStyle(document.documentElement);
+    const remPx = parseFloat(root.fontSize) || 16;
+    const sizeRem = parseFloat(root.getPropertyValue('--fs-2xs')) || 0.6875;
+    const family = root.getPropertyValue(familyToken).trim() || 'sans-serif';
+    return `${sizeRem * remPx}px ${family}`;
+  }
   function labelFont() {
-    if (!labelFontCache) {
-      const root = getComputedStyle(document.documentElement);
-      const remPx = parseFloat(root.fontSize) || 16;
-      const sizeRem = parseFloat(root.getPropertyValue('--fs-2xs')) || 0.6875;
-      const family = root.getPropertyValue('--ui').trim() || 'sans-serif';
-      labelFontCache = `${sizeRem * remPx}px ${family}`;
-    }
+    if (!labelFontCache) labelFontCache = fontFor('--ui');
     return labelFontCache;
   }
+  // .mp-node-sub's own font (--mono, same size) — only its descent is ever
+  // read, to fold the sub-line into the name label's collision rect below.
+  function subFont() {
+    if (!subFontCache) subFontCache = fontFor('--mono');
+    return subFontCache;
+  }
 
-  function measureLabel(text) {
-    labelMeasureCtx.font = labelFont();
+  function measureLabel(text, font) {
+    labelMeasureCtx.font = font || labelFont();
     const m = labelMeasureCtx.measureText(text);
     return {
       width: m.width,
@@ -1347,12 +1355,20 @@
   // into the live SVG, so hit-testing, hover/focus and the PNG export (a
   // clone of that same SVG) all agree on it for free, with nothing of
   // their own left to keep in sync.
+  //
+  // The rect covers the sub-line too when there is one: drawNode always
+  // draws info.sub LABEL_SUB_GAP below the name, as one visual block, so a
+  // name pushed clear of a collision but leaving its sub-line still
+  // sitting on the neighbour would just move the same overlap down a line.
   function labelRect(node, info, steps) {
     const pos = livePos(node);
     const { width, ascent, descent } = measureLabel(truncate(info.name, 24));
     const lineStep = ascent + descent + LABEL_GAP_PX;
     const baseY = pos.y - NODE_H / 2 + LABEL_BASE_Y + steps * lineStep;
-    return { x: pos.x - NODE_W / 2 + LABEL_X, y: baseY - ascent, w: width, h: ascent + descent };
+    const h = info.sub
+      ? ascent + LABEL_SUB_GAP + measureLabel(truncate(info.sub, 26), subFont()).descent
+      : ascent + descent;
+    return { x: pos.x - NODE_W / 2 + LABEL_X, y: baseY - ascent, w: width, h };
   }
 
   function rectsOverlap(a, b) {

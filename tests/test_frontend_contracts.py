@@ -4194,6 +4194,23 @@ check('class="err">cable down' in NODES,
       "a cable-down port's Status cell carries the same .err 'bad' class "
       "used elsewhere in this dialog for a failed read")
 
+# ---------------------------------------------------------------------------
+# 90. Sensor Snapshot: the vendor section's write-gated bar carries a
+#     dedicated button beside Re-identify, disabling itself before its own
+#     POST like every sibling PUT/POST button in this dialog already does
+#     (see contract 24), and the per-sensor table tags a fan row the same
+#     way a psu/stack_power row is tagged.
+_vendor_section = NODES[NODES.index("function renderVendorSection("):
+                       NODES.index("function ifaceStatsHtml(")]
+check('id="ndd-sensor-snapshot"' in NODES,
+      "the vendor section's write-gated bar has a #ndd-sensor-snapshot button")
+check("snapshotBtn.disabled = true" in _vendor_section
+      and "/sensor-snapshot`, {})" in _vendor_section,
+      "#ndd-sensor-snapshot disables itself before its POST")
+check("s.kind === 'fan' ? ' <span class=\"hint\">(fan)</span>'" in NODES,
+      "the per-sensor table hints a fan row the same way a psu/stack_power "
+      "row is hinted")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

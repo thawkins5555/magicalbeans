@@ -2247,9 +2247,14 @@
         <button id="ndd-vendor-save">Save</button>
         ${d.vendor_override ? '<button id="ndd-vendor-clear">Clear</button>' : ''}
         <span class="grow"></span>
+        <button id="ndd-sensor-snapshot">Sensor Snapshot</button>
         <button id="ndd-reidentify"${d.identifying ? ' disabled' : ''}>` +
         `${d.identifying ? 'Identifying…' : 'Re-identify'}</button>
       </div>
+      <p class="hint" id="ndd-snapshot-line" hidden></p>
+      <p class="hint">Sensor Snapshot accepts every power supply, stack power and fan
+        reading this device has right now as normal for it — a later reading that is
+        still exactly that stays quiet; anything worse still alerts.</p>
       <p class="hint">${d.learnable
         ? 'A manual vendor also teaches every device with the same sysObjectID.'
         : `A manual vendor applies to this device only: ${escape(d.learn_reason || '')}.`}</p>`
@@ -2296,6 +2301,32 @@
       }
       if (current()) refresh().catch(() => {});
     };
+    const paintSnapshotLine = (meta) => {
+      const line = holder.querySelector('#ndd-snapshot-line');
+      if (!line) return;
+      if (!meta || !meta.count) { line.hidden = true; line.textContent = ''; return; }
+      line.hidden = false;
+      line.textContent = `Baseline taken ${App.when(meta.ts)} · ${meta.count} sensor` +
+        (meta.count === 1 ? '' : 's');
+    };
+    const snapshotBtn = holder.querySelector('#ndd-sensor-snapshot');
+    if (snapshotBtn) {
+      snapshotBtn.onclick = async () => {
+        snapshotBtn.disabled = true;
+        try {
+          const result = await App.post(`/api/nodes/devices/${deviceId}/sensor-snapshot`, {});
+          App.toast(`Sensor snapshot saved: ${result.count} sensors marked normal`, 'ok');
+          if (current()) paintSnapshotLine(result);
+        } catch (error) {
+          App.toast(`Could not save snapshot: ${error.message}`, 'fail');
+        } finally {
+          snapshotBtn.disabled = false;
+        }
+      };
+      App.get(`/api/nodes/devices/${deviceId}/sensor-snapshot`)
+        .then((meta) => { if (current()) paintSnapshotLine(meta); })
+        .catch(() => {});
+    }
     const save = holder.querySelector('#ndd-vendor-save');
     if (save) save.onclick = async () => {
       const text = holder.querySelector('#ndd-vendor-override').value.trim();

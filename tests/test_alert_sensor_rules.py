@@ -15,7 +15,7 @@ import _paths  # noqa: F401  (puts the repo root and tests/ on sys.path)
 
 from netpath.alertsdb import AlertsDatabase
 from netpath.alertengine import AlertEngine
-from netpath.alertrules import (FALLBACK_OF, PUBLISHED_THRESHOLD_RULES,
+from netpath.alertrules import (BASELINE_FAMILIES, FALLBACK_OF, PUBLISHED_THRESHOLD_RULES,
                                 ROLLED_UP_BY, SENSOR_FAMILIES, device_id_for)
 from netpath.ipamdb import IpamDatabase
 from netpath.nodesdb import NodesDatabase
@@ -84,9 +84,9 @@ def publish(nodes, did, idx, warn, alarm):
 check("the two published temperature rules read the high bands",
       PUBLISHED_THRESHOLD_RULES["temp_sensor_high"] == ("temp_sensor_c", "high_warn")
       and PUBLISHED_THRESHOLD_RULES["temp_sensor_critical"] == ("temp_sensor_c", "high_alarm"))
-check("the four sensor families are declared",
+check("the five sensor families are declared",
       SENSOR_FAMILIES == {"temp_sensor_c", "temp_sensor_state", "psu_state",
-                          "stack_power_port"})
+                          "stack_power_port", "fan_state"})
 check("both chassis rules fall back to the sensor families",
       set(FALLBACK_OF) == {"temp_chassis_high", "temp_chassis_critical"})
 check("each pair rolls warning under critical and critical under device_down",
