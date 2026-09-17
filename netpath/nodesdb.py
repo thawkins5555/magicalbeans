@@ -5091,11 +5091,12 @@ class NodesDatabase(SqliteStore):
     def recent_interface_events_for(self, interface_id: int, since_s: float = 900,
                                     limit: int = 50) -> list[sqlite3.Row]:
         cutoff = time.time() - since_s
-        marks = ",".join("?" * len(self.FLAP_EVENT_KINDS))
+        # Two fixed placeholders, not a built list: FLAP_EVENT_KINDS is a
+        # constant, so there is no dynamic IN list here to chunk.
         with self._lock:
             return self._conn.execute(
                 "SELECT * FROM interface_events WHERE interface_id = ? AND ts >= ?"
-                f" AND kind IN ({marks}) ORDER BY ts DESC LIMIT ?",
+                " AND kind IN (?, ?) ORDER BY ts DESC LIMIT ?",
                 (interface_id, cutoff, *self.FLAP_EVENT_KINDS, limit)).fetchall()
 
     def interface_id_for(self, device_id: int, if_index: int) -> int | None:
