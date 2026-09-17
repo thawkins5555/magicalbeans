@@ -5,6 +5,67 @@ grouped by the version that carries it. This is a working record for the
 operator — the full story of each change is in `CHANGELOG.md`, and this file
 does not replace it.
 
+## 5.39.0 — Access-port VLANs restored on Mapper, and seven more Mapper/Device-details fixes
+
+**Operator prompt, eight items from a round of live use:**
+- Access-port links on Mapper show "No VLAN data known for this link"
+  even though the switch itself reports a VLAN for that port.
+- Under FiberView, the spanning-tree-blocked dotted line is invisible —
+  the glow smears it into a solid line.
+- A frame or note that is selected cannot be removed from the toolbar's
+  Remove button; the frame pane's own Remove button and Delete/Backspace
+  work fine.
+- Drop the legend's explanation of the VLAN line styles ("Trunks of N+
+  VLANs…", the dashed-line and dotted-line notes); keep the FiberView
+  colour key and the "no CDP/LLDP adjacency" message.
+- A multi-VLAN link should be one wide click target instead of a set of
+  ~1.5px strands an operator has to land a cursor on individually.
+- Colour-code the link detail pane's VLAN list by spanning-tree blocking
+  state, not just the footer text.
+- Stagger parallel cables' port labels so interface names stop printing
+  on top of each other.
+- Cap the Device-details interface dialog's MAC address table at five
+  rows behind a "+N more" control; give a Mapper frame's label its own
+  text size (Small/Medium/Large) beside its label and colour.
+
+**Plan.** One real data bug and seven display/UI fixes, all shipped
+together as 5.39.0. The VLAN bug is collector-side: an access port's own
+`dot1qPvid` is now trusted as a native-VLAN fallback the same way a
+Cisco trunk port's already was, guarded so a VLAN the device does not
+itself list anywhere still never appears on a link — fixed in
+`nodepoll.py`, so an affected link fills in on its next VLAN poll, not a
+page reload, and the fix reaches Nodes' own VLAN display as well as
+Mapper. The FiberView/STP-dots bug and the frame/note Remove-button bug
+are both rendering and toolbar-state bugs with no data behind them. The
+five UI changes and the new frame text-size control touch only
+`mapper.js`/`nodes.js`/`app.css`; Medium is defined to be identical to
+every frame's size today, so no existing map redraws differently.
+Version for this work: 5.39.0.
+
+## Branch check, and the vibrant-planck merge
+
+**Check for branches not merged to main.** Six branches carried commits
+not on `main`. Five had no shared git history with `main` at all — a
+repository history rebuild had left them with no common ancestor to
+diff against, so there was nothing meaningful to merge from them. One,
+`claude/vibrant-planck-zvgzy6`, had real, still-unmerged work sitting on
+it.
+
+**Was `claude/vibrant-planck-zvgzy6` worked on last night and not
+merged?** Yes — a fix to the browser-walk test harness (waiting on the
+right DOM state, looking up the newest object rather than a stale one,
+and no orphaned waits), committed at 02:27Z, parked on its own branch
+and never verified or merged.
+
+**Skip the walk — merge it to main.** Merged, `f0b60e7..818eb7e`.
+Javariius's review of the branch's own diff found an incomplete fix
+already sitting on it — the Frame and Note removal paths were keying a
+wait to the wrong object — and closed it before the merge landed.
+
+→ Merged straight to `main`, no version bump: a test-harness fix, not an
+operator-visible change, so it carries no `CHANGELOG.md`/`FEATURES.md`/
+`INTERNALS.md` entry of its own.
+
 ## 5.38.0 — FortiAP web tunnel, spanning-tree blocking alerts, Mapper notes, and a round of SFP/fan/FiberView fixes
 
 **Operator prompt, thirteen items:**

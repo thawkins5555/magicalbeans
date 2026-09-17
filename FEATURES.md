@@ -1764,7 +1764,10 @@ Cisco devices only, the **per-VLAN SNMP contexts** classic IOS hides its
 forwarding table behind (community indexing, `community@vlan`, with the
 VLAN list read from CISCO-VTP-MIB). The first source that returns
 anything wins. Devices that answer none of them show "no MAC address
-data" instead of an empty table.
+data" instead of an empty table. **From 5.39.0, the table shows the first
+five addresses learned on the port, with the rest behind a "+N more"
+button** — a busy access port's table used to grow without any limit at
+all.
 
 **From 5.33.0, RUNNING CONFIGURATION shows this port's own stanza from the
 device's latest ConfigRX backup**, in place of the earlier placeholder
@@ -1858,7 +1861,14 @@ From 4.47.0, Nodes walks past the SNMP poll to see the wire itself.
   VLANs as individual coloured strands rather than one anonymous line;
   there is no page of its own for it in Nodes, the same way the MAC table
   and the neighbour table feed MAPPER and the device pane rather than a
-  dedicated tab of their own.
+  dedicated tab of their own. **From 5.39.0, an access port's own native
+  VLAN (`dot1qPvid`) is trusted on its own when nothing else names that
+  port's membership** — some Cisco gear answers the Q-BRIDGE egress/
+  untagged bitmaps empty unless SNMP is indexed per VLAN, which used to
+  leave a plainly-configured access port showing no VLAN at all, on both
+  this table and MAPPER. A VLAN the device does not name anywhere else
+  still never appears; this only fills in a port whose native VLAN the
+  device already told the poller and nothing else picked up.
 - **From 5.11.0 a neighbour that only reported an address is named, not
   numbered.** Where LLDP sent a network-address chassis id or CDP sent an
   address as the device id, the Remote device column names it the way
@@ -4395,24 +4405,24 @@ like any other module.
   VLAN labels**, on by default in MAPPER's own Settings, put a small label
   at each end of every link (the port it leaves from) and on every strand
   or collapsed line (its VLAN, or its VLAN count) — turn either off on a
-  busy map where the labels start to crowd the lines.
-- **The legend above the canvas always says what the current threshold
-  is and what a dashed line means.** It reads the collapse threshold back
-  in words ("Trunks of 8+ VLANs draw as one thick line, scaled by count;
-  fewer draw as one coloured strand per VLAN") so the setting never has to
-  be looked up elsewhere, and calls out that a dashed line means *no VLAN
-  data at all* — a genuinely different fact from "this link carries
-  exactly one VLAN", which draws as a single, solid strand. If two placed
-  devices have no CDP/LLDP adjacency between them at all, the legend says
-  so plainly rather than leaving an operator to wonder whether the link is
-  missing by mistake or because nothing has been seen. **From 5.36.0**,
-  when any link on the map is spanning-tree blocked, the legend also
-  names what a *dotted* line means — deliberately a tighter, dot-like
-  pattern rather than the dashed one, so a blocked port and "no VLAN
-  data" are never mistaken for each other — and, with FiberView ticked
-  and a fiber link on the map, it spells out the colour key too: blue
-  for multimode, dark yellow for single-mode, dotted red for a mismatch
-  between the two.
+  busy map where the labels start to crowd the lines. **From 5.39.0, a
+  multi-VLAN link is one wide click target rather than a set of individual
+  ~1.5px strands.** Clicking or hovering anywhere across the width of the
+  strand bundle now opens or names the link; the target sits underneath
+  the strands, so hovering one strand precisely still names that strand's
+  own VLAN — the wide target only catches the narrow gaps and margin
+  between them that used to be impossible to land a cursor on.
+- **The legend above the canvas.** If two placed devices have no CDP/LLDP
+  adjacency between them at all, it says so plainly rather than leaving an
+  operator to wonder whether the link is missing by mistake or because
+  nothing has been seen. With FiberView ticked and a fiber link on the
+  map, it spells out FiberView's own colour key: dark orange for
+  multimode, bright yellow for single-mode, dotted red for a single/
+  multimode mismatch. **From 5.39.0, the legend no longer explains what a
+  dashed or dotted line means** — the "Trunks of N+ VLANs draw as one
+  thick line… / a dashed line means no VLAN data… / a dotted line means
+  spanning-tree blocked…" note that used to sit above the canvas is gone;
+  the adjacency message and the FiberView colour key are unchanged.
 - **What CDP and LLDP contribute, and what they cannot.** A link only ever
   draws between two devices (or a device and an unmanaged peer) that Nodes'
   own neighbour walk has actually reported adjacent to each other, folded
@@ -4610,7 +4620,12 @@ like any other module.
   60-character label, six colours — the same six a VLAN strand on this map
   already draws with — and **Remove**; Delete/Backspace on the canvas
   removes a selected frame, and it is reachable by keyboard too (Tab lands
-  on it, Enter or Space selects it). A frame is decoration only: moving or
+  on it, Enter or Space selects it). **From 5.39.0, the toolbar's own
+  Remove button also removes a selected frame or note** — until now it
+  only ever acted on a selected device, so it sat visibly greyed out for
+  the whole time a frame or note was selected instead; the frame pane's
+  own Remove button and the Delete/Backspace key were unaffected by that
+  bug throughout. A frame is decoration only: moving or
   resizing one never moves a device it encloses, and the inside of a frame
   passes clicks straight through, so a rubber-band selection or a pan
   started over a frame's interior works exactly as it did before frames
@@ -4626,7 +4641,12 @@ like any other module.
   debounced, the same way a node move already does; renaming or
   recolouring a frame is audited, moving one is not, the same split
   already drawn between a node's position and its name. **From 5.38.0, a
-  frame's label text reads slightly larger.**
+  frame's label text reads slightly larger.** **From 5.39.0, a frame's
+  label also has its own text size** — Small, Medium or Large, alongside
+  its label and colour in the detail pane. Medium is exactly the size
+  every frame already drew at, so nothing on an existing map moves;
+  it is stored per frame, and an existing database gains the setting
+  automatically on upgrade, defaulted to Medium.
 - **From 5.38.0, Notes: a thought-bubble annotation, free-floating or
   anchored to one device.** Click **Note**, then drag on empty canvas the
   same way you draw a Frame; a small speech-bubble shape appears, its tail
@@ -4705,7 +4725,12 @@ like any other module.
   view and FiberView alike**, read off the same BRIDGE-MIB port-state
   table the poller already polls — nothing new is polled for it. A link
   that is both a mismatch and blocked draws dotted red — colour still
-  separates it from a plain blocked line.
+  separates it from a plain blocked line. **From 5.39.0, that dotted line
+  no longer disappears under FiberView.** The dots and the fiber glow used
+  to be the same drawn line, and the glow's own blur bled across the
+  dots' gaps and smeared them into one solid glowing line — a blocked
+  fiber uplink read as an ordinary one. The dots now draw as their own
+  second, unglowed line on top of the glow.
 - **From 5.37.0, a Cisco PVST+/Rapid-PVST switch's blocked-link line
   reads every VLAN the port carries, not just the default spanning-tree
   instance (VLAN 1).** The poller now walks `dot1dStpPortState` a
@@ -4716,7 +4741,15 @@ like any other module.
   against a device whose detected vendor is Cisco, and only over an
   SNMP v1/v2c credential — an SNMPv3 device keeps the single
   default-context read. MST is unaffected either way, since its one
-  CIST instance already covered every VLAN.
+  CIST instance already covered every VLAN. **From 5.39.0, the link
+  detail pane's own VLAN list is colour-coded by that same blocking
+  state** — green for a passing VLAN, red for a blocked one, with
+  "(STP blocked)" written out in words beside the red ones so the list
+  never depends on colour alone. The "STP: blocking on `<switch>`
+  (`<port>`)" line beneath it still names the switch and port, but no
+  longer repeats the VLAN ids the list above it now shows in colour; the
+  hover tooltip and the screen-reader label still name them, since
+  neither one has a list of its own to colour.
 - **From 5.36.0, every cable between the same two devices draws as its
   own line, fanned apart from the others** rather than stacking on
   identical coordinates. Each line in the fan keeps its own strands,
@@ -4724,7 +4757,13 @@ like any other module.
   bundle but far enough apart that clicking, hovering or tabbing to one
   reliably lands on that line and not its neighbour. **From 5.38.0, that
   fan spaces further apart at normal zoom**, easier to read as two
-  distinct lines rather than one that reads faintly blurred.
+  distinct lines rather than one that reads faintly blurred. **From
+  5.39.0, each cable in the fan also staggers its own port labels further
+  along the line** rather than every cable in the group labelling at the
+  same distance from the device — stacking every label at one point is
+  what made interface names overlap and become unreadable. A short link's
+  labels stop staggering past its own midpoint, so its two ends can never
+  swap sides.
 
 ---
 

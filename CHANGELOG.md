@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.39.0 — Access-port VLANs restored on Mapper, and seven more Mapper/Device-details fixes](#5390--access-port-vlans-restored-on-mapper-and-seven-more-mapperdevice-details-fixes)
 - [5.38.0 — FortiAP web tunnel, spanning-tree blocking alerts, Mapper notes, and a round of SFP/fan/FiberView fixes](#5380--fortiap-web-tunnel-spanning-tree-blocking-alerts-mapper-notes-and-a-round-of-sfpfanfiberview-fixes)
 - [5.37.0 — Spanning-tree state per VLAN: blocked links on PVST switches](#5370--spanning-tree-state-per-vlan-blocked-links-on-pvst-switches)
 - [5.36.0 — Optic single/multimode per port, FiberView by mode, STP-blocked and parallel Mapper links](#5360--optic-singlemultimode-per-port-fiberview-by-mode-stp-blocked-and-parallel-mapper-links)
@@ -171,6 +172,94 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.39.0 — Access-port VLANs restored on Mapper, and seven more Mapper/Device-details fixes
+
+Eight items from a round of live use — one real data bug, two rendering/state
+bugs, and five changes to how Mapper reads. `PROMPT-LOG.md` carries the full
+request.
+
+**Access-port links were drawing "No VLAN data known for this link" on ports
+whose switch plainly knew the VLAN.** The VLAN collector read an access
+port's `dot1qPvid` into its native-VLAN field and stopped there — actual
+membership was only ever written from the Q-BRIDGE egress/untagged bitmaps,
+which Cisco gear commonly answers empty unless SNMP is indexed per VLAN
+(`community@vlan`). Trunk ports already had a native-VLAN fallback for
+exactly this gap; access ports did not. Every port with a known native VLAN
+now gets its own membership row, guarded so a VLAN the device does not
+itself list anywhere still never appears on a link — the fallback fires only
+for a port that has no membership row yet from any of the other three
+sources, and only for a VLAN the device names in at least one of them. This
+is a collector-side fix, not a display fix: an affected link fills in after
+its next VLAN poll, not on a page reload, and the same fix feeds Nodes'
+own VLAN column, not Mapper alone. File: `netpath/nodepoll.py`.
+
+**The spanning-tree dotted line went invisible under FiberView.** The
+blocked-port dots and the fiber glow were the same SVG path, and the glow's
+blur bled straight across the dots' own dash gaps, smearing them into one
+solid glowing line — a blocked fiber uplink looked like an ordinary one.
+The dots now draw as their own second, unglowed red path on top of the
+glow (no `.fiber` class on it, so no blur filter reaches it), and the
+glowing path underneath stops dashing itself wherever that overlay covers
+it, so the two never double up. Files: `netpath/web/static/mapper.js`,
+`netpath/web/static/app.css`.
+
+**A selected frame or note could not be removed from the toolbar.** The
+Remove button's enabled state was driven entirely by the device-selection
+set, which a frame or note never joins — so the button sat grey for the
+whole time one was selected, even though something clearly was. Remove now
+serves whatever is actually selected: a device, a frame or a note. The
+frame pane's own Remove button and the Delete/Backspace key were never
+affected — only the shared toolbar button was broken. File:
+`netpath/web/static/mapper.js`.
+
+**Five further changes, all operator-requested:**
+
+- The Mapper legend no longer explains the VLAN line styles — the "Trunks
+  of N+ VLANs draw as one thick line… / a dashed line means… / a dotted
+  line means…" note is gone. The FiberView colour key and the "No CDP/LLDP
+  adjacency was found" message are unchanged.
+- A multi-VLAN link is now one wide click target the full width of its
+  strand bundle, instead of a set of roughly 1.5px strands an operator had
+  to land a cursor on individually. It sits underneath the strands, so
+  hovering one strand still names that strand's own VLAN — the wide target
+  only catches the gaps and margin around them.
+- The link detail pane's VLAN list is colour-coded — green for passing,
+  red for blocked — with "(STP blocked)" written out in words beside the
+  red ones, so the list never depends on colour alone. The "STP: blocking
+  on `<switch>` (`<port>`)" footer stays, but no longer repeats the VLAN
+  ids the list now shows; the hover tooltip and the screen-reader label
+  still name them, since neither one has a list of its own to colour.
+- Parallel cables between the same two devices now stagger their port
+  labels along the line instead of stacking every one of them at the same
+  distance from the device — the stacking is what made interface names
+  overlap and become unreadable.
+- The Device-details interface dialog's MAC address table shows the first
+  five addresses learned on a port, with the rest behind a "+N more"
+  button, rather than a long table growing without limit.
+
+**Frame labels also gain a text size — Small, Medium or Large — next to a
+frame's existing label and colour controls.** Medium is exactly the size
+every frame already drew at, so nothing already on a map moves; it is
+stored per frame, and an existing database gains the new column
+automatically on upgrade.
+
+Files: `netpath/mapperdb.py`, `netpath/nodepoll.py`, `netpath/web/api.py`,
+`netpath/web/static/app.css`, `netpath/web/static/mapper.js`,
+`netpath/web/static/nodes.js`.
+
+Tests: `tests/test_port_vlans.py` gains a case (against a new
+`access_fallback` stub mode) proving all three sides of the access-port
+fix at once — a PVID with no bitmap coverage gets an untagged fallback
+row, a PVID naming a VLAN nobody lists gets none at all, and a PVID on a
+port that already has a real (tagged) membership from the bitmap is left
+exactly as the bitmap decoded it. `tests/test_frontend_contracts.py`
+section 96 pins the legend text removal, the unglowed overlay path and
+its colour, the wide click target and its draw order ahead of the
+strands, the VLAN list's colour classes and the footer's shortened text,
+the port-label stagger and its clamp, the toolbar Remove button's wider
+enabled state, the frame text-size control and its three CSS rules, and
+the MAC table's five-row cap.
 
 ### 5.38.0 — FortiAP web tunnel, spanning-tree blocking alerts, Mapper notes, and a round of SFP/fan/FiberView fixes
 

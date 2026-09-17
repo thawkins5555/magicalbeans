@@ -5630,6 +5630,47 @@ authority order:
    evidence that VLAN crosses it even though no VLAN table said so, but
    never allowed to override an authoritative answer.
 
+**5.39.0: an access port's own `dot1qPvid` is now trusted on its own, as
+a fifth and final fallback, run after all four sources above.** The bug
+this closes: `dot1qPvid` (the standards path's own per-port native-VLAN
+scalar, `port_native[if_index]`) was always read, but a port's actual
+*membership* row only ever came from the egress/untagged bitmaps in (2)
+or the Cisco override in (3) — and Cisco gear frequently answers those
+bitmaps completely empty for a port unless SNMP is indexed per VLAN
+(`community@vlan`), which is not this walk's default posture. A plainly
+access-mode port could therefore have a correctly-read native VLAN and
+still end up with zero rows in `port_vlans`, which is exactly what
+MAPPER's "No VLAN data known for this link" text means. The Cisco TRUNK
+branch already had this same fallback for its own native VLAN (see (3)'s
+`elif native is not None and native in existing_vlans` line) — this
+change is that same one-line idea, generalised to every port on every
+vendor rather than Cisco trunks alone, because the gap it closes is a
+plain Q-BRIDGE-MIB one, not a Cisco one. The new pass, after the Cisco
+block: `ports_with_membership` is recomputed from `memberships` as it
+stands at that point (so it already reflects anything the Cisco override
+just wrote), and every `(if_index, native)` in `port_native` is skipped
+if that port already has any membership row from (2) or (3) — **a real
+override from an earlier, more specific source always wins; this fallback
+only ever fills a genuine gap** — or if `native` is not itself a VLAN the
+device names anywhere (`existing_vlans = vlan_names | egress_ports |
+untagged_ports`, recomputed fresh here since `cisco_vlans_by_port` is
+deliberately not folded in — a VLAN known only from an allow-list nothing
+else corroborates is not treated as evidence it exists). A port that
+clears both checks gets `memberships[(if_index, native)] = False`
+(untagged), the same value the existing native-VLAN fallbacks already
+use. This is a collector-side fix: the next VLAN poll fills in an
+affected link, not a page reload, and every consumer of `port_vlans` —
+Nodes' own per-port VLAN display and MAPPER's strands alike — gains the
+row at once, since both read the same table. `tests/test_port_vlans.py`
+§6d (against a new `access_fallback` stub mode in `stub_agent_vlan.py`)
+covers all three shapes at once on one three-port fixture: a PVID with no
+bitmap coverage anywhere gets the fallback row untagged; a PVID naming a
+VLAN nobody lists in `vlan_names` or either bitmap gets no row at all —
+proving the "never appears unless the device says it exists" invariant
+holds for this path too; and a PVID on a port the egress bitmap already
+gave a real *tagged* membership is left exactly as the bitmap decoded
+it — the fallback never overrides an existing row.
+
 **PortList and VLAN-bitmap decoding** (`nodepoll._decode_port_list`,
 `_decode_vlan_bitmap`) share one octet/bit scan (`_bit_positions`) but NOT
 the same numbering — an off-by-one here, caught by review, meant every
@@ -6619,6 +6660,143 @@ pulse colour and the two `drawLegend()` strings in `mapper.js` that spell
 the key out in words. Every rule that reads the two custom properties —
 the glow, the `.selected` brightness multiplier, `.fiber-mismatch`'s own
 override — is unchanged; only what the two tokens resolve to moved.
+
+### Mapper operator round: STP dots above the glow, a wide strand hit
+target, a coloured VLAN list, staggered port labels, and a fixed Remove
+button (`mapperdb.py`, `web/api.py`, `mapper.js`, `nodes.js`, `app.css`)
+— 5.39.0
+
+**Blocked-STP dots and the fiber glow used to be one drawn path; they are
+now two.** `drawLink`'s existing strand/collapsed drawing added the CSS
+class `.blocking` (a `stroke-dasharray: 2 6` dot pattern) straight onto
+whichever path also carried `.fiber` when FiberView was on — and
+`.fiber`'s own glow filter blurs its stroke, which smeared the dots'
+2px-on/6px-off gaps into one solid glowing line. `overlaidBlocking =
+link.blocking && link.fiber === true && view.fiberView` now gates a
+second path, `blockingOverlay(width)`, appended on top: class `mp-link
+blocking mp-blocking-over`, `pointer-events: none`, no `.fiber` class at
+all so no glow filter ever reaches it, and CSS colours it `var(--fail)`
+(red) rather than the glow's own orange/yellow — matching the colour a
+blocked VLAN already gets in the detail pane (below). The original path
+stops adding `.blocking` itself wherever the overlay is drawing
+(`if (link.blocking && !overlaidBlocking) path.classList.add('blocking')`),
+in both the collapsed/plain drawing branch and the strand-bundle branch,
+so the two never double-dash the same pixels. Outside FiberView, or on a
+copper link, `overlaidBlocking` is false and nothing about the existing
+single-path `.blocking` dash changes at all.
+
+**The strand bundle's click/hover target is now one wide invisible path,
+not the visible strands themselves.** A trunk's individual strands still
+draw at `plan.width` (1.5px by default) so the drawing itself is
+unchanged, but `mp-link-hit` — `fill: none`, `stroke: transparent`,
+`stroke-width: span + LINK_HIT_PAD` (`LINK_HIT_PAD = 14`, `span` the
+full width the strand offsets already span), `pointer-events: stroke` —
+is appended to the link's `<g>` **before** the strands, carrying the
+link's own click and hover handlers (`selectLink`, the shared tooltip).
+Appending it first, not last, is what lets a strand drawn on top of it
+still win its own narrower hover/click for its own VLAN — an SVG event
+goes to whichever element is actually under the pointer, and a strand
+covers this path everywhere except the gaps between strands, which is
+exactly what the wide target exists to catch. It carries
+`aria-hidden="true"` and no `tabindex`, deliberately: the first strand in
+the bundle already carries the link's one Tab stop and its full
+"both ends, both ports, every VLAN" accessible name (5.34.0), so a second
+focusable element naming the same link would be a duplicate stop for a
+keyboard or screen-reader user, not new information.
+
+**The link detail pane's VLAN list carries STP blocking as colour, and
+the footer text was trimmed to match.** `stpBlockedVlans(link)` parses
+`a_stp_vlans`/`b_stp_vlans` (the same comma-separated id strings 5.37.0
+already stores) into one `Set<number>`, or returns `null` when the link
+is not blocking at all — `null` rather than an empty `Set` so an
+unblocked link's list stays the plain neutral colour instead of every
+row painting green for no reason. Building the VLAN list, a row gets
+class `mp-vlan-pass` (`color: var(--ok)`) or, if its own vlan id is in
+that set, `mp-vlan-blocked` (`color: var(--fail)`) with the literal text
+`"  (STP blocked)"` appended — never colour alone, the same rule the rest
+of the app already follows for status. `stpBlockingText`, which writes
+the "STP: blocking on `<switch>` (`<port>`) (VLANs …)" footer line,
+gained a fifth parameter, `withVlans` (default `true`): the detail pane
+is the one caller that now passes `false`, so its footer stops repeating
+the ids its own list already shows in colour above it, while the hover
+tooltip and the screen-reader label — both still call the old, default
+way — keep naming them, since neither has a coloured list of its own to
+carry that fact instead.
+
+**Parallel cables now stagger their port labels; `fanOffsets()` reports
+each link's place in its fan for exactly that.** `fanOffsets()` (5.36.0)
+already returns a `Map<link id, px offset>` for the whole group; it now
+returns `{ fan, index }`, `index` a second `Map<link id, its 0-based
+position within that group>`, built in the same loop that already
+assigns the offset. `drawPortLabels` takes a new `fanIndex` argument
+(`view.linkFanIndex.get(link.id) || 0`) and adds `Math.min(fanIndex *
+PORT_LABEL_STEP, Math.max(len / 2 - PORT_LABEL_INSET, 0))` (`PORT_LABEL_STEP
+= 16`) to its existing `PORT_LABEL_INSET` — every cable in a fan used to
+label at the identical distance from the node, which is what let a
+second cable's port name print directly over the first's; each one now
+steps further out along its own line instead. The `Math.min(...,
+len / 2 - PORT_LABEL_INSET)` clamp caps that step at the link's own
+midpoint, so a short link's two end labels cannot step past each other
+and swap sides — the fan itself already separates the lines by less than
+a port name is wide (5.38.0's own spacing bump notwithstanding), so
+without the clamp a short parallel pair would read worse, not better.
+
+**The toolbar Remove button now serves whatever is actually selected.**
+`removeSelected()` used to act purely on `view.selection` (a `Set` of
+device ids); a frame or a note never joins that set — each has always
+had its own selection state (`view.selectedFrameId`/`selectedNoteId`)
+and its own confirm/remove path — so the shared button read as disabled
+for the entire time either was selected, even though something plainly
+was. `removeSelected()` now checks `view.selectedFrameId` and
+`view.selectedNoteId` first, dispatching to `removeFrame`/`removeNote`
+and returning before ever touching `view.selection`; the button's own
+enabled-state computation widens the same way (`view.selection.size ===
+0 && !view.selectedFrameId && !view.selectedNoteId` is the new disabled
+condition). The frame pane's own Remove button and the canvas
+Delete/Backspace key were never gated on `view.selection` in the first
+place, so neither one was ever affected by this bug.
+
+**Frame label text size: `map_frames.text_size` (`mapperdb.py`,
+`web/api.py`, `mapper.js`).** `text_size` is `INTEGER NOT NULL DEFAULT
+1` (0=Small, 1=Medium, 2=Large), added the same way every other
+`map_frames` column addition has been — `ensure_columns` inside
+`MapperDatabase._migrate()` — so an existing database picks it up
+silently on next open, every stored frame defaulting to Medium.
+`FRAME_TEXT_SIZE_MAX = 2` gates `_validate_frame_fields`, `add_frame`
+takes `text_size: int = 1`, and `update_frame`'s allowed-field set and
+`_FRAME_UPDATE_FIELDS`/`put_mapper_map_frame`'s audit condition both
+gained it alongside `label`/`color` — a text-size change is audited the
+same accountability-worthy way a label or colour change already is,
+distinct from the un-audited position/size writes a drag or resize
+sends. On the drawing side, `FRAME_TEXT_SIZES = [{label:'S',dy:15},
+{label:'M',dy:17},{label:'L',dy:22}]` is the one table both
+`updateFrameElement` (which sets the label's own `y` from `dy` and
+toggles one of `.mp-frame-t0`/`-t2` — Medium gets neither class, since it
+is `.mp-frame-label`'s own base `font-size`) and `frameSizesHtml` (the
+pane's S/M/L button row, styled `.mp-textsize`, alongside the colour
+swatches) read from. `dy` is not one flat number because `--fs-xl` (Large)
+is nearly double `--fs-2xs` (Small) — a single baseline would either
+clip Large against the frame's own top edge or sit Small oddly low.
+Because index 1 (`dy: 17`) is the exact baseline `updateFrameElement`
+used unconditionally before this setting existed, and `.mp-frame-label`'s
+plain `font-size` is untouched, a frame stored before 5.39.0 — which
+reads back as `text_size` 1 via the column's own `DEFAULT 1` — draws
+byte-identical to how it always did.
+
+**The Device-details interface dialog's MAC table caps at five rows
+(`nodes.js`).** `MAC_TABLE_CAP = 5` lives in the dialog's own closure,
+alongside a `macExpanded` flag that starts `false` each time the dialog
+opens. `renderMacTable(mac, r, opts)` is now the one function that turns
+a fetched table into markup — `macTableHtml` itself unchanged apart from
+slicing `r.macs` to `MAC_TABLE_CAP` unless `macExpanded` is set — and
+appends a `+N more` button (`.nd-mac-show-all`) when rows are hidden,
+whose click sets `macExpanded = true` and calls `renderMacTable` again
+with the same `r`/`opts` it was first drawn with. Both the stored-table
+preview (painted immediately, no SNMP wait) and the live table that
+replaces it call the same `renderMacTable`, so expanding once and then
+having the live read land does not re-collapse the table back to five —
+`macExpanded` is read fresh by whichever render runs next, live or
+fallback-to-stored-on-failure alike.
 
 ---
 
