@@ -4493,11 +4493,11 @@ check("event.target.closest('.mp-link, .mp-link-hit')" in MAPPER96,
 # 96d. The one VLAN list carries the blocking as colour; the footer keeps the
 #      switch and port and drops the ids it used to repeat.
 check("function stpBlockedVlans(link) {" in MAPPER96,
-      "the blocked set is parsed from a_stp_vlans/b_stp_vlans")
+      "the blocked map is parsed from a_stp_vlans/b_stp_vlans")
 check("if (blocked === null) lines.push(row);" in MAPPER96,
       "a link with no blocking leaves its list uncoloured")
-check('<span class="mp-vlan-blocked">${row}  (STP blocked)</span>' in MAPPER96,
-      "a blocked VLAN says so in words as well as red")
+check('<span class="mp-vlan-blocked">${row}  (STP blocked on ${where})</span>' in MAPPER96,
+      "a blocked VLAN says so in words as well as red, naming the end")
 check("stpBlockingText(link, escape(a.name), escape(b.name), escape, false)" in MAPPER96,
       "the detail pane's STP footer drops the VLAN ids the list now shows")
 check("const suffix = (vlans) => (withVlans ? esc(stpVlanSuffix(vlans)) : '');" in MAPPER96,
@@ -4605,6 +4605,23 @@ check("const fanSide = Math.sign(fanOffset * nx) || 1;" in MAPPER97
       and "const ax = from.x + ux * inset + ox, ay = from.y + uy * inset + oy;" in MAPPER97,
       "the outward side comes from the cable's fan offset in screen x, and the "
       "label is offset from the line at its own height, not from the box edge")
+
+# ---------------------------------------------------------------------------
+# 98. 5.41.0: the link pane's blocked rows name the switch whose port blocks
+#     that VLAN: STP blocks one end of a link, and PVST can block different
+#     VLANs on different ends, so one word for every row hid which end.
+MAPPER98 = read("mapper.js")
+
+# 98a. Per-end map, gated on the end's own state; the row names the end.
+check("const out = new Map();" in MAPPER98
+      and "if (!raw || link[`${end}_stp`] !== 'blocking') continue;" in MAPPER98,
+      "stpBlockedVlans keeps the end per VLAN and reads an end only while its own "
+      "port blocks, the footer's gate")
+check("out.set(vlan, out.has(vlan) && out.get(vlan) !== end ? 'both' : end);" in MAPPER98,
+      "a VLAN both ends report maps to 'both'")
+check("const where = end === 'both' ? `${escape(a.name)} and ${escape(b.name)}`" in MAPPER98
+      and ": escape(end === 'a' ? a.name : b.name);" in MAPPER98,
+      "the row names the blocking switch, or both, escaped")
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))

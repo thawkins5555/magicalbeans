@@ -5,6 +5,21 @@ grouped by the version that carries it. This is a working record for the
 operator — the full story of each change is in `CHANGELOG.md`, and this file
 does not replace it.
 
+## 5.41.0 — Link detail pane names which switch is STP-blocking a VLAN
+
+**Operator prompt:** "On Mapper -> Nodes -> Link Details -> Step Blocked
+or passing list - if an VLAN is STP blocked please show which switch on
+which end of the link is actually in the block state. Only one side of
+the link will be in a blocked state I believe not both."
+
+Confirmed: STP only ever blocks one end of a link (both ends blocking
+the same VLAN is possible under PVST but rare), so the fix names the
+blocking end rather than assuming a fixed side. `stpBlockedVlans` now
+tracks which end (or both) blocks each VLAN, gated on that end's own
+port state, and the link detail pane's red rows read "(STP blocked on
+`<switch>`)" instead of the bare "(STP blocked)". No questions needed —
+single, well-scoped change. Version for this work: 5.41.0.
+
 ## 5.40.0 — Note text size, FiberView's missing redraw, vmVlan access ports, and port-label geometry
 
 **Operator prompt, four items with a screenshot attached:**

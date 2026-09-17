@@ -6727,21 +6727,39 @@ keyboard or screen-reader user, not new information.
 **The link detail pane's VLAN list carries STP blocking as colour, and
 the footer text was trimmed to match.** `stpBlockedVlans(link)` parses
 `a_stp_vlans`/`b_stp_vlans` (the same comma-separated id strings 5.37.0
-already stores) into one `Set<number>`, or returns `null` when the link
-is not blocking at all — `null` rather than an empty `Set` so an
-unblocked link's list stays the plain neutral colour instead of every
-row painting green for no reason. Building the VLAN list, a row gets
-class `mp-vlan-pass` (`color: var(--ok)`) or, if its own vlan id is in
-that set, `mp-vlan-blocked` (`color: var(--fail)`) with the literal text
-`"  (STP blocked)"` appended — never colour alone, the same rule the rest
-of the app already follows for status. `stpBlockingText`, which writes
-the "STP: blocking on `<switch>` (`<port>`) (VLANs …)" footer line,
-gained a fifth parameter, `withVlans` (default `true`): the detail pane
-is the one caller that now passes `false`, so its footer stops repeating
-the ids its own list already shows in colour above it, while the hover
-tooltip and the screen-reader label — both still call the old, default
-way — keep naming them, since neither has a coloured list of its own to
-carry that fact instead.
+already stores), or returns `null` when the link is not blocking at all —
+`null` rather than an empty map so an unblocked link's list stays the
+plain neutral colour instead of every row painting green for no reason.
+Building the VLAN list, a row gets class `mp-vlan-pass` (`color:
+var(--ok)`) or, if its own vlan id is blocked, `mp-vlan-blocked` (`color:
+var(--fail)`) with words appended — never colour alone, the same rule
+the rest of the app already follows for status. `stpBlockingText`, which
+writes the "STP: blocking on `<switch>` (`<port>`) (VLANs …)" footer
+line, gained a fifth parameter, `withVlans` (default `true`): the detail
+pane is the one caller that now passes `false`, so its footer stops
+repeating the ids its own list already shows in colour above it, while
+the hover tooltip and the screen-reader label — both still call the old,
+default way — keep naming them, since neither has a coloured list of its
+own to carry that fact instead.
+
+**From 5.41.0, `stpBlockedVlans` returns a `Map<vlan, 'a' | 'b' |
+'both'>` instead of a `Set<number>`, and the blocked row names the end.**
+STP only ever blocks one end of a link, and a PVST switch can block
+different VLANs on different ends, so a flat set — and the row text
+"(STP blocked)" it drove — never said which switch to go check. The
+parse loop now walks `['a', 'b']` explicitly and, for each end, reads
+that end's own `<end>_stp_vlans` only while `link[<end>_stp] ===
+'blocking'` — the same per-end gate `stpBlockingText` already applied
+for the footer line — so a blocked-id list left stale on a port that has
+since gone forwarding no longer paints a row red. Each VLAN id maps to
+`'a'`, `'b'`, or `'both'` when the second end to set it disagrees with
+the first (`out.set(vlan, out.has(vlan) && out.get(vlan) !== end ?
+'both' : end)`). `linkDetailHtml` reads that value when it builds a
+blocked row and appends `` (STP blocked on <switch>)`` — `<A> and <B>`
+for `'both'` — with the switch name passed through `escape()` the same
+as the rest of the pane. The footer line, the hover tooltip, the
+screen-reader label and the CSV export all already named the end and
+are unchanged.
 
 **Parallel cables now stagger their port labels; `fanOffsets()` reports
 each link's place in its fan for exactly that.** `fanOffsets()` (5.36.0)

@@ -1933,7 +1933,7 @@ body.kiosk .card.strip > .hint { overflow: visible; white-space: normal; }
   filter: brightness(1.35) drop-shadow(0 0 3px var(--fail)) drop-shadow(0 0 8px var(--fail));
 }
 /* The link detail pane's VLAN list, painted only where a link reports STP
-   blocking. Never colour alone: linkDetailHtml writes "(STP blocked)" too. */
+   blocking. Never colour alone: linkDetailHtml writes "(STP blocked on <switch>)" too. */
 .mp-vlan-pass { color: var(--ok); }
 .mp-vlan-blocked { color: var(--fail); }
 .mp-link-label { fill: var(--canvas-muted); font-family: var(--mono); font-size: var(--fs-2xs);

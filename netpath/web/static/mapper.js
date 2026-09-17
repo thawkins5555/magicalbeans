@@ -1428,16 +1428,19 @@
     return `STP: blocking on ${who.join(', ')}`;
   }
 
-  // null, not an empty Set: a link with nothing blocked leaves its list
-  // neutral rather than painting every row green for no reason.
+  // null, not an empty Map: a link with nothing blocked leaves its list
+  // neutral rather than painting every row green for no reason. Each end's
+  // ids count only while that end itself blocks, the footer's own gate.
   function stpBlockedVlans(link) {
     if (!link.blocking) return null;
-    const out = new Set();
-    for (const raw of [link.a_stp_vlans, link.b_stp_vlans]) {
-      if (!raw) continue;
+    const out = new Map();
+    for (const end of ['a', 'b']) {
+      const raw = link[`${end}_stp_vlans`];
+      if (!raw || link[`${end}_stp`] !== 'blocking') continue;
       for (const part of String(raw).split(',')) {
         const vlan = Number(part.trim());
-        if (part.trim() && Number.isFinite(vlan)) out.add(vlan);
+        if (!part.trim() || !Number.isFinite(vlan)) continue;
+        out.set(vlan, out.has(vlan) && out.get(vlan) !== end ? 'both' : end);
       }
     }
     return out.size ? out : null;
@@ -2699,8 +2702,12 @@
           `${link.native_vlan === vlan ? '  (native)' : ''}`;
         // Never colour alone, the same way (native) above carries words.
         if (blocked === null) lines.push(row);
-        else if (blocked.has(vlan)) lines.push(`<span class="mp-vlan-blocked">${row}  (STP blocked)</span>`);
-        else lines.push(`<span class="mp-vlan-pass">${row}</span>`);
+        else if (blocked.has(vlan)) {
+          const end = blocked.get(vlan);
+          const where = end === 'both' ? `${escape(a.name)} and ${escape(b.name)}`
+            : escape(end === 'a' ? a.name : b.name);
+          lines.push(`<span class="mp-vlan-blocked">${row}  (STP blocked on ${where})</span>`);
+        } else lines.push(`<span class="mp-vlan-pass">${row}</span>`);
       }
       if (!all) {
         // Behind a button, not truncated outright: a 200-VLAN trunk pushed

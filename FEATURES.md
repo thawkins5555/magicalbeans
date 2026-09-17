@@ -4781,7 +4781,13 @@ like any other module.
   (`<port>`)" line beneath it still names the switch and port, but no
   longer repeats the VLAN ids the list above it now shows in colour; the
   hover tooltip and the screen-reader label still name them, since
-  neither one has a list of its own to colour.
+  neither one has a list of its own to colour. **From 5.41.0, a blocked
+  row also names which switch is doing the blocking** — spanning tree
+  only ever blocks one end of a link, and a PVST switch can block
+  different VLANs on different ends, so "(STP blocked)" alone did not
+  say which side to go look at. A blocked row now reads
+  "(STP blocked on `<switch>`)", or names both switches in the rare case
+  where each end blocks the same VLAN.
 - **From 5.36.0, every cable between the same two devices draws as its
   own line, fanned apart from the others** rather than stacking on
   identical coordinates. Each line in the fan keeps its own strands,

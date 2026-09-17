@@ -1507,7 +1507,29 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       assert(hasBlockingPath,
         'expected a .mp-link.blocking path for acc-sw-005\'s TenGigabitEthernet1/1/2 link');
 
-      return `link ${linkId} blocking, stp_vlans=${stpVlans}`;
+      // 5.41.0: the pane's blocked row names the switch whose port blocks
+      // that VLAN -- here only acc-sw-005's end, and only VLAN 30. The demo
+      // persona puts this uplink in no VLAN, so the list may be absent; the
+      // footer must still name the end.
+      await page.evaluate((id) => {
+        const path = document.querySelector(`#mp-svg path.mp-link[data-link-id="${id}"]`);
+        path.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      }, linkId);
+      await page.waitForFunction(() => {
+        const pane = document.getElementById('mp-detail');
+        return !!pane && pane.textContent.includes('STP: blocking on acc-sw-005');
+      }, null, { timeout: 10000 });
+      const paneText = await page.evaluate(() => document.getElementById('mp-detail').innerText);
+      if (paneText.includes('No VLAN data known for this link')) {
+        return `link ${linkId} blocking, stp_vlans=${stpVlans}, footer names acc-sw-005 (no VLAN list to mark)`;
+      }
+      const blockedRows = await page.evaluate(() =>
+        [...document.querySelectorAll('#mp-detail .mp-vlan-blocked')].map((el) => el.textContent.trim()));
+      assert(blockedRows.length === 1 && /^30\b/.test(blockedRows[0])
+        && blockedRows[0].endsWith('(STP blocked on acc-sw-005)'),
+        `expected one blocked row "30 ... (STP blocked on acc-sw-005)", got ${JSON.stringify(blockedRows)}`);
+
+      return `link ${linkId} blocking, stp_vlans=${stpVlans}, pane names acc-sw-005`;
     });
 
   await check('Mapper: Find selects a device by name (#mp-find)',

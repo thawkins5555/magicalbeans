@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.41.0 — Link detail pane's blocked VLANs now name which switch is doing the blocking](#5410--link-detail-panes-blocked-vlans-now-name-which-switch-is-doing-the-blocking)
 - [5.40.0 — Notes get text size, FiberView's dots redraw, Cisco access VLANs via vmVlan, and parallel-link labels cleared](#5400--notes-get-text-size-fiberviews-dots-redraw-cisco-access-vlans-via-vmvlan-and-parallel-link-labels-cleared)
 - [5.39.0 — Access-port VLANs restored on Mapper, and seven more Mapper/Device-details fixes](#5390--access-port-vlans-restored-on-mapper-and-seven-more-mapperdevice-details-fixes)
 - [5.38.0 — FortiAP web tunnel, spanning-tree blocking alerts, Mapper notes, and a round of SFP/fan/FiberView fixes](#5380--fortiap-web-tunnel-spanning-tree-blocking-alerts-mapper-notes-and-a-round-of-sfpfanfiberview-fixes)
@@ -173,6 +174,36 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.41.0 — Link detail pane's blocked VLANs now name which switch is doing the blocking
+
+Spanning tree blocks a VLAN on one end of a link, not both, and a PVST
+switch can block different VLANs on different ends. The Mapper link
+detail pane's VLAN list (5.37.0/5.39.0) marked a blocked row
+"(STP blocked)" without saying which end was actually holding the
+block — this release adds the switch name.
+
+**Blocked rows now read "STP blocked on `<switch>`".** `stpBlockedVlans(link)`
+used to return a flat set of blocked VLAN ids; it now returns a map from
+VLAN id to which end blocks it (`a`, `b`, or `both` when both ends name
+the same VLAN), and reads an end's blocked-id list only while that end's
+own port is actually in the `blocking` state — the same gate the footer
+line already used, so a stale blocked-id list left over on a port that
+has since gone forwarding no longer paints a row red by mistake. The red
+row now reads `<vlan> <name> (STP blocked on <switch>)`, or
+"`<A>` and `<B>`" for the rare case both ends block the same VLAN. Names
+are escaped the same as everywhere else in the pane. Passing rows, the
+neutral (non-blocking link) case, the footer's own "STP: blocking on
+`<switch>` (`<port>`)" line, the hover tooltip, the screen-reader label
+and the CSV export are unchanged — they already named the end. File:
+`netpath/web/static/mapper.js`.
+
+Tests: `tests/test_frontend_contracts.py` section 96d re-pinned for the
+map-based rewrite, plus new section 98/98a covering the per-end gate,
+the `both` case, and the new row text. `tests/ui/walk.mjs`'s 5.37.0
+acc-sw-005 check now also opens that link's detail pane, confirms the
+footer names acc-sw-005 and, where the link carries a VLAN list, that its
+one blocked row reads VLAN 30 "(STP blocked on acc-sw-005)".
 
 ### 5.40.0 — Notes get text size, FiberView's dots redraw, Cisco access VLANs via vmVlan, and parallel-link labels cleared
 
