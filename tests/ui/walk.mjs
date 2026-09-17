@@ -1650,7 +1650,7 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
         page.click('#modal:not([hidden]) .modal-buttons button.danger'),
       ]);
       assert(removeResponse.ok(), `frame remove answered ${removeResponse.status()}`);
-      await page.waitForFunction(() => !document.querySelector('#mp-svg .mp-frame'), { timeout: 10000 });
+      await page.waitForFunction((id) => !document.querySelector(`#mp-svg .mp-frame[data-frame-id="${id}"]`), frameId, { timeout: 10000 });
       return `frame ${frameId} drawn, renamed to Core, removed`;
     });
 
@@ -1779,7 +1779,7 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
         await page.mouse.move(x0 + (120 * i) / steps, y0 + (90 * i) / steps);
       }
       await page.mouse.up();
-      await page.waitForSelector('#mp-svg .mp-note', { timeout: 10000 });
+      await page.waitForFunction(() => !!document.querySelector('#mp-svg .mp-note'), { timeout: 10000 });
       const noteId = await page.evaluate(() => {
         const notes = [...document.querySelectorAll('#mp-svg .mp-note')];
         return notes.reduce((newest, el) =>
@@ -1825,7 +1825,7 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
         page.click('#modal:not([hidden]) .modal-buttons button.danger'),
       ]);
       assert(removeResponse.ok(), `note remove answered ${removeResponse.status()}`);
-      await page.waitForFunction(() => !document.querySelector('#mp-svg .mp-note'), { timeout: 10000 });
+      await page.waitForFunction((id) => !document.querySelector(`#mp-svg .mp-note[data-note-id="${id}"]`), noteId, { timeout: 10000 });
       return `note ${noteId} drawn, text edited, removed`;
     });
 
