@@ -1539,7 +1539,13 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       const addBtn = page.locator('#mp-add-device');
       if (await addBtn.isDisabled()) return 'skipped: Add device is disabled (no write access, or no map selected)';
       await addBtn.click();
-      await page.waitForSelector('#modal:not([hidden]) #mpad-table', { timeout: 10000 });
+      // waitForSelector's geometric "visible" check forces a layout on every
+      // poll, which loses a race under the renderer load this deep in the
+      // Mapper checks; a plain DOM-state check does not and is reliable.
+      await page.waitForFunction(() => {
+        const modal = document.getElementById('modal');
+        return !!(modal && !modal.hidden && document.querySelector('#mpad-table'));
+      }, { timeout: 10000 });
       await settle(page, 400);
       const rowCount = await page.locator('#mpad-table tbody tr .mp-pick').count();
       if (rowCount === 0) {
@@ -1592,8 +1598,14 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
         await page.mouse.move(x0 + (120 * i) / steps, y0 + (90 * i) / steps);
       }
       await page.mouse.up();
-      await page.waitForSelector('#mp-svg .mp-frame', { timeout: 10000 });
-      const frameId = await page.evaluate(() => document.querySelector('#mp-svg .mp-frame').dataset.frameId);
+      // See the Add device dialog check above: a DOM-state wait, not a
+      // geometric one, under the same Mapper-tab renderer load.
+      await page.waitForFunction(() => !!document.querySelector('#mp-svg .mp-frame'), { timeout: 10000 });
+      const frameId = await page.evaluate(() => {
+        const frames = [...document.querySelectorAll('#mp-svg .mp-frame')];
+        return frames.reduce((newest, el) =>
+          (Number(el.dataset.frameId) > Number(newest.dataset.frameId) ? el : newest)).dataset.frameId;
+      });
 
       // Selecting by a real Playwright click on a thin SVG label is exactly
       // the pixel-precision problem the Connect check's own manual-link
@@ -1615,11 +1627,12 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
 
       await page.waitForSelector('#mp-detail #mpf-label', { timeout: 10000 });
       await page.fill('#mp-detail #mpf-label', 'Core');
-      const renamed = page.waitForResponse((response) =>
-        /\/api\/mapper\/maps\/\d+\/frames\/\d+$/.test(response.url())
-        && response.request().method() === 'PUT', { timeout: 10000 });
-      await page.click('#mp-detail #mpf-label-save');
-      const renameResponse = await renamed;
+      const [renameResponse] = await Promise.all([
+        page.waitForResponse((response) =>
+          /\/api\/mapper\/maps\/\d+\/frames\/\d+$/.test(response.url())
+          && response.request().method() === 'PUT', { timeout: 10000 }),
+        page.click('#mp-detail #mpf-label-save'),
+      ]);
       assert(renameResponse.ok(), `frame rename answered ${renameResponse.status()}`);
       await page.waitForFunction((id) => {
         const label = document.querySelector(`#mp-svg .mp-frame[data-frame-id="${id}"] .mp-frame-label`);
@@ -1630,11 +1643,12 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       // App.confirmDestructive: Cancel + a danger-styled confirm button,
       // not a native browser dialog.
       await page.waitForSelector('#modal:not([hidden]) .modal-buttons button.danger', { timeout: 10000 });
-      const removed = page.waitForResponse((response) =>
-        /\/api\/mapper\/maps\/\d+\/frames\/\d+$/.test(response.url())
-        && response.request().method() === 'DELETE', { timeout: 10000 });
-      await page.click('#modal:not([hidden]) .modal-buttons button.danger');
-      const removeResponse = await removed;
+      const [removeResponse] = await Promise.all([
+        page.waitForResponse((response) =>
+          /\/api\/mapper\/maps\/\d+\/frames\/\d+$/.test(response.url())
+          && response.request().method() === 'DELETE', { timeout: 10000 }),
+        page.click('#modal:not([hidden]) .modal-buttons button.danger'),
+      ]);
       assert(removeResponse.ok(), `frame remove answered ${removeResponse.status()}`);
       await page.waitForFunction(() => !document.querySelector('#mp-svg .mp-frame'), { timeout: 10000 });
       return `frame ${frameId} drawn, renamed to Core, removed`;
@@ -1660,8 +1674,13 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
         await page.mouse.move(x0 + (160 * i) / steps, y0 + (120 * i) / steps);
       }
       await page.mouse.up();
-      await page.waitForSelector('#mp-svg .mp-frame', { timeout: 10000 });
-      const frameId = await page.evaluate(() => document.querySelector('#mp-svg .mp-frame').dataset.frameId);
+      // Same DOM-state wait as the Frame tool check above.
+      await page.waitForFunction(() => !!document.querySelector('#mp-svg .mp-frame'), { timeout: 10000 });
+      const frameId = await page.evaluate(() => {
+        const frames = [...document.querySelectorAll('#mp-svg .mp-frame')];
+        return frames.reduce((newest, el) =>
+          (Number(el.dataset.frameId) > Number(newest.dataset.frameId) ? el : newest)).dataset.frameId;
+      });
 
       // The stroke rect's own bounding box edge, not an arbitrary point
       // inside it: pointer-events is 'stroke' on this rect (28c above), so
@@ -1675,18 +1694,24 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       }, frameId);
       assert(strokeBox, 'could not find the frame stroke rect');
 
-      const moveRequest = page.waitForRequest((request) =>
-        request.method() === 'PUT'
-        && /\/api\/mapper\/maps\/\d+\/frames\/\d+$/.test(request.url())
-        && (() => {
-          try { const body = request.postDataJSON(); return 'x' in body && 'y' in body; }
-          catch { return false; }
-        })(), { timeout: 20000 });
-      await page.mouse.move(strokeBox.x, strokeBox.y);
-      await page.mouse.down();
-      await page.mouse.move(strokeBox.x + 60, strokeBox.y + 60, { steps: 8 });
-      await page.mouse.up();
-      const moveReq = await moveRequest;
+      // Armed and awaited together: if the gesture throws, the wait is
+      // rejected right along with it instead of orphaning to reject on its
+      // own 20s later, after this check has already failed and moved on.
+      const [moveReq] = await Promise.all([
+        page.waitForRequest((request) =>
+          request.method() === 'PUT'
+          && /\/api\/mapper\/maps\/\d+\/frames\/\d+$/.test(request.url())
+          && (() => {
+            try { const body = request.postDataJSON(); return 'x' in body && 'y' in body; }
+            catch { return false; }
+          })(), { timeout: 20000 }),
+        (async () => {
+          await page.mouse.move(strokeBox.x, strokeBox.y);
+          await page.mouse.down();
+          await page.mouse.move(strokeBox.x + 60, strokeBox.y + 60, { steps: 8 });
+          await page.mouse.up();
+        })(),
+      ]);
       const moveResponse = await moveReq.response();
       assert(moveResponse && moveResponse.status() === 200,
         `frame move PUT answered ${moveResponse && moveResponse.status()}`);
@@ -1699,18 +1724,21 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       }, frameId);
       assert(handleBox, 'could not find the frame resize handle');
 
-      const resizeRequest = page.waitForRequest((request) =>
-        request.method() === 'PUT'
-        && /\/api\/mapper\/maps\/\d+\/frames\/\d+$/.test(request.url())
-        && (() => {
-          try { const body = request.postDataJSON(); return 'width' in body && 'height' in body; }
-          catch { return false; }
-        })(), { timeout: 20000 });
-      await page.mouse.move(handleBox.x, handleBox.y);
-      await page.mouse.down();
-      await page.mouse.move(handleBox.x + 40, handleBox.y + 40, { steps: 8 });
-      await page.mouse.up();
-      const resizeReq = await resizeRequest;
+      const [resizeReq] = await Promise.all([
+        page.waitForRequest((request) =>
+          request.method() === 'PUT'
+          && /\/api\/mapper\/maps\/\d+\/frames\/\d+$/.test(request.url())
+          && (() => {
+            try { const body = request.postDataJSON(); return 'width' in body && 'height' in body; }
+            catch { return false; }
+          })(), { timeout: 20000 }),
+        (async () => {
+          await page.mouse.move(handleBox.x, handleBox.y);
+          await page.mouse.down();
+          await page.mouse.move(handleBox.x + 40, handleBox.y + 40, { steps: 8 });
+          await page.mouse.up();
+        })(),
+      ]);
       const resizeResponse = await resizeReq.response();
       assert(resizeResponse && resizeResponse.status() === 200,
         `frame resize PUT answered ${resizeResponse && resizeResponse.status()}`);
@@ -1719,11 +1747,12 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       await page.waitForSelector('#mp-detail #mpf-remove', { timeout: 10000 });
       await page.click('#mp-detail #mpf-remove');
       await page.waitForSelector('#modal:not([hidden]) .modal-buttons button.danger', { timeout: 10000 });
-      const removed = page.waitForResponse((response) =>
-        /\/api\/mapper\/maps\/\d+\/frames\/\d+$/.test(response.url())
-        && response.request().method() === 'DELETE', { timeout: 10000 });
-      await page.click('#modal:not([hidden]) .modal-buttons button.danger');
-      const removeResponse = await removed;
+      const [removeResponse] = await Promise.all([
+        page.waitForResponse((response) =>
+          /\/api\/mapper\/maps\/\d+\/frames\/\d+$/.test(response.url())
+          && response.request().method() === 'DELETE', { timeout: 10000 }),
+        page.click('#modal:not([hidden]) .modal-buttons button.danger'),
+      ]);
       assert(removeResponse.ok(), `frame remove answered ${removeResponse.status()}`);
       return `frame ${frameId} dragged (PUT x/y) and resized (PUT width/height), removed`;
     });
@@ -1751,7 +1780,11 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       }
       await page.mouse.up();
       await page.waitForSelector('#mp-svg .mp-note', { timeout: 10000 });
-      const noteId = await page.evaluate(() => document.querySelector('#mp-svg .mp-note').dataset.noteId);
+      const noteId = await page.evaluate(() => {
+        const notes = [...document.querySelectorAll('#mp-svg .mp-note')];
+        return notes.reduce((newest, el) =>
+          (Number(el.dataset.noteId) > Number(newest.dataset.noteId) ? el : newest)).dataset.noteId;
+      });
 
       // Same real-pointerdown-on-the-element idiom the Frame check's own
       // label click uses, for the same reason (a thin SVG target).
@@ -1771,11 +1804,12 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
 
       await page.waitForSelector('#mp-detail #mpn-text', { timeout: 10000 });
       await page.fill('#mp-detail #mpn-text', 'Uplink to the core');
-      const edited = page.waitForResponse((response) =>
-        /\/api\/mapper\/maps\/\d+\/notes\/\d+$/.test(response.url())
-        && response.request().method() === 'PUT', { timeout: 10000 });
-      await page.click('#mp-detail #mpn-text-save');
-      const editResponse = await edited;
+      const [editResponse] = await Promise.all([
+        page.waitForResponse((response) =>
+          /\/api\/mapper\/maps\/\d+\/notes\/\d+$/.test(response.url())
+          && response.request().method() === 'PUT', { timeout: 10000 }),
+        page.click('#mp-detail #mpn-text-save'),
+      ]);
       assert(editResponse.ok(), `note text edit answered ${editResponse.status()}`);
       await page.waitForFunction((id) => {
         const text = document.querySelector(`#mp-svg .mp-note[data-note-id="${id}"] .mp-note-text`);
@@ -1784,11 +1818,12 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
 
       await page.click('#mp-detail #mpn-remove');
       await page.waitForSelector('#modal:not([hidden]) .modal-buttons button.danger', { timeout: 10000 });
-      const removed = page.waitForResponse((response) =>
-        /\/api\/mapper\/maps\/\d+\/notes\/\d+$/.test(response.url())
-        && response.request().method() === 'DELETE', { timeout: 10000 });
-      await page.click('#modal:not([hidden]) .modal-buttons button.danger');
-      const removeResponse = await removed;
+      const [removeResponse] = await Promise.all([
+        page.waitForResponse((response) =>
+          /\/api\/mapper\/maps\/\d+\/notes\/\d+$/.test(response.url())
+          && response.request().method() === 'DELETE', { timeout: 10000 }),
+        page.click('#modal:not([hidden]) .modal-buttons button.danger'),
+      ]);
       assert(removeResponse.ok(), `note remove answered ${removeResponse.status()}`);
       await page.waitForFunction(() => !document.querySelector('#mp-svg .mp-note'), { timeout: 10000 });
       return `note ${noteId} drawn, text edited, removed`;
