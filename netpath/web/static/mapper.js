@@ -1168,8 +1168,7 @@
     let reserve = 0;
     if (view.settings.show_port_labels) {
       reserve = drawPortLabels(labelLayer, link, from, to, nx, ny, bundleHalf,
-        (view.linkFanIndex && view.linkFanIndex.get(link.id)) || 0,
-        Math.sign(fanOffset * nx) || 1);
+        (view.linkFanIndex && view.linkFanIndex.get(link.id)) || 0, fanOffset);
     }
     if (plan.mode === 'strands' && plan.strands.length) {
       // Finding 9: every strand used to get the identical aria-label/tooltip
@@ -1306,45 +1305,53 @@
   // text clears the node box, and offset to one side of the line (the same
   // normal `nx,ny` the strand offsets use) so it never sits on top of the
   // stroke itself.
-  function drawPortLabels(layer, link, from, to, nx, ny, bundleHalf, fanIndex = 0, fanSide = 1) {
+  function drawPortLabels(layer, link, from, to, nx, ny, bundleHalf, fanIndex = 0, fanOffset = 0) {
     if (!link.a_port && !link.b_port) return 0;
     const dx = to.x - from.x, dy = to.y - from.y;
     const len = Math.max(Math.hypot(dx, dy), 1e-6);
     const ux = dx / len, uy = dy / len;
-    const clear = boxExit(ux, uy) + PORT_LABEL_INSET;
-    // Clamped at the midpoint: on a short link the two ends' labels would
-    // otherwise step past each other and swap sides.
-    const step = Math.min(fanIndex * PORT_LABEL_STEP, Math.max(len / 2 - clear, 0));
-    const inset = clear + step, aside = Math.max(8, bundleHalf + 5);
-    const label = (text, x, y, anchor) => layer.appendChild(App.svgNode('text', {
-      class: 'mp-link-label', x, y, 'text-anchor': anchor,
-    }, text));
+    const aside = Math.max(8, bundleHalf + 5);
     // A start/end anchor along x only reads right beside a shallow line. On
     // a steep one both labels sit on the fan's outward side and read away
     // from it, so a cable's own label never crosses its line or its neighbour's.
     const steep = Math.abs(uy) > Math.abs(ux);
+    const fanSide = Math.sign(fanOffset * nx) || 1;
+    const ox = steep ? fanSide * aside : nx * aside, oy = steep ? 0 : ny * aside;
+    // The box's reach is measured from where the label actually sits -- the
+    // fan and the sideways offset both move it -- at whichever end reaches
+    // further, so one inset serves both.
+    const ex = nx * fanOffset + ox, ey = ny * fanOffset + oy;
+    const clear = Math.max(boxExit(ux, uy, ex, ey), boxExit(-ux, -uy, ex, ey)) + PORT_LABEL_INSET;
+    // Clamped at the midpoint: on a short link the two ends' labels would
+    // otherwise step past each other and swap sides.
+    const step = Math.min(fanIndex * PORT_LABEL_STEP, Math.max(len / 2 - clear, 0));
+    const inset = clear + step;
+    const label = (text, x, y, anchor) => layer.appendChild(App.svgNode('text', {
+      class: 'mp-link-label', x, y, 'text-anchor': anchor,
+    }, text));
+    const ax = from.x + ux * inset + ox, ay = from.y + uy * inset + oy;
+    const bx = to.x - ux * inset + ox, by = to.y - uy * inset + oy;
     if (steep) {
       const anchor = fanSide > 0 ? 'start' : 'end';
-      if (link.a_port) label(link.a_port, from.x + fanSide * aside, from.y + uy * inset, anchor);
-      if (link.b_port) label(link.b_port, to.x + fanSide * aside, to.y - uy * inset, anchor);
+      if (link.a_port) label(link.a_port, ax, ay, anchor);
+      if (link.b_port) label(link.b_port, bx, by, anchor);
       return inset + PORT_LABEL_STEP;
     }
-    if (link.a_port) {
-      label(link.a_port, from.x + ux * inset + nx * aside, from.y + uy * inset + ny * aside, 'start');
-    }
-    if (link.b_port) {
-      label(link.b_port, to.x - ux * inset + nx * aside, to.y - uy * inset + ny * aside, 'end');
-    }
+    if (link.a_port) label(link.a_port, ax, ay, 'start');
+    if (link.b_port) label(link.b_port, bx, by, 'end');
     return 0;
   }
 
-  // How far past edgePoint()'s inscribed ellipse the node box itself reaches
-  // along the link: nothing on an axis-aligned link, up to NODE_H / 2 toward
-  // a corner. The label inset adds this so it clears the box at any angle.
-  function boxExit(ux, uy) {
+  // How far along (ux, uy) the node box reaches past edgePoint()'s inscribed
+  // ellipse, starting from a point (ox, oy) off that ellipse point: nothing
+  // on an axis-aligned link, up to NODE_H / 2 toward a corner.
+  function boxExit(ux, uy, ox, oy) {
     const hw = NODE_W / 2, hh = NODE_H / 2;
-    const rect = Math.min(hw / Math.max(Math.abs(ux), 1e-6), hh / Math.max(Math.abs(uy), 1e-6));
-    return rect - 1 / Math.sqrt((ux / hw) ** 2 + (uy / hh) ** 2);
+    const t = 1 / Math.sqrt((ux / hw) ** 2 + (uy / hh) ** 2);
+    const px = ux * t + ox, py = uy * t + oy;
+    const tx = ux ? (Math.sign(ux) * hw - px) / ux : Infinity;
+    const ty = uy ? (Math.sign(uy) * hh - py) / uy : Infinity;
+    return Math.max(0, Math.min(tx, ty));
   }
 
   // The one stop a "strands" or "collapsed" link gets (see drawLink's own

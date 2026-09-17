@@ -4512,7 +4512,8 @@ check("const PORT_LABEL_STEP = 16;" in MAPPER96,
       "the per-cable label step is named once")
 check("return { fan, index };" in MAPPER96,
       "fanOffsets reports each link's place in its fan, not just the offset")
-check("const inset = clear + step, aside = Math.max(8, bundleHalf + 5);" in MAPPER96,
+check("const inset = clear + step;" in MAPPER96
+      and "const aside = Math.max(8, bundleHalf + 5);" in MAPPER96,
       "drawPortLabels offsets by that place, and sits clear of the strand bundle")
 check("Math.max(len / 2 - clear, 0));" in MAPPER96,
       "clamped at the midpoint, so a short link's two ends cannot swap sides")
@@ -4589,17 +4590,21 @@ check("applyFiberView();" in _FIBER97 and "requestDraw();" in _FIBER97
 #      pair's stagger has room; steep links read away from their line.
 check("const PORT_LABEL_INSET = 18;" in MAPPER97,
       "the inset is a margin, not a corner allowance")
-check("function boxExit(ux, uy)" in MAPPER97
-      and "const clear = boxExit(ux, uy) + PORT_LABEL_INSET;" in MAPPER97,
-      "drawPortLabels adds the box's own reach along the link")
+check("function boxExit(ux, uy, ox, oy)" in MAPPER97
+      and "const clear = Math.max(boxExit(ux, uy, ex, ey), boxExit(-ux, -uy, ex, ey)) + PORT_LABEL_INSET;"
+      in MAPPER97,
+      "drawPortLabels adds the box's own reach along the link, measured from where "
+      "the label sits at whichever end reaches further")
 check("const steep = Math.abs(uy) > Math.abs(ux);" in MAPPER97
       and "const anchor = fanSide > 0 ? 'start' : 'end';" in MAPPER97,
       "a steep link anchors both labels away from the fan's outward side")
 check("return inset + PORT_LABEL_STEP;" in MAPPER97
       and "step = Math.min(step, Math.max(edgeLen - 2 * reserve, 0) / ((n - 1) * edgeLen));" in MAPPER97,
       "and hands the strands branch the span its labels took, so VLAN numbers stay off them")
-check("Math.sign(fanOffset * nx) || 1);" in MAPPER97,
-      "the outward side comes from the cable's fan offset in screen x")
+check("const fanSide = Math.sign(fanOffset * nx) || 1;" in MAPPER97
+      and "const ax = from.x + ux * inset + ox, ay = from.y + uy * inset + oy;" in MAPPER97,
+      "the outward side comes from the cable's fan offset in screen x, and the "
+      "label is offset from the line at its own height, not from the box edge")
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))
