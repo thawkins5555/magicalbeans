@@ -6940,15 +6940,18 @@ computed once, `Math.max(18, Math.hypot(NODE_W/2, NODE_H/2) - Math.min
 exit point and the box's actual corner, which only matters on a
 diagonal link and only gets bigger, never smaller, everywhere else.
 `PORT_LABEL_INSET` is now a flat `18` (a margin, not a corner
-allowance), and a new `boxExit(ux, uy)` computes that same corner-clearing
-distance per link, from the link's own unit direction: `rect =
-Math.min(hw / |ux|, hh / |uy|)` (the box's own edge along this exact
-ray) minus the ellipse's exit distance along the same ray — zero on a
-perfectly axis-aligned link, growing to the corner's own ~27px past the
-ellipse on a link running straight at `NODE_W×NODE_H`'s corner (176×54,
-so a corner run is about 17° off horizontal, not 45°). `drawPortLabels`
-now adds `PORT_LABEL_INSET` to `boxExit(ux, uy)` as `clear`, in place of
-the old constant, everywhere `PORT_LABEL_INSET` used to appear directly
+allowance), and a new `boxExit(ux, uy, ox, oy)` computes that same
+corner-clearing distance per link, from the link's own unit direction
+and from where the label actually starts — the ellipse exit point moved
+by the cable's fan offset and the label's sideways offset, since either
+can carry the label back over the box on a diagonal: it solves for the
+box edge along this exact ray from that point — zero on a perfectly
+axis-aligned link, growing to the corner's own ~27px past the ellipse
+on a link running straight at `NODE_W×NODE_H`'s corner (176×54, so a
+corner run is about 17° off horizontal, not 45°). `drawPortLabels` now
+takes the larger of the two ends' `boxExit` and adds `PORT_LABEL_INSET`
+as `clear`, in place of the old constant, everywhere `PORT_LABEL_INSET`
+used to appear directly
 — so an axis-aligned link's labels now sit about 18px out and a
 corner-bound link's about 45px out, instead of every link paying the
 old ~65px regardless of angle. This is what gave 5.39.0's own per-cable
