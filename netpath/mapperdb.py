@@ -91,6 +91,7 @@ CREATE TABLE IF NOT EXISTS map_frames (
     width      REAL NOT NULL,
     height     REAL NOT NULL,
     color      INTEGER NOT NULL DEFAULT 0,
+    text_size  INTEGER NOT NULL DEFAULT 1,
     added_ts   REAL NOT NULL,
     FOREIGN KEY (map_id) REFERENCES maps(id) ON DELETE CASCADE
 );
@@ -206,6 +207,8 @@ MAP_STYLES = ("modern", "classic", "blueprint", "minimal")
 # A frame's fill/border palette index -- fixed at 6 swatches (0-5), same
 # palette-by-index idiom as a node's role or a VLAN's colour_index.
 FRAME_COLOR_MAX = 5
+# A frame's label text size: 0=Small, 1=Medium (default), 2=Large.
+FRAME_TEXT_SIZE_MAX = 2
 FRAME_MIN_SIZE = 40.0
 FRAME_LABEL_MAX = 60
 
@@ -242,6 +245,12 @@ def _validate_frame_fields(fields: dict) -> None:
         if isinstance(color, bool) or not isinstance(color, int) \
                 or not (0 <= color <= FRAME_COLOR_MAX):
             raise ValueError(f"Frame color must be an integer between 0 and {FRAME_COLOR_MAX}.")
+    if "text_size" in fields:
+        text_size = fields["text_size"]
+        if isinstance(text_size, bool) or not isinstance(text_size, int) \
+                or not (0 <= text_size <= FRAME_TEXT_SIZE_MAX):
+            raise ValueError(
+                f"Frame text_size must be an integer between 0 and {FRAME_TEXT_SIZE_MAX}.")
 
 
 def _validate_note_fields(fields: dict) -> None:
@@ -277,6 +286,9 @@ class MapperDatabase(SqliteStore):
     SCHEMA = SCHEMA
     DEFAULTS = DEFAULTS
     LABEL = "mapper.db"
+
+    def _migrate(self) -> None:
+        self.ensure_columns("map_frames", {"text_size": "INTEGER NOT NULL DEFAULT 1"})
 
     # ------------------------------------------------------------------ maps
 
@@ -529,29 +541,30 @@ class MapperDatabase(SqliteStore):
                 (map_id,)).fetchall()
 
     def add_frame(self, map_id: int, x: float, y: float, width: float, height: float,
-                 label: str = "", color: int = 0, now: float | None = None) -> int:
+                 label: str = "", color: int = 0, text_size: int = 1,
+                 now: float | None = None) -> int:
         fields = {"x": x, "y": y, "width": width, "height": height,
-                  "label": label, "color": color}
+                  "label": label, "color": color, "text_size": text_size}
         _validate_frame_fields(fields)
         now = time.time() if now is None else now
         with self._lock:
             cur = self._conn.execute(
-                "INSERT INTO map_frames(map_id, label, x, y, width, height, color, added_ts)"
-                " VALUES (?,?,?,?,?,?,?,?)",
+                "INSERT INTO map_frames(map_id, label, x, y, width, height, color, text_size, added_ts)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
                 (map_id, fields["label"], fields["x"], fields["y"], fields["width"],
-                 fields["height"], fields["color"], now))
+                 fields["height"], fields["color"], fields["text_size"], now))
             self._touch_map(map_id, now)
             self._conn.commit()
             return int(cur.lastrowid)
 
     def update_frame(self, map_id: int, frame_id: int, **fields) -> bool:
-        """Any of label/x/y/width/height/color; a key not in that set is
-        silently dropped, same as update_nodes' fixed column list. Returns
-        False, not a raise, when frame_id/map_id do not match a row -- a
-        stale edit from a tab open on a since-deleted frame must not
+        """Any of label/x/y/width/height/color/text_size; a key not in that
+        set is silently dropped, same as update_nodes' fixed column list.
+        Returns False, not a raise, when frame_id/map_id do not match a row
+        -- a stale edit from a tab open on a since-deleted frame must not
         explode (add_frame/mapperdb's other update_* methods agree)."""
         allowed = {k: v for k, v in fields.items()
-                  if k in ("label", "x", "y", "width", "height", "color")}
+                  if k in ("label", "x", "y", "width", "height", "color", "text_size")}
         _validate_frame_fields(allowed)
         if not allowed:
             return False

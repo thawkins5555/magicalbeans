@@ -4295,8 +4295,11 @@ check("MAX_CANVAS_SIDE = 16384" in _EXPORT88K and "MAX_CANVAS_AREA = 268000000" 
 check("font-size: var(--fs-xs);" in APP_CSS[APP_CSS.index(".mp-frame-label {"):
                                              APP_CSS.index(".mp-frame-handle")],
       "the frame label's font-size moved up a step")
-check("label.setAttribute('y', r.y + 17);" in MAPPER,
-      "updateFrameElement's label baseline nudged down to match")
+check("label.setAttribute('y', r.y + FRAME_TEXT_SIZES[sizeIdx].dy);" in MAPPER,
+      "updateFrameElement takes the label baseline from the frame's own size")
+check("{ label: 'M', dy: 17 }" in MAPPER,
+      "Medium still sits at the baseline the fixed one used to, so a frame "
+      "drawn before there was a setting is unmoved")
 
 # ---------------------------------------------------------------------------
 # 89. The device dialog's STACK POWER section (Cisco StackPower/StackWise
@@ -4435,6 +4438,103 @@ check("App.el('wl-web-ap').hidden = !(ap && ap.ip && App.canWrite('web'))"
 APP95 = read("app.js")
 check("'wireless.ap.web': {" in APP95,
       "app.js registers the wireless.ap.web help topic")
+
+# 96. Mapper operator round (5.39.0): the legend note is gone, the STP dots
+#     ride above the fiber glow, the strand bundle has one wide click target,
+#     the detail pane's VLAN list carries the blocking in colour, parallel
+#     cables stagger their port labels, and the toolbar Remove serves a
+#     selected frame or note.
+MAPPER96 = read("mapper.js")
+CSS96 = read("app.css")
+
+# 96a. The VLAN/dash/dot note is removed; the FiberView key and the
+#      no-adjacency message stay.
+_LEGEND96 = MAPPER96[MAPPER96.index("function drawLegend("):
+                     MAPPER96.index("/* ------------------------------------------------------------ selection */")]
+check("draw as one thick line" not in _LEGEND96
+      and "A dashed line means" not in _LEGEND96
+      and "spanning-tree-blocked port" not in _LEGEND96,
+      "drawLegend no longer explains the VLAN line styles")
+check("FiberView: dark orange = multimode" in _LEGEND96
+      and "No CDP/LLDP adjacency was found" in _LEGEND96,
+      "the FiberView key and the empty-map message survive that removal")
+
+# 96b. The blocked dots are their own unglowed path, not a dasharray on the
+#      glowing one -- the glow's blur was smearing them into a solid line.
+check("const overlaidBlocking = link.blocking && link.fiber === true && view.fiberView;"
+      in MAPPER96,
+      "drawLink knows when the glow is carrying an overlay instead of dots")
+check("class: 'mp-link blocking mp-blocking-over', 'stroke-width': width," in MAPPER96,
+      "the overlay is a .blocking path with no .fiber, so no glow filter")
+check("if (link.blocking && !overlaidBlocking) path.classList.add('blocking');" in MAPPER96,
+      "the plain/collapsed link stops dashing its own glow where the overlay draws")
+check(".mp-link.mp-blocking-over { stroke: var(--fail); }" in CSS96,
+      "the overlay is red -- the same colour a blocked VLAN gets in the pane")
+
+# 96c. One wide invisible hit target under the strands, not a fatter strand:
+#      each strand must still answer for its own VLAN on hover.
+check("const LINK_HIT_PAD = 14;" in MAPPER96,
+      "the click target's margin past the ribbon is named once")
+check("'pointer-events': 'stroke', class: 'mp-link-hit'," in MAPPER96,
+      "the target is stroke-hit only, like a frame's outline")
+check("hit.setAttribute('aria-hidden', 'true');" in MAPPER96,
+      "it adds no second Tab stop or screen-reader name for the same link")
+check(MAPPER96.index("class: 'mp-link-hit'") < MAPPER96.index("plan.strands.forEach"),
+      "it is appended BEFORE the strands, so a strand still wins its own tooltip")
+
+# 96d. The one VLAN list carries the blocking as colour; the footer keeps the
+#      switch and port and drops the ids it used to repeat.
+check("function stpBlockedVlans(link) {" in MAPPER96,
+      "the blocked set is parsed from a_stp_vlans/b_stp_vlans")
+check("if (blocked === null) lines.push(row);" in MAPPER96,
+      "a link with no blocking leaves its list uncoloured")
+check('<span class="mp-vlan-blocked">${row}  (STP blocked)</span>' in MAPPER96,
+      "a blocked VLAN says so in words as well as red")
+check("stpBlockingText(link, escape(a.name), escape(b.name), escape, false)" in MAPPER96,
+      "the detail pane's STP footer drops the VLAN ids the list now shows")
+check("const suffix = (vlans) => (withVlans ? esc(stpVlanSuffix(vlans)) : '');" in MAPPER96,
+      "the tooltip and aria-label keep naming them -- they have no list to colour")
+check(".mp-vlan-pass { color: var(--ok); }" in CSS96
+      and ".mp-vlan-blocked { color: var(--fail); }" in CSS96,
+      "green passing, red blocked")
+
+# 96e. Parallel cables step their port labels apart: the fan separates the
+#      lines by less than a port name is wide.
+check("const PORT_LABEL_STEP = 16;" in MAPPER96,
+      "the per-cable label step is named once")
+check("return { fan, index };" in MAPPER96,
+      "fanOffsets reports each link's place in its fan, not just the offset")
+check("const inset = PORT_LABEL_INSET + step, aside = 8;" in MAPPER96,
+      "drawPortLabels offsets by that place")
+check("Math.max(len / 2 - PORT_LABEL_INSET, 0));" in MAPPER96,
+      "clamped at the midpoint, so a short link's two ends cannot swap sides")
+
+# 96f. The toolbar Remove button serves whatever is selected. A frame never
+#      joins view.selection, which is why it sat disabled.
+check("&& !view.selectedFrameId && !view.selectedNoteId)]," in MAPPER96,
+      "mp-remove-node enables for a selected frame or note")
+check("if (view.selectedFrameId) { removeFrame(view.selectedFrameId); return; }" in MAPPER96,
+      "and removeSelected dispatches to the frame's own confirm and endpoint")
+
+# 96g. Frame label text size: three presets beside the colour swatches,
+#      Medium unchanged from before the setting existed.
+check("data-frame-textsize=" in MAPPER96 and "class=\"mp-textsize" in MAPPER96,
+      "the size row renders beside the swatches")
+check("`Text size   ${frameSizesHtml(frame, canWrite)}`," in MAPPER96,
+      "it sits in the frame pane next to Label and Colour")
+check("{ text_size: textSize }" in MAPPER96,
+      "picking one PUTs text_size on the frame")
+check(".mp-frame-label.mp-frame-t0 { font-size: var(--fs-2xs); }" in CSS96
+      and ".mp-frame-label.mp-frame-t2 { font-size: var(--fs-xl); }" in CSS96,
+      "Small and Large are their own rules; Medium is the base font-size")
+
+# 96h. The interface dialog's MAC table stops after five, with the rest
+#      behind a count.
+NODES96 = read("nodes.js")
+check("MAC_TABLE_CAP = 5" in NODES96,
+      "the MAC table caps at five rows")
+check("more" in NODES96 and "nd-mac-show-all" in NODES96,
+      "the rest sit behind a +N more control")
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))

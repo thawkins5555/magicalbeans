@@ -3077,6 +3077,12 @@
     // The stored forwarding table renders immediately (no SNMP wait); the
     // live read below then replaces it, or — on a failed/unsupported live
     // read — leaves the stored table up with a one-line hint appended.
+    // Rows beyond MAC_TABLE_CAP sit behind a "+N more" button, same idea as
+    // mapper.js's VLAN_DETAIL_CAP; macExpanded lives in this dialog's own
+    // closure so it resets each time the dialog opens, and survives the
+    // stored->live swap because both renders read the same flag.
+    const MAC_TABLE_CAP = 5;
+    let macExpanded = false;
     function macTableHtml(r, { asOf, hint } = {}) {
       if (!r.macs || !r.macs.length) {
         const empty = r.walked === false
@@ -3087,16 +3093,27 @@
       // The VLAN column only earns its place when the source actually knew
       // one: dot1dTpFdbTable has no VLAN in it at all.
       const anyVlan = r.macs.some((m) => m.vlan);
+      const shown = macExpanded ? r.macs : r.macs.slice(0, MAC_TABLE_CAP);
+      const hidden = r.macs.length - shown.length;
       return `${asOf ? `<p class="hint">as of ${escape(asOf)}</p>` : ''}` +
         `<table><caption class="sr-only">MAC addresses learned on this port</caption><tr><th scope="col">MAC address</th>${
           anyVlan ? '<th scope="col">VLAN</th>' : ''}</tr>` +
-        r.macs.map((m) => `<tr><td>${escape(m.mac)}${
+        shown.map((m) => `<tr><td>${escape(m.mac)}${
           m.present === 0 ? ' <span class="hint">(stale)</span>' : ''}</td>${
           anyVlan ? `<td>${escape(m.vlan || '—')}</td>` : ''}</tr>`).join('') +
-        '</table>' + (hint ? `<p class="hint">${hint}</p>` : '');
+        '</table>' +
+        (hidden ? `<button class="linkish nd-mac-show-all">+${hidden} more</button>` : '') +
+        (hint ? `<p class="hint">${hint}</p>` : '');
     }
 
-    let storedMacHtml = null;
+    function renderMacTable(mac, r, opts) {
+      mac.innerHTML = macTableHtml(r, opts);
+      const showAll = mac.querySelector('.nd-mac-show-all');
+      if (showAll) showAll.onclick = () => { macExpanded = true; renderMacTable(mac, r, opts); };
+    }
+
+    let storedMacR = null;
+    let storedMacOpts = null;
     let liveRendered = false;
     App.get(`/api/nodes/devices/${deviceId}/interfaces/${ifIndex}/mac-table`, { stored: 1 })
       .then((r) => {
@@ -3104,8 +3121,9 @@
         if (!mac || !current()) return;
         const newest = r.macs && r.macs.length
           ? Math.max(...r.macs.map((m) => m.seen_ts || 0)) : 0;
-        storedMacHtml = macTableHtml(r, { asOf: newest ? App.when(newest) : '' });
-        if (!liveRendered) mac.innerHTML = storedMacHtml;
+        storedMacR = r;
+        storedMacOpts = { asOf: newest ? App.when(newest) : '' };
+        if (!liveRendered) renderMacTable(mac, storedMacR, storedMacOpts);
       })
       .catch(() => {});
 
@@ -3115,14 +3133,17 @@
         if (!mac || !current()) return;
         liveRendered = true;
         if (!r.supported) {
-          mac.innerHTML = storedMacHtml !== null ? storedMacHtml +
-            '<p class="hint">This device answers neither the Q-BRIDGE nor the BRIDGE-MIB ' +
-            'forwarding tables — showing the last stored walk.</p>' :
-            '<p class="hint">No MAC address data available — this device answers ' +
-            'neither the Q-BRIDGE nor the BRIDGE-MIB forwarding tables.</p>';
+          if (storedMacR !== null) {
+            renderMacTable(mac, storedMacR, { ...storedMacOpts,
+              hint: 'This device answers neither the Q-BRIDGE nor the BRIDGE-MIB '
+                + 'forwarding tables — showing the last stored walk.' });
+          } else {
+            mac.innerHTML = '<p class="hint">No MAC address data available — this device answers '
+              + 'neither the Q-BRIDGE nor the BRIDGE-MIB forwarding tables.</p>';
+          }
           return;
         }
-        mac.innerHTML = macTableHtml(r);
+        renderMacTable(mac, r, {});
       })
       .catch(() => {
         const mac = box.querySelector('#ifd-mac');
@@ -3130,9 +3151,12 @@
         liveRendered = true;
         // The stored table (already painted above) stays up; only append the
         // hint rather than replacing it, unless nothing ever rendered.
-        mac.innerHTML = storedMacHtml !== null ? storedMacHtml +
-          '<p class="hint">Live MAC address table read failed — showing the last stored walk.</p>' :
-          '<p class="hint">MAC address table read failed — the device may not answer BRIDGE-MIB requests.</p>';
+        if (storedMacR !== null) {
+          renderMacTable(mac, storedMacR, { ...storedMacOpts,
+            hint: 'Live MAC address table read failed — showing the last stored walk.' });
+        } else {
+          mac.innerHTML = '<p class="hint">MAC address table read failed — the device may not answer BRIDGE-MIB requests.</p>';
+        }
       });
   }
 

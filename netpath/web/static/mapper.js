@@ -34,6 +34,11 @@
   // further out on a diagonal link, so the inset clears the box at any angle.
   const PORT_LABEL_INSET = Math.max(
     18, Math.hypot(NODE_W / 2, NODE_H / 2) - Math.min(NODE_W, NODE_H) / 2);
+  // How much further along its own line each additional parallel cable puts
+  // its port labels. The fan separates the cables by less than a port name is
+  // wide, so without this every one of them labels at the same distance from
+  // the node and they overlap.
+  const PORT_LABEL_STEP = 16;
   // Position writes are debounced rather than sent on every pointermove —
   // a drag across a big map would otherwise queue one PUT per animation
   // frame. 500ms after the last move (or the last align/distribute) is
@@ -113,6 +118,7 @@
     dragPans: false,           // the Drag pans checkbox: left-drag on empty canvas pans
     fiberView: false,          // the FiberView checkbox: glow every link.fiber link
     linkFan: new Map(),        // link id -> px offset, draw()'s fanOffsets() (parallel cables)
+    linkFanIndex: new Map(),   // link id -> its place in that fan, for drawPortLabels' stagger
     settings: {},        // mapperdb.DEFAULTS shape, refreshed with every maps/settings fetch
     candidates: { devices: [], neighbours: [] },
 
@@ -936,6 +942,12 @@
   }
 
   function removeSelected() {
+    // The toolbar's one Remove button serves whatever is selected. A frame
+    // and a note each have their own confirm and endpoint, and neither ever
+    // joins view.selection, which holds device ids alone -- so the button sat
+    // disabled for the whole time one was selected.
+    if (view.selectedFrameId) { removeFrame(view.selectedFrameId); return; }
+    if (view.selectedNoteId) { removeNote(view.selectedNoteId); return; }
     if (!view.selection.size) return;
     const names = [...view.selection].map((id) => resolveNode(nodeById(id)).name).filter(Boolean);
     App.confirmDestructive('Remove from map',
@@ -1146,7 +1158,25 @@
       layer.appendChild(path);
       return path;
     };
-    if (view.settings.show_port_labels) drawPortLabels(labelLayer, link, from, to, nx, ny);
+    // Under FiberView the glow's blur bleeds straight across .blocking's own
+    // 2-on/6-off gaps and smears the dots back into a solid line. So the dots
+    // go on a second, unglowed path above it -- the same split the fiber
+    // underlay below already makes, in the other direction.
+    const overlaidBlocking = link.blocking && link.fiber === true && view.fiberView;
+    const blockingOverlay = (width) => {
+      if (!overlaidBlocking) return;
+      const overlay = App.svgNode('path', {
+        d: `M ${from.x} ${from.y} L ${to.x} ${to.y}`, fill: 'none',
+        class: 'mp-link blocking mp-blocking-over', 'stroke-width': width,
+        'pointer-events': 'none',
+      });
+      if (dimmed) overlay.classList.add('dimmed');
+      layer.appendChild(overlay);
+    };
+    if (view.settings.show_port_labels) {
+      drawPortLabels(labelLayer, link, from, to, nx, ny,
+        (view.linkFanIndex && view.linkFanIndex.get(link.id)) || 0);
+    }
     if (plan.mode === 'strands' && plan.strands.length) {
       // Finding 9: every strand used to get the identical aria-label/tooltip
       // (the link's own, naming no VLAN at all), so colour was the ONLY way
@@ -1165,12 +1195,13 @@
       // discoverable by a screen reader's browse cursor even off the Tab
       // order) and its own mouse tooltip, so hovering a specific coloured
       // line — not just Tabbing to the link — names that one VLAN.
+      const offsets = plan.strands.map((strand) => strand.offset);
+      const span = (Math.max(...offsets) - Math.min(...offsets)) + plan.width;
       if (link.fiber === true) {
         // Underneath every strand, not one of them: the strands keep their
         // own VLAN colours, and this lone unfocusable path (no wireOne — no
         // tooltip/dataset of its own) just glows behind the whole ribbon.
-        const offsets = plan.strands.map((strand) => strand.offset);
-        const span = (Math.max(...offsets) - Math.min(...offsets)) + plan.width;
+        // No .blocking here: see blockingOverlay above.
         const underlay = App.svgNode('path', {
           d: `M ${from.x} ${from.y} L ${to.x} ${to.y}`,
           class: 'mp-link fiber', 'pointer-events': 'none',
@@ -1179,9 +1210,30 @@
         if (dimmed) underlay.classList.add('dimmed');
         if (link.fiber_mode === 'sm') underlay.classList.add('fiber-sm');
         else if (link.fiber_mode === 'mismatch') underlay.classList.add('fiber-mismatch');
-        if (link.blocking) underlay.classList.add('blocking');
         layer.appendChild(underlay);
       }
+      // One target for the whole ribbon, drawn BEFORE the strands so a strand
+      // still wins its own per-VLAN tooltip where it actually is and this only
+      // catches the gaps and the margin around them. Separate hit element
+      // rather than a fatter visible stroke, the same way a frame's outline
+      // and fill are split below.
+      const hit = App.svgNode('path', {
+        d: `M ${from.x} ${from.y} L ${to.x} ${to.y}`, fill: 'none',
+        stroke: 'transparent', 'stroke-width': span + LINK_HIT_PAD,
+        'pointer-events': 'stroke', class: 'mp-link-hit',
+      });
+      // aria-hidden and no tabIndex: the first strand already carries the
+      // link's one Tab stop and name (see the note above), and a second
+      // would be a duplicate announcement for the same link.
+      hit.setAttribute('aria-hidden', 'true');
+      let hitTip = null;
+      hit.addEventListener('click', () => selectLink(link.id));
+      hit.addEventListener('mousemove', (event) => {
+        if (hitTip === null) hitTip = linkTooltip(link);
+        App.tooltip(hitTip, event);
+      });
+      hit.addEventListener('mouseleave', App.hideTooltip);
+      layer.appendChild(hit);
       plan.strands.forEach((strand, i) => {
         const ox = nx * strand.offset, oy = ny * strand.offset;
         const path = App.svgNode('path', {
@@ -1218,6 +1270,7 @@
           }, `${strand.vlan}`));
         }
       });
+      blockingOverlay(span + 4);
       return;
     }
     const neutral = 'var(--canvas-muted)';
@@ -1231,7 +1284,8 @@
       if (link.fiber_mode === 'sm') path.classList.add('fiber-sm');
       else if (link.fiber_mode === 'mismatch') path.classList.add('fiber-mismatch');
     }
-    if (link.blocking) path.classList.add('blocking');
+    if (link.blocking && !overlaidBlocking) path.classList.add('blocking');
+    blockingOverlay(plan.width);
     if (plan.mode === 'collapsed' && view.settings.show_vlan_labels) {
       const mx = (from.x + to.x) / 2, my = (from.y + to.y) / 2;
       labelLayer.appendChild(App.svgNode('text', {
@@ -1253,12 +1307,16 @@
   // text clears the node box, and offset to one side of the line (the same
   // normal `nx,ny` the strand offsets use) so it never sits on top of the
   // stroke itself.
-  function drawPortLabels(layer, link, from, to, nx, ny) {
+  function drawPortLabels(layer, link, from, to, nx, ny, fanIndex = 0) {
     if (!link.a_port && !link.b_port) return;
     const dx = to.x - from.x, dy = to.y - from.y;
     const len = Math.max(Math.hypot(dx, dy), 1e-6);
     const ux = dx / len, uy = dy / len;
-    const inset = PORT_LABEL_INSET, aside = 8;
+    // Clamped at the midpoint: on a short link the two ends' labels would
+    // otherwise step past each other and swap sides.
+    const step = Math.min(fanIndex * PORT_LABEL_STEP,
+      Math.max(len / 2 - PORT_LABEL_INSET, 0));
+    const inset = PORT_LABEL_INSET + step, aside = 8;
     if (link.a_port) {
       layer.appendChild(App.svgNode('text', {
         class: 'mp-link-label', x: from.x + ux * inset + nx * aside, y: from.y + uy * inset + ny * aside,
@@ -1332,17 +1390,42 @@
   function stpVlanSuffix(vlans) {
     return vlans ? ` (VLANs ${vlans.split(',').join(', ')})` : '';
   }
-  function stpBlockingText(link, a, b, esc = (x) => x) {
+  // withVlans: the tooltip and the aria-label have no list to colour, so the
+  // ids stay named there. The detail pane passes false -- its own VLAN list
+  // is red/green below, and naming them twice was the operator's complaint.
+  function stpBlockingText(link, a, b, esc = (x) => x, withVlans = true) {
     if (!link.blocking) return null;
     const who = [];
+    const suffix = (vlans) => (withVlans ? esc(stpVlanSuffix(vlans)) : '');
     if (link.a_stp === 'blocking') {
-      who.push(`${a} (${esc(link.a_port || '—')})${esc(stpVlanSuffix(link.a_stp_vlans))}`);
+      who.push(`${a} (${esc(link.a_port || '—')})${suffix(link.a_stp_vlans)}`);
     }
     if (link.b_stp === 'blocking') {
-      who.push(`${b} (${esc(link.b_port || '—')})${esc(stpVlanSuffix(link.b_stp_vlans))}`);
+      who.push(`${b} (${esc(link.b_port || '—')})${suffix(link.b_stp_vlans)}`);
     }
     return `STP: blocking on ${who.join(', ')}`;
   }
+
+  // null, not an empty Set, when there is nothing to contrast against: a
+  // link with no blocking (or none reported per-VLAN) leaves its list the
+  // neutral colour rather than painting every row green for no reason.
+  function stpBlockedVlans(link) {
+    if (!link.blocking) return null;
+    const out = new Set();
+    for (const raw of [link.a_stp_vlans, link.b_stp_vlans]) {
+      if (!raw) continue;
+      for (const part of String(raw).split(',')) {
+        const vlan = Number(part.trim());
+        if (Number.isFinite(vlan)) out.add(vlan);
+      }
+    }
+    return out.size ? out : null;
+  }
+
+  // How much wider than the drawn ribbon the invisible click target is. A
+  // strand is plan.width (1.5px default) and the operator was having to hit
+  // one exactly to open the link.
+  const LINK_HIT_PAD = 14;
 
   // How many VLANs a hover/detail-pane screen names before "N more".
   const VLAN_TOOLTIP_CAP = 10;
@@ -1668,8 +1751,12 @@
       el.setAttribute('x', r.x); el.setAttribute('y', r.y);
       el.setAttribute('width', r.width); el.setAttribute('height', r.height);
     }
+    const sizeIdx = frameTextSizeIndex(frame);
     label.setAttribute('x', r.x + 6);
-    label.setAttribute('y', r.y + 17);
+    label.setAttribute('y', r.y + FRAME_TEXT_SIZES[sizeIdx].dy);
+    for (let i = 0; i < FRAME_TEXT_SIZES.length; i += 1) {
+      label.classList.toggle(`mp-frame-t${i}`, i === sizeIdx);
+    }
     handle.setAttribute('x', r.x + r.width - FRAME_HANDLE);
     handle.setAttribute('y', r.y + r.height - FRAME_HANDLE);
   }
@@ -2006,6 +2093,7 @@
       group.push(link);
     }
     const fan = new Map();
+    const index = new Map();
     for (const group of groups.values()) {
       if (group.length < 2) continue;
       group.sort((x, y) => String(x.id).localeCompare(String(y.id)));
@@ -2029,9 +2117,10 @@
         // (nx, ny), which itself flips with a link's a/b order.
         const flip = a.id > b.id ? -1 : 1;
         fan.set(link.id, flip * (start + i * spacing));
+        index.set(link.id, i);
       });
     }
-    return fan;
+    return { fan, index };
   }
 
   function draw() {
@@ -2100,7 +2189,9 @@
     group.append(gridLayer, frameLayer, linkLayer, nodeLayer, labelLayer, noteLayer);
     if (shouldDrawGrid() && bounds) drawGrid(gridLayer, bounds);
     for (const frame of view.frames) view.frameEls.set(frame.id, drawFrame(frameLayer, frame));
-    view.linkFan = fanOffsets();
+    const fans = fanOffsets();
+    view.linkFan = fans.fan;
+    view.linkFanIndex = fans.index;
     // Own <g> per link: redrawDragged refills just the ones that moved.
     for (const link of view.links) {
       const holder = App.svgNode('g');
@@ -2162,17 +2253,11 @@
   /* -------------------------------------------------------------- legend */
 
   function drawLegend() {
-    const threshold = Number(view.settings.vlan_collapse_threshold) || 8;
-    const hasUnknown = view.links.some((l) => l.plan && l.plan.known === false);
-    const hasBlocking = view.links.some((l) => l.blocking);
     const hasFiber = view.links.some((l) => l.fiber);
     const hasLinks = view.links.length > 0;
-    let text = `Trunks of ${threshold}+ VLANs draw as one thick line, scaled by count; ` +
-      'fewer draw as one coloured strand per VLAN.';
-    if (hasUnknown) text += ' A dashed line means no VLAN data at all, not "one VLAN".';
-    if (hasBlocking) text += ' A dotted line is a spanning-tree-blocked port.';
+    let text = '';
     if (view.fiberView && hasFiber) {
-      text += ' FiberView: dark orange = multimode, bright yellow = single-mode, ' +
+      text = 'FiberView: dark orange = multimode, bright yellow = single-mode, ' +
         'dotted red = single/multimode mismatch.';
     }
     if (view.nodes.length && !hasLinks) {
@@ -2311,6 +2396,19 @@
             drawDetail();
           } catch (error) {
             App.toast(`Could not change the frame's colour: ${error.message}`, 'fail');
+          }
+        };
+      }
+      for (const sizeBtn of detail.querySelectorAll('[data-frame-textsize]')) {
+        sizeBtn.onclick = async () => {
+          const textSize = Number(sizeBtn.dataset.frameTextsize);
+          try {
+            await App.put(`/api/mapper/maps/${view.mapId}/frames/${frame.id}`, { text_size: textSize });
+            frame.text_size = textSize;
+            requestDraw();
+            drawDetail();
+          } catch (error) {
+            App.toast(`Could not change the frame's text size: ${error.message}`, 'fail');
           }
         };
       }
@@ -2546,12 +2644,18 @@
       lines.push('No VLAN data known for this link — neither end answered a VLAN MIB.');
     } else {
       const vlans = plan.vlans || [];
+      const blocked = stpBlockedVlans(link);
       const all = view.detailShowAllVlans || vlans.length <= VLAN_DETAIL_CAP;
       lines.push(`VLANs (${vlans.length})`, '-'.repeat(30));
       for (const vlan of all ? vlans : vlans.slice(0, VLAN_DETAIL_CAP)) {
         const name = view.vlanNameById.get(vlan);
-        lines.push(`${vlan}${name ? `  ${escape(name)}` : ''}` +
-          `${link.native_vlan === vlan ? '  (native)' : ''}`);
+        const row = `${vlan}${name ? `  ${escape(name)}` : ''}` +
+          `${link.native_vlan === vlan ? '  (native)' : ''}`;
+        // Never colour alone: the marker says it for a reader who cannot
+        // separate the two, the same way (native) above carries its own.
+        if (blocked === null) lines.push(row);
+        else if (blocked.has(vlan)) lines.push(`<span class="mp-vlan-blocked">${row}  (STP blocked)</span>`);
+        else lines.push(`<span class="mp-vlan-pass">${row}</span>`);
       }
       if (!all) {
         // Behind a button, not truncated outright: a 200-VLAN trunk pushed
@@ -2560,7 +2664,7 @@
       }
     }
     const fiberText = fiberModeText(link, escape(a.name), escape(b.name));
-    const stpText = stpBlockingText(link, escape(a.name), escape(b.name), escape);
+    const stpText = stpBlockingText(link, escape(a.name), escape(b.name), escape, false);
     if (fiberText || stpText) lines.push('', ...[fiberText, stpText].filter(Boolean));
     lines.push('', `Last seen   ${escape(App.ago(link.seen_ts))}`);
     return lines.join('\n');
@@ -2570,6 +2674,30 @@
   // fixed palette index (mapperdb validates 0-5), not a VLAN's free-form
   // --canvas-vlan-N choice — --canvas-vlan-1..6 supplies the six hues so a
   // frame reads with the same canvas-tuned palette a VLAN strand does.
+  // The three label sizes mapperdb validates 0-2. dy is the baseline inside
+  // the frame's top edge: --fs-xl is nearly twice --fs-2xs, so one fixed
+  // baseline would clip the large one against the border.
+  const FRAME_TEXT_SIZES = [
+    { label: 'S', dy: 15 },
+    { label: 'M', dy: 17 },
+    { label: 'L', dy: 22 },
+  ];
+
+  function frameTextSizeIndex(frame) {
+    const n = Number(frame.text_size);
+    return Number.isInteger(n) && n >= 0 && n < FRAME_TEXT_SIZES.length ? n : 1;
+  }
+
+  // Same row, gate and shape as frameSwatchesHtml above; letters rather than
+  // colours because a size has no swatch to show.
+  function frameSizesHtml(frame, canWrite) {
+    const current = frameTextSizeIndex(frame);
+    return FRAME_TEXT_SIZES.map((size, i) =>
+      `<button class="mp-textsize${current === i ? ' selected' : ''}" data-frame-textsize="${i}" ` +
+      `data-requires-write="mapper"${canWrite ? '' : ' disabled'} ` +
+      `aria-label="Label size ${escape(size.label)}">${escape(size.label)}</button>`).join('');
+  }
+
   function frameSwatchesHtml(frame, canWrite) {
     return Array.from({ length: 6 }, (_, i) => {
       const selected = Number(frame.color) === i;
@@ -2588,6 +2716,8 @@
         `<button id="mpf-label-save" data-requires-write="mapper"${gate}>Save</button>`,
       '',
       `Colour      ${frameSwatchesHtml(frame, canWrite)}`,
+      '',
+      `Text size   ${frameSizesHtml(frame, canWrite)}`,
       '',
       `Added       ${escape(App.ago(frame.added_ts))}`,
       '',
@@ -3270,7 +3400,8 @@
     // queues a real mutation even when the value is already there. There is
     // no App.setDisabled to borrow.
     const states = [
-      ['mp-remove-node', !canWrite || view.selection.size === 0],
+      ['mp-remove-node', !canWrite || (view.selection.size === 0
+        && !view.selectedFrameId && !view.selectedNoteId)],
       ['mp-connect', !canWrite || view.selection.size !== 2],
       ['mp-align', !canWrite || view.selection.size < 2],
       ['mp-add-device', !canWrite || !hasMap],

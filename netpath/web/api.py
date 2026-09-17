@@ -10452,7 +10452,7 @@ def get_mapper_map(service, params, body, map_id) -> dict:
     frames = [
         {"id": row["id"], "label": row["label"], "x": row["x"], "y": row["y"],
          "width": row["width"], "height": row["height"], "color": row["color"],
-         "added_ts": row["added_ts"]}
+         "text_size": row["text_size"], "added_ts": row["added_ts"]}
         for row in service.mapper_db.frames(map_id)]
 
     # Canvas-only, like frames: never fed to mapper.link_csv_rows/the CSV export.
@@ -10568,7 +10568,7 @@ def delete_mapper_map_link(service, params, body, map_id, link_id) -> dict:
     return {"ok": ok}
 
 
-_FRAME_UPDATE_FIELDS = ("label", "x", "y", "width", "height", "color")
+_FRAME_UPDATE_FIELDS = ("label", "x", "y", "width", "height", "color", "text_size")
 
 
 def post_mapper_map_frames(service, params, body, map_id) -> dict:
@@ -10602,14 +10602,15 @@ def post_mapper_map_frames(service, params, body, map_id) -> dict:
 
 def put_mapper_map_frame(service, params, body, map_id, frame_id) -> dict:
     """Position/size writes happen on every drag and are not audited, same
-    as put_mapper_map_nodes; a label or color change is an accountability-
-    worthy edit an operator made on purpose, so that alone is audited."""
+    as put_mapper_map_nodes; a label, color or text_size change is an
+    accountability-worthy edit an operator made on purpose, so that alone
+    is audited."""
     _require(service.mapper_db.map_row(map_id), "map")
     fields = _pick(body, _FRAME_UPDATE_FIELDS)
     if not fields:
         raise ValueError("No frame fields to update.")
     ok = service.mapper_db.update_frame(map_id, frame_id, **fields)
-    if ok and ("label" in fields or "color" in fields):
+    if ok and ("label" in fields or "color" in fields or "text_size" in fields):
         _audit(service, params, "mapper.frame.update", target=str(map_id),
               detail=f"frame_id={frame_id}")
     return {"ok": ok}

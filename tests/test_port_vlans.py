@@ -315,6 +315,39 @@ try:
 finally:
     stub.kill()
 
+# ---------------------------- 6d. access-port PVID fallback, no bitmap
+# The bug this release fixes: an access port's dot1qPvid is real evidence
+# of its native VLAN even when the Q-BRIDGE egress/untagged bitmaps never
+# cover that port at all (common on Cisco gear with no per-VLAN community
+# indexing configured).
+stub, port = spawn_stub("stub_agent_vlan.py", "access_fallback")
+nodepoll_mod.DEFAULT_SNMP_PORT = port
+try:
+    db = new_db("access_fallback")
+    did = device_against(db, port, vendor="", name="access-fallback-sw")
+    poller = NodePoller(db)
+    result = poller.read_device_vlans(did)
+    check("an access-fallback walk returns a result", result is not None, result)
+    if result:
+        memberships = {(m["if_index"], m["vlan"]): m["tagged"]
+                       for m in result["memberships"]}
+        check("...ifIndex 1 (PVID 20, no bitmap coverage at all) gets a "
+             "fallback membership row, untagged",
+              memberships.get((1, 20)) is False, memberships)
+        check("...ifIndex 2 (PVID 99, a VLAN nobody names or lists in "
+             "either bitmap) gets NO membership row at all -- the "
+             "'a VLAN never appears unless the device says it exists' "
+             "invariant",
+              (2, 99) not in memberships, memberships)
+        check("...ifIndex 3 (PVID also 20, but already given a real tagged "
+             "membership by the egress bitmap) is left exactly as the "
+             "bitmap decoded it -- the fallback must not override an "
+             "existing membership",
+              memberships.get((3, 20)) is True, memberships)
+    db.close()
+finally:
+    stub.kill()
+
 # --------------------------------------------------- 7. neither table -> None
 stub, port = spawn_stub("stub_agent_vlan.py", "no_vlan")
 nodepoll_mod.DEFAULT_SNMP_PORT = port

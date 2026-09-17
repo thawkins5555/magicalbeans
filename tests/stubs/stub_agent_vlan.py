@@ -50,6 +50,17 @@ Modes:
                      VLAN-related MIB whatsoever still speaks plain
                      bridging, so read_device_vlans must still return None
                      rather than mistake this answer for VLAN evidence.
+  access_fallback    dot1q standards path only, no Cisco tables, three
+                     access-style ports sharing VLAN 20 "voice" (plus one
+                     PVID naming a VLAN nobody lists): ifIndex 1's dot1qPvid
+                     is 20 with NO egress/untagged bitmap entry anywhere --
+                     the "device answers dot1qPvid but the bitmaps are
+                     empty" bug. ifIndex 2's dot1qPvid is 99, a VLAN neither
+                     vlan_names nor either bitmap ever mentions. ifIndex 3's
+                     dot1qPvid is also 20, but 3 IS in the VLAN 20 egress
+                     bitmap (and not the untagged one), so the standards
+                     path already gives it a real (tagged) membership before
+                     dot1qPvid is even read.
   cisco_default_trunk  The fleet-representative case: one Cisco switch
                      with a handful of real VLANs (1 "default", 10 "data",
                      20 "voice", 1030 "video" -- above 1023, so only the
@@ -138,6 +149,29 @@ DOT1Q_PVID = {
 # NO dot1dBasePortIfIndex answering at all -- read_device_vlans must fall
 # back to treating the bridge port number as the ifIndex directly.
 DOT1Q_NO_BASEPORT = {**DOT1Q_NAMES, **DOT1Q_EGRESS, **DOT1Q_UNTAGGED, **DOT1Q_PVID}
+
+# --------------------------------------- access_fallback: PVID, no bitmap
+#
+# See the module docstring's `access_fallback` entry. Bridge ports 1-3 map
+# 1:1 to ifIndex 1-3; only VLAN 20 is named at all.
+ACCESS_FALLBACK_BASEPORT = {
+    "1.3.6.1.2.1.17.1.4.1.2.1": ("int", 1),
+    "1.3.6.1.2.1.17.1.4.1.2.2": ("int", 2),
+    "1.3.6.1.2.1.17.1.4.1.2.3": ("int", 3),
+}
+ACCESS_FALLBACK_DOT1Q_NAMES = {
+    "1.3.6.1.2.1.17.7.1.4.3.1.1.20": ("str", "voice"),
+}
+ACCESS_FALLBACK_DOT1Q_EGRESS = {
+    # VLAN 20 on bridge port 3 only -> byte 0 bit 2 -> 0x20. Ports 1 and 2
+    # appear in NO bitmap at all for any VLAN.
+    "1.3.6.1.2.1.17.7.1.4.3.1.2.20": ("bytes", bytes([0x20])),
+}
+ACCESS_FALLBACK_DOT1Q_PVID = {
+    "1.3.6.1.2.1.17.7.1.4.5.1.1.1": ("int", 20),  # port 1: no bitmap coverage
+    "1.3.6.1.2.1.17.7.1.4.5.1.1.2": ("int", 99),  # port 2: VLAN nobody names
+    "1.3.6.1.2.1.17.7.1.4.5.1.1.3": ("int", 20),  # port 3: already has membership
+}
 
 # ----------------------------------------------------------- CISCO-VTP-MIB
 VTP_NAMES = {
@@ -327,6 +361,10 @@ def table_for():
                 **DOT1Q_EGRESS, **DOT1Q_UNTAGGED, **DOT1Q_PVID}
     if MODE == "dot1q_no_baseport":
         return {**GENERIC_SCALARS, **DOT1Q_NO_BASEPORT}
+    if MODE == "access_fallback":
+        return {**GENERIC_SCALARS, **ACCESS_FALLBACK_BASEPORT,
+                **ACCESS_FALLBACK_DOT1Q_NAMES, **ACCESS_FALLBACK_DOT1Q_EGRESS,
+                **ACCESS_FALLBACK_DOT1Q_PVID}
     if MODE == "cisco_vtp":
         return {**CISCO_SCALARS, **VTP_NAMES, **VTP_TRUNK_STATUS,
                 **VTP_TRUNK_NATIVE, **VTP_TRUNK_ENABLED}
