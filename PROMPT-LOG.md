@@ -42,6 +42,18 @@ five UI changes and the new frame text-size control touch only
 every frame's size today, so no existing map redraws differently.
 Version for this work: 5.39.0.
 
+**Code review caught two real problems in the first pass at the
+blocked-link overlay fix.** The first attempt gave multi-VLAN "strands"
+links the same overlay as a plain link — a solid-red bar drawn at the
+full bundle width, which covered the individual VLAN colours instead of
+showing dots. The second: the overlay's invisible click area was not
+one of the shapes the canvas's own background press handler knows to
+leave alone, so clicking it cleared the current selection instead of
+selecting the link. Both were fixed before this went to `main` —
+strands mode dropped the overlay entirely rather than needing a redraw.
+Javariius's review also caught that the new frame text_size setting had
+no backend tests. All were closed before the release shipped.
+
 ## Branch check, and the vibrant-planck merge
 
 **Check for branches not merged to main.** Six branches carried commits

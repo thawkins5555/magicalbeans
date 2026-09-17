@@ -6666,24 +6666,44 @@ target, a coloured VLAN list, staggered port labels, and a fixed Remove
 button (`mapperdb.py`, `web/api.py`, `mapper.js`, `nodes.js`, `app.css`)
 — 5.39.0
 
-**Blocked-STP dots and the fiber glow used to be one drawn path; they are
-now two.** `drawLink`'s existing strand/collapsed drawing added the CSS
-class `.blocking` (a `stroke-dasharray: 2 6` dot pattern) straight onto
-whichever path also carried `.fiber` when FiberView was on — and
-`.fiber`'s own glow filter blurs its stroke, which smeared the dots'
-2px-on/6px-off gaps into one solid glowing line. `overlaidBlocking =
-link.blocking && link.fiber === true && view.fiberView` now gates a
-second path, `blockingOverlay(width)`, appended on top: class `mp-link
-blocking mp-blocking-over`, `pointer-events: none`, no `.fiber` class at
-all so no glow filter ever reaches it, and CSS colours it `var(--fail)`
-(red) rather than the glow's own orange/yellow — matching the colour a
-blocked VLAN already gets in the detail pane (below). The original path
-stops adding `.blocking` itself wherever the overlay is drawing
-(`if (link.blocking && !overlaidBlocking) path.classList.add('blocking')`),
-in both the collapsed/plain drawing branch and the strand-bundle branch,
-so the two never double-dash the same pixels. Outside FiberView, or on a
-copper link, `overlaidBlocking` is false and nothing about the existing
-single-path `.blocking` dash changes at all.
+**Blocked-STP dots merging into the fiber glow was a stroke-cap geometry
+bug, not a blur one — and the fix is not the same for every link type.**
+`.mp-link` sets `stroke-linecap: round` (`app.css:1872`), and
+`.mp-link.blocking` sets `stroke-dasharray: 2 6` — an 8px repeat. A round
+cap extends each dash by the full stroke width at each end, so a dash's
+visible length is `2 + strokeWidth`. At a link's normal drawn width that
+reads as clean dots; under FiberView the glowing stroke is
+`var(--mp-fiber-w)`, a minimum of 5px, so each 2px dash rendered roughly
+7px long against the 8px repeat — the dots merged into a near-solid line
+from the cap geometry alone, before the glow's own `drop-shadow` blur
+ever entered into it.
+
+For a plain or collapsed link, `overlaidBlocking = link.blocking &&
+link.fiber === true && view.fiberView` gates a second path drawn on top
+of the glow: class `mp-link blocking mp-blocking-over`, `pointer-events:
+none`, carrying no `.fiber` class so no glow filter ever reaches it.
+`.mp-link.mp-blocking-over` also sets `stroke-linecap: butt` — without
+square-cut ends this path would hit the same round-cap problem all over
+again, and worse: a collapsed trunk can draw as wide as `link_width_max`
+(14px), which would stretch a 2px dash straight back into a solid red
+bar. The original path stops adding `.blocking` itself wherever the
+overlay is drawing (`if (link.blocking && !overlaidBlocking)
+path.classList.add('blocking')`), so the two never double-dash the same
+pixels. Outside FiberView, or on a copper link, `overlaidBlocking` is
+false and nothing about the existing single-path `.blocking` dash
+changes at all.
+
+A multi-VLAN "strands" link gets no overlay at all — `overlaidBlocking`
+is never consulted in the strand-drawing branch, and every strand still
+adds `.blocking` itself (`if (link.blocking) path.classList.add
+('blocking')`) exactly as it always has. Individual strands draw at only
+about 1.5px wide, so once the glowing fiber underlay beneath the bundle
+stopped carrying the `.blocking` class itself, the strands' own dots
+rendered correctly with no further change needed. An earlier version of
+this fix drew a bundle-width overlay here too, matching the plain/
+collapsed approach; it painted a solid red bar across the VLAN strand
+colours instead of dots and was caught and removed in code review before
+the release reached `main`.
 
 **The strand bundle's click/hover target is now one wide invisible path,
 not the visible strands themselves.** A trunk's individual strands still

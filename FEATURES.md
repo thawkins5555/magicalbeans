@@ -4726,11 +4726,15 @@ like any other module.
   table the poller already polls — nothing new is polled for it. A link
   that is both a mismatch and blocked draws dotted red — colour still
   separates it from a plain blocked line. **From 5.39.0, that dotted line
-  no longer disappears under FiberView.** The dots and the fiber glow used
-  to be the same drawn line, and the glow's own blur bled across the
-  dots' gaps and smeared them into one solid glowing line — a blocked
-  fiber uplink read as an ordinary one. The dots now draw as their own
-  second, unglowed line on top of the glow.
+  no longer disappears under FiberView.** The dots were merging into a
+  solid line for a geometry reason, not a glow-blur one: a round stroke
+  cap lengthens each dash, and FiberView's wider glow stroke lengthened
+  the blocked-link dashes enough to close their own gaps. The fix differs
+  by link type — a plain or collapsed link's dots now draw as their own
+  second, unglowed red line on top of the glow with square-cut ends; a
+  multi-VLAN link's individual strands were already thin enough to show
+  the dots correctly once the glowing line beneath the bundle stopped
+  carrying the dash pattern itself, so no overlay was needed there.
 - **From 5.37.0, a Cisco PVST+/Rapid-PVST switch's blocked-link line
   reads every VLAN the port carries, not just the default spanning-tree
   instance (VLAN 1).** The poller now walks `dot1dStpPortState` a

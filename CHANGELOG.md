@@ -195,14 +195,21 @@ its next VLAN poll, not on a page reload, and the same fix feeds Nodes'
 own VLAN column, not Mapper alone. File: `netpath/nodepoll.py`.
 
 **The spanning-tree dotted line went invisible under FiberView.** The
-blocked-port dots and the fiber glow were the same SVG path, and the glow's
-blur bled straight across the dots' own dash gaps, smearing them into one
-solid glowing line — a blocked fiber uplink looked like an ordinary one.
-The dots now draw as their own second, unglowed red path on top of the
-glow (no `.fiber` class on it, so no blur filter reaches it), and the
-glowing path underneath stops dashing itself wherever that overlay covers
-it, so the two never double up. Files: `netpath/web/static/mapper.js`,
-`netpath/web/static/app.css`.
+cause was dash geometry, not the glow's blur: every link draws with
+rounded stroke caps, and a round cap extends each dash by the full stroke
+width at both ends. A blocked link's dots are a tight 2px-on/6px-off
+pattern (an 8px repeat) — fine at the link's normal 1.5-2px width, but
+FiberView's glow widens the same stroke to at least 5px, stretching each
+2px dash to roughly 7px against that 8px repeat. The dots merged into a
+near-solid line from the stroke geometry alone, before the glow filter
+ever came into it. The fix differs by how the link draws: a plain or
+collapsed link's dots now draw as their own second, unglowed red path on
+top of the glow, with square (butt) caps so a wide collapsed trunk's
+dashes don't stretch straight back into a solid bar; a multi-VLAN
+"strands" link needed no overlay at all — its individual strands are
+already thin enough to show the dots correctly once the glowing fiber
+line underneath them stopped carrying the dash pattern itself. Files:
+`netpath/web/static/mapper.js`, `netpath/web/static/app.css`.
 
 **A selected frame or note could not be removed from the toolbar.** The
 Remove button's enabled state was driven entirely by the device-selection
