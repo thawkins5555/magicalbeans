@@ -1813,7 +1813,8 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       assert(editResponse.ok(), `note text edit answered ${editResponse.status()}`);
       await page.waitForFunction((id) => {
         const text = document.querySelector(`#mp-svg .mp-note[data-note-id="${id}"] .mp-note-text`);
-        return !!text && text.textContent.includes('Uplink to the core');
+        // Wrapped text is one <tspan> per line with no separator between them, so join with a space before matching.
+        return !!text && [...text.querySelectorAll('tspan')].map((t) => t.textContent).join(' ').includes('Uplink to the core');
       }, noteId, { timeout: 10000 });
 
       await page.click('#mp-detail #mpn-remove');
