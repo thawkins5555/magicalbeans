@@ -6818,6 +6818,184 @@ having the live read land does not re-collapse the table back to five —
 `macExpanded` is read fresh by whichever render runs next, live or
 fallback-to-stored-on-failure alike.
 
+### Note text size, a redrawing FiberView toggle, vmVlan access ports, and port-label geometry (`mapperdb.py`, `nodeoids.py`, `nodepoll.py`, `web/api.py`, `mapper.js`, `app.css`) — 5.40.0
+
+**Note text size: `map_notes.text_size`, added the same way, and
+sharing the frame's own size table.** `ensure_columns` inside
+`MapperDatabase._migrate()` gains a second call, `ensure_columns
+("map_notes", {"text_size": "INTEGER NOT NULL DEFAULT 1"})`, right after
+the frame one — same default, same silent pickup on an existing
+database. `_validate_note_fields` gained the identical 0-2 range check
+`_validate_frame_fields` already ran (`FRAME_TEXT_SIZE_MAX`, shared
+between both), `add_note` takes `text_size: int = 1`, and `update_note`'s
+allowed-field set and `put_mapper_map_note`'s audit condition both gained
+it alongside `text`/`color` — the same accountability split as a frame's
+label or colour change, distinct from the un-audited position/size
+writes a drag or resize sends. `get_mapper_map` now serves `text_size`
+in each note's JSON the same way it already did for a frame.
+
+On the drawing side, the table itself moved: 5.39.0's `FRAME_TEXT_SIZES`
+is now `TEXT_SIZES`, with a third field added per entry — `{label:'S',
+dy:15,fs:'--fs-2xs'}, {label:'M',dy:17,fs:'--fs-xs'}, {label:'L',dy:22,
+fs:'--fs-xl'}` — and `frameTextSizeIndex`/`frameSizesHtml` are now
+`textSizeIndex`/`textSizesHtml(item, attr, canWrite)`, reading whichever
+object (frame or note) is handed in and writing whichever data attribute
+(`data-frame-textsize` or `data-note-textsize`) the caller names; the
+frame pane's own `Text size` row and the note pane's new one both call
+the one function. `fs` exists because a note, unlike a frame's single-line
+label, wraps across several lines and has to measure against the exact
+font it will draw in: `noteFont(sizeIdx)` (backed by a small
+`noteFontCache` Map, cleared alongside `labelFontCache`/`subFontCache` on
+every draw) calls `fontFor('--ui', TEXT_SIZES[sizeIdx].fs)` — `fontFor`
+itself gained a second, defaulted parameter (`sizeToken = '--fs-2xs'`)
+for this. `updateNoteElement` now measures line height and wrap width
+against `noteFont(textSizeIndex(note))` instead of the node-label font,
+and toggles one of `mp-note-t0`/`mp-note-t2` on the text element the same
+way `updateFrameElement` already toggled `mp-frame-t0`/`mp-frame-t2`
+(Medium gets neither class). The first line's baseline, `padTop`, is now
+`Math.max(NOTE_PAD_TOP, metrics.ascent + 3)` rather than the old flat
+`NOTE_PAD_TOP` — Large's taller ascent would otherwise clip against the
+bubble's own top edge.
+
+**A note's base font-size moved a step, which is why an existing note
+grows on upgrade.** `.mp-note-text`'s own `font-size` changed from
+`var(--fs-2xs)` to `var(--fs-xs)` (app.css:2063-2070), with
+`.mp-note-text.mp-note-t0 { font-size: var(--fs-2xs) }` and `.mp-note-t2
+{ font-size: var(--fs-xl) }` added below it for Small and Large — the
+same three-rule shape `.mp-frame-label`/`.mp-frame-t0`/`.mp-frame-t2`
+already used, Medium being whichever rule needs no override. Because
+every note in the database reads back `text_size` 1 (Medium) — new rows
+by the column's own `DEFAULT 1`, existing rows by the same default via
+`ensure_columns` — and Medium's own base font-size is the one that
+moved, from `--fs-2xs` (11px) to `--fs-xs` (12px), every note already on
+a map draws one step larger the next time that map opens. A frame's own
+Medium size was untouched this release — only `.mp-note-text`'s base
+rule changed, not `.mp-frame-label`'s.
+
+**FiberView's toggle now redraws.** `applyFiberView()` still only sets
+`#mp-canvas`'s `data-fiberview` attribute; the fix is at the call site,
+not in the function. `App.el('mp-fiberview').onchange` already called
+`applyFiberView()` then `drawLegend()`; it now also calls `requestDraw()`
+after both. This matters because `overlaidBlocking` — the flag `drawLink`
+reads to decide whether a blocked fiber link's dots belong on the
+glowing path or on the separate unglowed overlay (5.39.0) — is computed
+fresh on every draw from `view.fiberView`, not stored on the link or
+recomputed by anything else the checkbox used to trigger; without a
+redraw, a link already on screen kept whichever choice it was drawn with
+until some unrelated event (a pan, a selection, the poll refresh)
+redrew it anyway, which read as the dots "sometimes" reappearing. The
+operator's separate page-refresh report was not reproduced here: a
+refresh calls the normal load path, which always draws once with the
+current `view.fiberView` and the server's current STP state, so nothing
+about the client's own logic can leave it stale across a refresh the way
+the toggle could. What a refresh *can* show differently is
+`link.blocking`/`a_stp_vlans`/`b_stp_vlans` itself, which `get_mapper_map`
+serves from `nodesdb`'s own per-VLAN STP columns (5.37.0) as of the most
+recent poll — if a poll landed between two loads of the page, the two
+draws are drawing two different facts, not the same fact drawn two ways.
+Left open for the operator to re-check against a specific case.
+
+**vmVlan: a second, Cisco-native access-VLAN source, gated exactly where
+`dot1qPvid` came up empty.** `nodeoids.CISCO_VM_VLAN =
+"1.3.6.1.4.1.9.9.68.1.2.2.1.2"` is `vmVlan` from CISCO-VLAN-MEMBERSHIP-MIB
+— indexed by ifIndex directly, not a bridge port, so it needs no
+`dot1dBasePortIfIndex` resolution the way the Q-BRIDGE and VTP tables do.
+`read_device_vlans` walks it alongside `trunk_status`/`trunk_native`
+(`vm_vlan = _int_keyed(walk(nodeoids.CISCO_VM_VLAN))`) and folds it into
+`cisco_ports` so a port answering only `vmVlan` still gets visited by the
+Cisco loop. Inside that loop, the existing `status != 1` (not-trunking)
+branch — which already labels the port `"access"` when IOS says
+`notTrunking(2)` outright — gained one addition: `if if_index in vm_vlan
+and if_index not in port_native: port_native[if_index] = vm_vlan
+[if_index]; described_ports.add(if_index)`. Gating on `if_index not in
+port_native` means a real `dot1qPvid` answer is never overwritten —
+`vmVlan` only ever fills a port the standards path left with nothing.
+From there the port takes the exact same path 5.39.0 already built: the
+generalised `dot1qPvid`-as-fallback pass that runs after the Cisco block
+reads `port_native` (now including the `vmVlan`-sourced entries), skips
+any port that already has a membership row, and skips any native VLAN
+the device does not name anywhere else (`existing_vlans`) — so a
+`vmVlan` answer naming a VLAN nobody's VTP/Q-BRIDGE tables ever mention
+still produces no membership row at all, the same guarantee `dot1qPvid`
+itself gets. The new `cisco_access` stub mode in
+`tests/stubs/stub_agent_vlan.py` proves all three shapes at once: ifIndex
+1's `vmVlan` (a named VLAN) becomes a real access membership; ifIndex 2's
+`vmVlan` (named nowhere) becomes none; ifIndex 3, an ordinary trunk with
+no `vmVlan` row at all, is untouched.
+
+Two things this pass surfaced and left alone, both called out in
+`CHANGELOG.md`: `read_device_vlans` still discards a device's whole
+result if any one SNMP column it walks is cut short by the walk's shared
+20-second budget (a large stack's worth of columns sharing one clock),
+which would blank trunks and access ports alike on a device that times
+out mid-walk — a different failure shape from this one, not touched
+here; and 5.39.0's own `dot1qPvid` fallback test (`tests/test_port_vlans.py`,
+case 6d) ran against a non-Cisco stub, so the Cisco branch's own access
+arm had no coverage of its own until this release's `cisco_access` case.
+
+**Port labels: the inset is now the node box's own reach along the
+link, not one flat worst-case number.** The old `PORT_LABEL_INSET` was
+computed once, `Math.max(18, Math.hypot(NODE_W/2, NODE_H/2) - Math.min
+(NODE_W, NODE_H)/2)` — the gap between `edgePoint()`'s inscribed-ellipse
+exit point and the box's actual corner, which only matters on a
+diagonal link and only gets bigger, never smaller, everywhere else.
+`PORT_LABEL_INSET` is now a flat `18` (a margin, not a corner
+allowance), and a new `boxExit(ux, uy)` computes that same corner-clearing
+distance per link, from the link's own unit direction: `rect =
+Math.min(hw / |ux|, hh / |uy|)` (the box's own edge along this exact
+ray) minus the ellipse's exit distance along the same ray — zero on a
+perfectly axis-aligned link, growing to the corner's own ~27px past the
+ellipse on a link running straight at `NODE_W×NODE_H`'s corner (176×54,
+so a corner run is about 17° off horizontal, not 45°). `drawPortLabels`
+now adds `PORT_LABEL_INSET` to `boxExit(ux, uy)` as `clear`, in place of
+the old constant, everywhere `PORT_LABEL_INSET` used to appear directly
+— so an axis-aligned link's labels now sit about 18px out and a
+corner-bound link's about 45px out, instead of every link paying the
+old ~65px regardless of angle. This is what gave 5.39.0's own per-cable
+stagger (`PORT_LABEL_STEP`) room again: the stagger is clamped at
+`Math.max(len / 2 - clear, 0)`, and between two closely stacked
+switches the old flat 65px could eat the entire clamp on its own,
+leaving every parallel cable's stagger at zero.
+
+A steep link (`Math.abs(uy) > Math.abs(ux)`) now takes a different
+anchor entirely: instead of the shallow-link `text-anchor: start/end`
+placement measured along `ux/uy` (which reads fine on a mostly-horizontal
+line but let a near-vertical cable's label drift sideways into its
+neighbour's), both of a steep link's labels sit offset by `fanSide *
+aside` in x — `fanSide = Math.sign(fanOffset * nx) || 1`, the same sign
+`fanOffsets()` already assigns the cable within its parallel group — and
+anchor `start`/`end` accordingly, so the label reads outward from the
+fan on whichever side that cable already sits, away from the line
+itself. `aside` also grew from a flat `8` to `Math.max(8, bundleHalf +
+5)`, `bundleHalf` being half the strand bundle's own drawn width (or
+`plan.width / 2` for a plain/collapsed link) computed once in `drawLink`
+and passed down — so a fat collapsed trunk's port label no longer sits
+inside its own strand fan.
+
+`drawPortLabels` returns how much span it just used — `inset +
+PORT_LABEL_STEP` on the steep path, `0` on the shallow one where the
+strand labels already read at the link's own midpoint band rather than
+its ends — as `reserve`. `drawLink` threads that back into the
+strand-VLAN-number stagger (5.18.0): where `reserve` is set and there is
+more than one strand, the stagger's own `step` is additionally clamped
+to `Math.max(edgeLen - 2 * reserve, 0) / ((n - 1) * edgeLen)`, so the
+VLAN numbers on a steep multi-VLAN link keep inside the band the port
+labels didn't already claim at each end, rather than the two label sets
+competing for the same pixels.
+
+Tests: `tests/test_frontend_contracts.py` section 97 pins the shared
+`TEXT_SIZES` table and its `fs` tokens, `textSizesHtml`'s two call sites,
+`noteFont`/`noteFontCache`, the note pane's baseline-drop math, the
+FiberView `onchange` handler's `applyFiberView()` → `requestDraw()`
+order, the flat `PORT_LABEL_INSET = 18`, `boxExit`, the steep-link
+anchor branch, and the `reserve` value handed to the strand stagger.
+`tests/test_mapper_db.py` and `tests/test_mapper_api.py` cover
+`map_notes.text_size` the same way frames were covered in 5.39.0 —
+default, range validation, persistence, the `mapper.note.update` audit
+row, and a hand-built pre-5.40 `map_notes` table proving the migration
+installs the column on an existing note the same way it does on an
+existing frame.
+
 ---
 
 ## Alerts

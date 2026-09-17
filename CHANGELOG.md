@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.40.0 — Notes get text size, FiberView's dots redraw, Cisco access VLANs via vmVlan, and parallel-link labels cleared](#5400--notes-get-text-size-fiberviews-dots-redraw-cisco-access-vlans-via-vmvlan-and-parallel-link-labels-cleared)
 - [5.39.0 — Access-port VLANs restored on Mapper, and seven more Mapper/Device-details fixes](#5390--access-port-vlans-restored-on-mapper-and-seven-more-mapperdevice-details-fixes)
 - [5.38.0 — FortiAP web tunnel, spanning-tree blocking alerts, Mapper notes, and a round of SFP/fan/FiberView fixes](#5380--fortiap-web-tunnel-spanning-tree-blocking-alerts-mapper-notes-and-a-round-of-sfpfanfiberview-fixes)
 - [5.37.0 — Spanning-tree state per VLAN: blocked links on PVST switches](#5370--spanning-tree-state-per-vlan-blocked-links-on-pvst-switches)
@@ -172,6 +173,106 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.40.0 — Notes get text size, FiberView's dots redraw, Cisco access VLANs via vmVlan, and parallel-link labels cleared
+
+Four items from a further round of live use. `PROMPT-LOG.md` carries the
+full request and the operator's answers on the three open questions.
+
+**Mapper notes gain the same Small/Medium/Large text size frames got in
+5.39.0.** A Text size row of S/M/L buttons sits under Colour in the
+note's detail pane; the choice is stored per note (`map_notes.text_size`,
+default Medium), added by the same migration idiom the frame column
+used, and the note's own text re-wraps against whichever font the pick
+draws with, so a longer size never overruns the bubble. One thing worth
+knowing before this lands on the fleet: a note used to draw at what is
+now the Small size. With Medium the default for every note — new and
+existing alike — every note already on a map grows one step (11px to
+12px) the next time its map is opened. Files: `netpath/mapperdb.py`,
+`netpath/web/api.py`, `netpath/web/static/mapper.js`,
+`netpath/web/static/app.css`.
+
+**STP-blocked dots on a fiber link could still vanish when FiberView was
+toggled.** The link drawing decides, at the moment it draws, whether a
+blocked fiber link's dots belong on the glowing line itself or on the
+separate unglowed overlay 5.39.0 added — and that decision depends on
+whether FiberView is on. The FiberView checkbox, though, only ever
+flipped a canvas attribute the CSS reads; it never asked the map to draw
+again. So a link drawn one way could sit on screen unchanged after the
+toggle flipped, dots merged into the glow exactly as before. The toggle
+now redraws. The operator separately reported the same dots vanishing on
+a plain page refresh; that was not reproduced in the client code — a
+refresh rebuilds the whole map consistently, so a redraw already
+happens automatically. What a refresh *can* change is the data
+underneath it: the map reads each port's spanning-tree state live from
+the device's last poll, so if a poll changed that state between two
+page loads, the drawing follows the new state rather than staying with
+the old one. Recorded as open, for a closer look after this release, at
+the operator's own "not sure" on whether it is the same bug. File:
+`netpath/web/static/mapper.js`.
+
+**Access-port links on Mapper could still read "No VLAN data known for
+this link" on Cisco switches after 5.39.0's fix.** NetPath's only source
+for an access port's VLAN was the standards object `dot1qPvid`
+(Q-BRIDGE-MIB) — which the operator's Catalysts do not answer at all, so
+5.39.0's own dot1qPvid fallback had nothing to fall back to, and the
+Cisco branch of the VLAN walk recorded no native VLAN for a non-trunking
+port either way. 5.40.0 also walks `vmVlan` (CISCO-VLAN-MEMBERSHIP-MIB,
+Cisco's own "this access port is in VLAN N" object) and uses it for any
+non-trunking port that still has no `dot1qPvid` answer once the rest of
+the walk has run; `dot1qPvid` keeps precedence wherever both answer. The
+existing rule is unchanged: a VLAN appears on a link only if the switch
+itself lists that VLAN somewhere. Data appears after the device's next
+VLAN poll (hourly by default), not on a page reload. Two things this
+pass noticed and left alone: the VLAN walk discards a device's *entire*
+poll result if any single SNMP column is cut short by the walk's shared
+20-second budget, which would blank a large stack's whole VLAN picture
+(trunks included) rather than just an access port — a different symptom
+from this one, not fixed here; and 5.39.0's own access-fallback test ran
+against a non-Cisco stub device, so the Cisco branch's access arm went
+untested until this release's new `cisco_access` stub mode and test.
+Files: `netpath/nodeoids.py`, `netpath/nodepoll.py`.
+
+**Port-name and VLAN-number labels could still land on top of each
+other on parallel links** — three cables between two stacked switches,
+in the operator's own screenshot, printed all six port labels on top of
+the VLAN numbers. The port label's own margin past the node box was one
+fixed worst-case number, ~65px, sized to clear the box's far corner on
+a diagonal link; on a vertical or horizontal link the cable actually
+leaves the box at its flat edge; and 5.39.0's own per-cable stagger,
+which steps each parallel cable's labels a little further out, had
+nowhere left to step once that 65px margin used up all the room between
+two closely stacked switches — so all three cables' labels collapsed
+onto the same point. The margin is now measured from the node box's own
+reach along each link's actual angle instead of a single flat number:
+about 18px past the edge on an axis-aligned link, growing to as much as
+45px toward a true corner. A steep (closer to vertical than horizontal)
+link also used to anchor its labels as though the link were shallow and
+horizontal, letting a cable's own label cross over its line into a
+neighbour's; a steep link's labels now both sit on the outward side of
+the cable fan, reading away from the line. The label now also clears
+the width of a multi-VLAN strand bundle rather than a flat offset, and
+the VLAN numbers on a strand link keep to whatever span the port labels
+leave free, rather than the two ever competing for the same space.
+File: `netpath/web/static/mapper.js`.
+
+Files: `netpath/mapperdb.py`, `netpath/nodeoids.py`, `netpath/nodepoll.py`,
+`netpath/web/api.py`, `netpath/web/static/app.css`,
+`netpath/web/static/mapper.js`.
+
+Tests: `tests/stubs/stub_agent_vlan.py` gains a `cisco_access` mode —
+`vmVlan` as the only access-VLAN source, no `dot1qPvid` rows at all —
+and `tests/test_port_vlans.py` gains a matching case proving a named
+VLAN becomes a real access membership, an unnamed one gets none, and an
+ordinary trunk on the same device is untouched. `tests/test_mapper_db.py`
+and `tests/test_mapper_api.py` gain a `map_notes.text_size` pass mirroring
+the frame one — default Medium, range validation, persistence, an audit
+row on change, and the same pre-5.40 database migration proof used for
+frames. `tests/test_frontend_contracts.py` section 97 pins the text-size
+table frames and notes now share, the note pane's Text size row, the
+FiberView toggle's redraw call, and the port-label geometry (the fixed
+18px margin, the box-reach calculation, steep-link anchoring, and the
+span it hands the strand VLAN numbers to stay clear of).
 
 ### 5.39.0 — Access-port VLANs restored on Mapper, and seven more Mapper/Device-details fixes
 

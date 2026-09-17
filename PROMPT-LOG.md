@@ -5,6 +5,39 @@ grouped by the version that carries it. This is a working record for the
 operator — the full story of each change is in `CHANGELOG.md`, and this file
 does not replace it.
 
+## 5.40.0 — Note text size, FiberView's missing redraw, vmVlan access ports, and port-label geometry
+
+**Operator prompt, four items with a screenshot attached:**
+- Give Mapper notes the same Small/Medium/Large text size frames already
+  got in 5.39.0.
+- Toggling FiberView makes the STP-blocked dots on a fiber link vanish;
+  the operator also saw them vanish on a plain page refresh.
+- Access-port links on Mapper still show "No VLAN data known for this
+  link" on Cisco switches even after the 5.39.0 fix.
+- Port-name and VLAN-number labels overlap on parallel links — the
+  screenshot showed three cables between two stacked switches with all
+  six port labels landing on top of the VLAN numbers.
+
+**Three questions asked during planning, answered by the operator:**
+- Whether the page-refresh case was a separate bug from the FiberView
+  toggle — operator said "not sure." The toggle fix ships regardless;
+  the refresh case was not reproduced in the client code (a refresh
+  rebuilds the map consistently) and is recorded open for re-check —
+  what a refresh *can* change is the underlying STP data itself, read
+  live from the last poll.
+- vmVlan (CISCO-VLAN-MEMBERSHIP-MIB) versus reading CDP's native-VLAN
+  TLV as the second access-port source — operator chose vmVlan.
+- Whether notes get their own size scale or share the frame presets —
+  operator chose sharing, Medium as the default so no existing note's
+  size is a surprise.
+
+Bob planned and built the Mapper front end; Dora (`deep-code-explorer`)
+traced the STP-dot and VLAN-membership data paths first; Thing1 built the
+note text-size column, API and tests; Thing2 built the vmVlan collector
+change, its stub mode and test; Testy ran the suite and a Mapper-only
+browser walk; Javariius reviewed before the push to `main`. Version for
+this work: 5.40.0.
+
 ## 5.39.0 — Access-port VLANs restored on Mapper, and seven more Mapper/Device-details fixes
 
 **Operator prompt, eight items from a round of live use:**

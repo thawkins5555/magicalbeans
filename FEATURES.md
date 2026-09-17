@@ -1868,7 +1868,17 @@ From 4.47.0, Nodes walks past the SNMP poll to see the wire itself.
   leave a plainly-configured access port showing no VLAN at all, on both
   this table and MAPPER. A VLAN the device does not name anywhere else
   still never appears; this only fills in a port whose native VLAN the
-  device already told the poller and nothing else picked up.
+  device already told the poller and nothing else picked up. **From
+  5.40.0, a Cisco access port that answers no `dot1qPvid` at all now
+  falls back a step further, to `vmVlan` (CISCO-VLAN-MEMBERSHIP-MIB)** —
+  Cisco's own "this access port is in VLAN N" object, which some
+  Catalysts answer even though they never answer the standards
+  `dot1qPvid` scalar 5.39.0's fallback depended on. `dot1qPvid` still
+  wins wherever a switch answers both. The same rule still holds either
+  way: a VLAN only ever appears on a link if the switch itself lists
+  that VLAN somewhere, and the fix reaches Nodes' own VLAN column as
+  well as Mapper. An affected link fills in on its next VLAN poll, not
+  on a page reload.
 - **From 5.11.0 a neighbour that only reported an address is named, not
   numbered.** Where LLDP sent a network-address chassis id or CDP sent an
   address as the device id, the Remote device column names it the way
@@ -4665,7 +4675,14 @@ like any other module.
   keyboard the same way a Frame is (Tab, Enter/Space, Delete/Backspace).
   They're included in **Fit** and the PNG export, and deliberately left
   out of the CSV export, which lists links rather than drawing
-  decoration — the same treatment Frames get.
+  decoration — the same treatment Frames get. **From 5.40.0, a note gets
+  the same Small/Medium/Large text size a frame's label already has** — a
+  Text size row under Colour in the note's detail pane, defaulting to
+  Medium; the note's own text re-wraps against whichever size is picked,
+  since a bigger font fits fewer words on a line. Every note drawn before
+  5.40.0 was, in effect, drawn at Small; with Medium now the default it
+  grows one step on an upgraded map's next open — nothing else about it
+  moves.
 - **From 5.33.0, double-clicking a device box opens that device's own
   Device Details dialog without leaving Mapper.** It is the exact same
   dialog a double-click on a Nodes row already opens — its identity,
@@ -4735,6 +4752,17 @@ like any other module.
   multi-VLAN link's individual strands were already thin enough to show
   the dots correctly once the glowing line beneath the bundle stopped
   carrying the dash pattern itself, so no overlay was needed there.
+  **From 5.40.0, ticking or unticking FiberView redraws the map
+  immediately.** The checkbox used to only flip the setting the CSS reads
+  and never redraw the canvas, so a blocked link's dots could still show
+  merged until something else forced a redraw. An operator also reported
+  the same dots vanishing on a plain page refresh; that was not
+  reproduced in the client code — a refresh rebuilds the whole map
+  consistently — so it stays open for a closer look. What a refresh
+  *can* change is the underlying spanning-tree state itself, which the
+  map reads live from the device's last poll: if a poll changed which
+  VLANs are blocking between one page load and the next, the drawing
+  simply follows that change.
 - **From 5.37.0, a Cisco PVST+/Rapid-PVST switch's blocked-link line
   reads every VLAN the port carries, not just the default spanning-tree
   instance (VLAN 1).** The poller now walks `dot1dStpPortState` a
@@ -4767,7 +4795,21 @@ like any other module.
   same distance from the device — stacking every label at one point is
   what made interface names overlap and become unreadable. A short link's
   labels stop staggering past its own midpoint, so its two ends can never
-  swap sides.
+  swap sides. **From 5.40.0, a port label's own distance from the node
+  box is measured along that link's actual angle, not one fixed
+  worst-case margin.** The margin used to be a flat ~65px, sized to
+  clear the box's far corner on a diagonal cable, which left needless
+  empty space — and no room for the stagger above — on a straight
+  vertical or horizontal run; between two stacked switches with several
+  parallel cables, that left the stagger nothing to work with and put
+  every port label on top of the VLAN numbers. The margin is now
+  measured from wherever the box actually ends along that link's own
+  angle, so a straight run sits close in and a diagonal one still clears
+  the corner. A steep (more vertical than horizontal) cable also now
+  reads both its labels outward from the fan, away from its own line,
+  instead of assuming a shallow line — so a label can no longer cross
+  into its neighbour's — and a multi-VLAN link's VLAN numbers keep to
+  whatever span the port labels leave free.
 
 ---
 
