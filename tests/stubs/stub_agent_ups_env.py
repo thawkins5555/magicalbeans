@@ -351,9 +351,6 @@ CISCO_DOM_TABLE = {
     "1.3.6.1.2.1.47.1.1.1.1.2.2000": ("str", "Switch 1 - Inlet Temp Sensor"),
     "1.3.6.1.2.1.47.1.1.1.1.7.2000": ("str", "Switch 1 - Inlet Temp Sensor"),
     "1.3.6.1.2.1.47.1.1.1.1.4.2000": ("int", 1),
-    "1.3.6.1.2.1.47.1.1.1.1.2.2001": ("str", "Switch 1 - Outlet Temp Sensor"),
-    "1.3.6.1.2.1.47.1.1.1.1.7.2001": ("str", "Switch 1 - Outlet Temp Sensor"),
-    "1.3.6.1.2.1.47.1.1.1.1.4.2001": ("int", 1),
 
     # entSensorType: celsius(8), voltsDC(4), amperes(5), dBm(14) x2, celsius(8)
     "1.3.6.1.4.1.9.9.91.1.1.1.1.1.1010": ("int", 8),
@@ -362,7 +359,6 @@ CISCO_DOM_TABLE = {
     "1.3.6.1.4.1.9.9.91.1.1.1.1.1.1013": ("int", 14),
     "1.3.6.1.4.1.9.9.91.1.1.1.1.1.1014": ("int", 14),
     "1.3.6.1.4.1.9.9.91.1.1.1.1.1.2000": ("int", 8),
-    "1.3.6.1.4.1.9.9.91.1.1.1.1.1.2001": ("int", 8),
 
     # entSensorScale: units(9) or milli(8)
     "1.3.6.1.4.1.9.9.91.1.1.1.1.2.1010": ("int", 9),
@@ -371,7 +367,6 @@ CISCO_DOM_TABLE = {
     "1.3.6.1.4.1.9.9.91.1.1.1.1.2.1013": ("int", 9),
     "1.3.6.1.4.1.9.9.91.1.1.1.1.2.1014": ("int", 8),
     "1.3.6.1.4.1.9.9.91.1.1.1.1.2.2000": ("int", 9),
-    "1.3.6.1.4.1.9.9.91.1.1.1.1.2.2001": ("int", 9),
 
     # entSensorPrecision
     "1.3.6.1.4.1.9.9.91.1.1.1.1.3.1010": ("int", 0),
@@ -380,7 +375,6 @@ CISCO_DOM_TABLE = {
     "1.3.6.1.4.1.9.9.91.1.1.1.1.3.1013": ("int", 1),
     "1.3.6.1.4.1.9.9.91.1.1.1.1.3.1014": ("int", 0),
     "1.3.6.1.4.1.9.9.91.1.1.1.1.3.2000": ("int", 0),
-    "1.3.6.1.4.1.9.9.91.1.1.1.1.3.2001": ("int", 0),
 
     # entSensorValue. The two dBm rows are the two shapes real Cisco gear
     # reports optical power in, and BOTH decode through the ordinary RFC
@@ -393,7 +387,6 @@ CISCO_DOM_TABLE = {
     "1.3.6.1.4.1.9.9.91.1.1.1.1.4.1013": ("int", -24),     # -2.4 dBm
     "1.3.6.1.4.1.9.9.91.1.1.1.1.4.1014": ("int", -5500),   # -5.5 dBm
     "1.3.6.1.4.1.9.9.91.1.1.1.1.4.2000": ("int", 41),      # 41 C
-    "1.3.6.1.4.1.9.9.91.1.1.1.1.4.2001": ("int", 44),      # 44 C
 
     # entSensorStatus: ok(1) throughout
     "1.3.6.1.4.1.9.9.91.1.1.1.1.5.1010": ("int", 1),
@@ -402,7 +395,6 @@ CISCO_DOM_TABLE = {
     "1.3.6.1.4.1.9.9.91.1.1.1.1.5.1013": ("int", 1),
     "1.3.6.1.4.1.9.9.91.1.1.1.1.5.1014": ("int", 1),
     "1.3.6.1.4.1.9.9.91.1.1.1.1.5.2000": ("int", 1),
-    "1.3.6.1.4.1.9.9.91.1.1.1.1.5.2001": ("int", 1),
 }
 
 # --------------------------------- entSensorThresholdTable (CISCO, 5.3.0)
@@ -482,9 +474,20 @@ CISCO_DOM_THRESHOLD_TABLE = {
     "1.3.6.1.4.1.9.9.91.1.2.1.1.3.2000.1": ("int", 3),
     "1.3.6.1.4.1.9.9.91.1.2.1.1.4.2000.1": ("int", 55),
 
-    # --- 2001 the chassis outlet: every level severity other(1), a pair on
-    # the high side. The platforms that do this publish a sensor's whole
-    # band that way, which used to leave the sensor with no limits at all.
+    # --- 2001 the chassis outlet, sensor rows and all: it lives HERE, not in
+    # CISCO_DOM_TABLE, so `cisco_dom` stays byte-identical for the suites
+    # that count its sensors and its requests. Every level is severity
+    # other(1), a pair on the high side -- the platforms that do this
+    # publish a sensor's whole band that way, which used to leave the
+    # sensor with no limits at all.
+    "1.3.6.1.2.1.47.1.1.1.1.2.2001": ("str", "Switch 1 - Outlet Temp Sensor"),
+    "1.3.6.1.2.1.47.1.1.1.1.7.2001": ("str", "Switch 1 - Outlet Temp Sensor"),
+    "1.3.6.1.2.1.47.1.1.1.1.4.2001": ("int", 1),
+    "1.3.6.1.4.1.9.9.91.1.1.1.1.1.2001": ("int", 8),
+    "1.3.6.1.4.1.9.9.91.1.1.1.1.2.2001": ("int", 9),
+    "1.3.6.1.4.1.9.9.91.1.1.1.1.3.2001": ("int", 0),
+    "1.3.6.1.4.1.9.9.91.1.1.1.1.4.2001": ("int", 44),      # 44 C
+    "1.3.6.1.4.1.9.9.91.1.1.1.1.5.2001": ("int", 1),
     "1.3.6.1.4.1.9.9.91.1.2.1.1.2.2001.1": ("int", 1),       # other
     "1.3.6.1.4.1.9.9.91.1.2.1.1.3.2001.1": ("int", 3),       # greaterThan
     "1.3.6.1.4.1.9.9.91.1.2.1.1.4.2001.1": ("int", 70),      # 70 C
