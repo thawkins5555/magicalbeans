@@ -399,7 +399,7 @@ reopened.close()
 
 # ---------------------------------------------------- text_size install path
 #
-# A pre-6.x map_frames table, built by hand without the text_size column,
+# A pre-5.39 map_frames table, built by hand without the text_size column,
 # to prove MapperDatabase's ensure_columns migration installs it cleanly
 # on top of an existing field, not just a brand-new file.
 
