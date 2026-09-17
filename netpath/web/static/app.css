@@ -2036,7 +2036,8 @@ body.kiosk .card.strip > .hint { overflow: visible; white-space: normal; }
   stroke-width: 3px;
   stroke-linejoin: round;
 }
-/* Small and Large only: Medium is .mp-frame-label's own font-size above. */
+/* Small and Large only: Medium is .mp-frame-label's own font-size above.
+   A note's text (.mp-note-t*, below) takes the same three. */
 .mp-frame-label.mp-frame-t0 { font-size: var(--fs-2xs); }
 .mp-frame-label.mp-frame-t2 { font-size: var(--fs-xl); }
 .mp-frame-handle { fill: var(--mp-frame-color); opacity: 0.8; cursor: nwse-resize; }
@@ -2062,9 +2063,11 @@ body.kiosk .card.strip > .hint { overflow: visible; white-space: normal; }
 .mp-note-text {
   fill: var(--canvas-text);
   font-family: var(--ui);
-  font-size: var(--fs-2xs);
+  font-size: var(--fs-xs);
   cursor: move;
 }
+.mp-note-text.mp-note-t0 { font-size: var(--fs-2xs); }
+.mp-note-text.mp-note-t2 { font-size: var(--fs-xl); }
 .mp-note-tail { fill: var(--canvas); stroke: var(--mp-note-color); stroke-width: 1.5; }
 .mp-note-handle { fill: var(--mp-note-color); opacity: 0.8; cursor: nwse-resize; }
 

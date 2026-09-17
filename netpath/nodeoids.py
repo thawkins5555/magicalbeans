@@ -389,6 +389,11 @@ VTP_TRUNK_DYNAMIC_STATUS = "1.3.6.1.4.1.9.9.46.1.6.1.1.14"  # vlanTrunkPortDynam
 
 VTP_TRUNK_DYNAMIC_STATUS_ENUM = {1: "trunking", 2: "notTrunking"}
 
+# CISCO-VLAN-MEMBERSHIP-MIB vmVlan: an access port's VLAN, indexed by
+# ifIndex directly (not a bridge port) -- some Catalysts answer this where
+# they never answer dot1qPvid at all.
+CISCO_VM_VLAN = "1.3.6.1.4.1.9.9.68.1.2.2.1.2"   # vmVlan
+
 # ---------------------------------------------------------- PtP radio links
 #
 # Point-to-point wireless bridges: a PtP link has exactly one

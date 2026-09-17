@@ -61,6 +61,16 @@ Modes:
                      bitmap (and not the untagged one), so the standards
                      path already gives it a real (tagged) membership before
                      dot1qPvid is even read.
+  cisco_access       CISCO-VLAN-MEMBERSHIP-MIB vmVlan as the ONLY access
+                     VLAN source -- no dot1qPvid rows at all, the case real
+                     Catalysts that never answer dot1qPvid need. VTP names
+                     three VLANs (1, 20, 30). ifIndex 1: notTrunking, vmVlan
+                     20 -- named, so it gets a real access membership.
+                     ifIndex 2: notTrunking, vmVlan 99 -- NOT named and in
+                     no Q-BRIDGE bitmap, so it must get no membership at all
+                     (the "device names it" invariant). ifIndex 3: trunking,
+                     native VLAN 1, allow-list {20, 30}, no vmVlan row --
+                     the ordinary trunk path, untouched by vmVlan.
   cisco_default_trunk  The fleet-representative case: one Cisco switch
                      with a handful of real VLANs (1 "default", 10 "data",
                      20 "voice", 1030 "video" -- above 1023, so only the
@@ -286,6 +296,37 @@ CISCO_MIXED_TRUNK_ENABLED = {
     "1.3.6.1.4.1.9.9.46.1.6.1.1.4.2": ("bytes", bytes([0xFF] * 128)),
 }
 
+# ------------------------------------------------- cisco_access: vmVlan only
+#
+# See the module docstring's `cisco_access` entry. No dot1qPvid at all --
+# vmVlan (CISCO-VLAN-MEMBERSHIP-MIB) is the only access-VLAN evidence.
+CISCO_ACCESS_VTP_NAMES = {
+    # domain.vlan suffixes -- see VTP_NAMES above.
+    "1.3.6.1.4.1.9.9.46.1.3.1.1.4.1.1": ("str", "default"),
+    "1.3.6.1.4.1.9.9.46.1.3.1.1.4.1.20": ("str", "voice"),
+    "1.3.6.1.4.1.9.9.46.1.3.1.1.4.1.30": ("str", "guest"),
+}
+CISCO_ACCESS_TRUNK_STATUS = {
+    "1.3.6.1.4.1.9.9.46.1.6.1.1.14.1": ("int", 2),   # ifIndex 1: notTrunking
+    "1.3.6.1.4.1.9.9.46.1.6.1.1.14.2": ("int", 2),   # ifIndex 2: notTrunking
+    "1.3.6.1.4.1.9.9.46.1.6.1.1.14.3": ("int", 1),   # ifIndex 3: trunking
+}
+CISCO_ACCESS_TRUNK_NATIVE = {
+    "1.3.6.1.4.1.9.9.46.1.6.1.1.5.3": ("int", 1),    # ifIndex 3's native VLAN
+}
+CISCO_ACCESS_TRUNK_ENABLED = {
+    # ifIndex 3 (trunk) allow-list: VLANs 20 and 30 -> byte 2 bit 4 (0x08),
+    # byte 3 bit 6 (0x02) -- see the weight formula above VTP_TRUNK_ENABLED.
+    "1.3.6.1.4.1.9.9.46.1.6.1.1.4.3": ("bytes", bytes([0x00, 0x00, 0x08, 0x02])),
+}
+CISCO_ACCESS_VM_VLAN = {
+    # vmVlan.<ifIndex>: ifIndex 1 is a real, named VLAN; ifIndex 2 is not
+    # named anywhere and covered by no Q-BRIDGE bitmap either. ifIndex 3
+    # (trunking) has no vmVlan row at all.
+    "1.3.6.1.4.1.9.9.68.1.2.2.1.2.1": ("int", 20),
+    "1.3.6.1.4.1.9.9.68.1.2.2.1.2.2": ("int", 99),
+}
+
 # ---------------------------------- cisco_default_trunk: the fleet case
 #
 # See the module docstring's `cisco_default_trunk` entry. Two trunks
@@ -379,6 +420,10 @@ def table_for():
                 **CISCO_MIXED_DOT1Q_UNTAGGED, **CISCO_MIXED_DOT1Q_PVID,
                 **CISCO_MIXED_VTP_NAMES, **CISCO_MIXED_TRUNK_STATUS,
                 **CISCO_MIXED_TRUNK_NATIVE, **CISCO_MIXED_TRUNK_ENABLED}
+    if MODE == "cisco_access":
+        return {**CISCO_SCALARS, **CISCO_ACCESS_VTP_NAMES,
+                **CISCO_ACCESS_TRUNK_STATUS, **CISCO_ACCESS_TRUNK_NATIVE,
+                **CISCO_ACCESS_TRUNK_ENABLED, **CISCO_ACCESS_VM_VLAN}
     if MODE == "no_vlan":
         return dict(GENERIC_SCALARS)
     if MODE == "baseport_only":

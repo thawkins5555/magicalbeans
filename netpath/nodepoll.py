@@ -8822,6 +8822,7 @@ class NodePoller(Worker):
 
             trunk_status = _int_keyed(walk(nodeoids.VTP_TRUNK_DYNAMIC_STATUS))
             trunk_native = _int_keyed(walk(nodeoids.VTP_TRUNK_NATIVE_VLAN))
+            vm_vlan = _int_keyed(walk(nodeoids.CISCO_VM_VLAN))
 
             # vlanTrunkPortVlansEnabled* is the trunk's configured ALLOW
             # LIST, not the VLANs actually crossing it -- a trunk left at
@@ -8852,7 +8853,7 @@ class NodePoller(Worker):
                         _decode_vlan_bitmap(raw, base))
 
             cisco_ports = (set(trunk_status) | set(trunk_native)
-                          | set(cisco_vlans_by_port))
+                          | set(cisco_vlans_by_port) | set(vm_vlan))
             for if_index in cisco_ports:
                 status = trunk_status.get(if_index)
                 # The trunk allow-list is only meaningful for a port that is
@@ -8873,6 +8874,11 @@ class NodePoller(Worker):
                 if status != 1:
                     if status == 2:
                         port_mode[if_index] = "access"
+                    # vmVlan: some Catalysts never answer dot1qPvid at all,
+                    # so this is the only access-VLAN evidence they give.
+                    if if_index in vm_vlan and if_index not in port_native:
+                        port_native[if_index] = vm_vlan[if_index]
+                        described_ports.add(if_index)
                     continue
 
                 # Supersede: drop whatever the standards path recorded for

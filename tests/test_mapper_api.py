@@ -669,6 +669,8 @@ try:
           and note["width"] == 120 and note["height"] == 80
           and note["text"] == "Uplink to the core" and note["color"] == 3
           and note["node_id"] == node_a, note)
+    check("...including text_size, defaulted to 1 (Medium)",
+          note is not None and note["text_size"] == 1, note)
 
     status, payload = call("POST", f"/api/mapper/maps/{map_id}/notes",
                            {"x": 0, "y": 0, "width": 60, "height": 60,
@@ -690,6 +692,22 @@ try:
           moved_note is not None and moved_note["x"] == 40 and moved_note["y"] == 45
           and moved_note["text"] == "Uplink to the core" and moved_note["node_id"] == node_a,
           moved_note)
+
+    audit_mark = service.app_db.audit_last_id()
+    status, payload = call("PUT", f"/api/mapper/maps/{map_id}/notes/{note_id}",
+                           {"text_size": 2}, token=admin)
+    check("PUT text_size is accepted", status == 200 and payload["ok"], (status, payload))
+    status, payload = call("GET", f"/api/mapper/maps/{map_id}", token=admin)
+    resized_note = next((n for n in payload["notes"] if n["id"] == note_id), None)
+    check("...and it persists", resized_note is not None and resized_note["text_size"] == 2,
+          resized_note)
+    audit_actions = [r["action"] for r in service.app_db.audit_events(audit_mark, 500)]
+    check("...and writes a mapper.note.update audit row",
+          audit_actions.count("mapper.note.update") == 1, audit_actions)
+
+    status, payload = call("PUT", f"/api/mapper/maps/{map_id}/notes/{note_id}",
+                           {"text_size": 3}, token=admin)
+    check("PUT text_size out of range is a 400", status == 400, (status, payload))
 
     status, payload = call("PUT", f"/api/mapper/maps/{map_id}/notes/{note_id}",
                            {"node_id": node_b}, token=admin)

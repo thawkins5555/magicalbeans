@@ -10459,7 +10459,7 @@ def get_mapper_map(service, params, body, map_id) -> dict:
     notes = [
         {"id": row["id"], "node_id": row["node_id"], "text": row["text"],
          "x": row["x"], "y": row["y"], "width": row["width"], "height": row["height"],
-         "color": row["color"], "added_ts": row["added_ts"]}
+         "color": row["color"], "text_size": row["text_size"], "added_ts": row["added_ts"]}
         for row in service.mapper_db.notes(map_id)]
 
     return {
@@ -10624,7 +10624,7 @@ def delete_mapper_map_frame(service, params, body, map_id, frame_id) -> dict:
     return {"ok": ok}
 
 
-_NOTE_UPDATE_FIELDS = ("text", "x", "y", "width", "height", "color")
+_NOTE_UPDATE_FIELDS = ("text", "x", "y", "width", "height", "color", "text_size")
 
 
 def post_mapper_map_notes(service, params, body, map_id) -> dict:
@@ -10666,14 +10666,15 @@ def post_mapper_map_notes(service, params, body, map_id) -> dict:
 
 def put_mapper_map_note(service, params, body, map_id, note_id) -> dict:
     """Position/size writes happen on every drag and are not audited, same
-    as put_mapper_map_frame; a text or color change is audited. The anchor
-    itself is never accepted here -- see post_mapper_map_notes' docstring."""
+    as put_mapper_map_frame; a text, color or text_size change is audited.
+    The anchor itself is never accepted here -- see post_mapper_map_notes'
+    docstring."""
     _require(service.mapper_db.map_row(map_id), "map")
     fields = _pick(body, _NOTE_UPDATE_FIELDS)
     if not fields:
         raise ValueError("No note fields to update.")
     ok = service.mapper_db.update_note(map_id, note_id, **fields)
-    if ok and ("text" in fields or "color" in fields):
+    if ok and ("text" in fields or "color" in fields or "text_size" in fields):
         _audit(service, params, "mapper.note.update", target=str(map_id),
               detail=f"note_id={note_id}")
     return {"ok": ok}

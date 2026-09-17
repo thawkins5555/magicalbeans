@@ -341,6 +341,50 @@ check("delete_frame returns True and removes a real frame",
 check("...it is actually gone", all(r["id"] != blank_id for r in db.frames(map_id)))
 db.close()
 
+# ---------------------------------------------------------------- map_notes
+
+db = new_db("notes")
+map_id = db.create_map("Notes map")
+
+note_id = db.add_note(map_id, x=10, y=20, width=200, height=150, text="Core Rack")
+check("add_note with no text_size argument defaults to 1 (Medium)",
+      next(r for r in db.notes(map_id) if r["id"] == note_id)["text_size"] == 1)
+
+for size in (0, 1, 2):
+    size_id = db.add_note(map_id, x=0, y=0, width=100, height=100, text_size=size)
+    check(f"add_note stores text_size {size} and reads it back",
+          next(r for r in db.notes(map_id) if r["id"] == size_id)["text_size"] == size)
+
+for kwargs, why in (
+    ({"x": 0, "y": 0, "text_size": FRAME_TEXT_SIZE_MAX + 1, "width": 100, "height": 100},
+     "text_size out of range"),
+    ({"x": 0, "y": 0, "text_size": -1, "width": 100, "height": 100}, "negative text_size"),
+    ({"x": 0, "y": 0, "text_size": True, "width": 100, "height": 100}, "boolean text_size"),
+    ({"x": 0, "y": 0, "text_size": 1.0, "width": 100, "height": 100}, "float text_size"),
+):
+    try:
+        db.add_note(map_id, **kwargs)
+        check(f"add_note rejects {why}", False)
+    except ValueError as exc:
+        check(f"add_note rejects {why}", True)
+        check(f"...with a readable message ({why})", len(str(exc)) > 0, str(exc))
+
+for bad_size, why in ((3, "out-of-range (3)"), (-1, "out-of-range (-1)"),
+                      (True, "a boolean"), (1.0, "a float")):
+    try:
+        db.update_note(map_id, note_id, text_size=bad_size)
+        check(f"update_note rejects text_size {why}", False)
+    except ValueError as exc:
+        check(f"update_note rejects text_size {why}", True)
+        check(f"...with a readable message ({why})", len(str(exc)) > 0, str(exc))
+
+for size in (0, 2, 1):
+    check(f"update_note(text_size={size}) lands",
+          db.update_note(map_id, note_id, text_size=size) is True)
+    check(f"...and reads back as {size}",
+          next(r for r in db.notes(map_id) if r["id"] == note_id)["text_size"] == size)
+db.close()
+
 # --------------------------------------------------------------- settings
 
 db = new_db("settings")
@@ -399,9 +443,9 @@ reopened.close()
 
 # ---------------------------------------------------- text_size install path
 #
-# A pre-5.39 map_frames table, built by hand without the text_size column,
-# to prove MapperDatabase's ensure_columns migration installs it cleanly
-# on top of an existing field, not just a brand-new file.
+# A pre-5.39 map_frames/map_notes pair, built by hand without the text_size
+# column, to prove MapperDatabase's ensure_columns migration installs it
+# cleanly on top of an existing field, not just a brand-new file.
 
 old_path = f"{TMPDIR}/pretextsize.db"
 raw = sqlite3.connect(old_path)
@@ -429,18 +473,42 @@ raw.execute("""
         FOREIGN KEY (map_id) REFERENCES maps(id) ON DELETE CASCADE
     )
 """)
+# Raw sqlite3.connect() does not enforce foreign keys by default, so
+# node_id can stay NULL here without a map_nodes table to point at.
+raw.execute("""
+    CREATE TABLE map_notes (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        map_id     INTEGER NOT NULL,
+        node_id    INTEGER,
+        text       TEXT NOT NULL DEFAULT '',
+        x          REAL NOT NULL,
+        y          REAL NOT NULL,
+        width      REAL NOT NULL,
+        height     REAL NOT NULL,
+        color      INTEGER NOT NULL DEFAULT 0,
+        added_ts   REAL NOT NULL,
+        FOREIGN KEY (map_id) REFERENCES maps(id) ON DELETE CASCADE,
+        FOREIGN KEY (node_id) REFERENCES map_nodes(id) ON DELETE SET NULL
+    )
+""")
 raw.execute("INSERT INTO maps(id, name, notes, created_ts, updated_ts)"
            " VALUES (1, 'Old Map', '', 0, 0)")
 raw.execute("INSERT INTO map_frames(id, map_id, label, x, y, width, height, color, added_ts)"
            " VALUES (1, 1, 'Pre-existing Rack', 5, 5, 100, 100, 0, 0)")
+raw.execute("INSERT INTO map_notes(id, map_id, node_id, text, x, y, width, height, color,"
+           " added_ts) VALUES (1, 1, NULL, 'Pre-existing Note', 5, 5, 100, 100, 0, 0)")
 raw.commit()
 raw.close()
 
 upgraded = MapperDatabase(old_path)
 with upgraded._lock:
-    cols = {row["name"] for row in
+    frame_cols = {row["name"] for row in
            upgraded._conn.execute("PRAGMA table_info(map_frames)").fetchall()}
-check("opening a pre-text_size database adds the column", "text_size" in cols, cols)
+    note_cols = {row["name"] for row in
+           upgraded._conn.execute("PRAGMA table_info(map_notes)").fetchall()}
+check("opening a pre-text_size database adds the column to map_frames",
+      "text_size" in frame_cols, frame_cols)
+check("...and to map_notes", "text_size" in note_cols, note_cols)
 pre_existing = next(r for r in upgraded.frames(1) if r["id"] == 1)
 check("...and the pre-existing frame row reads text_size == 1 (the default)",
       pre_existing["text_size"] == 1, dict(pre_existing))
@@ -448,6 +516,13 @@ check("update_frame(text_size=2) lands on the migrated row",
       upgraded.update_frame(1, 1, text_size=2) is True)
 check("...and reads back as 2",
       next(r for r in upgraded.frames(1) if r["id"] == 1)["text_size"] == 2)
+pre_existing_note = next(r for r in upgraded.notes(1) if r["id"] == 1)
+check("...and the pre-existing note row reads text_size == 1 (the default)",
+      pre_existing_note["text_size"] == 1, dict(pre_existing_note))
+check("update_note(text_size=2) lands on the migrated row",
+      upgraded.update_note(1, 1, text_size=2) is True)
+check("...and reads back as 2",
+      next(r for r in upgraded.notes(1) if r["id"] == 1)["text_size"] == 2)
 upgraded.close()
 
 print()

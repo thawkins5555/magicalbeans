@@ -30,10 +30,10 @@
   // staggered VLAN label needs from its neighbour before it's worth
   // staggering at all.
   const STRAND_LABEL_MIN_GAP_PX = 22;
-  // edgePoint() sits on the box's inscribed ellipse; the corner is this much
-  // further out on a diagonal link, so the inset clears the box at any angle.
-  const PORT_LABEL_INSET = Math.max(
-    18, Math.hypot(NODE_W / 2, NODE_H / 2) - Math.min(NODE_W, NODE_H) / 2);
+  // A port label's margin past the node box, on top of boxExit()'s own
+  // geometry; the old fixed 65px corner allowance left a short vertical
+  // link no room for the stagger below.
+  const PORT_LABEL_INSET = 18;
   // The fan separates parallel cables by less than a port name is wide, so
   // each steps its labels this much further along its own line.
   const PORT_LABEL_STEP = 16;
@@ -1044,8 +1044,9 @@
     return MAP_STYLES.includes(view.settings.map_style) ? view.settings.map_style : 'modern';
   }
 
-  // A rendering preference, not a map edit: toggling it never refetches or
-  // redraws, it just flips the data attribute app.css keys off.
+  // A rendering preference, not a map edit: toggling it never refetches.
+  // It flips the attribute app.css keys off; the toggle handler also redraws,
+  // since drawLink picks where a blocked link's dots live by view.fiberView.
   function applyFiberView() {
     App.el('mp-canvas').dataset.fiberview = view.fiberView ? '1' : '0';
   }
@@ -1158,9 +1159,17 @@
     // glow's own 5px-plus stroke closes .blocking's 2-on/6-off gaps and the
     // dots read solid. Below, a thin unglowed path carries them instead.
     const overlaidBlocking = link.blocking && link.fiber === true && view.fiberView;
+    let bundleHalf = plan.width / 2;
+    if (plan.mode === 'strands' && plan.strands.length) {
+      const offsets = plan.strands.map((strand) => strand.offset);
+      bundleHalf = (Math.max(...offsets) - Math.min(...offsets) + plan.width) / 2;
+    }
+    // How much of each end a port label takes, so the VLAN numbers below stay off it.
+    let reserve = 0;
     if (view.settings.show_port_labels) {
-      drawPortLabels(labelLayer, link, from, to, nx, ny,
-        (view.linkFanIndex && view.linkFanIndex.get(link.id)) || 0);
+      reserve = drawPortLabels(labelLayer, link, from, to, nx, ny, bundleHalf,
+        (view.linkFanIndex && view.linkFanIndex.get(link.id)) || 0,
+        Math.sign(fanOffset * nx) || 1);
     }
     if (plan.mode === 'strands' && plan.strands.length) {
       // Finding 9: every strand used to get the identical aria-label/tooltip
@@ -1238,8 +1247,11 @@
           // at the midpoint; a link too short to fit them 22px apart
           // falls back to the midpoint, same as before label_step existed.
           const n = plan.strands.length;
-          const step = plan.label_step || 0;
           const edgeLen = Math.hypot(to.x - from.x, to.y - from.y);
+          let step = plan.label_step || 0;
+          if (reserve && n > 1) {
+            step = Math.min(step, Math.max(edgeLen - 2 * reserve, 0) / ((n - 1) * edgeLen));
+          }
           const staggered = n > 1 && step * edgeLen >= STRAND_LABEL_MIN_GAP_PX;
           const frac = staggered ? 0.5 + (i - (n - 1) / 2) * step : 0.5;
           labelLayer.appendChild(App.svgNode('text', {
@@ -1294,28 +1306,45 @@
   // text clears the node box, and offset to one side of the line (the same
   // normal `nx,ny` the strand offsets use) so it never sits on top of the
   // stroke itself.
-  function drawPortLabels(layer, link, from, to, nx, ny, fanIndex = 0) {
-    if (!link.a_port && !link.b_port) return;
+  function drawPortLabels(layer, link, from, to, nx, ny, bundleHalf, fanIndex = 0, fanSide = 1) {
+    if (!link.a_port && !link.b_port) return 0;
     const dx = to.x - from.x, dy = to.y - from.y;
     const len = Math.max(Math.hypot(dx, dy), 1e-6);
     const ux = dx / len, uy = dy / len;
+    const clear = boxExit(ux, uy) + PORT_LABEL_INSET;
     // Clamped at the midpoint: on a short link the two ends' labels would
     // otherwise step past each other and swap sides.
-    const step = Math.min(fanIndex * PORT_LABEL_STEP,
-      Math.max(len / 2 - PORT_LABEL_INSET, 0));
-    const inset = PORT_LABEL_INSET + step, aside = 8;
+    const step = Math.min(fanIndex * PORT_LABEL_STEP, Math.max(len / 2 - clear, 0));
+    const inset = clear + step, aside = Math.max(8, bundleHalf + 5);
+    const label = (text, x, y, anchor) => layer.appendChild(App.svgNode('text', {
+      class: 'mp-link-label', x, y, 'text-anchor': anchor,
+    }, text));
+    // A start/end anchor along x only reads right beside a shallow line. On
+    // a steep one both labels sit on the fan's outward side and read away
+    // from it, so a cable's own label never crosses its line or its neighbour's.
+    const steep = Math.abs(uy) > Math.abs(ux);
+    if (steep) {
+      const anchor = fanSide > 0 ? 'start' : 'end';
+      if (link.a_port) label(link.a_port, from.x + fanSide * aside, from.y + uy * inset, anchor);
+      if (link.b_port) label(link.b_port, to.x + fanSide * aside, to.y - uy * inset, anchor);
+      return inset + PORT_LABEL_STEP;
+    }
     if (link.a_port) {
-      layer.appendChild(App.svgNode('text', {
-        class: 'mp-link-label', x: from.x + ux * inset + nx * aside, y: from.y + uy * inset + ny * aside,
-        'text-anchor': 'start',
-      }, link.a_port));
+      label(link.a_port, from.x + ux * inset + nx * aside, from.y + uy * inset + ny * aside, 'start');
     }
     if (link.b_port) {
-      layer.appendChild(App.svgNode('text', {
-        class: 'mp-link-label', x: to.x - ux * inset + nx * aside, y: to.y - uy * inset + ny * aside,
-        'text-anchor': 'end',
-      }, link.b_port));
+      label(link.b_port, to.x - ux * inset + nx * aside, to.y - uy * inset + ny * aside, 'end');
     }
+    return 0;
+  }
+
+  // How far past edgePoint()'s inscribed ellipse the node box itself reaches
+  // along the link: nothing on an axis-aligned link, up to NODE_H / 2 toward
+  // a corner. The label inset adds this so it clears the box at any angle.
+  function boxExit(ux, uy) {
+    const hw = NODE_W / 2, hh = NODE_H / 2;
+    const rect = Math.min(hw / Math.max(Math.abs(ux), 1e-6), hh / Math.max(Math.abs(uy), 1e-6));
+    return rect - 1 / Math.sqrt((ux / hw) ** 2 + (uy / hh) ** 2);
   }
 
   // The one stop a "strands" or "collapsed" link gets (see drawLink's own
@@ -1478,10 +1507,10 @@
   const labelMeasureCtx = document.createElement('canvas').getContext('2d');
   let labelFontCache = '';
   let subFontCache = '';
-  function fontFor(familyToken) {
+  function fontFor(familyToken, sizeToken = '--fs-2xs') {
     const root = getComputedStyle(document.documentElement);
     const remPx = parseFloat(root.fontSize) || 16;
-    const sizeRem = parseFloat(root.getPropertyValue('--fs-2xs')) || 0.6875;
+    const sizeRem = parseFloat(root.getPropertyValue(sizeToken)) || 0.6875;
     const family = root.getPropertyValue(familyToken).trim() || 'sans-serif';
     return `${sizeRem * remPx}px ${family}`;
   }
@@ -1493,6 +1522,13 @@
   function subFont() {
     if (!subFontCache) subFontCache = fontFor('--mono');
     return subFontCache;
+  }
+
+  // A note's font at one of the three TEXT_SIZES; cleared with labelFontCache.
+  const noteFontCache = new Map();
+  function noteFont(sizeIdx) {
+    if (!noteFontCache.has(sizeIdx)) noteFontCache.set(sizeIdx, fontFor('--ui', TEXT_SIZES[sizeIdx].fs));
+    return noteFontCache.get(sizeIdx);
   }
 
   function measureLabel(text, font) {
@@ -1735,10 +1771,10 @@
       el.setAttribute('x', r.x); el.setAttribute('y', r.y);
       el.setAttribute('width', r.width); el.setAttribute('height', r.height);
     }
-    const sizeIdx = frameTextSizeIndex(frame);
+    const sizeIdx = textSizeIndex(frame);
     label.setAttribute('x', r.x + 6);
-    label.setAttribute('y', r.y + FRAME_TEXT_SIZES[sizeIdx].dy);
-    for (let i = 0; i < FRAME_TEXT_SIZES.length; i += 1) {
+    label.setAttribute('y', r.y + TEXT_SIZES[sizeIdx].dy);
+    for (let i = 0; i < TEXT_SIZES.length; i += 1) {
       label.classList.toggle(`mp-frame-t${i}`, i === sizeIdx);
     }
     handle.setAttribute('x', r.x + r.width - FRAME_HANDLE);
@@ -1870,15 +1906,20 @@
       el.setAttribute('x', r.x); el.setAttribute('y', r.y);
       el.setAttribute('width', r.width); el.setAttribute('height', r.height);
     }
-    const font = labelFont();
+    const sizeIdx = textSizeIndex(note);
+    const font = noteFont(sizeIdx);
     const metrics = measureLabel('M', font);
     const lineHeight = metrics.ascent + metrics.descent + 2;
+    const padTop = Math.max(NOTE_PAD_TOP, metrics.ascent + 3);
     const innerWidth = Math.max(10, r.width - NOTE_PAD_X * 2);
-    const innerHeight = Math.max(lineHeight, r.height - NOTE_PAD_TOP - NOTE_PAD_X);
+    const innerHeight = Math.max(lineHeight, r.height - padTop - NOTE_PAD_X);
     const maxLines = Math.max(1, Math.floor(innerHeight / lineHeight));
     text.textContent = '';
     text.setAttribute('x', r.x + NOTE_PAD_X);
-    text.setAttribute('y', r.y + NOTE_PAD_TOP);
+    text.setAttribute('y', r.y + padTop);
+    for (let i = 0; i < TEXT_SIZES.length; i += 1) {
+      text.classList.toggle(`mp-note-t${i}`, i === sizeIdx);
+    }
     wrapNoteLines(note.text, innerWidth, maxLines, font).forEach((line, i) => {
       text.appendChild(App.svgNode('tspan', { x: r.x + NOTE_PAD_X, dy: i === 0 ? 0 : lineHeight }, line));
     });
@@ -2189,6 +2230,7 @@
     // Refreshed every draw so a theme switch's font change is picked up on the next redraw.
     labelFontCache = fontFor('--ui');
     subFontCache = fontFor('--mono');
+    noteFontCache.clear();
     const labelOffsets = placeLabels(view.nodes);
     for (const node of view.nodes) view.nodeEls.set(node.id, drawNode(nodeLayer, node, labelOffsets));
     for (const note of view.notes) view.noteEls.set(note.id, drawNote(noteLayer, note));
@@ -2430,6 +2472,19 @@
           }
         };
       }
+      for (const sizeBtn of detail.querySelectorAll('[data-note-textsize]')) {
+        sizeBtn.onclick = async () => {
+          const textSize = Number(sizeBtn.dataset.noteTextsize);
+          try {
+            await App.put(`/api/mapper/maps/${view.mapId}/notes/${note.id}`, { text_size: textSize });
+            note.text_size = textSize;
+            requestDraw();
+            drawDetail();
+          } catch (error) {
+            App.toast(`Could not change the note's text size: ${error.message}`, 'fail');
+          }
+        };
+      }
       const removeBtn = detail.querySelector('#mpn-remove');
       if (removeBtn) removeBtn.onclick = () => removeNote(note.id);
       return;
@@ -2657,26 +2712,29 @@
   // fixed palette index (mapperdb validates 0-5), not a VLAN's free-form
   // --canvas-vlan-N choice — --canvas-vlan-1..6 supplies the six hues so a
   // frame reads with the same canvas-tuned palette a VLAN strand does.
-  // The three sizes mapperdb validates 0-2. dy is the baseline: one fixed
-  // value would clip Large, --fs-xl being nearly twice --fs-2xs.
-  const FRAME_TEXT_SIZES = [
-    { label: 'S', dy: 15 },
-    { label: 'M', dy: 17 },
-    { label: 'L', dy: 22 },
+  // The three sizes mapperdb validates 0-2, shared by a frame's label and a
+  // note's text. dy is a frame label's baseline: one fixed value would clip
+  // Large. fs is the token app.css's mp-frame-t*/mp-note-t* rules use, so a
+  // note wraps against the same font it is drawn in.
+  const TEXT_SIZES = [
+    { label: 'S', dy: 15, fs: '--fs-2xs' },
+    { label: 'M', dy: 17, fs: '--fs-xs' },
+    { label: 'L', dy: 22, fs: '--fs-xl' },
   ];
 
-  function frameTextSizeIndex(frame) {
-    const n = Number(frame.text_size);
-    return Number.isInteger(n) && n >= 0 && n < FRAME_TEXT_SIZES.length ? n : 1;
+  function textSizeIndex(item) {
+    const n = Number(item.text_size);
+    return Number.isInteger(n) && n >= 0 && n < TEXT_SIZES.length ? n : 1;
   }
 
   // Same row, gate and shape as frameSwatchesHtml; letters, not colours.
-  function frameSizesHtml(frame, canWrite) {
-    const current = frameTextSizeIndex(frame);
-    return FRAME_TEXT_SIZES.map((size, i) =>
-      `<button class="mp-textsize${current === i ? ' selected' : ''}" data-frame-textsize="${i}" ` +
+  // `attr` is data-frame-textsize or data-note-textsize, whichever pane asks.
+  function textSizesHtml(item, attr, canWrite) {
+    const current = textSizeIndex(item);
+    return TEXT_SIZES.map((size, i) =>
+      `<button class="mp-textsize${current === i ? ' selected' : ''}" ${attr}="${i}" ` +
       `data-requires-write="mapper"${canWrite ? '' : ' disabled'} ` +
-      `aria-label="Label size ${escape(size.label)}">${escape(size.label)}</button>`).join('');
+      `aria-label="Text size ${escape(size.label)}">${escape(size.label)}</button>`).join('');
   }
 
   function frameSwatchesHtml(frame, canWrite) {
@@ -2698,7 +2756,7 @@
       '',
       `Colour      ${frameSwatchesHtml(frame, canWrite)}`,
       '',
-      `Text size   ${frameSizesHtml(frame, canWrite)}`,
+      `Text size   ${textSizesHtml(frame, 'data-frame-textsize', canWrite)}`,
       '',
       `Added       ${escape(App.ago(frame.added_ts))}`,
       '',
@@ -2727,6 +2785,8 @@
         `<button id="mpn-text-save" data-requires-write="mapper"${gate}>Save</button>`,
       '',
       `Colour      ${noteSwatchesHtml(note, canWrite)}`,
+      '',
+      `Text size   ${textSizesHtml(note, 'data-note-textsize', canWrite)}`,
       '',
     ];
     if (anchor) lines.push(`Anchored to ${escape(resolveNode(anchor).name)}`, '');
@@ -3790,6 +3850,7 @@
       try { localStorage.setItem('mapper.fiberView', view.fiberView ? '1' : '0'); } catch (error) { /* per-browser convenience only */ }
       applyFiberView();
       drawLegend();
+      requestDraw();
     };
     App.el('mp-snap').onchange = async (event) => {
       await App.post('/api/settings', { scope: 'mapper', values: { snap_to_grid: event.target.checked } });

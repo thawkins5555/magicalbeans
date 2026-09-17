@@ -113,6 +113,7 @@ CREATE TABLE IF NOT EXISTS map_notes (
     width      REAL NOT NULL,
     height     REAL NOT NULL,
     color      INTEGER NOT NULL DEFAULT 0,
+    text_size  INTEGER NOT NULL DEFAULT 1,
     added_ts   REAL NOT NULL,
     FOREIGN KEY (map_id) REFERENCES maps(id) ON DELETE CASCADE,
     FOREIGN KEY (node_id) REFERENCES map_nodes(id) ON DELETE SET NULL
@@ -280,6 +281,12 @@ def _validate_note_fields(fields: dict) -> None:
         if isinstance(color, bool) or not isinstance(color, int) \
                 or not (0 <= color <= FRAME_COLOR_MAX):
             raise ValueError(f"Note color must be an integer between 0 and {FRAME_COLOR_MAX}.")
+    if "text_size" in fields:
+        text_size = fields["text_size"]
+        if isinstance(text_size, bool) or not isinstance(text_size, int) \
+                or not (0 <= text_size <= FRAME_TEXT_SIZE_MAX):
+            raise ValueError(
+                f"Note text_size must be an integer between 0 and {FRAME_TEXT_SIZE_MAX}.")
 
 
 class MapperDatabase(SqliteStore):
@@ -289,6 +296,7 @@ class MapperDatabase(SqliteStore):
 
     def _migrate(self) -> None:
         self.ensure_columns("map_frames", {"text_size": "INTEGER NOT NULL DEFAULT 1"})
+        self.ensure_columns("map_notes", {"text_size": "INTEGER NOT NULL DEFAULT 1"})
 
     # ------------------------------------------------------------------ maps
 
@@ -596,10 +604,10 @@ class MapperDatabase(SqliteStore):
                 (map_id,)).fetchall()
 
     def add_note(self, map_id: int, x: float, y: float, width: float, height: float,
-                text: str = "", color: int = 0, node_id: int | None = None,
-                now: float | None = None) -> int:
+                text: str = "", color: int = 0, text_size: int = 1,
+                node_id: int | None = None, now: float | None = None) -> int:
         fields = {"x": x, "y": y, "width": width, "height": height,
-                  "text": text, "color": color}
+                  "text": text, "color": color, "text_size": text_size}
         _validate_note_fields(fields)
         now = time.time() if now is None else now
         with self._lock:
@@ -611,19 +619,19 @@ class MapperDatabase(SqliteStore):
                     raise ValueError("A note's anchor node must be on this map.")
             cur = self._conn.execute(
                 "INSERT INTO map_notes(map_id, node_id, text, x, y, width, height, color,"
-                " added_ts) VALUES (?,?,?,?,?,?,?,?,?)",
+                " text_size, added_ts) VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (map_id, node_id, fields["text"], fields["x"], fields["y"], fields["width"],
-                 fields["height"], fields["color"], now))
+                 fields["height"], fields["color"], fields["text_size"], now))
             self._touch_map(map_id, now)
             self._conn.commit()
             return int(cur.lastrowid)
 
     def update_note(self, map_id: int, note_id: int, **fields) -> bool:
-        """Any of text/x/y/width/height/color -- the anchor itself (node_id)
-        is set once, at creation, and never patched. Same not-found-is-False
-        shape as update_frame."""
+        """Any of text/x/y/width/height/color/text_size -- the anchor itself
+        (node_id) is set once, at creation, and never patched. Same
+        not-found-is-False shape as update_frame."""
         allowed = {k: v for k, v in fields.items()
-                  if k in ("text", "x", "y", "width", "height", "color")}
+                  if k in ("text", "x", "y", "width", "height", "color", "text_size")}
         _validate_note_fields(allowed)
         if not allowed:
             return False

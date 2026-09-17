@@ -348,6 +348,48 @@ try:
 finally:
     stub.kill()
 
+# ------------------------------ 6e. vmVlan: the only access-VLAN source
+# CISCO-VLAN-MEMBERSHIP-MIB vmVlan, for Catalysts that never answer
+# dot1qPvid at all. ifIndex 1's vmVlan (20) is a real, named VLAN and must
+# become its access membership; ifIndex 2's vmVlan (99) is named nowhere and
+# in no Q-BRIDGE bitmap, so it must get no membership at all; ifIndex 3 is
+# an ordinary trunk, untouched by vmVlan.
+stub, port = spawn_stub("stub_agent_vlan.py", "cisco_access")
+nodepoll_mod.DEFAULT_SNMP_PORT = port
+try:
+    db = new_db("cisco_access")
+    did = device_against(db, port, vendor="cisco", name="access-vmvlan-sw")
+    poller = NodePoller(db)
+    result = poller.read_device_vlans(did)
+    check("a Cisco switch answering only vmVlan for its access ports "
+         "returns a result", result is not None, result)
+    if result:
+        memberships = {(m["if_index"], m["vlan"]): m["tagged"]
+                       for m in result["memberships"]}
+        ports = {p["if_index"]: p for p in result["ports"]}
+        check("...ifIndex 1's vmVlan (20, a real named VLAN) becomes its "
+             "access membership, untagged",
+              memberships.get((1, 20)) is False, memberships)
+        check("...and is recorded as mode 'access' with native_vlan 20",
+              ports[1]["mode"] == "access" and ports[1]["native_vlan"] == 20,
+              ports)
+        check("...ifIndex 2's vmVlan (99, named nowhere, no Q-BRIDGE "
+             "bitmap) gets NO membership row at all",
+              (2, 99) not in memberships, memberships)
+        check("...ifIndex 3 (trunk) gets exactly the allow-list intersected "
+             "with the VLANs this device names: 20 and 30, both tagged -- "
+             "native VLAN 1 is not in the allow-list, so it gets no row",
+              {v for (i, v) in memberships if i == 3} == {20, 30}
+              and memberships.get((3, 20)) is True
+              and memberships.get((3, 30)) is True,
+              memberships)
+        check("...and is recorded as mode 'trunk' with native_vlan 1",
+              ports[3]["mode"] == "trunk" and ports[3]["native_vlan"] == 1,
+              ports)
+    db.close()
+finally:
+    stub.kill()
+
 # --------------------------------------------------- 7. neither table -> None
 stub, port = spawn_stub("stub_agent_vlan.py", "no_vlan")
 nodepoll_mod.DEFAULT_SNMP_PORT = port

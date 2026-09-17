@@ -4295,9 +4295,9 @@ check("MAX_CANVAS_SIDE = 16384" in _EXPORT88K and "MAX_CANVAS_AREA = 268000000" 
 check("font-size: var(--fs-xs);" in APP_CSS[APP_CSS.index(".mp-frame-label {"):
                                              APP_CSS.index(".mp-frame-handle")],
       "the frame label's font-size moved up a step")
-check("label.setAttribute('y', r.y + FRAME_TEXT_SIZES[sizeIdx].dy);" in MAPPER,
+check("label.setAttribute('y', r.y + TEXT_SIZES[sizeIdx].dy);" in MAPPER,
       "updateFrameElement takes the label baseline from the frame's own size")
-check("{ label: 'M', dy: 17 }" in MAPPER,
+check("{ label: 'M', dy: 17, fs: '--fs-xs' }" in MAPPER,
       "Medium still sits at the baseline the fixed one used to, so a frame "
       "drawn before there was a setting is unmoved")
 
@@ -4512,9 +4512,9 @@ check("const PORT_LABEL_STEP = 16;" in MAPPER96,
       "the per-cable label step is named once")
 check("return { fan, index };" in MAPPER96,
       "fanOffsets reports each link's place in its fan, not just the offset")
-check("const inset = PORT_LABEL_INSET + step, aside = 8;" in MAPPER96,
-      "drawPortLabels offsets by that place")
-check("Math.max(len / 2 - PORT_LABEL_INSET, 0));" in MAPPER96,
+check("const inset = clear + step, aside = Math.max(8, bundleHalf + 5);" in MAPPER96,
+      "drawPortLabels offsets by that place, and sits clear of the strand bundle")
+check("Math.max(len / 2 - clear, 0));" in MAPPER96,
       "clamped at the midpoint, so a short link's two ends cannot swap sides")
 
 # 96f. The toolbar Remove button serves whatever is selected. A frame never
@@ -4526,9 +4526,9 @@ check("if (view.selectedFrameId) { removeFrame(view.selectedFrameId); return; }"
 
 # 96g. Frame label text size: three presets beside the colour swatches,
 #      Medium unchanged from before the setting existed.
-check("data-frame-textsize=" in MAPPER96 and "class=\"mp-textsize" in MAPPER96,
+check("'data-frame-textsize'" in MAPPER96 and "class=\"mp-textsize" in MAPPER96,
       "the size row renders beside the swatches")
-check("`Text size   ${frameSizesHtml(frame, canWrite)}`," in MAPPER96,
+check("`Text size   ${textSizesHtml(frame, 'data-frame-textsize', canWrite)}`," in MAPPER96,
       "it sits in the frame pane next to Label and Colour")
 check("{ text_size: textSize }" in MAPPER96,
       "picking one PUTs text_size on the frame")
@@ -4543,6 +4543,63 @@ check("MAC_TABLE_CAP = 5" in NODES96,
       "the MAC table caps at five rows")
 check('nd-mac-show-all">+${hidden} more</button>' in NODES96,
       "the rest sit behind a control naming how many are hidden")
+
+# ---------------------------------------------------------------------------
+# 97. 5.40.0: notes take the frame's three text sizes; the FiberView toggle
+#     redraws; port labels measure the node box instead of assuming a corner.
+MAPPER97 = read("mapper.js")
+CSS97 = read("app.css")
+
+# 97a. One size table for frames and notes, each entry naming the font token
+#      the note is wrapped against, so measured lines match drawn ones.
+check("const TEXT_SIZES = [" in MAPPER97 and "{ label: 'L', dy: 22, fs: '--fs-xl' }" in MAPPER97,
+      "the shared table carries a font token per size")
+check("function textSizesHtml(item, attr, canWrite)" in MAPPER97,
+      "one row builder serves both panes, told which data attribute to write")
+check("`Text size   ${textSizesHtml(note, 'data-note-textsize', canWrite)}`," in MAPPER97,
+      "the note pane gets the row after Colour")
+check("await App.put(`/api/mapper/maps/${view.mapId}/notes/${note.id}`, { text_size: textSize });"
+      in MAPPER97,
+      "picking one PUTs text_size on the note")
+_NOTE97 = MAPPER97[MAPPER97.index("  function updateNoteElement(g, note)"):
+                   MAPPER97.index("  function drawNote(layer, note)")]
+check("const font = noteFont(sizeIdx);" in _NOTE97,
+      "the note wraps with its own size's font, not the node-label font")
+check("const padTop = Math.max(NOTE_PAD_TOP, metrics.ascent + 3);" in _NOTE97,
+      "the first baseline drops with the font so Large is not clipped at the top")
+check("text.classList.toggle(`mp-note-t${i}`, i === sizeIdx);" in _NOTE97,
+      "the size lands as a class the CSS keys off")
+check("noteFontCache.clear();" in MAPPER97,
+      "the per-size font cache is dropped with labelFontCache every draw")
+check(".mp-note-text.mp-note-t0 { font-size: var(--fs-2xs); }" in CSS97
+      and ".mp-note-text.mp-note-t2 { font-size: var(--fs-xl); }" in CSS97,
+      "Small and Large are their own rules; Medium is .mp-note-text's base font-size")
+check("font-size: var(--fs-xs);" in CSS97[CSS97.index(".mp-note-text {"):CSS97.index(".mp-note-tail")],
+      "...and that base is the frame's Medium")
+
+# 97b. FiberView: drawLink decides at draw time which element carries a
+#      blocked link's dots, so flipping the view must draw again.
+_FIBER97 = MAPPER97[MAPPER97.index("App.el('mp-fiberview').onchange"):MAPPER97.index("App.el('mp-snap').onchange")]
+check("applyFiberView();" in _FIBER97 and "requestDraw();" in _FIBER97
+      and _FIBER97.index("applyFiberView();") < _FIBER97.index("requestDraw();"),
+      "the FiberView toggle redraws after flipping the attribute")
+
+# 97c. Port labels: the inset is measured from the node box along the link,
+#      so an axis-aligned link keeps its labels near the box and a stacked
+#      pair's stagger has room; steep links read away from their line.
+check("const PORT_LABEL_INSET = 18;" in MAPPER97,
+      "the inset is a margin, not a corner allowance")
+check("function boxExit(ux, uy)" in MAPPER97
+      and "const clear = boxExit(ux, uy) + PORT_LABEL_INSET;" in MAPPER97,
+      "drawPortLabels adds the box's own reach along the link")
+check("const steep = Math.abs(uy) > Math.abs(ux);" in MAPPER97
+      and "const anchor = fanSide > 0 ? 'start' : 'end';" in MAPPER97,
+      "a steep link anchors both labels away from the fan's outward side")
+check("return inset + PORT_LABEL_STEP;" in MAPPER97
+      and "step = Math.min(step, Math.max(edgeLen - 2 * reserve, 0) / ((n - 1) * edgeLen));" in MAPPER97,
+      "and hands the strands branch the span its labels took, so VLAN numbers stay off them")
+check("Math.sign(fanOffset * nx) || 1);" in MAPPER97,
+      "the outward side comes from the cable's fan offset in screen x")
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))
