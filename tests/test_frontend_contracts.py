@@ -3574,8 +3574,9 @@ for _id in ("wl-hist-days", "wl-hist-sample-s"):
 check("history_days: Number(m.querySelector('#wl-hist-days').value)," in WIRELESS77
       and "history_sample_s: Number(m.querySelector('#wl-hist-sample-s').value)," in WIRELESS77,
       "Save posts both fields to the wireless settings scope")
-check('"wireless": {"history_days": (1, 3650), "history_sample_s": (60, 86400)},' in
-      open(os.path.join(REPO_ROOT, "netpath", "web", "api.py"), encoding="utf-8").read(),
+_API77 = open(os.path.join(REPO_ROOT, "netpath", "web", "api.py"), encoding="utf-8").read()
+check('"wireless": {"history_days": (1, 3650), "history_sample_s": (60, 86400),' in _API77
+      and '"ap_web_port": (1, 65535)},' in _API77,
       "api.py's _SCOPE_SETTINGS_RANGES carries the wireless override, so "
       "POST /api/settings refuses history_days <= 0 and history_sample_s "
       "below 60 the same way every other range-checked setting is refused")
