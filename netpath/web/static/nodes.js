@@ -3077,10 +3077,9 @@
     // The stored forwarding table renders immediately (no SNMP wait); the
     // live read below then replaces it, or — on a failed/unsupported live
     // read — leaves the stored table up with a one-line hint appended.
-    // Rows beyond MAC_TABLE_CAP sit behind a "+N more" button, same idea as
-    // mapper.js's VLAN_DETAIL_CAP; macExpanded lives in this dialog's own
-    // closure so it resets each time the dialog opens, and survives the
-    // stored->live swap because both renders read the same flag.
+    // Rows past MAC_TABLE_CAP sit behind "+N more", as mapper.js caps VLANs.
+    // macExpanded is per dialog, and every render path reads it, so an
+    // expanded list survives the stored->live swap.
     const MAC_TABLE_CAP = 5;
     let macExpanded = false;
     function macTableHtml(r, { asOf, hint } = {}) {

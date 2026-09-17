@@ -1880,14 +1880,11 @@ body.kiosk .card.strip > .hint { overflow: visible; white-space: normal; }
    distinct from .unknown's own dash -- comes after .unknown so a link that
    is both wins the dotted read. */
 .mp-link.blocking { stroke-dasharray: 2 6; }
-/* Under FiberView the glow's blur bleeds across .blocking's own dash gaps on
-   the glowing path and smears the dots into a solid line, so drawLink hands
-   the dots to this second path above it instead: no .fiber, so no filter, and
-   red rather than the glow's orange because that is the colour the link
-   detail pane gives a blocked VLAN. */
-.mp-link.mp-blocking-over { stroke: var(--fail); }
-/* The strand bundle's click target: invisible, far wider than the ~1.5px
-   strands, and under them so each still answers for its own VLAN on hover. */
+/* Carries a blocked link's dots above the fiber glow: no .fiber, so no
+   filter, and butt caps, or .mp-link's round ones lengthen each 2px dash by
+   the stroke width and close the gaps this exists to keep open. */
+.mp-link.mp-blocking-over { stroke: var(--fail); stroke-linecap: butt; }
+/* The strand bundle's click target: invisible, and under the strands so each still answers for its own VLAN. */
 .mp-link-hit { fill: none; cursor: pointer; }
 .mp-link.manual { stroke: var(--canvas-muted); stroke-dasharray: 6 4; }   /* operator-drawn, not discovered */
 /* A VLAN picked in the table dims every strand that is not it rather than
@@ -1935,9 +1932,8 @@ body.kiosk .card.strip > .hint { overflow: visible; white-space: normal; }
 #mp-canvas[data-fiberview="1"] .mp-link.fiber.fiber-mismatch.selected {
   filter: brightness(1.35) drop-shadow(0 0 3px var(--fail)) drop-shadow(0 0 8px var(--fail));
 }
-/* The link detail pane's VLAN list. Only painted on a link that reports STP
-   blocking -- there is nothing to contrast against otherwise -- and never
-   colour alone: linkDetailHtml writes "(STP blocked)" beside the red ones. */
+/* The link detail pane's VLAN list, painted only where a link reports STP
+   blocking. Never colour alone: linkDetailHtml writes "(STP blocked)" too. */
 .mp-vlan-pass { color: var(--ok); }
 .mp-vlan-blocked { color: var(--fail); }
 .mp-link-label { fill: var(--canvas-muted); font-family: var(--mono); font-size: var(--fs-2xs);
@@ -1991,8 +1987,7 @@ body.kiosk .card.strip > .hint { overflow: visible; white-space: normal; }
   cursor: pointer;
 }
 .mp-swatch.selected { outline: 2px solid var(--focus); outline-offset: 1px; }
-/* The frame label's size row: a swatch's box, carrying a letter instead of
-   a colour. */
+/* The frame label's size row: a swatch's box, carrying a letter. */
 .mp-textsize {
   min-width: 18px;
   height: 18px;
@@ -2041,8 +2036,7 @@ body.kiosk .card.strip > .hint { overflow: visible; white-space: normal; }
   stroke-width: 3px;
   stroke-linejoin: round;
 }
-/* Small and Large only: Medium is .mp-frame-label's own font-size above, so
-   every frame drawn before there was a setting keeps exactly its size. */
+/* Small and Large only: Medium is .mp-frame-label's own font-size above. */
 .mp-frame-label.mp-frame-t0 { font-size: var(--fs-2xs); }
 .mp-frame-label.mp-frame-t2 { font-size: var(--fs-xl); }
 .mp-frame-handle { fill: var(--mp-frame-color); opacity: 0.8; cursor: nwse-resize; }

@@ -544,6 +544,8 @@ try:
           frame is not None and frame["x"] == 10 and frame["y"] == 20
           and frame["width"] == 300 and frame["height"] == 200
           and frame["label"] == "Core Rack" and frame["color"] == 2, frame)
+    check("...including text_size, defaulted to 1 (Medium)",
+          frame is not None and frame["text_size"] == 1, frame)
 
     status, payload = call("PUT", f"/api/mapper/maps/{map_id}/frames/{frame_id}",
                            {"x": 50, "y": 60}, token=admin)
@@ -554,6 +556,17 @@ try:
     check("...and the move landed, label untouched",
           moved is not None and moved["x"] == 50 and moved["y"] == 60
           and moved["label"] == "Core Rack", moved)
+
+    audit_mark = service.app_db.audit_last_id()
+    status, payload = call("PUT", f"/api/mapper/maps/{map_id}/frames/{frame_id}",
+                           {"text_size": 2}, token=admin)
+    check("PUT text_size is accepted", status == 200 and payload["ok"], (status, payload))
+    status, payload = call("GET", f"/api/mapper/maps/{map_id}", token=admin)
+    resized = next((f for f in payload["frames"] if f["id"] == frame_id), None)
+    check("...and it persists", resized is not None and resized["text_size"] == 2, resized)
+    audit_actions = [r["action"] for r in service.app_db.audit_events(audit_mark, 500)]
+    check("...and writes a mapper.frame.update audit row",
+          audit_actions.count("mapper.frame.update") == 1, audit_actions)
 
     status, payload = call("PUT", f"/api/mapper/maps/{map_id}/frames/{frame_id}",
                            {}, token=admin)

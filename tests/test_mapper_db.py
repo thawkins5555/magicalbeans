@@ -2,11 +2,13 @@
 device or peer per map enforced by two partial unique indexes), the global
 vlan_colors override table, and settings coercion/validation.
 """
+import sqlite3
 import time
 
 from _paths import tmpdir
 
-from netpath.mapperdb import DEFAULTS, FRAME_COLOR_MAX, MAP_STYLES, MapperDatabase, ROLES
+from netpath.mapperdb import (DEFAULTS, FRAME_COLOR_MAX, FRAME_TEXT_SIZE_MAX, MAP_STYLES,
+                              MapperDatabase, ROLES)
 
 TMPDIR = tmpdir("mapperdb_")
 
@@ -240,6 +242,13 @@ blank_id = db.add_frame(map_id, x=0, y=0, width=40, height=40)
 check("label/color default to '' and 0",
       next(r for r in db.frames(map_id) if r["id"] == blank_id)["label"] == "" and
       next(r for r in db.frames(map_id) if r["id"] == blank_id)["color"] == 0)
+check("add_frame with no text_size argument defaults to 1 (Medium)",
+      next(r for r in db.frames(map_id) if r["id"] == blank_id)["text_size"] == 1)
+
+for size in (0, 1, 2):
+    size_id = db.add_frame(map_id, x=0, y=0, width=100, height=100, text_size=size)
+    check(f"add_frame stores text_size {size} and reads it back",
+          next(r for r in db.frames(map_id) if r["id"] == size_id)["text_size"] == size)
 
 for kwargs, why in (
     ({"x": 0, "y": 0, "width": 39.9, "height": 100}, "width under 40"),
@@ -257,6 +266,11 @@ for kwargs, why in (
     ({"x": 0, "y": 0, "color": 2.0, "width": 100, "height": 100}, "float color"),
     ({"x": 0, "y": 0, "color": "2", "width": 100, "height": 100}, "string color"),
     ({"x": 0, "y": 0, "label": 123, "width": 100, "height": 100}, "non-string label"),
+    ({"x": 0, "y": 0, "text_size": FRAME_TEXT_SIZE_MAX + 1, "width": 100, "height": 100},
+     "text_size out of range"),
+    ({"x": 0, "y": 0, "text_size": -1, "width": 100, "height": 100}, "negative text_size"),
+    ({"x": 0, "y": 0, "text_size": True, "width": 100, "height": 100}, "boolean text_size"),
+    ({"x": 0, "y": 0, "text_size": 1.0, "width": 100, "height": 100}, "float text_size"),
 ):
     try:
         db.add_frame(map_id, **kwargs)
@@ -304,6 +318,21 @@ try:
     check("update_frame validates like add_frame (width under 40 raises)", False)
 except ValueError:
     check("update_frame validates like add_frame (width under 40 raises)", True)
+
+for bad_size, why in ((3, "out-of-range (3)"), (-1, "out-of-range (-1)"),
+                      (True, "a boolean"), (1.0, "a float")):
+    try:
+        db.update_frame(map_id, frame_id, text_size=bad_size)
+        check(f"update_frame rejects text_size {why}", False)
+    except ValueError as exc:
+        check(f"update_frame rejects text_size {why}", True)
+        check(f"...with a readable message ({why})", len(str(exc)) > 0, str(exc))
+
+for size in (0, 2, 1):
+    check(f"update_frame(text_size={size}) lands",
+          db.update_frame(map_id, frame_id, text_size=size) is True)
+    check(f"...and reads back as {size}",
+          next(r for r in db.frames(map_id) if r["id"] == frame_id)["text_size"] == size)
 
 check("delete_frame returns False for an id that is not there",
       db.delete_frame(map_id, 999999) is False)
@@ -367,6 +396,59 @@ check("...and keeps map_nodes", len(reopened.nodes(map_id)) == 1)
 check("...and keeps vlan_colors", reopened.vlan_colors() == {99: 1})
 check("...and keeps settings", reopened.settings()["grid_size"] == 40)
 reopened.close()
+
+# ---------------------------------------------------- text_size install path
+#
+# A pre-6.x map_frames table, built by hand without the text_size column,
+# to prove MapperDatabase's ensure_columns migration installs it cleanly
+# on top of an existing field, not just a brand-new file.
+
+old_path = f"{TMPDIR}/pretextsize.db"
+raw = sqlite3.connect(old_path)
+raw.execute("""
+    CREATE TABLE maps (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        name       TEXT NOT NULL,
+        notes      TEXT NOT NULL DEFAULT '',
+        created_ts REAL NOT NULL,
+        updated_ts REAL NOT NULL,
+        UNIQUE (name COLLATE NOCASE)
+    )
+""")
+raw.execute("""
+    CREATE TABLE map_frames (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        map_id     INTEGER NOT NULL,
+        label      TEXT NOT NULL DEFAULT '',
+        x          REAL NOT NULL,
+        y          REAL NOT NULL,
+        width      REAL NOT NULL,
+        height     REAL NOT NULL,
+        color      INTEGER NOT NULL DEFAULT 0,
+        added_ts   REAL NOT NULL,
+        FOREIGN KEY (map_id) REFERENCES maps(id) ON DELETE CASCADE
+    )
+""")
+raw.execute("INSERT INTO maps(id, name, notes, created_ts, updated_ts)"
+           " VALUES (1, 'Old Map', '', 0, 0)")
+raw.execute("INSERT INTO map_frames(id, map_id, label, x, y, width, height, color, added_ts)"
+           " VALUES (1, 1, 'Pre-existing Rack', 5, 5, 100, 100, 0, 0)")
+raw.commit()
+raw.close()
+
+upgraded = MapperDatabase(old_path)
+with upgraded._lock:
+    cols = {row["name"] for row in
+           upgraded._conn.execute("PRAGMA table_info(map_frames)").fetchall()}
+check("opening a pre-text_size database adds the column", "text_size" in cols, cols)
+pre_existing = next(r for r in upgraded.frames(1) if r["id"] == 1)
+check("...and the pre-existing frame row reads text_size == 1 (the default)",
+      pre_existing["text_size"] == 1, dict(pre_existing))
+check("update_frame(text_size=2) lands on the migrated row",
+      upgraded.update_frame(1, 1, text_size=2) is True)
+check("...and reads back as 2",
+      next(r for r in upgraded.frames(1) if r["id"] == 1)["text_size"] == 2)
+upgraded.close()
 
 print()
 print("FAILURES:", FAILS if FAILS else "none")

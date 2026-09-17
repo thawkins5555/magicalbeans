@@ -8895,11 +8895,9 @@ class NodePoller(Worker):
                 elif native is not None and native in existing_vlans:
                     memberships[(if_index, native)] = False
 
-        # An access port's dot1qPvid names its native VLAN even when the
-        # Q-BRIDGE egress/untagged bitmaps above never cover that port (Cisco
-        # gear frequently answers those bitmaps empty) -- same fallback as
-        # the Cisco TRUNK branch's native-VLAN case just above, generalised
-        # to every vendor since this is a plain Q-BRIDGE-MIB gap.
+        # An access port's dot1qPvid names its VLAN even where the Q-BRIDGE
+        # bitmaps never cover it -- the trunk branch above already falls back
+        # this way; the gap is Q-BRIDGE's, so this is not Cisco-only.
         existing_vlans = set(vlan_names) | set(egress_ports) | set(untagged_ports)
         ports_with_membership = {if_index for if_index, _ in memberships}
         for if_index, native in port_native.items():

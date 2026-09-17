@@ -4464,12 +4464,17 @@ check("FiberView: dark orange = multimode" in _LEGEND96
 check("const overlaidBlocking = link.blocking && link.fiber === true && view.fiberView;"
       in MAPPER96,
       "drawLink knows when the glow is carrying an overlay instead of dots")
-check("class: 'mp-link blocking mp-blocking-over', 'stroke-width': width," in MAPPER96,
+check("class: 'mp-link blocking mp-blocking-over', 'stroke-width': plan.width," in MAPPER96,
       "the overlay is a .blocking path with no .fiber, so no glow filter")
 check("if (link.blocking && !overlaidBlocking) path.classList.add('blocking');" in MAPPER96,
       "the plain/collapsed link stops dashing its own glow where the overlay draws")
-check(".mp-link.mp-blocking-over { stroke: var(--fail); }" in CSS96,
-      "the overlay is red -- the same colour a blocked VLAN gets in the pane")
+check(".mp-link.mp-blocking-over { stroke: var(--fail); stroke-linecap: butt; }" in CSS96,
+      "red, and butt-capped -- .mp-link's round caps lengthen each 2px dash by "
+      "the stroke width, which is what closed the gaps in the first place")
+check("mp-blocking-over" not in
+      MAPPER96[MAPPER96.index("if (plan.mode === 'strands'"):MAPPER96.index("const neutral =")],
+      "the strands ribbon gets NO overlay: its strands are thin and already "
+      "dotted, and a bundle-width dashed stroke would paint a solid bar")
 
 # 96c. One wide invisible hit target under the strands, not a fatter strand:
 #      each strand must still answer for its own VLAN on hover.
@@ -4481,6 +4486,9 @@ check("hit.setAttribute('aria-hidden', 'true');" in MAPPER96,
       "it adds no second Tab stop or screen-reader name for the same link")
 check(MAPPER96.index("class: 'mp-link-hit'") < MAPPER96.index("plan.strands.forEach"),
       "it is appended BEFORE the strands, so a strand still wins its own tooltip")
+check("event.target.closest('.mp-link, .mp-link-hit')" in MAPPER96,
+      "the canvas press handler exempts the hit path too -- without it a press "
+      "there starts a rubber band and clears the selection instead of selecting")
 
 # 96d. The one VLAN list carries the blocking as colour; the footer keeps the
 #      switch and port and drops the ids it used to repeat.
@@ -4533,8 +4541,8 @@ check(".mp-frame-label.mp-frame-t0 { font-size: var(--fs-2xs); }" in CSS96
 NODES96 = read("nodes.js")
 check("MAC_TABLE_CAP = 5" in NODES96,
       "the MAC table caps at five rows")
-check("more" in NODES96 and "nd-mac-show-all" in NODES96,
-      "the rest sit behind a +N more control")
+check('nd-mac-show-all">+${hidden} more</button>' in NODES96,
+      "the rest sit behind a control naming how many are hidden")
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))
