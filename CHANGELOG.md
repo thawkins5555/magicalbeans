@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.42.0 — Mapper placeholder blocks, and a shorter blocked-VLAN row](#5420--mapper-placeholder-blocks-and-a-shorter-blocked-vlan-row)
 - [5.41.0 — Link detail pane's blocked VLANs now name which switch is doing the blocking](#5410--link-detail-panes-blocked-vlans-now-name-which-switch-is-doing-the-blocking)
 - [5.40.0 — Notes get text size, FiberView's dots redraw, Cisco access VLANs via vmVlan, and parallel-link labels cleared](#5400--notes-get-text-size-fiberviews-dots-redraw-cisco-access-vlans-via-vmvlan-and-parallel-link-labels-cleared)
 - [5.39.0 — Access-port VLANs restored on Mapper, and seven more Mapper/Device-details fixes](#5390--access-port-vlans-restored-on-mapper-and-seven-more-mapperdevice-details-fixes)
@@ -174,6 +175,54 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.42.0 — Mapper placeholder blocks, and a shorter blocked-VLAN row
+
+Two items.
+
+**Mapper can now place a box that is not a device.** A new **Placeholder**
+button on the toolbar opens a one-field dialog — a name — and drops a
+logical box onto the map: "Internet", "Carrier MPLS", "Site B", a patch
+panel, anything worth showing on the diagram that will never answer SNMP.
+It stores as an ordinary `map_nodes` row with `device_id` NULL, the same
+shape an unmanaged peer already uses, but with a synthetic `peer_key`
+(`placeholder:<16 hex>`, `mapper.PLACEHOLDER_PREFIX`) instead of a
+discovered chassis/sysName/row identity, so no schema change was needed —
+the existing per-map uniqueness indexes, the Connect dialog's peer_key
+lookup, and Remove's cascade onto its links all apply exactly as they do
+to any other node. A placeholder draws with its own dashed, muted border
+and a small "placeholder" sub-line, carries no status glyph and does not
+open the Nodes dialog on a double-click (there is nothing in Nodes to
+open); its detail pane offers a rename, a role override, and Remove from
+map, the same as a device's does minus the parts that assume one. The CSV
+export now names any unmanaged peer or placeholder by its current label
+rather than its raw key — `link_csv_rows` took an optional `peer_name`
+callable for this, so a renamed unmanaged peer's export also reads its
+name for the first time. A placeholder is never discovered, never polled,
+and never appears as an Add-neighbours candidate or a forget/reassign
+target — it simply is not a device. Files: `netpath/mapper.py`,
+`netpath/mapperdb.py`, `netpath/web/api.py`,
+`netpath/web/static/mapper.js`, `netpath/web/static/app.css`,
+`netpath/web/static/index.html`.
+
+**The link detail pane's blocked-VLAN row dropped the words "STP blocked
+on".** 5.41.0 added the blocking switch's name to the row but kept the
+old "(STP blocked on `<switch>`)" wording around it, which was long
+enough on a busy trunk to wrap the row onto a second line. The row now
+reads `<vlan> <name> (<switch>)` — still red, still the switch's name, just
+without the six words the red colour and the VLAN list heading already
+said for it. File: `netpath/web/static/mapper.js`.
+
+Tests: `tests/test_mapper_db.py` and `tests/test_mapper_api.py` cover
+`add_placeholder` (blank/whitespace label rejected, two placeholders with
+the same label getting distinct rows, remove-node cascading its manual
+link), the map payload's `placeholder: true`/`false` on every node, the
+CSV export naming a placeholder by label, and rename/move through the
+existing bulk-update route. `tests/test_frontend_contracts.py` section 99
+pins the button, the toolbar gate, the detail-pane copy, and the
+placeholder branch in `resolveNode`/`drawNode`; section 96d's pinned
+string is updated for the shorter row. `tests/ui/walk.mjs` gained a step
+that adds a placeholder, connects it to a device, and removes it.
 
 ### 5.41.0 — Link detail pane's blocked VLANs now name which switch is doing the blocking
 

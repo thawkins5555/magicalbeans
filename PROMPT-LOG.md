@@ -1670,3 +1670,42 @@ labelled as such. Testing: the full suite on the release commit passed 159 of 16
 → Stephen_King. `CHANGELOG.md`, `FEATURES.md`, `INTERNALS.md`,
 `NETWORK-AND-STORAGE-REQUIREMENTS.md` written for 5.23.0; no code
 touched.
+
+## 5.42.0 — Placeholder blocks on Mapper, and a shorter STP-blocked row
+
+**Operator prompt, two asks:**
+- Add a "placeholder" block type to Mapper — a named box on the diagram
+  that is not a real device (things like "Internet" or a patch panel),
+  so a map can show the whole picture without every box needing SNMP
+  behind it.
+- Drop the "STP Blocked on" wording from the link detail pane's blocked
+  VLAN rows added in 5.41.0 — just the switch name in red is enough.
+
+Dora explored `mapper.py`/`mapperdb.py`/`web/api.py`/`mapper.js` first
+to confirm a placeholder could reuse `map_nodes`' existing device_id-NULL
+shape without a schema change, and where the unmanaged-peer code paths
+would need a branch instead of a rewrite. Thing1 built the server side:
+`mapperdb.add_placeholder`, the `mapper.PLACEHOLDER_PREFIX`/
+`is_placeholder` identity scheme, the API's placeholder branch in
+`get_mapper_map`/`post_mapper_map_nodes`, and the CSV export's
+`peer_name` lookup. Thing2 built the browser side: the Placeholder
+toolbar button and its one-field dialog, the dashed/muted draw style,
+the detail-pane branch (rename, role, Remove — no status or "Open in
+Nodes"), and the shortened STP-blocked row text. Testy ran the mapper
+test suites and the browser walk's new placeholder step. Javariius
+reviewed the whole diff before the push to main.
+
+**Outcome.** A placeholder is now its own `map_nodes` row — device_id
+NULL, a synthetic `placeholder:<hex>` peer_key that can never collide
+with a discovered peer's identity — so the existing per-map uniqueness
+indexes, the Connect dialog's peer lookup, and Remove's link cascade all
+apply unchanged. It draws dashed and muted with no status glyph, never
+opens the Nodes dialog, is never discovered or polled, and never shows up
+as an Add-neighbours candidate. The CSV export now names a placeholder
+(and, as a side effect, a renamed unmanaged peer) by its current label
+instead of its raw key. Separately, the link detail pane's blocked-VLAN
+row dropped the words "STP blocked on" — the row now just reads
+`<vlan> <name> (<switch>)` in red, which also fixes the row wrapping
+onto a second line that the longer wording caused on a busy trunk.
+
+Testing and review: see CHANGELOG 5.42.0.

@@ -6761,6 +6761,15 @@ as the rest of the pane. The footer line, the hover tooltip, the
 screen-reader label and the CSV export all already named the end and
 are unchanged.
 
+**From 5.42.0, that appended text drops to just `` (<switch>)``.** The
+full "(STP blocked on `<switch>`)" wording was long enough that it
+routinely wrapped a row onto a second line on a trunk with named VLANs;
+the red colour and the "VLANs" heading above the list already say what
+is blocking, so the row only needs to say who. `linkDetailHtml`'s
+template literal changed from `` (STP blocked on ${where})`` to
+`` (${where})``; `where` itself, and everything upstream of it, is
+unchanged.
+
 **Parallel cables now stagger their port labels; `fanOffsets()` reports
 each link's place in its fan for exactly that.** `fanOffsets()` (5.36.0)
 already returns a `Map<link id, px offset>` for the whole group; it now
@@ -7016,6 +7025,95 @@ default, range validation, persistence, the `mapper.note.update` audit
 row, and a hand-built pre-5.40 `map_notes` table proving the migration
 installs the column on an existing note the same way it does on an
 existing frame.
+
+### Placeholder blocks: a fourth `map_nodes` identity, with no schema change — 5.42.0
+
+A placeholder is an operator-created logical box — "Internet", a patch
+panel, anything worth drawing that is not, and never will be, a polled
+device. It needed a place in `map_nodes` alongside a real device and an
+unmanaged peer, and got one without touching the schema: `device_id`
+NULL, exactly like an unmanaged peer, but `peer_key` set to
+`mapper.PLACEHOLDER_PREFIX + secrets.token_hex(8)`
+(`"placeholder:<16 hex>"`) rather than one of `peer_identity`'s own
+`chassis:`/`sysname:`/`row:` prefixes. `mapper.is_placeholder(peer_key)`
+is the one predicate every consumer checks; because the prefix is
+disjoint from every prefix `peer_identity` hands out, a placeholder's key
+can never collide with a discovered peer's, and no third `map_nodes`
+column or third partial index was needed — `ux_map_nodes_peer`
+(`WHERE peer_key <> ''`) already covers this row the same way it covers
+an unmanaged peer's.
+
+**`mapperdb.add_placeholder(map_id, label=...)`** is the write path: it
+strips and requires a non-blank label (`ValueError` otherwise, the same
+shape `add_node`'s own validation takes), mints a fresh random peer_key,
+and inserts with `role=""` (mapperdb's own "unset" sentinel) — deliberately
+a plain `INSERT`, not a call into `add_node`, because `add_node` raises
+unless exactly one of `device_id`/`peer_key` is set by the *caller*, and a
+placeholder's peer_key is generated here, not supplied. `secrets.token_hex`
+rather than a sequence or a hash of the label means two placeholders
+named the same thing on the same map are still two distinct rows with
+two distinct keys — nothing about the identity scheme assumes labels are
+unique, only that keys are.
+
+**`api.post_mapper_map_nodes`** branches on a `"placeholder": true` field
+in the POST body before it reaches the existing device_id/peer_key
+handling — a placeholder request ignores both of those fields entirely
+and calls `add_placeholder` instead, so a bad placeholder body (a blank
+label) is the same 400-from-the-database-layer shape the existing
+device/peer paths already use, rather than a second validation branch
+that could disagree with it.
+
+**`api.get_mapper_map`** checks `mapper.is_placeholder(row["peer_key"])`
+before it falls into the unmanaged-peer branch, and short-circuits: no
+`peers_by_key` lookup, no `_mapper_node_name`, no status/ip/badges —
+`name` and `resolved_name` are just the row's own `label`, since a
+placeholder has no discovered identity to reconcile a rename against the
+way an unmanaged peer's `renamed_from` logic does. Every node in the
+payload now carries `"placeholder": true` or `"placeholder": false`
+(added to all four branches — device, unmanaged peer, missing device, and
+placeholder itself) so the client never has to infer it from the absence
+of other fields.
+
+**CSV export**: `mapper.link_csv_rows` took a third, optional `peer_name`
+callable (default: the identity function, i.e. the raw peer_key, so every
+existing caller is unaffected) — `api.get_mapper_map_export` now builds
+one from the same payload `get_mapper_map` already produced and passes
+it in, so a placeholder's row names it by its current label rather than
+its `placeholder:<hex>` key. Because the lookup keys on `peer_key`
+regardless of what produced the row, a renamed *unmanaged* peer's export
+picked up the same fix incidentally — it used to export the peer's raw
+key even after an operator renamed it on the map.
+
+**Everything that walks devices to discover or poll never sees a
+placeholder at all**: `device_id` is NULL, so `forget_device`,
+`reassign_device` and the Add-neighbours candidate query — all keyed off
+real device ids or discovered peer identities — simply have nothing to
+match. No exclusion logic was added anywhere for this; there was nothing
+to exclude.
+
+**`mapper.js`** gates on `node.placeholder` in the same three places it
+already gates on `node.unmanaged`/`node.gone`: `resolveNode` returns
+early with its own `sub: 'placeholder'` and tooltip before the unmanaged
+branch runs, the status glyph and dblclick-to-Nodes handler both skip a
+placeholder node, and `nodeHtml`'s class list adds `placeholder` for the
+CSS dash pattern (`app.css`'s `.mp-node.placeholder .mp-node-box`, 8/4
+dashed against `--canvas-muted`, distinct from `.gone`'s 1/4 fail-tone
+dash). The detail pane's placeholder branch offers only a rename, a role
+select and Remove from map — no status, no badges, no "Open in Nodes" —
+and returns early rather than falling through the device/unmanaged
+rendering below it.
+
+Tests: `tests/test_mapper_db.py` covers `add_placeholder`'s blank/
+whitespace rejection, two same-labelled placeholders getting distinct
+peer_keys, and `remove_node` cascading a placeholder's manual link away
+the same as any other node's. `tests/test_mapper_api.py` covers the same
+through the HTTP layer plus the map payload's `placeholder` field on
+every node kind and the CSV export naming a placeholder by label.
+`tests/test_frontend_contracts.py` section 99 pins the toolbar button,
+its write-gated disabled state, the `resolveNode`/`drawNode` branches,
+the CSS dash rule, and the detail-pane copy. `tests/ui/walk.mjs` gained a
+step that adds a placeholder, connects it to a visible device with
+Connect, and removes it.
 
 ---
 

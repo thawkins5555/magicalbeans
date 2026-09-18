@@ -4393,7 +4393,16 @@ like any other module.
   of its own) that never will be, drawn dashed and visually distinct from
   a monitored device. Drag anything anywhere; **Snap** rounds a drag to a
   grid, and **Align** lines up or evenly spaces whatever is currently
-  selected. Nothing here ever adds or moves something on its own.
+  selected. Nothing here ever adds or moves something on its own. **From
+  5.42.0, Placeholder adds a box that is not a device at all** —
+  "Internet", "Carrier MPLS", a patch panel, a demarc, anything worth
+  showing on the diagram that will never answer SNMP. One dialog, one
+  name, nothing else to fill in; it draws dashed and muted, carries no
+  status, and cannot be opened in Nodes (there is nothing there to open),
+  but takes a rename, a role and a Connect line exactly like any other
+  node, and Remove takes it and its lines off the map together. A
+  placeholder is never discovered, never polled, and never offered as an
+  Add-neighbours candidate.
 - **A trunk carrying several VLANs draws as several coloured strands, one
   per VLAN, side by side** — the point of the whole module: the VLAN count
   on a link is legible from the drawing itself, without opening a dialog
@@ -4787,7 +4796,11 @@ like any other module.
   different VLANs on different ends, so "(STP blocked)" alone did not
   say which side to go look at. A blocked row now reads
   "(STP blocked on `<switch>`)", or names both switches in the rare case
-  where each end blocks the same VLAN.
+  where each end blocks the same VLAN. **From 5.42.0, the row drops the
+  words "STP blocked on" and just reads "(`<switch>`)"** — the longer
+  wording was enough to wrap a row onto a second line on a busy trunk;
+  the row is still red and still names the switch, the red colour and
+  the VLANs heading above it already say the rest.
 - **From 5.36.0, every cable between the same two devices draws as its
   own line, fanned apart from the others** rather than stacking on
   identical coordinates. Each line in the fan keeps its own strands,
