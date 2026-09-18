@@ -25,6 +25,16 @@ from .mapperdb import ROLES as _MAP_NODE_ROLES
 
 LINK_PROTOCOLS = ("lldp", "cdp")
 
+# A placeholder is an operator-created logical box, never discovered or
+# polled -- its map_nodes row has device_id NULL like an unmanaged peer, but
+# peer_key carries this prefix instead of one of the chassis:/sysname:/row:
+# prefixes peer_identity() hands out above, so the two can never collide.
+PLACEHOLDER_PREFIX = "placeholder:"
+
+
+def is_placeholder(peer_key) -> bool:
+    return bool(peer_key) and peer_key.startswith(PLACEHOLDER_PREFIX)
+
 # mapperdb.ROLES is map_nodes.role's own domain, and it leads with "" to mean
 # "no operator override -- auto-detect" (a column-storage concern: the
 # database has to store SOMETHING for "unset", and '' is that something).
@@ -814,12 +824,13 @@ LINK_CSV_HEADER = ["A Device", "A Device ID", "A Port", "A Port Mode", "A Native
                    "Fiber Mode", "STP"]
 
 
-def link_csv_rows(links, device_name) -> list[list]:
+def link_csv_rows(links, device_name, peer_name=lambda peer_key: peer_key) -> list[list]:
     """One row per link for the CSV export, in `LINK_CSV_HEADER` order. The
     B side is either a real device (name/id from `device_name`) or, for an
-    unmanaged peer, its `peer_key` with no id -- an export exists to leave
-    with the whole picture, so an unmanaged peer still gets a row rather
-    than being silently dropped just because it has no device id.
+    unmanaged peer or placeholder, its name from `peer_name` (default: the
+    raw `peer_key`) with no id -- an export exists to leave with the whole
+    picture, so a peer without a device id still gets a row rather than
+    being silently dropped.
 
     Each end carries its own port mode and native VLAN (from vlan_ports,
     what the device itself reports) alongside the older single "Native VLAN"
@@ -836,13 +847,13 @@ def link_csv_rows(links, device_name) -> list[list]:
             a_name = device_name(link["a_device_id"])
             a_id = link["a_device_id"]
         else:
-            a_name = link.get("a_peer_key") or ""
+            a_name = peer_name(link.get("a_peer_key") or "")
             a_id = ""
         if link["b_device_id"] is not None:
             b_name = device_name(link["b_device_id"])
             b_id = link["b_device_id"]
         else:
-            b_name = link["b_peer_key"]
+            b_name = peer_name(link["b_peer_key"])
             b_id = ""
 
         def cell(key):

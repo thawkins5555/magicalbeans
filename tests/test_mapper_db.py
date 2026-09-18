@@ -123,6 +123,32 @@ try:
 except ValueError:
     check("add_node with an invalid role raises", True)
 
+# ------------------------------------------------------- add_placeholder
+
+ph_id = db.add_placeholder(map_id, label="Comm Room A")
+ph_row = next(r for r in db.nodes(map_id) if r["id"] == ph_id)
+check("add_placeholder inserts a device_id-NULL row with a placeholder: peer_key",
+      ph_row["device_id"] is None and ph_row["peer_key"].startswith("placeholder:"),
+      dict(ph_row))
+check("...and its label is stored", ph_row["label"] == "Comm Room A")
+
+try:
+    db.add_placeholder(map_id, label="")
+    check("add_placeholder rejects a blank label", False)
+except ValueError:
+    check("add_placeholder rejects a blank label", True)
+
+try:
+    db.add_placeholder(map_id, label="   ")
+    check("add_placeholder rejects a whitespace-only label", False)
+except ValueError:
+    check("add_placeholder rejects a whitespace-only label", True)
+
+ph2_id = db.add_placeholder(map_id, label="Comm Room A")
+check("two placeholders with the same label are two distinct rows",
+      ph2_id != ph_id and ph_row["peer_key"] !=
+      next(r for r in db.nodes(map_id) if r["id"] == ph2_id)["peer_key"])
+
 # ---------------------------------------------------------- update_nodes
 
 other_map = db.create_map("Other Map")
@@ -223,6 +249,12 @@ check("...it is actually gone", len(db.links(map_id)) == 1)
 db.remove_node(map_id, b_id)
 check("removing a node the remaining link points at cascades the link away",
       db.links(map_id) == [])
+
+ph_id = db.add_placeholder(map_id, label="Patch Panel")
+ph_link_id = db.add_link(map_id, a_id, ph_id, "")
+db.remove_node(map_id, ph_id)
+check("removing a placeholder cascades its manual link away too",
+      all(r["id"] != ph_link_id for r in db.links(map_id)))
 db.close()
 
 # --------------------------------------------------------------- map_frames

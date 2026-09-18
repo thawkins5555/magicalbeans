@@ -11,6 +11,7 @@ and is read live, joined against these placements, when a map is rendered.
 from __future__ import annotations
 
 import math
+import secrets
 import sqlite3
 import time
 
@@ -400,6 +401,28 @@ class MapperDatabase(SqliteStore):
                 "INSERT INTO map_nodes(map_id, device_id, peer_key, label, role,"
                 " x, y, added_ts) VALUES (?,?,?,?,?,?,?,?)",
                 (map_id, device_id, peer_key, label or "", role, x, y, now))
+            self._touch_map(map_id, now)
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def add_placeholder(self, map_id: int, *, label: str, x: float = 0.0, y: float = 0.0,
+                        now: float | None = None) -> int:
+        """Add an operator-created logical box -- not a device, never
+        discovered or polled -- as its own map_nodes row: device_id NULL,
+        peer_key a fresh random `placeholder:` key (see mapper.py) so it
+        never collides with a real discovered peer and never matches an
+        "existing" lookup the way add_node's peer_key branch does."""
+        from . import mapper
+        label = (label or "").strip()
+        if not label:
+            raise ValueError("A placeholder needs a name.")
+        now = time.time() if now is None else now
+        peer_key = mapper.PLACEHOLDER_PREFIX + secrets.token_hex(8)
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO map_nodes(map_id, device_id, peer_key, label, role,"
+                " x, y, added_ts) VALUES (?,?,?,?,?,?,?,?)",
+                (map_id, None, peer_key, label, "", x, y, now))
             self._touch_map(map_id, now)
             self._conn.commit()
             return int(cur.lastrowid)

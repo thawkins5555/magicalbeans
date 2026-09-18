@@ -10366,6 +10366,19 @@ def get_mapper_map(service, params, body, map_id) -> dict:
     nodes = []
     for row in node_rows:
         device_id = row["device_id"]
+        if device_id is None and mapper.is_placeholder(row["peer_key"]):
+            # Operator-created logical box: never discovered, never polled,
+            # never an unmanaged peer -- its name IS its label, always.
+            nodes.append({
+                "id": row["id"], "device_id": None, "peer_key": row["peer_key"],
+                "label": row["label"], "name": row["label"],
+                "resolved_name": row["label"],
+                "role": row["role"], "role_auto": False, "x": row["x"], "y": row["y"],
+                "status": None, "ip": None, "unmanaged": False, "missing": False,
+                "placeholder": True,
+                "temp_c": None, "cpu_pct": None, "port_count": None,
+            })
+            continue
         if device_id is None:
             peer = peers_by_key.get(row["peer_key"])
             name, resolved_name = _mapper_node_name(
@@ -10376,7 +10389,7 @@ def get_mapper_map(service, params, body, map_id) -> dict:
                 "label": row["label"], "name": name, "resolved_name": resolved_name,
                 "role": role, "role_auto": role_auto, "x": row["x"], "y": row["y"],
                 "status": None, "ip": (peer["address"] if peer else None),
-                "unmanaged": True, "missing": False,
+                "unmanaged": True, "missing": False, "placeholder": False,
                 "temp_c": None, "cpu_pct": None, "port_count": None,
             })
             continue
@@ -10399,7 +10412,7 @@ def get_mapper_map(service, params, body, map_id) -> dict:
                 "label": row["label"], "name": name, "resolved_name": resolved_name,
                 "role": role, "role_auto": role_auto, "x": row["x"], "y": row["y"],
                 "status": "missing", "ip": None, "unmanaged": False,
-                "missing": True,
+                "missing": True, "placeholder": False,
                 "temp_c": None, "cpu_pct": None, "port_count": None,
             })
             continue
@@ -10412,7 +10425,7 @@ def get_mapper_map(service, params, body, map_id) -> dict:
             "name_source": name_source,
             "role": role, "role_auto": role_auto, "x": row["x"], "y": row["y"],
             "status": device["status"], "ip": device["ip"], "unmanaged": False,
-            "missing": False,
+            "missing": False, "placeholder": False,
             "temp_c": temp_by_device.get(device_id) if badge_temp else None,
             "cpu_pct": cpu_by_device.get(device_id) if badge_cpu else None,
             "port_count": port_count_by_device.get(device_id) if badge_ports else None,
@@ -10475,11 +10488,21 @@ def get_mapper_map(service, params, body, map_id) -> dict:
 
 
 def post_mapper_map_nodes(service, params, body, map_id) -> dict:
-    """Add one device or one unmanaged peer to the map -- exactly one of
-    `device_id`/`peer_key`, exactly what mapperdb.add_node itself enforces,
-    so a bad body is a 400 from there rather than a second check here that
-    could disagree with it."""
+    """Add one device, one unmanaged peer, or one placeholder to the map.
+    A placeholder (`"placeholder": true`) ignores device_id/peer_key and
+    goes through mapperdb.add_placeholder instead -- otherwise exactly one
+    of `device_id`/`peer_key`, exactly what mapperdb.add_node itself
+    enforces, so a bad body is a 400 from there rather than a second check
+    here that could disagree with it."""
     _require(service.mapper_db.map_row(map_id), "map")
+    if body.get("placeholder"):
+        label = str(body.get("label", "") or "")
+        node_id = service.mapper_db.add_placeholder(
+            map_id, label=label,
+            x=float(body.get("x", 0.0) or 0.0), y=float(body.get("y", 0.0) or 0.0))
+        _audit(service, params, "mapper.node.add", target=str(map_id),
+              detail=f"placeholder={label.strip()}")
+        return {"id": node_id}
     device_id = body.get("device_id")
     if device_id is not None:
         device_id = int(device_id)
@@ -10763,11 +10786,16 @@ def get_mapper_map_export(service, params, body, map_id) -> dict:
     payload = get_mapper_map(service, params, body, map_id)
     names = {node["device_id"]: node["name"] for node in payload["nodes"]
              if node["device_id"] is not None}
+    peer_names = {node["peer_key"]: node["name"] for node in payload["nodes"]
+                  if node["device_id"] is None}
 
     def device_name(device_id) -> str:
         return names.get(device_id) or f"Device {device_id}"
 
-    rows = mapper.link_csv_rows(payload["links"], device_name)
+    def peer_name(peer_key) -> str:
+        return peer_names.get(peer_key) or peer_key
+
+    rows = mapper.link_csv_rows(payload["links"], device_name, peer_name)
     return _csv_response("mapper-links", mapper.LINK_CSV_HEADER, rows)
 
 

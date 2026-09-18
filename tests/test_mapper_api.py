@@ -525,6 +525,85 @@ try:
     check("...and it is gone from the map payload",
           status == 200 and not any(l.get("manual") for l in payload["links"]), payload)
 
+    # ------------------------------------------ 7b2. placeholders (D2)
+
+    status, payload = call("POST", f"/api/mapper/maps/{map_id}/nodes",
+                           {"placeholder": True, "label": ""}, token=admin)
+    check("a blank-label placeholder is a 400", status == 400, (status, payload))
+
+    status, payload = call("POST", f"/api/mapper/maps/{map_id}/nodes",
+                           {"placeholder": True, "label": "  "}, token=admin)
+    check("a whitespace-only label is a 400", status == 400, (status, payload))
+
+    status, payload = call("POST", f"/api/mapper/maps/{map_id}/nodes",
+                           {"placeholder": True, "label": "Patch Panel 3",
+                            "x": 5.0, "y": 6.0}, token=admin)
+    check("placing a placeholder is accepted", status == 200 and "id" in payload,
+          (status, payload))
+    node_ph = payload["id"]
+
+    status, payload = call("GET", f"/api/mapper/maps/{map_id}", token=admin)
+    ph_json = next((n for n in payload["nodes"] if n["id"] == node_ph), None) \
+        if status == 200 else None
+    check("the placeholder appears in the map payload with placeholder: true",
+          ph_json is not None and ph_json["placeholder"] is True, ph_json)
+    check("...with device_id None and a placeholder: peer_key",
+          ph_json is not None and ph_json["device_id"] is None
+          and ph_json["peer_key"].startswith("placeholder:"), ph_json)
+    check("...and its name/resolved_name are the operator's label",
+          ph_json is not None and ph_json["name"] == "Patch Panel 3"
+          and ph_json["resolved_name"] == "Patch Panel 3", ph_json)
+    check("...not marked unmanaged (it is not a discovered peer)",
+          ph_json is not None and ph_json["unmanaged"] is False, ph_json)
+    check("a real device node also carries placeholder: false",
+          any(n["id"] == node_a and n["placeholder"] is False
+              for n in payload["nodes"]), payload["nodes"])
+
+    status, payload = call("POST", f"/api/mapper/maps/{map_id}/links",
+                           {"a_node_id": node_ph, "b_node_id": node_b,
+                            "label": "patch cord"}, token=admin)
+    check("connecting a placeholder to a device is accepted",
+          status == 200 and "id" in payload, (status, payload))
+    ph_link_id = payload["id"]
+
+    status, payload = call("GET", f"/api/mapper/maps/{map_id}", token=admin)
+    ph_manual = next((l for l in payload["links"]
+                      if l.get("manual") and l.get("a_peer_key", "").startswith("placeholder:")),
+                     None) if status == 200 else None
+    check("the placeholder<->device manual link round-trips through GET",
+          ph_manual is not None and ph_manual["b_device_id"] == dev_b
+          and ph_manual["label"] == "patch cord", ph_manual)
+
+    status, payload = call("GET", f"/api/mapper/maps/{map_id}/export.csv", token=admin)
+    ph_csv_rows = (list(csv.reader(io.StringIO(payload["csv"].lstrip("﻿"))))
+                  if status == 200 else [])
+    a_name_col = mapper_mod.LINK_CSV_HEADER.index("A Device")
+    check("the CSV export names the placeholder end by its label, not its peer_key",
+          status == 200 and any(row and row[a_name_col] == "Patch Panel 3"
+                                for row in ph_csv_rows[1:]),
+          ph_csv_rows)
+
+    status, payload = call("PUT", f"/api/mapper/maps/{map_id}/nodes",
+                           {"updates": [{"id": node_ph, "x": 42.0, "y": 43.0,
+                                        "label": "Patch Panel 3 Renamed"}]}, token=admin)
+    check("renaming/moving a placeholder via PUT is accepted",
+          status == 200 and payload["changed"] == 1, (status, payload))
+    status, payload = call("GET", f"/api/mapper/maps/{map_id}", token=admin)
+    ph_json = next((n for n in payload["nodes"] if n["id"] == node_ph), None) \
+        if status == 200 else None
+    check("...and the rename/move took effect",
+          ph_json is not None and ph_json["name"] == "Patch Panel 3 Renamed"
+          and ph_json["x"] == 42.0 and ph_json["y"] == 43.0, ph_json)
+
+    status, payload = call("DELETE",
+                           f"/api/mapper/maps/{map_id}/links/{ph_link_id}", token=admin)
+    check("removing the placeholder's manual link is accepted",
+          status == 200 and payload["ok"], (status, payload))
+    status, payload = call("DELETE", f"/api/mapper/maps/{map_id}/nodes/{node_ph}",
+                           token=admin)
+    check("removing the placeholder node is accepted", status == 200 and payload["ok"],
+          (status, payload))
+
     # -------------------------------------------------- 7c. frames (5.31.0)
 
     status, payload = call("GET", f"/api/mapper/maps/{map_id}", token=admin)
