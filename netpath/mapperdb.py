@@ -219,6 +219,19 @@ FRAME_LABEL_MAX = 60
 # text runs much longer than a frame's label, so it gets its own cap.
 NOTE_TEXT_MAX = 500
 
+# A placeholder's label IS its name (there is no device to fall back to),
+# so it can never be blank, and it is capped like a frame's or a note's.
+PLACEHOLDER_LABEL_MAX = 200
+
+
+def _placeholder_label(label) -> str:
+    label = (label or "").strip()
+    if not label:
+        raise ValueError("A placeholder needs a name.")
+    if len(label) > PLACEHOLDER_LABEL_MAX:
+        raise ValueError(f"Placeholder name is over {PLACEHOLDER_LABEL_MAX} characters.")
+    return label
+
 
 def _validate_frame_fields(fields: dict) -> None:
     """Checks only the keys present in `fields` (shared by add_frame, which
@@ -413,9 +426,7 @@ class MapperDatabase(SqliteStore):
         never collides with a real discovered peer and never matches an
         "existing" lookup the way add_node's peer_key branch does."""
         from . import mapper
-        label = (label or "").strip()
-        if not label:
-            raise ValueError("A placeholder needs a name.")
+        label = _placeholder_label(label)
         now = time.time() if now is None else now
         peer_key = mapper.PLACEHOLDER_PREFIX + secrets.token_hex(8)
         with self._lock:
@@ -441,10 +452,14 @@ class MapperDatabase(SqliteStore):
         for item in updates:
             if "role" in item and item["role"] not in ROLES:
                 raise ValueError(f"Unknown role: {item['role']!r}")
+        from . import mapper
         changed = 0
         with self._lock:
-            on_map = {row["id"] for row in self._conn.execute(
-                "SELECT id FROM map_nodes WHERE map_id = ?", (map_id,)).fetchall()}
+            on_map = {row["id"]: row["peer_key"] for row in self._conn.execute(
+                "SELECT id, peer_key FROM map_nodes WHERE map_id = ?", (map_id,)).fetchall()}
+            for item in updates:
+                if "label" in item and mapper.is_placeholder(on_map.get(item.get("id"))):
+                    item["label"] = _placeholder_label(item["label"])
             for item in updates:
                 node_id = item.get("id")
                 if node_id not in on_map:

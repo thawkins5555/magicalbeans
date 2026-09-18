@@ -594,6 +594,20 @@ try:
     check("...and the rename/move took effect",
           ph_json is not None and ph_json["name"] == "Patch Panel 3 Renamed"
           and ph_json["x"] == 42.0 and ph_json["y"] == 43.0, ph_json)
+    status, payload = call("PUT", f"/api/mapper/maps/{map_id}/nodes",
+                           {"updates": [{"id": node_ph, "label": "  "}]}, token=admin)
+    check("renaming a placeholder to blank is a 400", status == 400, (status, payload))
+    status, payload = call("PUT", f"/api/mapper/maps/{map_id}/nodes",
+                           {"updates": [{"id": node_ph, "label": "x" * 201}]}, token=admin)
+    check("a placeholder name over 200 characters is a 400 on PUT", status == 400,
+          (status, payload))
+    status, payload = call("POST", f"/api/mapper/maps/{map_id}/nodes",
+                           {"placeholder": True, "label": "x" * 201}, token=admin)
+    check("...and on POST", status == 400, (status, payload))
+    status, payload = call("GET", f"/api/mapper/maps/{map_id}", token=admin)
+    ph_json = next((n for n in payload["nodes"] if n["id"] == node_ph), None)
+    check("a rejected rename leaves the placeholder's name alone",
+          ph_json is not None and ph_json["name"] == "Patch Panel 3 Renamed", ph_json)
 
     status, payload = call("DELETE",
                            f"/api/mapper/maps/{map_id}/links/{ph_link_id}", token=admin)

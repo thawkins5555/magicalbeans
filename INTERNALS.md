@@ -7044,8 +7044,11 @@ column or third partial index was needed — `ux_map_nodes_peer`
 an unmanaged peer's.
 
 **`mapperdb.add_placeholder(map_id, label=...)`** is the write path: it
-strips and requires a non-blank label (`ValueError` otherwise, the same
-shape `add_node`'s own validation takes), mints a fresh random peer_key,
+strips and requires a non-blank label of at most `PLACEHOLDER_LABEL_MAX`
+(200) characters (`ValueError` otherwise, the same shape `add_node`'s own
+validation takes; `update_nodes` applies the same rule to a rename of a
+placeholder row, so a placeholder can never be left nameless), mints a
+fresh random peer_key,
 and inserts with `role=""` (mapperdb's own "unset" sentinel) — deliberately
 a plain `INSERT`, not a call into `add_node`, because `add_node` raises
 unless exactly one of `device_id`/`peer_key` is set by the *caller*, and a
@@ -7095,7 +7098,7 @@ to exclude.
 already gates on `node.unmanaged`/`node.gone`: `resolveNode` returns
 early with its own `sub: 'placeholder'` and tooltip before the unmanaged
 branch runs, the status glyph and dblclick-to-Nodes handler both skip a
-placeholder node, and `nodeHtml`'s class list adds `placeholder` for the
+placeholder node, and `drawNode`'s class list adds `placeholder` for the
 CSS dash pattern (`app.css`'s `.mp-node.placeholder .mp-node-box`, 8/4
 dashed against `--canvas-muted`, distinct from `.gone`'s 1/4 fail-tone
 dash). The detail pane's placeholder branch offers only a rename, a role

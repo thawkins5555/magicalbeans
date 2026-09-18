@@ -10501,7 +10501,7 @@ def post_mapper_map_nodes(service, params, body, map_id) -> dict:
             map_id, label=label,
             x=float(body.get("x", 0.0) or 0.0), y=float(body.get("y", 0.0) or 0.0))
         _audit(service, params, "mapper.node.add", target=str(map_id),
-              detail=f"placeholder={label.strip()}")
+              detail=f"placeholder={label.strip()[:120]}")
         return {"id": node_id}
     device_id = body.get("device_id")
     if device_id is not None:
