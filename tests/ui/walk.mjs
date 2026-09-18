@@ -1429,7 +1429,6 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
           .map((n) => n.id);
       });
       if (!deviceIds.length) return 'skipped: no device visible on the demo map';
-      const nodeSel = (id) => `#mp-svg .mp-node[data-node-id="${id}"]`;
 
       const placeholderName = `Walk PH ${Date.now() % 100000}`;
       await page.click('#mp-add-placeholder');
@@ -1450,9 +1449,28 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       }, placeholderName);
       assert(placeholderId, `no .placeholder node with label "${placeholderName}" found on the canvas`);
 
-      await page.click(nodeSel(deviceIds[0]));
+      // nextPlacement puts a new placeholder past the demo map's right edge
+      // (same as Add device does for a real device -- not a bug to fix), so
+      // a real page.click() on it has no on-screen point to land on. Select
+      // it the way onNodePointerDown itself does: a pointerdown/pointerup
+      // pair with the coordinates its own getBoundingClientRect() gives,
+      // shiftKey true to add it to the device already selected below.
+      const dispatchSelect = async (id, shiftKey) => {
+        const ok = await page.evaluate(({ id, shiftKey }) => {
+          const g = document.querySelector(`#mp-svg .mp-node[data-node-id="${id}"]`);
+          if (!g) return false;
+          const rect = g.getBoundingClientRect();
+          const opts = { bubbles: true, cancelable: true, pointerId: 1, isPrimary: true,
+            button: 0, shiftKey, clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2 };
+          g.dispatchEvent(new PointerEvent('pointerdown', opts));
+          g.dispatchEvent(new PointerEvent('pointerup', opts));
+          return true;
+        }, { id, shiftKey });
+        assert(ok, `could not find node ${id} to select`);
+      };
+      await dispatchSelect(deviceIds[0], false);
       await sleep(200);
-      await page.click(nodeSel(placeholderId), { modifiers: ['Shift'] });
+      await dispatchSelect(placeholderId, true);
       await page.waitForFunction(
         () => !document.getElementById('mp-connect').disabled, { timeout: 10000 });
 
@@ -1466,18 +1484,22 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       assert(linkResponse.ok(), `Connect answered ${linkResponse.status()}`);
       await settle(page, 800);
 
-      const dispatched = await page.evaluate((id) => {
-        const g = document.querySelector(`#mp-svg .mp-node.placeholder[data-node-id="${id}"]`);
-        if (!g) return false;
-        g.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-        return true;
-      }, placeholderId);
-      assert(dispatched, 'could not find the placeholder node to click');
+      // Connect leaves both ends selected (the multi-select pane, with no
+      // [data-remove-node]); a shift-click on the device drops it back out
+      // of the selection, same as onNodePointerDown's shift toggle-off,
+      // leaving just the placeholder selected for its own detail pane.
+      await dispatchSelect(deviceIds[0], true);
       await page.waitForSelector('#mp-detail [data-remove-node]', { timeout: 10000 });
+      await page.click('#mp-detail [data-remove-node]');
+      // [data-remove-node] opens App.confirmDestructive (Cancel + a
+      // danger-styled confirm button), not a native dialog nor an
+      // immediate DELETE.
+      await page.waitForSelector('#modal:not([hidden]) .modal-buttons button.danger',
+        { timeout: 10000 });
       const removed = page.waitForResponse((response) =>
         /\/api\/mapper\/maps\/\d+\/nodes\/\d+$/.test(response.url())
         && response.request().method() === 'DELETE', { timeout: 10000 });
-      await page.click('#mp-detail [data-remove-node]');
+      await page.click('#modal:not([hidden]) .modal-buttons button.danger');
       const removeResponse = await removed;
       assert(removeResponse.ok(), `Remove from map answered ${removeResponse.status()}`);
       return `placeholder "${placeholderName}" added, connected, removed`;
