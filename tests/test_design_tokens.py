@@ -9,6 +9,7 @@ colour or a pixel font size written anywhere else, and the retired --faint
 tone coming back under its old name.
 """
 
+import ast
 import itertools
 import os
 import re
@@ -441,9 +442,14 @@ for page in ("index.html", "login.html", "ssh.html"):
         check(query.startswith("?v=__SW_VERSION__"),
               "%s: %s carries the version placeholder (found %r)" % (page, path, query))
 server = read(REPO_ROOT, "netpath", "web", "server.py")
-check('"/tokens.css"' in server.split("PUBLIC_PATHS")[1].split("}")[0],
+public_paths_src = next(
+    ast.get_source_segment(server, node)
+    for node in ast.parse(server).body
+    if isinstance(node, ast.Assign)
+    and any(isinstance(t, ast.Name) and t.id == "PUBLIC_PATHS" for t in node.targets))
+check('"/tokens.css"' in public_paths_src,
       "server.py serves /tokens.css before sign-in")
-check('"/boot.js"' in server.split("PUBLIC_PATHS")[1].split("}")[0],
+check('"/boot.js"' in public_paths_src,
       "server.py serves /boot.js before sign-in (the theme must not flash on the sign-in page)")
 boot = read(STATIC, "boot.js")
 check("sappiwhere.theme" in boot and "dataset.theme" in boot,

@@ -18,6 +18,7 @@ import time
 from collections import defaultdict
 
 from _paths import free_tcp_port, tmpdir
+from _source import python_files, python_functions
 
 TMPDIR = tmpdir("web_gates_")
 
@@ -320,8 +321,6 @@ try:
     _repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     _server_src = open(os.path.join(_repo_root, "netpath", "web", "server.py"),
                        encoding="utf-8").read()
-    _api_src = open(os.path.join(_repo_root, "netpath", "web", "api.py"),
-                    encoding="utf-8").read()
 
     def _unparse(node):
         try:
@@ -360,9 +359,17 @@ try:
 
     ROUTES_PARSED = _parse_routes(_server_src)
 
-    _api_tree = ast.parse(_api_src)
-    API_FUNCS = {n.name: n for n in ast.walk(_api_tree)
-                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    # web.api may be one module or a package of several files; every def in
+    # every one of them, merged, so a handler split into its own file is
+    # still found by name. python_functions raises if two files define the
+    # same TOP-LEVEL name; a nested name shadowing another nested one (peer_name,
+    # validate) keeps today's last-file-wins behaviour.
+    python_functions("web.api")
+    API_FUNCS = {}
+    for _api_path in python_files("web.api"):
+        _api_tree = ast.parse(open(_api_path, encoding="utf-8").read())
+        API_FUNCS.update({n.name: n for n in ast.walk(_api_tree)
+                          if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))})
 
     # Write-shaped calls: a db-object method named like a mutation, or a raw
     # execute() whose SQL text is a write statement. Matched on the call

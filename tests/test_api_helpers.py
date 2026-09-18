@@ -9,13 +9,13 @@ import ast
 import http.client
 import json
 import os
-import pathlib
 import shutil
 import sqlite3
 import sys
 import time
 
 import _paths  # noqa: F401  (repo root + tests dir on sys.path)
+import _source
 
 from netpath import permissions
 from netpath.auth import DEFAULT_PASSWORD, DEFAULT_USER, hash_password
@@ -45,7 +45,7 @@ def check(name, ok, detail=""):
 # there is no value to withhold. Read from the source rather than by calling
 # every route: a serialiser added tomorrow is caught whether or not anyone
 # remembers to give it a test.
-API_SOURCE = pathlib.Path(api_mod.__file__).read_text(encoding="utf-8")
+API_SOURCE = _source.python_text("web.api")
 API_TREE = ast.parse(API_SOURCE)
 API_LINES = API_SOURCE.splitlines()
 

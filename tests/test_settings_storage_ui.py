@@ -26,6 +26,7 @@ import tempfile
 import time
 
 import _paths  # noqa: F401  (repo root + tests dir on sys.path)
+import _source
 
 from netpath.web.service import STORES
 from netpath.nodesdb import DEFAULTS as NODES_DEFAULTS
@@ -53,8 +54,7 @@ CSS = read("app.css")
 
 RETENTION = INDEX[INDEX.index('<div id="settings-sub-retention"'):
                   INDEX.index('<div id="settings-sub-signin"')]
-USAGE = SETTINGS[SETTINGS.index("  function showUsage(storage) {"):
-                 SETTINGS.index("  function status(message, colour) {")]
+USAGE = _source.js_function(SETTINGS, "showUsage")
 
 
 # --------------------------------------------- 1. every store has its row
@@ -141,7 +141,7 @@ check("...and its hints and legend span the whole width rather than "
 check(".usage has no margin of its own -- it stacked on the grid's own "
       "column-gap and made the gap before a meter differ from the gap "
       "before an age",
-      "margin-left: 10px" not in CSS[CSS.index(".usage {"):CSS.index(".usage .meter {")])
+      "margin-left: 10px" not in _source.css_rule(CSS, ".usage"))
 check("the meter is still .meter, not .bar (see its comment above the rule)",
       ".usage .meter {" in CSS and '<span class="meter">' in USAGE)
 
@@ -326,8 +326,9 @@ RETENTION_FIELDS = [
     ("interface_sample_retention_days", "np-if-sampledays"),
     ("interface_rollup_retention_days", "np-if-rollupdays"),
 ]
-STORAGE = NODES_JS[NODES_JS.index("<legend>STORAGE</legend>"):
-                   NODES_JS.index("App.wireColumnPickers(settingsBox);")]
+_SETTINGS_DIALOG = _source.js_function(NODES_JS, "settingsDialog")
+STORAGE = _SETTINGS_DIALOG[_SETTINGS_DIALOG.index("<legend>STORAGE</legend>"):
+                           _SETTINGS_DIALOG.index("App.wireColumnPickers(settingsBox);")]
 
 for key, field_id in RETENTION_FIELDS:
     check(f"nodes STORAGE renders {field_id} as a number field",

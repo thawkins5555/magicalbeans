@@ -18,6 +18,7 @@ import shutil
 import sys
 
 import _paths  # noqa: F401  (repo root + tests dir on sys.path)
+import _source
 
 from netpath import dbreport
 from netpath.nodesseriesdb import NodesSeriesDatabase
@@ -155,14 +156,9 @@ if ROUTE:
     check("...served by api.get_db_report", handler is api_mod.get_db_report)
 check("it is cached for five minutes, because COUNT(*) over a "
       "hundred-million-row samples table is seconds",
-      '"db_report", 300' in io.open(
-          os.path.join(_paths.REPO_ROOT, "netpath", "web", "api.py"),
-          encoding="utf-8").read())
+      '"db_report", 300' in _source.python_text("web.api"))
 
-STATE = io.open(os.path.join(_paths.REPO_ROOT, "netpath", "web", "api.py"),
-                encoding="utf-8").read()
-STORAGE_FN = STATE[STATE.index("def _storage(service)"):
-                   STATE.index("def get_db_report(")]
+STORAGE_FN = _source.python_function("web.api", "_storage")
 check("and _storage -- which /api/state polls every two seconds -- runs no "
       "COUNT(*) and no report of its own",
       "COUNT(" not in STORAGE_FN and "dbreport" not in STORAGE_FN)

@@ -13711,6 +13711,30 @@ promoted device's manual name as the IP on purpose and seeds `sys_name`
 into the identity instead, so the display name follows the device and a
 later rename is never shadowed by a copied sysName.
 
+### Source-text suites (`tests/_source.py`)
+
+A separate family of suites doesn't run the application at all — it reads
+the shipped browser and server source as plain text and pins specific
+pieces of it, to catch a change that would otherwise only show up as a
+subtle bug in someone's browser. `tests/_source.py` is the shared helper
+every one of them now goes through to find the piece it's checking:
+`js_function`/`js_const` for a named JS function or `const`, `css_rule`/
+`css_block` for a CSS selector or nested block (`@media`, `@keyframes`),
+and `python_function`/`python_functions` for a named Python function —
+each searched for by name in one file or, via `python_files`, across every
+file of a package. The rule this exists to enforce: **a source-text suite
+finds code by name, never by position or by a decorative comment banner.**
+Anchoring on position ("the code right after function X" or "everything
+until the next `// ===` banner") breaks, or silently starts checking
+nothing, the moment code is reorganised — exactly what the planned
+restructure ahead of 5.44.0 is going to do a lot of. 5.43.0 converted
+`test_frontend_contracts.py`, `test_alerts_ui.py`, `test_reports_ui.py`,
+`test_settings_storage_ui.py`, `test_design_tokens.py`, `test_db_report.py`,
+`test_web_gates.py` and `test_bulk_contracts.py` onto it; the last of
+those also widened its own separate `id_chunks` scan from `netpath/`'s
+top level to the whole tree (`rglob` in place of `glob`), so a module that
+becomes a package cannot escape the audit either.
+
 ### Help links (`app.js registerHelp`, `helpLink`, `showHelp`)
 
 A "?" beside a setting is `App.helpLink(key)`: a `<button type="button"

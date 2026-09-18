@@ -8,6 +8,8 @@ import os
 import re
 import sys
 
+import _source
+
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATIC = os.path.join(REPO_ROOT, "netpath", "web", "static")
 
@@ -141,8 +143,7 @@ for element_id in ["nd-rep-sfp-devgroup", "nd-rep-sfp-empty", "nd-rep-sfp-run",
 # 6. report.py's own query parameters are the ones actually sent: rank_by,
 #    ascending, like, n, device_ids, t0/t1 — read from api.py's
 #    get_nodes_reports_top_metrics rather than guessed.
-TOPN_JOB = NODES[NODES.index("function runTopMetricsReport("):
-                 NODES.index("function exportTopnReportCsv(")]
+TOPN_JOB = _source.js_function(NODES, "runTopMetricsReport")
 for param in ["key", "t0", "t1", "rank_by", "ascending", "like", "n", "device_ids"]:
     check(("%s:" % param) in TOPN_JOB or ("%s," % param) in TOPN_JOB
           or ("%s " % param) in TOPN_JOB,
@@ -175,7 +176,7 @@ check(NODES.count("App.drawRows(body,") >= 2 or NODES.count("App.drawRows(body, 
 #    its own server route for a fleet too large to want as a table.
 check("function saveReportCsv(" in NODES and "App.saveCsv(" in NODES,
       "report CSV export goes out through App.saveCsv")
-CSV_HELPER = NODES[NODES.index("function csvField("):NODES.index("const AVAIL_COLUMNS")]
+CSV_HELPER = _source.js_functions(NODES, "csvField", "saveReportCsv")
 check("new Blob(" not in CSV_HELPER,
       "the report CSV helpers do not re-implement the Blob download "
       "App.saveCsv already does (nodes.js has its own, unrelated, for the "
@@ -210,8 +211,7 @@ for fn_name, call_name in [("runAvailabilityReport", "reportDeviceIds('nd-rep-av
                            ("runTopMetricsReport", "reportDeviceIds('nd-rep-topn-devgroup')"),
                            ("runFirmwareReport", "reportDeviceIds('nd-rep-fw-devgroup')"),
                            ("runSfpReport", "reportDeviceIds('nd-rep-sfp-devgroup')")]:
-    body = NODES[NODES.index("function %s(" % fn_name):]
-    body = body[:body.index("\n  }\n", body.index("App.runJob("))]
+    body = _source.js_function(NODES, fn_name)
     run_job_at = body.index("App.runJob(")
     lookup_at = body.index(call_name)
     check(lookup_at > run_job_at,

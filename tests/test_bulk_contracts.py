@@ -28,8 +28,10 @@ import ast
 import pathlib
 import re
 import sys
+from collections import Counter
 
 import _paths  # noqa: F401  (repo root + tests dir on sys.path)
+import _source
 
 from netpath.web import api as api_mod
 
@@ -86,8 +88,10 @@ ALLOWED = {
 }
 
 offenders = []
-seen_allowed = set()
-for path in sorted(ROOT.glob("*.py")):
+seen_allowed = Counter()
+for path in sorted(ROOT.rglob("*.py")):
+    if "__pycache__" in path.parts:
+        continue
     source = path.read_text(encoding="utf-8")
     lines = source.splitlines()
     for node in ast.walk(ast.parse(source)):
@@ -96,9 +100,14 @@ for path in sorted(ROOT.glob("*.py")):
         body = "\n".join(lines[node.lineno - 1:node.end_lineno])
         if not IN_CLAUSE.search(body):
             continue
-        name = f"{path.stem}.{node.name}"
+        # The allow-list keys on the top-level module under netpath, so a
+        # module split into a package (nodesdb.py -> nodesdb/*.py) keeps its
+        # existing key rather than one per file inside it.
+        top = path.relative_to(ROOT).parts[0]
+        component = top[:-3] if top.endswith(".py") else top
+        name = f"{component}.{node.name}"
         if name in ALLOWED:
-            seen_allowed.add(name)
+            seen_allowed[name] += 1
             continue
         if "id_chunks(" not in body:
             offenders.append(f"{name} (line {node.lineno})")
@@ -106,23 +115,28 @@ for path in sorted(ROOT.glob("*.py")):
 check("every dynamic IN (...) list is split by sqlitebase.id_chunks",
       not offenders, "; ".join(offenders))
 check("the allow-list has no entry for a function that no longer builds one",
-      seen_allowed == set(ALLOWED), sorted(set(ALLOWED) - seen_allowed))
+      set(seen_allowed) == set(ALLOWED), sorted(set(ALLOWED) - set(seen_allowed)))
+check("every allow-list entry matches exactly one function, so a namesake "
+      "in a future package cannot ride its exemption",
+      all(count == 1 for count in seen_allowed.values()),
+      {k: v for k, v in seen_allowed.items() if v != 1})
 check("every allow-list entry carries a reason",
       all(reason.strip() for reason in ALLOWED.values()))
 
-api_source = (ROOT / "web" / "api.py").read_text(encoding="utf-8")
-api_lines = api_source.splitlines()
-api_tree = ast.parse(api_source)
+api_source = _source.python_text("web.api")
 
 # Only _bulk_ids itself may read a body's id list directly.
 BODY_ID_READ = re.compile(r'body\.get\("[a-z_]*ids"\)')
 hand_rolled = []
-for node in ast.walk(api_tree):
-    if not isinstance(node, ast.FunctionDef) or node.name == "_bulk_ids":
-        continue
-    body = "\n".join(api_lines[node.lineno - 1:node.end_lineno])
-    if BODY_ID_READ.search(body):
-        hand_rolled.append(f"{node.name} (line {node.lineno})")
+for api_path in _source.python_files("web.api"):
+    text = open(api_path, encoding="utf-8").read()
+    lines = text.splitlines()
+    for node in ast.walk(ast.parse(text)):
+        if not isinstance(node, ast.FunctionDef) or node.name == "_bulk_ids":
+            continue
+        body = "\n".join(lines[node.lineno - 1:node.end_lineno])
+        if BODY_ID_READ.search(body):
+            hand_rolled.append(f"{node.name} (line {node.lineno})")
 
 check("no route reads a bulk id list without _bulk_ids",
       not hand_rolled, "; ".join(hand_rolled))

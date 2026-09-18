@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.43.0 — Test hardening ahead of the restructure](#5430--test-hardening-ahead-of-the-restructure)
 - [5.42.0 — Mapper placeholder blocks, and a shorter blocked-VLAN row](#5420--mapper-placeholder-blocks-and-a-shorter-blocked-vlan-row)
 - [5.41.0 — Link detail pane's blocked VLANs now name which switch is doing the blocking](#5410--link-detail-panes-blocked-vlans-now-name-which-switch-is-doing-the-blocking)
 - [5.40.0 — Notes get text size, FiberView's dots redraw, Cisco access VLANs via vmVlan, and parallel-link labels cleared](#5400--notes-get-text-size-fiberviews-dots-redraw-cisco-access-vlans-via-vmvlan-and-parallel-link-labels-cleared)
@@ -175,6 +176,39 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.43.0 — Test hardening ahead of the restructure
+
+No product code changed in this release. Nothing changes for the operator.
+
+This is groundwork for a planned five-part restructure of the codebase
+(dead code and backend cleanup, then front-end, then performance, then a
+full security/bug/performance pass). Before any of that starts, the test
+suites that check the shipped browser and server code by reading it as
+plain text needed fixing: they used to find a block of code by its
+**position** — "whatever comes after this function" or "whatever follows
+this comment banner" — so simply moving code around during the restructure
+could silently break them, or worse, leave them checking nothing at all
+without failing.
+
+Those suites now find each block by **name** instead, through one new
+shared helper, `tests/_source.py`. It locates a JS function or `const`, a
+CSS rule, a nested CSS block, or a Python function — in one file or across
+every file of a package — regardless of where it sits or what reorganising
+happens around it. Eight suites were converted onto it: `test_frontend_contracts.py`
+(about 175 pinned checks), `test_alerts_ui.py`, `test_reports_ui.py`,
+`test_settings_storage_ui.py`, `test_design_tokens.py`, `test_db_report.py`,
+`test_web_gates.py` and `test_bulk_contracts.py` — whose audit of every
+dynamic SQL `IN (...)` list now walks the whole `netpath/` tree recursively,
+so a module that later becomes a package still cannot slip past the check.
+
+Proof this changed nothing it shouldn't: every converted suite's output is
+byte-for-byte identical to 5.42.0's; a deliberate bug planted in the guarded
+product code is still caught; and a simulated split of `api.py` into a
+package produced identical results before and after. The full suite on
+5.42.0 passed 176 of 184, with the remaining 8 the same pre-existing
+environmental failures the build machine always shows (no SMS passphrase,
+no `traceroute` binary, and two timing-sensitive suites).
 
 ### 5.42.0 — Mapper placeholder blocks, and a shorter blocked-VLAN row
 

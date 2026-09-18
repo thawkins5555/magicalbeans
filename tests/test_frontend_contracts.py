@@ -19,6 +19,9 @@ import subprocess
 import sys
 import tempfile
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _source import js_function, js_functions, js_const, css_rule, python_text
+
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATIC = os.path.join(REPO_ROOT, "netpath", "web", "static")
 
@@ -296,7 +299,7 @@ if digit_range:
 # skipped every group written after it. Matched on shape (an `await get(`
 # inside its own `try` block, each followed by its own `catch`), not on a
 # fixed count, since a group added later must keep the same shape.
-GSEARCH = APP[APP.index("async function gsearchRun("):APP.index("function gsearchRender(")]
+GSEARCH = js_function(APP, "gsearchRun")
 gsearch_tries = re.findall(r"try\s*\{[^}]*await get\(", GSEARCH, re.S)
 check(len(gsearch_tries) >= 10,
       "gsearchRun wraps each lookup in its own try (found %d, want >= 10)"
@@ -337,7 +340,9 @@ check("No forwarding tables or ARP caches have been collected yet" in APP,
       "the hint's wording matches what the plan promised the operator")
 check("get('/api/ipam/dhcp/lease-search'" in GSEARCH and "'DHCP leases'" in GSEARCH,
       "global search reaches DHCP leases through their own endpoint")
-GSEARCH_EMPTY = APP[APP.index('class="gsearch-empty"'):APP.index("</p>'", APP.index('class="gsearch-empty"'))]
+_GSEARCH_RENDER = js_function(APP, "gsearchRender")
+GSEARCH_EMPTY = _GSEARCH_RENDER[_GSEARCH_RENDER.index('class="gsearch-empty"'):
+                                 _GSEARCH_RENDER.index("</p>'", _GSEARCH_RENDER.index('class="gsearch-empty"'))]
 check("ARP" in GSEARCH_EMPTY and "DHCP leases" in GSEARCH_EMPTY,
       "the empty-state text names ARP and DHCP leases among what the box searches")
 check("/api/syslog/search" in GSEARCH and "'Syslog'" in GSEARCH,
@@ -463,7 +468,7 @@ check("function forcePasswordChange(" not in SETTINGS and "forcePasswordChange,"
 check(re.search(r"new Intl\.DateTimeFormat\(", APP), "a cached Intl.DateTimeFormat exists")
 check(APP.count("new Intl.DateTimeFormat(") == 2,
       "exactly two cached formatters (with year, without) — not rebuilt per call")
-formatting_block = APP[APP.index("function clock("):APP.index("function span(")]
+formatting_block = js_functions(APP, "clock", "stamp")
 check(".format(d)" in formatting_block, "dateShort/stamp call .format() on the cached formatter")
 code_lines = [line for line in formatting_block.splitlines() if not line.strip().startswith("//")]
 check(not any("toLocaleDateString" in line for line in code_lines),
@@ -514,7 +519,7 @@ check(not cross_module_pages_access,
 CONFIGRX = read("configrx.js")
 check("redacted_only_change" in CONFIGRX,
       "configrx.js reads the redacted_only_change field the diff route sends")
-_diff_render = CONFIGRX[CONFIGRX.index("async function showDiff("):CONFIGRX.index("function closeDiff(")]
+_diff_render = js_function(CONFIGRX, "showDiff")
 check("result.identical" in _diff_render and "result.redacted_only_change" in _diff_render,
       "showDiff branches on both identical and redacted_only_change, not just on an empty diff string")
 check(not re.search(r"redacted[\s\S]{0,200}(old value|new value|previous value|became|now reads)",
@@ -541,12 +546,13 @@ check(not re.search(r"redacted[\s\S]{0,200}(old value|new value|previous value|b
 SSH = read("ssh.js")
 check("__closeMessage" in SSH,
       "ssh.js stashes the server's close message somewhere onclose can read it")
-_onclose = SSH[SSH.index("ws.onclose = (event)"):SSH.index("function closeSocket(")]
+_connect = js_function(SSH, "connect")
+_onclose = _connect[_connect.index("ws.onclose = (event)"):]
 check("ws.__closeMessage" in _onclose,
       "onclose reads the stashed message")
 check(_onclose.index("ws.__closeMessage") < _onclose.index("CLOSE_WORDS[event.code]"),
       "onclose checks the stashed message BEFORE falling back to CLOSE_WORDS, not after")
-_handle_control = SSH[SSH.index("function handleControl("):SSH.index("function firstLine(")]
+_handle_control = js_function(SSH, "handleControl")
 check("ws.__closeMessage = message.message" in _handle_control,
       "the status:closed frame's own message is what gets stashed, on the socket that received it")
 
@@ -603,13 +609,11 @@ check(bool(re.search(r"addEventListener\('beforeunload'[\s\S]{0,200}modalDirty",
 #     deliberately excluded from app.js's GET abort-dedupe, so a double-click
 #     really did fire two concurrent writes.
 NODES = read("nodes.js")
-_vendor_save = NODES[NODES.index("function renderVendorSection("):
-                     NODES.index("function ifaceStatsHtml(")]
+_vendor_save = js_function(NODES, "renderVendorSection")
 check("#ndd-vendor-save" in _vendor_save
       and "save.disabled = true" in _vendor_save and "App.put(" in _vendor_save,
       "#ndd-vendor-save disables itself before its PUT")
-_devgroup_save = NODES[NODES.index("function wireDeviceGroupRows("):
-                       NODES.index("async function refreshDeviceGroupsList(")]
+_devgroup_save = js_function(NODES, "wireDeviceGroupRows")
 check("save.disabled = true" in _devgroup_save and "App.put(" in _devgroup_save,
       ".devgroup-save disables itself before its PUT")
 
@@ -622,12 +626,10 @@ check("save.disabled = true" in _devgroup_save and "App.put(" in _devgroup_save,
 #     enough; nodes.js had already made, and documented, the opposite call
 #     for the equivalent action, so both now ask first too, the same way
 #     every other credential-destroying control in the product does.
-_forget = CONFIGRX[CONFIGRX.index("async function drawHostKey("):
-                   CONFIGRX.index("function wireEnableSecretClear(")]
+_forget = js_function(CONFIGRX, "drawHostKey")
 check("App.confirmDestructive(" in _forget,
       "#cx-hostkey-forget confirms before deleting the stored host key")
-_clear_secret = CONFIGRX[CONFIGRX.index("function wireEnableSecretClear("):
-                         CONFIGRX.index("function deviceSettingsModal(")]
+_clear_secret = js_function(CONFIGRX, "wireEnableSecretClear")
 check("App.confirmDestructive(" in _clear_secret,
       "#cx-enable-secret-clear confirms before deleting the stored enable secret")
 
@@ -644,7 +646,7 @@ check("App.confirmDestructive(" in _clear_secret,
 #     its sort on the very first live poll tick).
 check("function sortableTable(table)" in APP, "app.js defines App.sortableTable")
 check(bool(re.search(r"sortableTable\s*,\s*\n?\s*\};", APP))
-      or bool(re.search(r"\bsortableTable,", APP[APP.index("const api = {"):])),
+      or bool(re.search(r"\bsortableTable,", js_const(APP, "api"))),
       "App.sortableTable is exported on the api object")
 check("new MutationObserver" in APP and "reapplyPlainSort" in APP,
       "app.js re-applies a plain table's remembered sort via a MutationObserver")
@@ -703,7 +705,7 @@ check(not _missing_header,
 #      whole-link text, already used by "collapsed"/"plain" links) were
 #      defined but never reached from strands mode at all.
 MAPPER = read("mapper.js")
-DRAW_LINK = MAPPER[MAPPER.index("function drawLink("):MAPPER.index("function drawPortLabels(")]
+DRAW_LINK = js_function(MAPPER, "drawLink")
 check("i === 0" in DRAW_LINK,
       "drawLink's strands branch still singles out the first strand as the one Tab stop")
 check("ariaLabel: linkAriaLabel(link)" in DRAW_LINK
@@ -723,9 +725,8 @@ check("`VLAN ${vlanDisplay(strand.vlan)} strand on the link.`" in DRAW_LINK,
 #      pairs match (Dark: swatch #DA6C6C, strand #862727), so picking
 #      "Colour 1" showed a pastel that was never the maroon actually drawn.
 #      Both now read the same --canvas-vlan-* family the strand itself uses.
-VLAN_TABLE_BLOCK = MAPPER[MAPPER.index("const VLAN_COLUMNS"):MAPPER.index("let vlanSort")]
-PICKER_BLOCK = MAPPER[MAPPER.index("function openVlanColorPicker("):
-                       MAPPER.index("/* ----------------------------------------------------------- settings */")]
+VLAN_TABLE_BLOCK = js_const(MAPPER, "VLAN_COLUMNS")
+PICKER_BLOCK = js_function(MAPPER, "openVlanColorPicker")
 STRAND_STROKE = "stroke: `var(--canvas-vlan-" in DRAW_LINK
 check(STRAND_STROKE, "drawLink strokes a strand with --canvas-vlan-N (the pairing "
       "this swatch/picker check assumes stays put)")
@@ -742,7 +743,7 @@ check("var(--canvas-vlan-" in PICKER_BLOCK and "var(--vlan-" not in PICKER_BLOCK
 # legible as a square. --hairline (a 1.3-1.6:1 surface-step divider in every
 # theme) is not that border; --line (>=3.38:1 against --panel everywhere) is.
 APP_CSS = read("app.css")
-SWATCH_RULE = APP_CSS[APP_CSS.index(".mp-swatch {"):APP_CSS.index(".mp-swatch.selected")]
+SWATCH_RULE = css_rule(APP_CSS, ".mp-swatch")
 check("border: 1px solid var(--line)" in SWATCH_RULE,
       ".mp-swatch's border is --line, which clears 3:1 against --panel in every "
       "theme, not --hairline (1.3-1.6:1) which would leave the swatch's own "
@@ -849,8 +850,7 @@ check(".nd-resources {" in APP_CSS, "app.css lays out the RESOURCES grid")
 check("'/api/update/status'" in SETTINGS,
       "settings.js reads the update job's progress from /api/update/status "
       "rather than from the POST that started it")
-_CHECK_FOR_UPDATE = SETTINGS[SETTINGS.index("async function checkForUpdate"):
-                             SETTINGS.index("async function pollUpdateStatus")]
+_CHECK_FOR_UPDATE = js_function(SETTINGS, "checkForUpdate")
 check("pollUpdateStatus()" in _CHECK_FOR_UPDATE
       and "payload.up_to_date" not in _CHECK_FOR_UPDATE,
       "checkForUpdate hands over to pollUpdateStatus instead of reading an "
@@ -873,8 +873,7 @@ check(all(("    %s:" % _s) in SETTINGS for _s in _STEPS),
 #      view.lastAutoTs only after that first await, the poll tick landing
 #      meanwhile started a third. Two of the three raced each other through
 #      loadMapData's generation guard and the canvas drew whichever lost.
-_REFRESH = MAPPER[MAPPER.index("  async function refresh()"):
-                  MAPPER.index("  function forceRefresh()")]
+_REFRESH = js_function(MAPPER, "refresh")
 check("App.currentRoute()" in MAPPER,
       "mapper.js reads the route (App.currentRoute) so a reload of "
       "#/mapper/<id> loads the map the URL names, not the remembered one")
@@ -882,7 +881,7 @@ check("view.lastAutoTs = " in _REFRESH
       and _REFRESH.index("view.lastAutoTs = ") < _REFRESH.index("selectMap(initial"),
       "refresh() stamps view.lastAutoTs BEFORE awaiting its first selectMap, so "
       "the poll tick that lands mid-load does not start a second one")
-check("currentRoute" in APP[APP.index("  const api = {"):],
+check("currentRoute" in js_const(APP, "api"),
       "App exports currentRoute, the accessor mapper.js's refresh() reads")
 
 # 29b. master() has refused to overlap a page's refresh() with itself since
@@ -890,12 +889,9 @@ check("currentRoute" in APP[APP.index("  const api = {"):],
 #      a route or tab refresh goes through refreshNow() and was invisible
 #      to that guard. Since 5.3.0 both go through one runner, so the flag,
 #      the busy line and the connected() bookkeeping cannot drift apart.
-_MASTER = APP[APP.index("  async function master()"):
-              APP.index("  function restartTimer()")]
-_RUN_REFRESH = APP[APP.index("  function runRefresh(name, page)"):
-                   APP.index("  /* Called when a page needs its data now")]
-_REFRESH_NOW = APP[APP.index("  function refreshNow(name)"):
-                   APP.index("  async function start()")]
+_MASTER = js_function(APP, "master")
+_RUN_REFRESH = js_function(APP, "runRefresh")
+_REFRESH_NOW = js_function(APP, "refreshNow")
 check("page.refreshing = true" in _RUN_REFRESH and "page.refreshing = false" in _RUN_REFRESH,
       "the refresh runner marks the page as refreshing for the whole call, so "
       "master()'s own overlap guard covers a route or tab refresh too")
@@ -932,17 +928,16 @@ check("function applyTransform()" in MAPPER and "function redrawDragged()" in MA
       and "function drawRubber()" in MAPPER,
       "pan/zoom, a node drag and the rubber band each have their own partial "
       "redraw rather than going through the full draw()")
-_ON_WHEEL = MAPPER[MAPPER.index("  function onSvgWheel("):MAPPER.index("  function zoomBy(")]
+_ON_WHEEL = js_function(MAPPER, "onSvgWheel")
 check("applyTransform();" in _ON_WHEEL and "draw();" not in _ON_WHEEL,
       "a wheel zoom moves the scene group and does not rebuild the scene")
-_DRAW_GRID = MAPPER[MAPPER.index("  function drawGrid("):MAPPER.index("  function vlanDisplay(")]
+_DRAW_GRID = js_function(MAPPER, "drawGrid")
 check("patternUnits: 'userSpaceOnUse'" in _DRAW_GRID and "'line'" not in _DRAW_GRID,
       "the grid is one tiled <pattern> and one rect, not one <line> per grid step")
 check(".mp-grid { pointer-events: none; }" in APP_CSS,
       "the grid rect covers the whole drawing, so it must not take pointer events "
       "from the nodes and links underneath it")
-_INLINE = MAPPER[MAPPER.index("function inlineComputedColors("):
-                 MAPPER.index("function exportPng(")]
+_INLINE = js_function(MAPPER, "inlineComputedColors")
 check("value.startsWith('url(')" in _INLINE,
       "exportPng leaves a url(#pattern) paint reference alone — the browser reports "
       "it absolutised against this page, which resolves to nothing in the detached "
@@ -950,8 +945,7 @@ check("value.startsWith('url(')" in _INLINE,
 _PAGES = MAPPER[MAPPER.index("    init, refresh, activate"):]
 check("drawLegend" not in _PAGES,
       "the mapper page registration no longer redraws the legend on every fast tick")
-_NEIGHBOUR_ROWS = MAPPER[MAPPER.index("    function redrawNeighbourRows()"):
-                         MAPPER.index("    redrawNeighbourRows();")]
+_NEIGHBOUR_ROWS = js_function(MAPPER, "redrawNeighbourRows")
 check("App.grid(" in _NEIGHBOUR_ROWS,
       "redrawNeighbourRows calls App.grid the way drawVlanTable does, so re-sorting "
       "the Add-neighbours dialog replaces its rows instead of appending a second copy")
@@ -962,16 +956,14 @@ check("App.grid(" in _NEIGHBOUR_ROWS,
 #      rest.
 check("VLAN_TOOLTIP_CAP" in MAPPER and "VLAN_DETAIL_CAP" in MAPPER,
       "the hover text and the detail pane each cap how many VLANs they name")
-_LINK_DETAIL = MAPPER[MAPPER.index("  function linkDetailHtml("):
-                      MAPPER.index("  /* -------------------------------------------------------- pointer input */")]
+_LINK_DETAIL = js_function(MAPPER, "linkDetailHtml")
 check("data-show-all-vlans" in _LINK_DETAIL,
       "linkDetailHtml offers the rest of a capped VLAN list behind a button")
-_DRAW_DETAIL = MAPPER[MAPPER.index("  function drawDetail()"):
-                      MAPPER.index("  function roleSelectHtml(")]
+_DRAW_DETAIL = js_functions(MAPPER, "drawDetail", "renderDetail")
 check("data-show-all-vlans" in _DRAW_DETAIL,
       "drawDetail wires that button — the pane owns its own innerHTML, so it is the "
       "only place that can")
-_TOOLTIP_RULE = APP_CSS[APP_CSS.index(".tooltip {"):APP_CSS.index(".tooltip {") + 900]
+_TOOLTIP_RULE = css_rule(APP_CSS, ".tooltip")
 check("overflow-wrap" in _TOOLTIP_RULE and "max-height" in _TOOLTIP_RULE
       and "white-space: pre-wrap" in _TOOLTIP_RULE,
       ".tooltip wraps a long line and caps its own height, so a wide VLAN list "
@@ -997,7 +989,7 @@ check('id="nd-arp-table"' in INDEX and "function drawArpTable(" in NODES
       "the ARP pane holds #nd-arp-table, nodes.js draws it and DETAIL_SUBS fetches it")
 check("view.arpEnabled === false" in NODES and "Read the ARP cache every" in NODES,
       "the ARP pane tells 'walk switched off' from 'nothing collected yet' and names the setting")
-ARP_DRAW = NODES[NODES.index("function drawArpTable("):NODES.index("function drawAddressesTable(")]
+ARP_DRAW = js_function(NODES, "drawArpTable")
 check("nd-arp-mac" in ARP_DRAW and "view.macSearchPending = true" in ARP_DRAW
       and "App.refreshNow('nodes')" in ARP_DRAW,
       "an ARP row's MAC cell reuses the Find box's own MAC search (the Enter path) "
@@ -1008,8 +1000,7 @@ check("parts[2] === 'arp'" in NODES and "selectDetailSub('arp')" in NODES,
       "#/nodes/device/<id>/arp opens the device and its ARP pane")
 check('id="nd-duplicates"' in INDEX and "duplicatesDialog" in NODES,
       "the Devices bar has the Duplicates button and nodes.js opens it")
-MERGE_BLOCK = NODES[NODES.index("async function mergeDialog("):
-                    NODES.index("/* ------------------------------------------------------- bridge & RF")]
+MERGE_BLOCK = js_function(NODES, "mergeDialog")
 check("dataset.requiresWrite = 'nodes'" in MERGE_BLOCK
       and "App.applyPermissions(" in MERGE_BLOCK,
       "mergeDialog stamps data-requires-write=\"nodes\" on its Merge button and "
@@ -1025,8 +1016,7 @@ check("duplicate_of_device_id" in NODES and "'/api/nodes/duplicates'" in NODES,
 # until the POST answers, so a live button is two sweeps for two clicks. The
 # server refuses the second one, but a button that stays clickable while it
 # works is the defect the refusal exists to survive, not a design.
-_REDISCOVER = NODES[NODES.index("  async function rediscover("):
-                    NODES.index("  function discStatus(")]
+_REDISCOVER = js_function(NODES, "rediscover")
 check("button.disabled = true" in _REDISCOVER
       and "rediscover(job, e.target)" in NODES,
       "the Re-discover button is handed to rediscover() and disabled for the "
@@ -1044,8 +1034,7 @@ check("function whenModuleReady(" in APP
       and "selectTab, whenModuleReady," in APP,
       "app.js exports whenModuleReady, so a caller can await a lazy module's "
       "init() before pressing a button that module wires")
-_MODULES_PANE = SETTINGS[SETTINGS.index("  function buildModulesPane()"):
-                         SETTINGS.index("  /* --------------------------------------------------------- role presets")]
+_MODULES_PANE = js_function(SETTINGS, "buildModulesPane")
 check("await App.whenModuleReady(" in _MODULES_PANE
       and _MODULES_PANE.index("await App.whenModuleReady(")
       < _MODULES_PANE.index("target.click()"),
@@ -1061,8 +1050,7 @@ check("dataset.requiresWrite = tab" in _MODULES_PANE
       and "App.applyPermissions(" in _MODULES_PANE,
       "each entry carries the module's write gate and is gated on the spot - it "
       "is built long after start-up's applyPermissions() walked the page")
-_MODULE_DIALOGS = SETTINGS[SETTINGS.index("  const MODULE_DIALOGS = ["):
-                           SETTINGS.index("  function buildModulesPane()")]
+_MODULE_DIALOGS = js_const(SETTINGS, "MODULE_DIALOGS")
 _pane_ids = re.findall(r"\['([a-z]+)', '[^']+', '([a-z-]+)'\]", _MODULE_DIALOGS)
 check(len(_pane_ids) == 10,
       "all ten modules are still listed in MODULE_DIALOGS")
@@ -1086,8 +1074,7 @@ for _tab, _button_id in _pane_ids:
 #      only clicked. The element is captured once, at the press, and the
 #      teardown runs in a `finally` so a throw in the write path cannot leave
 #      the listeners or the drag state behind either.
-_NODE_DRAG = MAPPER[MAPPER.index("  function onNodePointerDown("):
-                    MAPPER.index("  function queuePositionWrite(")]
+_NODE_DRAG = js_function(MAPPER, "onNodePointerDown")
 check("const target = event.currentTarget" in _NODE_DRAG,
       "onNodePointerDown captures the node's element once, into the closures it "
       "leaves behind, instead of reading event.currentTarget after dispatch")
@@ -1126,15 +1113,13 @@ check("const perPixelX" in _NODE_DRAG and "const perPixelY" in _NODE_DRAG,
 #      pan (`!view.userZoom`), so an auto-refresh, a pane resize or a badge
 #      appearing threw away an arrangement they had just made. A map is
 #      fitted when it is opened and when Fit is pressed, and not otherwise.
-_DRAW = MAPPER[MAPPER.index("  function draw()"):MAPPER.index("  function emptyCanvas(")]
+_DRAW = js_function(MAPPER, "draw")
 check("if (!view.frame || view.needsFit) {" in _DRAW and "fitView(bounds, width, height);" in _DRAW,
       "draw() fits only a scene with no frame yet or one flagged for a fit, not "
       "every draw the operator has not yet zoomed away from")
-check("view.needsFit = false;" in MAPPER[MAPPER.index("  function fitView("):
-                                         MAPPER.index("  function translation(")],
+check("view.needsFit = false;" in js_function(MAPPER, "fitView"),
       "fitView clears the flag, so one request means one fit")
-check("view.needsFit = true;" in MAPPER[MAPPER.index("  async function selectMap("):
-                                        MAPPER.index("  function mapForm(")],
+check("view.needsFit = true;" in js_function(MAPPER, "selectMap"),
       "opening a map (first load, or a switch from the Map dropdown) is what asks "
       "for a fit")
 check("App.el('mp-fit').onclick" in MAPPER and "fitView(contentBounds()" in MAPPER,
@@ -1157,17 +1142,15 @@ check(_DRAW.index("showCanvas(svg, canvas);") < _DRAW.index("svg.getBoundingClie
 check("function gestureActive()" in MAPPER,
       "one predicate answers whether a gesture is in flight (node drag, rubber "
       "band or pan)")
-_MP_REFRESH = MAPPER[MAPPER.index("  async function refresh()"):
-                     MAPPER.index("  function forceRefresh()")]
+_MP_REFRESH = js_function(MAPPER, "refresh")
 check("gestureActive()" in _MP_REFRESH,
       "refresh() leaves the canvas alone while the operator is mid-gesture")
 check("view.nodeDrag" in _MP_REFRESH or "gestureActive" in _MP_REFRESH,
       "refresh()'s guard names the drag state it is protecting")
-_INIT = MAPPER[MAPPER.index("  function init()"):]
+_INIT = js_function(MAPPER, "init")
 check("'resize', 'panes-resized'" in _INIT and "!gestureActive()" in _INIT,
       "a window resize or a pane drag redraws only when no gesture is in flight")
-_LOAD_MAP_DATA = MAPPER[MAPPER.index("  async function loadMapData()"):
-                        MAPPER.index("  /* ---------------------------------------------------------- candidates */")]
+_LOAD_MAP_DATA = js_function(MAPPER, "loadMapData")
 check("if (view.nodeDrag) view.nodeDrag = null;" in _LOAD_MAP_DATA,
       "a payload that does land mid-drag (an explicit reload) ends the drag "
       "rather than dropping nodes at coordinates from the payload it replaced")
@@ -1201,8 +1184,7 @@ check("const img = new Image();" in MAPPER_JS and "URL.createObjectURL(svgBlob)"
 #      module's own auto-refresh redraws it on its own clock — so a tick
 #      landing while the operator was typing a new node name emptied the box
 #      mid-word, and Save then wrote the markup's value instead of theirs.
-_DETAIL = MAPPER_JS[MAPPER_JS.index("  function drawDetail()"):
-                    MAPPER_JS.index("  function renderDetail()")]
+_DETAIL = js_function(MAPPER_JS, "drawDetail")
 check("document.activeElement" in _DETAIL and "detail.contains(active)" in _DETAIL,
       "drawDetail notices when the field being rebuilt is the one the operator "
       "is in")
@@ -1240,8 +1222,7 @@ check("canvas.focus({ preventScroll: true })" in MAPPER_JS,
 #      made, Remove re-opened its destructive confirm.
 check("const SPACE_ACTIVATES" in MAPPER_JS,
       "the controls Space activates are named in one place")
-_SPACE = MAPPER_JS[MAPPER_JS.index("  function wireSpaceModifier()"):
-                   MAPPER_JS.index("  /* --------------------------------------------------------- align tools */")]
+_SPACE = js_function(MAPPER_JS, "wireSpaceModifier")
 check("closest(SPACE_ACTIVATES)" in _SPACE,
       "the pan modifier stands aside when the focus is on something Space would "
       "press, so Space either pans or presses — never both")
@@ -1253,10 +1234,9 @@ check("'INPUT'" in _SPACE and "'TEXTAREA'" in _SPACE and "'SELECT'" in _SPACE,
 # ---------------------------------------------------------------------------
 # 36. MAPPER (5.0.1): the follow-up review of the drag fixes.
 _MAPPER2 = read("mapper.js")
-_NODE_DRAG2 = _MAPPER2[_MAPPER2.index("  function onNodePointerDown("):
-                       _MAPPER2.index("  function queuePositionWrite(")]
-_DRAW2 = _MAPPER2[_MAPPER2.index("  function draw() {"):
-                  _MAPPER2.index("  function draw() {") + 400]
+_NODE_DRAG2 = js_function(_MAPPER2, "onNodePointerDown")
+_DRAW2_FULL = js_function(_MAPPER2, "draw")
+_DRAW2 = _DRAW2_FULL[:400]
 check(_NODE_DRAG2.index("focusCanvas();") < _NODE_DRAG2.index("drawDetail();"),
       "a node press focuses the canvas BEFORE the pane is rebuilt, or the "
       "restore in drawDetail would carry one node's typed name into another's")
@@ -1273,8 +1253,7 @@ check("window.addEventListener('blur'" in _MAPPER2 and
       "view.panDrag = null; view.rubber = null; view.spaceHeld = false;" in _MAPPER2,
       "a window blur ends every gesture flag, or a release the page never "
       "saw skips refresh for good")
-check("a[href]" not in _MAPPER2[_MAPPER2.index("const SPACE_ACTIVATES"):
-                                _MAPPER2.index("const SPACE_ACTIVATES") + 120],
+check("a[href]" not in js_const(_MAPPER2, "SPACE_ACTIVATES"),
       "Space never activates a link, so a focused link must not block the pan")
 check("userZoom" not in _MAPPER2 and "dragMoved" not in _MAPPER2,
       "the write-only view flags are gone")
@@ -1286,7 +1265,7 @@ check("userZoom" not in _MAPPER2 and "dragMoved" not in _MAPPER2,
 #     childList mutation the plain-table observer answers by re-applying the
 #     sort, which writes the caret again, forever. The glyph is written only
 #     when it differs.
-_APP_SORT = APP[APP.index("  function sortPlainTable("):APP.index("  function visibleHeaderText(")]
+_APP_SORT = js_function(APP, "sortPlainTable")
 check("caret.textContent !== glyph" in _APP_SORT,
       "the sort caret is rewritten only when its glyph changes, or the "
       "MutationObserver that re-applies a plain table's sort loops on it")
@@ -1319,8 +1298,7 @@ check("s.value === 0" not in NODES,
 check("sfpBadge(r) + escape(r.descr" in NODES,
       "the badge is prepended to the descr cell, so it is visible in the "
       "default column set rather than behind the column picker")
-_DEV_DIALOG = NODES[NODES.index("  function deviceDialog("):
-                    NODES.index("  /* ------------------------------------------- temperature alert overrides")]
+_DEV_DIALOG = js_function(NODES, "deviceDialog")
 check("dialogOptics = new Set(" in _DEV_DIALOG
       and _DEV_DIALOG.count("paintDialogIfaces()") >= 2,
       "the device dialog's /dom response patches the fetched interface rows "
@@ -1333,8 +1311,7 @@ check("view.ifaces =" not in _DEV_DIALOG,
 # 41. STORAGE (5.1.0): "oldest record N ago" beside each data file, from
 #     /api/state's {name}_oldest_ts, rendered where the byte counts already are.
 _SETTINGS41 = read("settings.js")
-_USAGE41 = _SETTINGS41[_SETTINGS41.index("  function showUsage(storage) {"):
-                       _SETTINGS41.index("  function status(message, colour) {")]
+_USAGE41 = js_function(_SETTINGS41, "showUsage")
 check("`oldest record ${App.ago(ts)}`" in _USAGE41,
       "the age is rendered through App.ago, the one place that turns an epoch "
       "into a relative figure")
@@ -1352,8 +1329,7 @@ for _id in ("age-app", "age-trace", "age-flow", "age-snmp", "age-syslog",
 
 # 42. ConfigRX (5.1.0): the CHANGE DETECTION fieldset for ignore_line_patterns,
 #     the operator-editable companion to configrx_volatile.VOLATILE.
-_CX_SETTINGS = CONFIGRX[CONFIGRX.index("function settingsDialog()"):
-                        CONFIGRX.index("  /* ------------------------------------------------------------- search")]
+_CX_SETTINGS = js_function(CONFIGRX, "settingsDialog")
 check("CHANGE DETECTION" in _CX_SETTINGS,
       "the settings dialog has a fieldset for the volatile-line ignore list, "
       "not just SCHEDULE/RETENTION/SSH")
@@ -1390,6 +1366,10 @@ check("'alerts.settings.notifyminsev'" in _ALERTS_JS
       and "App.helpLink('alerts.settings.notifyminsev')" in _ALERTS_JS,
       "the floor's help entry is both registered and linked -- the ingest "
       "filter and the email floor are one word apart and read as each other")
+# ANCHOR-TODO: these are two keys inside one App.registerHelp({...}) object
+# literal, not a function or a top-level const — no _source.py helper
+# extracts a call-expression's object literal by key, so this stays a
+# same-file text slice.
 _MINSEV_HELP = _ALERTS_JS[_ALERTS_JS.index("'alerts.settings.minsev'"):
                           _ALERTS_JS.index("'alerts.settings.notifyminsev'")]
 check("EMAIL SERVER" in _MINSEV_HELP,
@@ -1399,8 +1379,7 @@ check("EMAIL SERVER" in _MINSEV_HELP,
 
 # 40. The WEB relay (5.1.0): must not regress — a URL in the markup, a
 #     missing permission gate, or a window.open placed after an await.
-_WEB_CLICK = NODES[NODES.index("  async function webDevice()"):
-                   NODES.index("  /* ------------------------------------------------------------ profiles */")]
+_WEB_CLICK = js_function(NODES, "webDevice")
 check("dataset.url" not in NODES,
       "no device URL is stashed in the markup any more -- the destination "
       "comes from the device row, server-side, and the button carries a "
@@ -1437,8 +1416,7 @@ check("set-web-relay-range" in INDEX and "web_relay_port_range" in SETTINGS,
 #     the STORAGE fieldset carries them and Save posts them under the keys
 #     flowdb.DEFAULTS names.
 _NETFLOW = read("netflow.js")
-_NF_SETTINGS = _NETFLOW[_NETFLOW.index("  function settingsDialog() {"):
-                        _NETFLOW.index("  async function sendTestPacket() {")]
+_NF_SETTINGS = js_function(_NETFLOW, "settingsDialog")
 _NF_STORAGE = _NF_SETTINGS[_NF_SETTINGS.index("STORAGE AND DISPLAY"):
                            _NF_SETTINGS.index("columnPickerFieldset")]
 for _id, _key in (("n-rollup-min", "rollup_minute_days"),
@@ -1461,7 +1439,7 @@ check("scan_bounded" in _NETFLOW,
 # 44. NetFlow (5.3.0): switching windows was slow in the browser, not on the
 #     server — the two queries ran one after the other for no reason, and
 #     nothing cancelled the window that had just been left.
-_GET = APP[APP.index("  const get = (path, params"):APP.index("  const post = (path")]
+_GET = js_const(APP, "get")
 check("call(path + query, options)" in _GET,
       "App.get passes a caller's own options through to call(), which is the "
       "only way to cancel a request whose URL has changed — call()'s in-flight "
@@ -1469,8 +1447,7 @@ check("call(path + query, options)" in _GET,
 check("options.signal && options.signal.aborted" in APP,
       "a caller's own abort is flagged superseded like call()'s own, so "
       "abandoning a window is silent rather than an outage banner")
-_NF_REFRESH = _NETFLOW[_NETFLOW.index("  async function refresh() {"):
-                       _NETFLOW.index("  function init() {")]
+_NF_REFRESH = js_function(_NETFLOW, "refresh")
 check("Promise.all" in _NF_REFRESH and "await App.get(" not in _NF_REFRESH,
       "the overview and the record list are asked for together: they are "
       "independent, and in series every window change cost the sum of both "
@@ -1481,8 +1458,7 @@ check("new AbortController()" in _NF_REFRESH and "signal: abort.signal" in _NF_R
       "it finally answers")
 check("if (token !== view.request) return;" in _NF_REFRESH,
       "...with the repaint guard still checked after both")
-_NF_FETCH = _NETFLOW[_NETFLOW.index("  function dropInFlight() {"):
-                     _NETFLOW.index("  function applyWindow(")]
+_NF_FETCH = js_functions(_NETFLOW, "dropInFlight", "requestFetch")
 check("view.abort.abort()" in _NF_FETCH,
       "and a change of view aborts what is already in flight rather than "
       "waiting for it to answer something nobody will read")
@@ -1499,8 +1475,7 @@ check("if (windowChanged) showLoading();" in _NF_FETCH,
       "the Loading state is for a window change, not for every refresh — the "
       "two-second poll must not blank the page it is refreshing")
 
-_NF_LOADING = _NETFLOW[_NETFLOW.index("  function showLoading() {"):
-                       _NETFLOW.index("  function filters() {")]
+_NF_LOADING = js_function(_NETFLOW, "showLoading")
 for _target in ("drawChart();", "drawBars();", "drawTable("):
     check(_target in _NF_LOADING,
           "a window change says so over the chart, the top-N bars and the "
@@ -1532,9 +1507,7 @@ _FAILED_AT = "  function loadFailed(error) {"
 check(_FAILED_AT in _NETFLOW,
       "the loading state has a way out other than success at all — this is "
       "the function that did not exist, and every check below reads it")
-_NF_FAILED = (_NETFLOW[_NETFLOW.index(_FAILED_AT):
-                       _NETFLOW.index("  function filters() {")]
-              if _FAILED_AT in _NETFLOW else "")
+_NF_FAILED = js_function(_NETFLOW, "loadFailed") if _FAILED_AT in _NETFLOW else ""
 check("error.superseded" in _NF_FAILED,
       "a superseded abort is not a failure — the newer fetch it was abandoned "
       "for is still loading, and its answer is the one worth waiting for")
@@ -1683,12 +1656,9 @@ print()
 #      These are the cheap grep half; 45b below RUNS the chart, because a
 #      slotSeconds() that returned bucket_s unconditionally, or a slotAt()
 #      off by one, passes every line here.
-_NF_CHART = _NETFLOW[_NETFLOW.index("  function drawChart() {"):
-                     _NETFLOW.index("  /* -------------------------------------------------------------- bars */")]
-_NF_AXIS = _NETFLOW[_NETFLOW.index("  function axisOf(data, plot) {"):
-                    _NETFLOW.index("  /* The chart carries too many time buckets for one tab stop each")]
-_NF_BARS = _NETFLOW[_NETFLOW.index("  function drawBars() {"):
-                    _NETFLOW.index("  function filterByBar(row) {")]
+_NF_CHART = js_functions(_NETFLOW, "drawChart", "slotTip")
+_NF_AXIS = js_function(_NETFLOW, "axisOf")
+_NF_BARS = js_function(_NETFLOW, "drawBars")
 check("* 8 / slotSeconds(data, i)" in _NF_CHART
       and "App.rate(entry.value, seconds)" in _NF_CHART
       and "App.rate(total, seconds)" in _NF_CHART
@@ -1699,9 +1669,9 @@ check("* 8 / slotSeconds(data, i)" in _NF_CHART
       "the chart did not draw")
 check("* 8 / bucket)" not in _NF_CHART and "App.rate(entry.value, bucket)" not in _NF_CHART,
       "...and nowhere divides by the nominal bucket width any more")
-check("Number.isFinite(data.t1)" in _NETFLOW and "view.t1" not in _NETFLOW[
-          _NETFLOW.index("  function windowEnd(data) {"):
-          _NETFLOW.index("  function slotSeconds(data, slot) {")],
+_WINDOW_END_BLOCK = (js_functions(_NETFLOW, "windowEnd", "slotCovered")
+                      + js_const(_NETFLOW, "SLOT_MIN_FRACTION"))
+check("Number.isFinite(data.t1)" in _NETFLOW and "view.t1" not in _WINDOW_END_BLOCK,
       "the window's end is the response's own t1, which is what the values "
       "were read over, not view.t1")
 check("stepX" not in _NF_CHART and "const xOf = (ts) =>" in _NF_AXIS
@@ -1778,8 +1748,10 @@ check("if (folded) tip.push({ text: FOLDED_TEXT });" in _NF_BARS
 #      section exists, and why that is printed rather than passed over.
 NODE = shutil.which("node") or shutil.which("nodejs")
 
-_NF_HELPERS = _NETFLOW[_NETFLOW.index("  /* ------------------------------------------------------------- chart */"):
-                       _NETFLOW.index("  /* -------------------------------------------------------------- bars */")]
+_NF_HELPERS = (js_functions(_NETFLOW, "niceCeiling", "rateLabel", "windowEnd", "slotCovered",
+                             "slotSeconds", "slotCount", "axisOf", "showFocusTip", "drawChart",
+                             "slotTip")
+               + js_const(_NETFLOW, "SLOT_MIN_FRACTION"))
 _NF_CONSTS = "".join(re.search(pat, _NETFLOW).group(0) for pat in (
     r"  const PAD = \{[^\n]*\n", r"  const DRAG_MIN_S = [^\n]*\n", r"  const DRAG_MIN_PX = [^\n]*\n"))
 
@@ -2307,7 +2279,7 @@ check("V3_AUTH_PROTOCOLS.map(" in _WIRELESS58
 # The Wireless settings dialog has the verify-replies switch the changelog
 # says it has, posts it under the key wirelessdb.DEFAULTS stores, and its
 # hint says what turning it off gives up.
-_WL_SETTINGS = _WIRELESS58[_WIRELESS58.index("function settingsDialog("):]
+_WL_SETTINGS = js_function(_WIRELESS58, "settingsDialog")
 check('id="wl-v3verify"' in _WL_SETTINGS
       and "v3_verify_replies: m.querySelector('#wl-v3verify').checked" in _WL_SETTINGS,
       "wireless.js's settings dialog carries the SNMPv3 verify-replies switch "
@@ -2330,7 +2302,7 @@ check(_CRED_BODY.count("return null") == 1
       and "!fields.v3_user || !fields.v3_auth_proto" not in _CRED_BODY[:_FIRST_NULL],
       "credentialBody returns null only when nothing was typed; a typed "
       "password that cannot be stored is thrown, never dropped")
-_ADD_PATH = _NODES58[_NODES58.index("function addDevice("):_NODES58.index("function editDevice(")]
+_ADD_PATH = js_function(_NODES58, "addDevice")
 check("/credential`, credential)\n              .catch(() => {})" not in _ADD_PATH
       and "credentialError" in _ADD_PATH
       and "but its SNMPv3 credential was not stored" in _ADD_PATH,
@@ -2702,7 +2674,7 @@ check("escape(String(s.value))" in _slice59(_N59, "  function domValueCell(s) {"
 # back was the reported workaround: that path runs activate()+refreshNow
 # and waits for none of it.
 DASH = read("dashboard.js")
-_START = APP[APP.index("  async function start()"):APP.index("  // Started from here")]
+_START = js_function(APP, "start")
 # The boot chain's own first await — not the `await post('/api/logout')`
 # inside the sign-out handler start() wires further up.
 _FIRST_AWAIT = _START.index("await loadState()")
@@ -2729,8 +2701,7 @@ check("function plannedInitialTab()" in APP
       and APP.count("localStorage.getItem(TAB_KEY)") == 1,
       "the landing tab (hash, then the remembered tab, then Dashboard) is "
       "worked out in one function rather than twice")
-_ENSURE = APP[APP.index("  function ensureModuleReady(name)"):
-              APP.index("  const activationReported = new Set();")]
+_ENSURE = js_function(APP, "ensureModuleReady")
 _EAGER50 = _ENSURE.split("if (!isLazyModule(name))")[1].split(
     "if (pages[name] && pages[name].__ready)")[0]
 check("if (!pages[name])" in _EAGER50
@@ -2739,12 +2710,10 @@ check("if (!pages[name])" in _EAGER50
       "it — activating one that never registered was a silent no-op")
 check("never registered" in _EAGER50,
       "...and it rejects with the same 'never registered' error the lazy path uses")
-_ACTIVATE = APP[APP.index("  const activationReported = new Set();"):
-                APP.index("  /* ---------------------------------------------------- host capabilities")]
+_ACTIVATE = js_const(APP, "activationReported") + js_function(APP, "activateTab")
 check("activationReported" in _ACTIVATE and "console.error(" in _ACTIVATE,
       "activateTab's catch reports the failure once instead of swallowing it")
-_MASTER50 = APP[APP.index("  async function master()"):
-                APP.index("  function restartTimer()")]
+_MASTER50 = js_function(APP, "master")
 check("!first.lastFetch" in _MASTER50 and "refreshNow(state.tab)" in _MASTER50,
       "a page that has never fetched still gets one refresh while /api/state "
       "is failing — a tab switch would have fetched it")
@@ -2756,7 +2725,7 @@ check("state.loadingState = true" in _START
       and _START.index("state.loadingState = true") < _FIRST_AWAIT,
       "...and the boot's own first load claims the same flag, so the "
       "heartbeat started above it cannot abort it")
-_PERMS50 = APP[APP.index("  function applyPermissions()"):APP.index("  const pages = {};")]
+_PERMS50 = js_function(APP, "applyPermissions")
 check("page.permissionsChanged()" in _PERMS50,
       "applyPermissions tells the modules already on screen that permissions "
       "have landed (the Dashboard now paints before /api/config answers)")
@@ -2768,11 +2737,11 @@ _SPLIT50 = _START[_START.index("initKiosk();"):_START.index("window.addEventList
 check(_SPLIT50.count("try {") >= 2,
       "initSplitters() and applyDensity() are wrapped the way initKiosk() is, "
       "so neither takes the module inits and the boot route down with it")
-_DRAW50 = DASH[DASH.index("  function draw() {"):DASH.index("  async function refresh()")]
+_DRAW50 = js_function(DASH, "draw")
 check("const parts = [errorLine];" in _DRAW50,
       "dashboard.js draws a failed read as a line ABOVE the tiles rather than "
       "replacing a whole shift's view with one sentence")
-_DREFRESH50 = DASH[DASH.index("  async function refresh()"):DASH.index("  function activate()")]
+_DREFRESH50 = js_function(DASH, "refresh")
 check("if (error && error.superseded) { draw(); return; }" in _DREFRESH50,
       "a superseded first fetch still draws — returning left the grid on "
       "'Loading…' whenever the boot and the first poll tick overlapped")
@@ -2802,7 +2771,7 @@ check('value="netpath_event"' in ALERTS51,
 
 # --- 52. 5.11.0: a neighbour known only by its IP gets a name ---------------
 NODES52 = read("nodes.js")
-_NB52 = NODES52[NODES52.index("  function drawNeighborsTable()"):]
+_NB52 = js_function(NODES52, "drawNeighborsTable")
 _NB52 = _NB52[:_NB52.index("App.wireRowKeyboard(body)")]
 check("r.resolved_name" in _NB52,
       "nodes.js' neighbours table shows the name the API resolved for an "
@@ -2844,8 +2813,10 @@ check("const muteLabel = (h) =>" in ALERTS52,
       "...through a muteLabel() helper, so 168 never reaches a dropdown raw")
 check("7-day cap" in ALERTS52,
       "...and the bulk-mute hint names the 7-day cap, not the old 24-hour one")
-for _id in ("alerts-d-mute-hours", "bm-hours"):
-    _near52 = ALERTS52[ALERTS52.index('id="%s"' % _id):][:400]
+_MUTE_SELECT_OWNERS = {"alerts-d-mute-hours": "showDetail", "bm-hours": "bulkMuteDialog"}
+for _id, _owner in _MUTE_SELECT_OWNERS.items():
+    _owner_body = js_function(ALERTS52, _owner)
+    _near52 = _owner_body[_owner_body.index('id="%s"' % _id):][:400]
     check("MUTE_HOURS.map(" in _near52,
           "the %s select is built from MUTE_HOURS rather than its own list" % _id)
 
@@ -3053,8 +3024,7 @@ check("formatMetricValue(unit, p.min)" in _hover_body,
 
 # --- 60. 5.17.0: the Find box words an uplink-learned MAC hit as such -------
 NODES60 = read("nodes.js")
-_RESOLVE60 = NODES60[NODES60.index("  async function resolveMacSearch("):]
-_RESOLVE60 = _RESOLVE60[:_RESOLVE60.index("\n  async function openPort(")]
+_RESOLVE60 = js_function(NODES60, "resolveMacSearch")
 check("via uplink to" in _RESOLVE60,
       "resolveMacSearch words an uplink-learned MAC hit as 'via uplink to "
       "<neighbour>', not a plain port name indistinguishable from an "
@@ -3064,7 +3034,7 @@ check("loc.uplink" in _RESOLVE60 and "loc.uplink_to" in _RESOLVE60,
 
 # --- 61. 5.18.0: the interface dialog's bandwidth chart has a range picker -
 NODES61 = read("nodes.js")
-_ifd_body = NODES61[NODES61.index("function interfaceDialog("):]
+_ifd_body = js_function(NODES61, "interfaceDialog")
 check("id=\"ifd-range\" aria-label=\"Chart range\"" in _ifd_body,
       "interfaceDialog's BANDWIDTH bar has a #ifd-range select")
 check("App.fillRanges(box.querySelector('#ifd-range')" in _ifd_body,
@@ -3147,8 +3117,7 @@ check("const drawSeriesChart = App.drawSeriesChart;" in read("nodes.js")
 check("Not readable with your access." in DASH64,
       "a tile whose module the account cannot read says so instead of showing numbers")
 DEBUG64 = read("debug.js")
-_DRAW_EVENTS64 = DEBUG64[DEBUG64.index("  function drawEvents("):
-                        DEBUG64.index("  /* Typing eight characters")]
+_DRAW_EVENTS64 = js_function(DEBUG64, "drawEvents")
 _FOLLOW_IF = _DRAW_EVENTS64[_DRAW_EVENTS64.index("App.el('dbg-follow').checked"):
                             _DRAW_EVENTS64.index("wrap.scrollTop = wrap.scrollHeight;")]
 check("atBottom" in _FOLLOW_IF and len(_FOLLOW_IF) < 120,
@@ -3164,14 +3133,12 @@ check("atBottom = wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight <= 4;" 
 # null/undefined config value before the PUT rather than send it literally.
 check("function sanitizedLayout(layout)" in DASH64,
       "dashboard.js strips null/undefined config values before saving")
-_SANITIZED = DASH64[DASH64.index("function sanitizedLayout(layout)"):
-                    DASH64.index("async function saveDraft()")]
+_SANITIZED = js_function(DASH64, "sanitizedLayout")
 check("value !== null && value !== undefined" in _SANITIZED,
       "...specifically by dropping keys whose value is null or undefined")
 check("sanitizedLayout(view.draft)" in DASH64,
       "...and saveDraft actually calls it rather than PUTting view.draft raw")
-_DRAGSTART = DASH64[DASH64.index("function onDragStart(event)"):
-                    DASH64.index("function onDragOver(event)")]
+_DRAGSTART = js_function(DASH64, "onDragStart")
 check(_DRAGSTART.strip().startswith("function onDragStart(event) {\n    if (!view.editing) return;"),
       "onDragStart bails out in view mode before it can preventDefault() a "
       "plain link or text drag")
@@ -3235,7 +3202,7 @@ check("App.attachChartZoom(svg, geo" in NODES66,
 check("function setTimelineWindow(t0, t1)" in NODES66
       and "App.attachChartZoom(svg, { plot:" in NODES66,
       "drawStatusTimeline attaches App.attachChartZoom over its own bar geometry")
-check("timelineWindow()" in NODES66[NODES66.index("async function loadRfChart("):],
+check("timelineWindow()" in js_function(NODES66, "loadRfChart"),
       "loadRfChart follows the #nd-d-range window instead of a fixed last hour")
 for _name, _needle in (
         ("netpath.js", "App.rangeDialog("),
@@ -3311,8 +3278,7 @@ check("r.sys_uptime_s != null ? App.duration(r.sys_uptime_s) : '—'" in NODES68
 # --- 69. 5.23.0: Mapper PNG export carries font/opacity/dash props too, and
 # renders at device pixel ratio.
 MAPPER69 = read("mapper.js")
-_INLINE69 = MAPPER69[MAPPER69.index("function inlineComputedColors("):
-                     MAPPER69.index("function exportPng(")]
+_INLINE69 = js_function(MAPPER69, "inlineComputedColors")
 check("'font-family'" in _INLINE69 and "'font-size'" in _INLINE69,
       "inlineComputedColors' props list carries font-family and font-size, so "
       "a label serialised for PNG export keeps its on-screen font instead of "
@@ -3322,8 +3288,7 @@ for _prop in ("font-weight", "text-anchor", "letter-spacing", "opacity",
     check("'%s'" % _prop in _INLINE69,
           "...and %s, so a manual link's dashed stroke and any faded element "
           "survive the export too" % _prop)
-_EXPORT69 = MAPPER69[MAPPER69.index("function exportPng("):
-                     MAPPER69.index("function exportCsvClick(")]
+_EXPORT69 = js_function(MAPPER69, "exportPng")
 check("Math.min(window.devicePixelRatio || 1, 2)" in _EXPORT69,
       "exportPng renders at devicePixelRatio, capped at 2x, instead of a 1:1 "
       "canvas that looks soft on any HiDPI screen")
@@ -3386,8 +3351,9 @@ check(r'r"^/api/mapper/maps/(\d+)/links/(\d+)$"' in SERVER_PY
 NODES72 = read("nodes.js")
 check('id="ifd-priority"' in NODES72,
       "the interface dialog carries the ifd-priority checkbox")
-_IFD_PRIORITY72 = NODES72[max(0, NODES72.index('id="ifd-priority"') - 100):
-                          NODES72.index('id="ifd-priority"') + 100]
+_IFD72 = js_function(NODES72, "interfaceDialog")
+_IFD_PRIORITY72 = _IFD72[max(0, _IFD72.index('id="ifd-priority"') - 100):
+                         _IFD72.index('id="ifd-priority"') + 100]
 check('data-requires-write="nodes"' in _IFD_PRIORITY72,
       "...gated on nodes write access like every other control that changes "
       "stored state")
@@ -3476,8 +3442,9 @@ check("App.fillRanges(App.el('nd-hist-range'), 'Last 24 hours', undefined, { cus
       "like every other chart range picker")
 check("await App.get('/api/nodes/series/batch', { q, t0, t1, bucket_s: bucketS });" in NODES74,
       "Run queries the existing batch route with the built q= string")
-check("App.drawSeriesChart(svg, wrap," in NODES74[NODES74.index("function histDrawChart("):]
-      and "App.attachChartZoom(svg, geo, {" in NODES74[NODES74.index("function histDrawChart("):],
+_HIST_DRAW_CHART74 = js_function(NODES74, "histDrawChart")
+check("App.drawSeriesChart(svg, wrap," in _HIST_DRAW_CHART74
+      and "App.attachChartZoom(svg, geo, {" in _HIST_DRAW_CHART74,
       "the chart is drawn through App.drawSeriesChart and wired to "
       "App.attachChartZoom, so a drag/wheel re-runs the query over the new window")
 check("dash: iface && iface[1] === 'out' ? '4 3' : undefined," in NODES74,
@@ -3489,8 +3456,7 @@ check("function histDrawTable(" in NODES74 and "const tsSet = new Set();" in NOD
 check("App.exportCsv('/api/nodes/series/export.csv'," in NODES74,
       "Export CSV calls the new server-side history export route")
 check("localStorage.setItem(HIST_LOCAL_KEY, JSON.stringify({" in NODES74
-      and "try {" in NODES74[NODES74.index("function histSaveLocal("):
-                            NODES74.index("function histSaveLocal(") + 200]
+      and "try {" in js_function(NODES74, "histSaveLocal")[:200]
       and "localStorage.getItem(HIST_LOCAL_KEY)" in NODES74,
       "the last query is remembered in localStorage under 'nodes.history', "
       "guarded by try/catch for a private window or blocked storage")
@@ -3548,8 +3514,7 @@ check("['wireless', 'size-wireless', 'age-wireless', 'use-wireless', "
       "'set-wireless-cap', true]" in SETTINGS76,
       "...and showUsage's per-store table now gives Wireless a meter/cap "
       "pair instead of the null/null a store with no cap gets")
-check('"max_wireless_db_mb": (16, None),' in
-      open(os.path.join(REPO_ROOT, "netpath", "web", "api.py"), encoding="utf-8").read(),
+check('"max_wireless_db_mb": (16, None),' in python_text("web.api"),
       "api.py's settings-range check has an entry for max_wireless_db_mb, "
       "like every other db-mb cap")
 _APPDB76 = open(os.path.join(REPO_ROOT, "netpath", "appdb.py"), encoding="utf-8").read()
@@ -3574,7 +3539,7 @@ for _id in ("wl-hist-days", "wl-hist-sample-s"):
 check("history_days: Number(m.querySelector('#wl-hist-days').value)," in WIRELESS77
       and "history_sample_s: Number(m.querySelector('#wl-hist-sample-s').value)," in WIRELESS77,
       "Save posts both fields to the wireless settings scope")
-_API77 = open(os.path.join(REPO_ROOT, "netpath", "web", "api.py"), encoding="utf-8").read()
+_API77 = python_text("web.api")
 check('"wireless": {"history_days": (1, 3650), "history_sample_s": (60, 86400),' in _API77
       and '"ap_web_port": (1, 65535)},' in _API77,
       "api.py's _SCOPE_SETTINGS_RANGES carries the wireless override, so "
@@ -3633,8 +3598,7 @@ check("badge badge-cop" in NODES80 and "r.media === 'copper'" in NODES80,
 check(".badge-cop" in APP_CSS,
       "app.css styles the COP badge, or it inherits the amber warning fill "
       "every other badge uses")
-_DEV_DIALOG80 = NODES80[NODES80.index("  function deviceDialog("):
-                        NODES80.index("  /* ------------------------------------------- temperature alert overrides")]
+_DEV_DIALOG80 = js_function(NODES80, "deviceDialog")
 check("r.media !== 'copper' && dialogOptics.has(r.if_index)" in _DEV_DIALOG80,
       "a stored COP row is never upgraded to DOM by the live /dom read, "
       "whatever it carries for that port")
@@ -3722,8 +3686,8 @@ check("Folded into" not in NODES82,
 check("folded_into_result_id" not in NODES82,
       "folded_into_result_id is gone from nodes.js -- the server JSON no "
       "longer carries it")
-_API82 = open(os.path.join(REPO_ROOT, "netpath", "web", "api.py"), encoding="utf-8").read()
-_NODEPOLL82 = open(os.path.join(REPO_ROOT, "netpath", "nodepoll.py"), encoding="utf-8").read()
+_API82 = python_text("web.api")
+_NODEPOLL82 = python_text("nodepoll")
 check("address_owners(configured=True)" in _API82,
       "api.py's duplicate-evidence paths call address_owners(configured=True), "
       "so only ipAddrTable-sourced addresses feed duplicate detection")
@@ -3816,8 +3780,7 @@ check("await revealDevice(deviceId);" in NODES,
 check("} else if (view.selected !== deviceId) {" in NODES,
       "a device route that DOES carry a q/name/filter keeps the old "
       "select-only behaviour, guarded the way it always was")
-REVEAL = NODES[NODES.index("async function revealDevice(deviceId) {"):
-               NODES.index("  /* A route into this tab: #/nodes,")]
+REVEAL = js_function(NODES, "revealDevice")
 check("App.clearFilters('nodes', ['nd-q']);" in REVEAL,
       "revealDevice clears the Find box through App.clearFilters, the same "
       "reset the Clear button runs")
@@ -3903,8 +3866,8 @@ check("function rebuildFindList()" in MAPPER86 and "function findMatches(text)" 
       and "function pickFindSuggestion(index)" in MAPPER86,
       "rebuildFindList/findMatches/findNode/centerOn/showFindSuggestions/"
       "pickFindSuggestion all exist")
-_FIND86 = MAPPER86[MAPPER86.index("  let findOpen ="):
-                   MAPPER86.index("  // Reassigned (not mutated in place)")]
+_FIND86 = js_functions(MAPPER86, "findMatches", "renderFindList", "showFindSuggestions",
+                       "centerOn", "findNode")
 check("for (const value of [node.label, node.name, node.resolved_name, node.ip])" in _FIND86,
       "findMatches ranks over the same four fields — label, name, "
       "resolved_name, ip — that the dropdown is built from")
@@ -3950,10 +3913,8 @@ check("rebuildFindList();" in MAPPER86
 #     keystroke and every sort), so the header checkbox and the Add button
 #     both read that Set, never the DOM's own checked state.
 MAPPER87 = read("mapper.js")
-_ADD_DEVICE87 = MAPPER87[MAPPER87.index("  async function openAddDevice()"):
-                         MAPPER87.index("  // netpath/web/api.py's get_mapper_map_candidates")]
-_ADD_NEIGH87 = MAPPER87[MAPPER87.index("  async function openAddNeighbours()"):
-                        MAPPER87.index("  function removeSelected()")]
+_ADD_DEVICE87 = js_function(MAPPER87, "openAddDevice")
+_ADD_NEIGH87 = js_function(MAPPER87, "openAddNeighbours")
 for _name, _block, _picked, _field in (
     ("Add device", _ADD_DEVICE87, "devicePicked", "r.id"),
     ("Add neighbours", _ADD_NEIGH87, "neighbourPicked", "r.key"),
@@ -4030,8 +3991,7 @@ check("'pointer-events': 'none'" in MAPPER88 and "'pointer-events': 'stroke'" in
 # 88b. frameLayer paints under both links and nodes (§28d's own pin, above,
 #      already covers the exact append order — this just names the class
 #      list a frame's <g> carries and the fixed child order within it).
-_DRAW_FRAME88 = MAPPER88[MAPPER88.index("  function drawFrame(layer, frame)"):
-                         MAPPER88.index("  // `bounds`/size come from draw()")]
+_DRAW_FRAME88 = js_function(MAPPER88, "drawFrame")
 check("g.append(fill, stroke, label, handle);" in _DRAW_FRAME88,
       "a frame's <g> holds its fill, stroke, label and resize handle in "
       "that fixed order")
@@ -4071,8 +4031,7 @@ check("function selectFrame(frame) {" in MAPPER88,
       "selectFrame is the keyboard-only path (a frame's own Enter/Space) "
       "that selects a frame and clears whatever node/link selection there "
       "was, via a full requestDraw()")
-_SELECT_FRAME88 = MAPPER88[MAPPER88.index("function selectFrame(frame) {"):
-                           MAPPER88.index("function selectFrame(frame) {") + 250]
+_SELECT_FRAME88 = js_function(MAPPER88, "selectFrame")[:250]
 check("view.selectedFrameId = frame.id;" in _SELECT_FRAME88
       and "view.selection = new Set();" in _SELECT_FRAME88
       and "view.selectedLinkId = null;" in _SELECT_FRAME88,
@@ -4086,8 +4045,7 @@ check("function selectFrameInPlace(frame) {" in MAPPER88,
       "selectFrameInPlace is the frame analogue of applySelectionClasses: "
       "an in-place selection with no redraw, for onFramePointerDown's own "
       "press")
-_SELECT_FRAME_IP88 = MAPPER88[MAPPER88.index("function selectFrameInPlace(frame) {"):
-                              MAPPER88.index("function selectFrameInPlace(frame) {") + 600]
+_SELECT_FRAME_IP88 = js_function(MAPPER88, "selectFrameInPlace")[:600]
 check("view.selectedFrameId = frame.id;" in _SELECT_FRAME_IP88
       and "view.selection = new Set();" in _SELECT_FRAME_IP88
       and "view.selectedLinkId = null;" in _SELECT_FRAME_IP88,
@@ -4101,8 +4059,8 @@ check("if (!view.frameEls.size) { requestDraw(); return; }" in _SELECT_FRAME_IP8
 check("requestDraw();\n    drawDetail();" not in _SELECT_FRAME_IP88,
       "...and the ordinary path never falls through to a requestDraw() + "
       "drawDetail() pair the way selectFrame's does")
-_ON_FRAME_PD88 = MAPPER88[MAPPER88.index("function onFramePointerDown"):
-                          MAPPER88.index("function onFramePointerDown") + 400]
+_ON_FRAME_PD88_FULL = js_function(MAPPER88, "onFramePointerDown")
+_ON_FRAME_PD88 = _ON_FRAME_PD88_FULL[:400]
 check("selectFrameInPlace(frame);" in _ON_FRAME_PD88,
       "onFramePointerDown's select half calls selectFrameInPlace, not "
       "selectFrame, so the press that arms a drag never triggers a "
@@ -4112,13 +4070,10 @@ check("selectFrame(frame);" not in _ON_FRAME_PD88,
 check("if (!App.canWrite('mapper')) return;" in _ON_FRAME_PD88,
       "a reader may select a frame (selectFrameInPlace above already ran) "
       "but the drag itself never arms below this guard")
-check("view.selectedFrameId = null;" in MAPPER88[MAPPER88.index("function setSelection("):
-                                                 MAPPER88.index("function setSelection(") + 200]
-      and "view.selectedFrameId = null;" in MAPPER88[MAPPER88.index("function selectLink("):
-                                                      MAPPER88.index("function selectLink(") + 300],
+check("view.selectedFrameId = null;" in js_function(MAPPER88, "setSelection")[:200]
+      and "view.selectedFrameId = null;" in js_function(MAPPER88, "selectLink")[:300],
       "...and selecting a node or a link clears the frame selection back")
-check("if (view.selectedFrameId) {" in MAPPER88[MAPPER88.index("function renderDetail()"):
-                                                MAPPER88.index("function renderDetail()") + 400],
+check("if (view.selectedFrameId) {" in js_function(MAPPER88, "renderDetail")[:400],
       "renderDetail's FRAME branch runs before the link/node branches")
 check("function frameDetailHtml(frame)" in MAPPER88 and "function frameSwatchesHtml(frame, canWrite)" in MAPPER88,
       "the frame pane has its own label-input/colour-swatch/Remove markup")
@@ -4151,15 +4106,14 @@ check("view.frameWriteRetryTimers.set(id, setTimeout(() => flushFrameWrite(id), 
 check("view.pendingFramePatches = new Map();" in MAPPER88 or "pendingFramePatches: new Map()," in MAPPER88,
       "one pending patch is tracked per frame id, not one shared patch for "
       "every frame being edited at once")
-check("if (snap) { x = snapValue(x); y = snapValue(y); }" in MAPPER88[MAPPER88.index("function onFramePointerDown"):],
+check("if (snap) { x = snapValue(x); y = snapValue(y); }" in _ON_FRAME_PD88_FULL,
       "a frame move snaps to the grid the same way a node drag does when "
       "Snap is on")
 check("Math.max(FRAME_MIN, snapValue(width))" in MAPPER88 and "Math.max(FRAME_MIN, snapValue(height))" in MAPPER88,
       "a resize never snaps below the 40-unit floor")
 
 # 88f. contentBounds (Fit / PNG export) encloses frames too.
-_CONTENT_BOUNDS88 = MAPPER88[MAPPER88.index("  function contentBounds()"):
-                             MAPPER88.index("  // `bounds`/size come from draw()")]
+_CONTENT_BOUNDS88 = js_function(MAPPER88, "contentBounds")
 check("for (const frame of view.frames) {" in _CONTENT_BOUNDS88
       and "liveFrameRect(frame)" in _CONTENT_BOUNDS88,
       "contentBounds folds every frame's live rect into the same min/max "
@@ -4171,20 +4125,19 @@ check("for (const frame of view.frames) {" in _CONTENT_BOUNDS88
 # also fall through while the Frame or Note tool is armed (5.32.0 fix,
 # extended for notes), or a brand-new empty map can never draw its first
 # frame or note.
-_DRAW88F = MAPPER88[MAPPER88.index("  function draw() {"):
-                    MAPPER88.index("  function emptyCanvas(svg, canvas, message)")]
+_DRAW88F = js_function(MAPPER88, "draw")
 check("if (!view.nodes.length && !view.frames.length) {" not in _DRAW88F
       and "if (!view.nodes.length && !view.frames.length && !view.notes.length "
           "&& !view.framing && !view.noting) {" in _DRAW88F,
       "an all-frames/all-notes, no-devices map still has content to fit, "
       "rather than reading as empty, and an armed Frame or Note tool keeps "
       "the real canvas up on a wholly empty map")
-check("requestDraw();" in MAPPER88[MAPPER88.index("App.el('mp-add-frame').onclick"):
-                                    MAPPER88.index("App.el('mp-refresh').onclick")],
+_INIT88 = js_function(MAPPER88, "init")
+check("requestDraw();" in _INIT88[_INIT88.index("App.el('mp-add-frame').onclick"):
+                                   _INIT88.index("App.el('mp-refresh').onclick")],
       "arming or disarming the Frame tool redraws, so the placeholder and "
       "the real canvas swap in step with it")
-check("requestDraw();" in MAPPER88[MAPPER88.index("function disarmFraming()"):
-                                    MAPPER88.index("async function createFrame(")],
+check("requestDraw();" in js_function(MAPPER88, "disarmFraming"),
       "Escape and a click-with-no-drag disarm through disarmFraming(), "
       "which redraws the same way the toolbar button's own disarm does")
 
@@ -4193,8 +4146,7 @@ check("requestDraw();" in MAPPER88[MAPPER88.index("function disarmFraming()"):
 #      <g> sets them, Enter/Space selects through selectFrame (no drag),
 #      Delete/Backspace removes. Nodes have no keyboard delete of their
 #      own, so none was added here either — only what nodes already do.
-_DRAW_FRAME88G = MAPPER88[MAPPER88.index("  function drawFrame(layer, frame)"):
-                          MAPPER88.index("  // `bounds`/size come from draw()")]
+_DRAW_FRAME88G = js_function(MAPPER88, "drawFrame")
 check("g.tabIndex = 0;" in _DRAW_FRAME88G and "g.setAttribute('role', 'button');" in _DRAW_FRAME88G,
       "a frame's <g> is a Tab stop with role=button, the same two lines a "
       "node's own <g> carries")
@@ -4239,8 +4191,7 @@ check("function drawNote(layer, note)" in MAPPER88
       and "function noteTail(note, r)" in MAPPER88,
       "the note drawing functions exist, mirroring drawFrame/"
       "updateFrameElement/liveFrameRect")
-_DRAW_NOTE88H = MAPPER88[MAPPER88.index("  function drawNote(layer, note)"):
-                         MAPPER88.index("  // `bounds`/size come from draw()")]
+_DRAW_NOTE88H = js_function(MAPPER88, "drawNote")
 check("g.append(fill, stroke, text, tail1, tail2, handle);" in _DRAW_NOTE88H,
       "a note's children append in a fixed order -- fill, stroke, text, the "
       "two tail circles, resize handle -- the same 'one place decides the "
@@ -4254,8 +4205,8 @@ check("selectNote(note);" in _NOTE_KEYDOWN88H and "removeNote(note.id);" in _NOT
 check("function wrapNoteLines(text, innerWidth, maxLines, font)" in MAPPER88,
       "note text wraps to the bubble's own width, capped to however many "
       "lines its height fits")
-check("for (const note of view.notesByNode.get(id) || []) {" in MAPPER88[
-    MAPPER88.index("  function redrawDragged()"):MAPPER88.index("  // The frame-drag analogue")],
+check("for (const note of view.notesByNode.get(id) || []) {" in
+      js_function(MAPPER88, "redrawDragged"),
       "redrawDragged also repositions any note anchored to a dragged node, "
       "so its tail follows the node it points at")
 check(".mp-note-c0 { --mp-note-color: var(--canvas-vlan-1); }" in APP_CSS
@@ -4281,7 +4232,7 @@ check("const spacing = Math.max(30, widest + 16);" in MAPPER,
 
 # 88k. Export PNG targets a higher raster (4x), backed off only by a
 #      conservative canvas-size guard, never below the old dpr-capped floor.
-_EXPORT88K = MAPPER[MAPPER.index("function exportPng("):MAPPER.index("function exportCsvClick(")]
+_EXPORT88K = js_function(MAPPER, "exportPng")
 check("Math.min(window.devicePixelRatio || 1, 2)" in _EXPORT88K,
       "the old dpr-capped scale is still computed, as the export's floor")
 check("Math.max(dprScale, Math.min(4, guardScale))" in _EXPORT88K,
@@ -4292,8 +4243,7 @@ check("MAX_CANVAS_SIDE = 16384" in _EXPORT88K and "MAX_CANVAS_AREA = 268000000" 
 
 # 88l. A frame's label reads slightly larger (fs-2xs -> fs-xs), baseline
 #      nudged so it still sits inside the frame.
-check("font-size: var(--fs-xs);" in APP_CSS[APP_CSS.index(".mp-frame-label {"):
-                                             APP_CSS.index(".mp-frame-handle")],
+check("font-size: var(--fs-xs);" in css_rule(APP_CSS, ".mp-frame-label"),
       "the frame label's font-size moved up a step")
 check("label.setAttribute('y', r.y + TEXT_SIZES[sizeIdx].dy);" in MAPPER,
       "updateFrameElement takes the label baseline from the frame's own size")
@@ -4338,8 +4288,7 @@ check('class="err">cable down' in NODES,
 #     POST like every sibling PUT/POST button in this dialog already does
 #     (see contract 24), and the per-sensor table tags a fan row the same
 #     way a psu/stack_power row is tagged.
-_vendor_section = NODES[NODES.index("function renderVendorSection("):
-                       NODES.index("function ifaceStatsHtml(")]
+_vendor_section = js_function(NODES, "renderVendorSection")
 check('id="ndd-sensor-snapshot"' in NODES,
       "the vendor section's write-gated bar has a #ndd-sensor-snapshot button")
 check("snapshotBtn.disabled = true" in _vendor_section
@@ -4449,8 +4398,7 @@ CSS96 = read("app.css")
 
 # 96a. The VLAN/dash/dot note is removed; the FiberView key and the
 #      no-adjacency message stay.
-_LEGEND96 = MAPPER96[MAPPER96.index("function drawLegend("):
-                     MAPPER96.index("/* ------------------------------------------------------------ selection */")]
+_LEGEND96 = js_function(MAPPER96, "drawLegend")
 check("draw as one thick line" not in _LEGEND96
       and "A dashed line means" not in _LEGEND96
       and "spanning-tree-blocked port" not in _LEGEND96,
@@ -4471,8 +4419,10 @@ check("if (link.blocking && !overlaidBlocking) path.classList.add('blocking');" 
 check(".mp-link.mp-blocking-over { stroke: var(--fail); stroke-linecap: butt; }" in CSS96,
       "red, and butt-capped -- .mp-link's round caps lengthen each 2px dash by "
       "the stroke width, which is what closed the gaps in the first place")
+_DRAW_LINK96 = js_function(MAPPER96, "drawLink")
 check("mp-blocking-over" not in
-      MAPPER96[MAPPER96.index("if (plan.mode === 'strands'"):MAPPER96.index("const neutral =")],
+      _DRAW_LINK96[_DRAW_LINK96.index("if (plan.mode === 'strands'"):
+                    _DRAW_LINK96.index("const neutral =")],
       "the strands ribbon gets NO overlay: its strands are thin and already "
       "dotted, and a bundle-width dashed stroke would paint a solid bar")
 
@@ -4484,7 +4434,7 @@ check("'pointer-events': 'stroke', class: 'mp-link-hit'," in MAPPER96,
       "the target is stroke-hit only, like a frame's outline")
 check("hit.setAttribute('aria-hidden', 'true');" in MAPPER96,
       "it adds no second Tab stop or screen-reader name for the same link")
-check(MAPPER96.index("class: 'mp-link-hit'") < MAPPER96.index("plan.strands.forEach"),
+check(_DRAW_LINK96.index("class: 'mp-link-hit'") < _DRAW_LINK96.index("plan.strands.forEach"),
       "it is appended BEFORE the strands, so a strand still wins its own tooltip")
 check("event.target.closest('.mp-link, .mp-link-hit')" in MAPPER96,
       "the canvas press handler exempts the hit path too -- without it a press "
@@ -4562,8 +4512,7 @@ check("`Text size   ${textSizesHtml(note, 'data-note-textsize', canWrite)}`," in
 check("await App.put(`/api/mapper/maps/${view.mapId}/notes/${note.id}`, { text_size: textSize });"
       in MAPPER97,
       "picking one PUTs text_size on the note")
-_NOTE97 = MAPPER97[MAPPER97.index("  function updateNoteElement(g, note)"):
-                   MAPPER97.index("  function drawNote(layer, note)")]
+_NOTE97 = js_function(MAPPER97, "updateNoteElement")
 check("const font = noteFont(sizeIdx);" in _NOTE97,
       "the note wraps with its own size's font, not the node-label font")
 check("const padTop = Math.max(NOTE_PAD_TOP, metrics.ascent + 3);" in _NOTE97,
@@ -4575,12 +4524,14 @@ check("noteFontCache.clear();" in MAPPER97,
 check(".mp-note-text.mp-note-t0 { font-size: var(--fs-2xs); }" in CSS97
       and ".mp-note-text.mp-note-t2 { font-size: var(--fs-xl); }" in CSS97,
       "Small and Large are their own rules; Medium is .mp-note-text's base font-size")
-check("font-size: var(--fs-xs);" in CSS97[CSS97.index(".mp-note-text {"):CSS97.index(".mp-note-tail")],
+check("font-size: var(--fs-xs);" in css_rule(CSS97, ".mp-note-text"),
       "...and that base is the frame's Medium")
 
 # 97b. FiberView: drawLink decides at draw time which element carries a
 #      blocked link's dots, so flipping the view must draw again.
-_FIBER97 = MAPPER97[MAPPER97.index("App.el('mp-fiberview').onchange"):MAPPER97.index("App.el('mp-snap').onchange")]
+_INIT97 = js_function(MAPPER97, "init")
+_FIBER97 = _INIT97[_INIT97.index("App.el('mp-fiberview').onchange"):
+                    _INIT97.index("App.el('mp-snap').onchange")]
 check("applyFiberView();" in _FIBER97 and "requestDraw();" in _FIBER97
       and _FIBER97.index("applyFiberView();") < _FIBER97.index("requestDraw();"),
       "the FiberView toggle redraws after flipping the attribute")

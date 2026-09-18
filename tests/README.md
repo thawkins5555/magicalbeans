@@ -50,7 +50,15 @@ One family is worth calling out by name: `test_frontend_contracts.py`,
 and `test_static_headers.py` read the shipped JS/HTML/CSS as text rather than
 running it, and pin the literal strings, shared helpers, CSS tokens and
 response headers that a refactor could otherwise change invisibly — no
-stub, no browser, no server.
+stub, no browser, no server. Most of that family, plus a few source-reading
+suites outside it (`test_alerts_ui.py`, `test_reports_ui.py`,
+`test_settings_storage_ui.py`, `test_db_report.py`, `test_web_gates.py`,
+`test_bulk_contracts.py`), find the block they are pinning through
+`_source.py`: a JS function/`const`, a CSS rule or nested block, or a
+Python function, looked up by name in one file or across every file of a
+package — never by position or by a comment banner, so reorganising the
+code around a pinned block does not break the suite or, worse, leave it
+silently checking nothing.
 
 ## The benchmarks (`bench_*.py`)
 

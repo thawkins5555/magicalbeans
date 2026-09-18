@@ -1709,3 +1709,51 @@ row dropped the words "STP blocked on" — the row now just reads
 onto a second line that the longer wording caused on a busy trunk.
 
 Testing and review: see CHANGELOG 5.42.0.
+
+## 5.43.0 — Full refactor kicked off: test hardening first (phase 1 of a 5-part plan)
+
+**Operator prompt, verbatim:**
+> Pull the latest repo and team details. Perform a complete refactor of the
+> application — improve internal structure, readability and design; no
+> change for the end user other than performance. Remove dead code and
+> files no longer used. Then perform a full code review for performance,
+> bugs and security vulnerabilities.
+
+**Starting point.** Repo was already up to date, at 5.42.0 (commit
+`e25e756`). No end-user features change in this work — this is
+housekeeping under the hood plus a speed check, not a new-features
+release.
+
+**Groundwork.** Three explorer reports were run before touching anything:
+one over the backend, one over the front end (browser/UI code), and one
+hunting for dead code and unused files across the whole repo. Planning
+then went through the findings with the operator rather than guessing at
+scope.
+
+**Decisions made in planning:**
+- Harden the test suite's own text-matching checks first, before any
+  other refactor work — so later phases have a trustworthy safety net
+  instead of tests that could silently stop checking what they claim to.
+- Backend gets a full internal restructure; the front end gets a lighter,
+  moderate tidy-up rather than a full rewrite.
+- New database indexes may be added to speed things up; no existing
+  database columns or tables are removed.
+- Work is split into five releases so each piece can be tested and
+  reviewed on its own rather than as one giant change:
+  - **5.43.0** — test-suite hardening (this release)
+  - **5.44.0** — dead code/file removal plus backend restructure
+  - **5.45.0** — front-end restructure
+  - **5.46.0** — performance pass
+  - **5.47.0** — the full security/bug/performance review, with findings
+    reported to the operator for approval before any fixes are made
+- Approved for removal: an unused MIB reference file (`if-mib-core.mib`),
+  an old unused browser-walk test script (`demo/ui_walk.mjs`), and unused
+  colour definitions left over in the desktop app's theme.
+- Kept as-is: the self-test blocks built into individual modules — these
+  stay even though they look like extra code, because they are the
+  in-place sanity checks each module runs on itself.
+- A running list of known odd behaviours ("quirks") already in the app is
+  being kept so nothing gets accidentally "fixed" or changed along the
+  way — that list gets reviewed with the operator at the end (5.47.0).
+
+**Status:** Phase 1 (test hardening) in progress.

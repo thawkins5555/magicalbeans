@@ -30,6 +30,7 @@ import sys
 import tempfile
 
 import _paths  # noqa: F401  (repo root + tests dir on sys.path)
+import _source
 
 from netpath import alertrules
 from netpath.alertsdb import _BUILTIN_RULES
@@ -90,8 +91,12 @@ check("interface_flapping is still an interface_event rule whose source_kind "
 # From the const editRule() reads, not from templateOptionsHtml: 5.3.0 gave
 # the editor PUBLISHED_THRESHOLD_KEYS, and a slice that started below it ran
 # the real editor against a name node could not resolve.
-EDITOR = ALERTS[ALERTS.index("  const PUBLISHED_THRESHOLD_KEYS = ["):
-                ALERTS.index("  function addRule() {")]
+EDITOR = "\n".join([
+    _source.js_const(ALERTS, "PUBLISHED_THRESHOLD_KEYS"),
+    _source.js_const(ALERTS, "SENSOR_PUBLISHED_KEYS"),
+    _source.js_function(ALERTS, "templateOptionsHtml"),
+    _source.js_function(ALERTS, "editRule"),
+])
 
 # The editor's copy of the published-threshold keys is a second list of the
 # same rules alertrules holds (eight optic, two sensor), so it can drift silently -- the editor
@@ -265,8 +270,8 @@ check("...and it throws rather than answering with a sentinel: a false or a "
 # 2. The severity highlight on the alert list (ITEM 2).
 # ===========================================================================
 
-ROWCLASS = ALERTS[ALERTS.index("  const HIGHLIGHT_SEVERITY = 2;"):
-                  ALERTS.index("  function drawTable() {")]
+ROWCLASS = (_source.js_const(ALERTS, "HIGHLIGHT_SEVERITY")
+           + "\n" + _source.js_function(ALERTS, "severityClasses"))
 
 ROW_HARNESS = """
 'use strict';
@@ -346,13 +351,14 @@ check("the highlight is set on the td -- row backgrounds in this app are "
       "td backgrounds (tr.selected td, tr.bulk-checked td), and a rule on "
       "the tr would simply not show",
       re.search(r"tr\.alert-severe td \{[^}]*background:", CSS) is not None)
+ALERT_SEVERE_RULES = (_source.css_rule(CSS, "table.grid tr.alert-severe td")
+                      + _source.css_rule(CSS, "table.grid tr.alert-severe td .sev"))
+KEYFRAMES = _source.css_block(CSS, "@keyframes alert-severe-pulse")
 check("...from --fail, never a literal: the tone is redefined in all six "
       "theme blocks in tokens.css",
-      "var(--fail)" in CSS[CSS.index("tr.alert-severe td {"):
-                           CSS.index("@keyframes alert-severe-pulse")]
-      and not re.search(r"#[0-9A-Fa-f]{6}",
-                        CSS[CSS.index("tr.alert-severe td {"):
-                            CSS.index("@media (prefers-reduced-motion: no-preference) {\n  table.grid tr.alert-severe-unacked")]))
+      "var(--fail)" in ALERT_SEVERE_RULES
+      and not re.search(r"#[0-9A-Fa-f]{6}", ALERT_SEVERE_RULES)
+      and not re.search(r"#[0-9A-Fa-f]{6}", KEYFRAMES))
 
 
 def specificity(selector):
@@ -372,8 +378,7 @@ check("...and it outranks both tints it has to sit above, or an operator "
 check("...and it is not !important: the td transition above is allowed to "
       "smear the entry and exit, which is a smaller price than a rule "
       "nothing downstream can override",
-      "!important" not in CSS[CSS.index("tr.alert-severe td {"):
-                              CSS.index("@keyframes alert-severe-pulse")])
+      "!important" not in ALERT_SEVERE_RULES)
 
 check("the static highlight sits OUTSIDE every media query, so a viewer who "
       "asked for reduced motion still gets it",
@@ -396,9 +401,6 @@ check("the pulse is a slow breathe, not a strobe: well under the three "
 check("...and it alternates rather than snapping back, so there is no step "
       "change in brightness at the end of each cycle",
       "infinite alternate" in CSS)
-KEYFRAMES = CSS[CSS.index("@keyframes alert-severe-pulse {"):
-                CSS.index("@media (prefers-reduced-motion: no-preference) {\n"
-                          "  table.grid tr.alert-severe-unacked")]
 check("the keyframes move nothing but background-color -- the codebase's "
       "first, and no animation here may cost a layout",
       set(re.findall(r"([a-z-]+):", KEYFRAMES)) == {"background-color"},
@@ -435,30 +437,13 @@ check("...and that reduced motion is honoured",
 NODES = read("nodes.js")
 
 
-def slice_between(text, start, end):
-    """`text` from `start` up to the next `end` -- "" when either is missing,
-    so a helper that does not exist yet arrives as a failed check rather than
-    as a ValueError at import time."""
-    try:
-        at = text.index(start)
-        return text[at:text.index(end, at)]
-    except ValueError:
-        return ""
-
-
-NAME_LINK = slice_between(APP, "  function deviceNameLink(",
-                          "  /* The dangerous failure this replaces:")
-ESCAPE_HTML = slice_between(APP, "  const escapeHtml = (s) =>",
-                            "  /* ------------------------------------------------- sortable")
-BUILD_ROUTE = slice_between(APP, "  function buildRoute(tab",
-                            "  /* Called by a module when its own selection changes.")
-CAN_READ = slice_between(APP, "  function canRead(module) {",
-                         "  function canWrite(module)")
-SORT_ROWS = slice_between(APP, "  const rowCollator = new Intl.Collator",
-                          "  /* Short screens get tighter chrome")
-COLUMNS = slice_between(ALERTS, "  const COLUMNS = [", "  const alertColumns = ")
-ACTIVATE = slice_between(NODES, "  async function activate(opts) {",
-                         "  async function loadDetail() {")
+NAME_LINK = _source.js_function(APP, "deviceNameLink")
+ESCAPE_HTML = _source.js_const(APP, "escapeHtml")
+BUILD_ROUTE = _source.js_function(APP, "buildRoute")
+CAN_READ = _source.js_function(APP, "canRead")
+SORT_ROWS = _source.js_const(APP, "rowCollator") + "\n" + _source.js_function(APP, "sortRows")
+COLUMNS = _source.js_const(ALERTS, "COLUMNS")
+ACTIVATE = _source.js_function(NODES, "activate")
 
 check("App.deviceNameLink exists beside deviceLink: the rule about what a "
       "device name links to, and who may be handed a link at all, lives in "
