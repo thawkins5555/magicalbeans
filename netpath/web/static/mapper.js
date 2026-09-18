@@ -310,16 +310,24 @@
     // out from under an already-open detail pane rather than a real state.
     if (!node) {
       return { node: null, name: '(removed)', sub: '', tone: 'none', unmanaged: false,
-        gone: true, role: '', badges: {}, tooltip: 'This node is no longer on the map.' };
+        gone: true, role: '', badges: {}, placeholder: false,
+        tooltip: 'This node is no longer on the map.' };
     }
     const name = node.name;
     const badges = { temp_c: node.temp_c, cpu_pct: node.cpu_pct, port_count: node.port_count };
     if (node.missing) {
       return {
         node, name, sub: 'removed from Nodes', tone: 'none', unmanaged: false,
-        gone: true, role: node.role || '', badges,
+        gone: true, role: node.role || '', badges, placeholder: false,
         tooltip: `${name}\nThis device has been removed from Nodes; its position is kept ` +
           'in case it comes back, but nothing here is live any more.',
+      };
+    }
+    if (node.placeholder) {
+      return {
+        node, name, sub: 'placeholder', tone: 'none', unmanaged: false,
+        gone: false, placeholder: true, role: node.role || '', badges,
+        tooltip: `${name}\nPlaceholder — not a device, drawn for the diagram only.`,
       };
     }
     if (node.unmanaged) {
@@ -330,7 +338,7 @@
       }).join(', ') : '';
       return {
         node, name, sub: (peer && peer.platform) || 'unmanaged', tone: 'none',
-        unmanaged: true, gone: false, role: node.role || 'unmanaged', badges,
+        unmanaged: true, gone: false, role: node.role || 'unmanaged', badges, placeholder: false,
         tooltip: `${name}\nUnmanaged peer — seen over LLDP/CDP, not polled directly.` +
           (node.ip ? `\nAddress   ${node.ip}` : '') + (via ? `\nSeen via  ${via}` : ''),
       };
@@ -339,7 +347,7 @@
     const statusWord = DEVICE_STATUS_LABEL[node.status] || node.status || 'Unknown';
     return {
       node, name, sub: (node.name_source === 'ip' || node.ip === name) ? '' : (node.ip || ''),
-      tone, unmanaged: false, gone: false,
+      tone, unmanaged: false, gone: false, placeholder: false,
       role: node.role || '', badges,
       tooltip: `${name}\n${node.ip || ''}\nStatus    ${statusWord}` +
         (node.name_source ? `\nName      ${NAME_SOURCES[node.name_source] || node.name_source}` : ''),
@@ -838,6 +846,27 @@
     };
     box.querySelector('#mpad-q').oninput = draw2;
     draw2();
+  }
+
+  // A placeholder is not a device: no candidate list, just a name. The
+  // server rejects a blank label (400), so a blank/whitespace-only entry
+  // is caught here too rather than round-tripping to find that out.
+  function openAddPlaceholder() {
+    const box = App.modal('Add placeholder', `
+      <input id="mpph-name" maxlength="200" style="width:100%"
+        placeholder="Name, e.g. Internet, Carrier MPLS, Site B">`, [
+      { label: 'Cancel', onClick: App.closeModal },
+      { label: 'Add', primary: true, onClick: async (b) => {
+        const label = b.querySelector('#mpph-name').value.trim();
+        if (!label) { App.closeModal(); return; }
+        const pos = nextPlacement(0, contentBounds());
+        await App.post(`/api/mapper/maps/${view.mapId}/nodes`,
+          { placeholder: true, label, x: pos.x, y: pos.y });
+        App.closeModal();
+        await loadMapData();
+      } },
+    ]);
+    if (box) { const input = box.querySelector('#mpph-name'); if (input) input.focus(); }
   }
 
   // netpath/web/api.py's get_mapper_map_candidates: each row is
@@ -1599,7 +1628,8 @@
     const pos = livePos(node);
     const g = App.svgNode('g', {
       class: `mp-node${view.selection.has(node.id) ? ' selected' : ''}` +
-        `${info.unmanaged ? ' unmanaged' : ''}${info.gone ? ' gone' : ''}`,
+        `${info.unmanaged ? ' unmanaged' : ''}${info.gone ? ' gone' : ''}` +
+        `${info.placeholder ? ' placeholder' : ''}`,
       transform: `translate(${pos.x - NODE_W / 2},${pos.y - NODE_H / 2})`,
     });
     g.dataset.nodeId = node.id;
@@ -1611,7 +1641,7 @@
     // Status is never colour alone: the same shape App.statusMark uses
     // elsewhere is drawn here too, sized for the canvas rather than the
     // <i> glyph the table version renders as text.
-    if (!info.unmanaged && !info.gone) {
+    if (!info.unmanaged && !info.gone && !info.placeholder) {
       g.appendChild(statusGlyph(info.tone, NODE_W - 14, 12));
     }
     const steps = (labelOffsets && labelOffsets.get(node.id)) || 0;
@@ -1647,7 +1677,7 @@
     g.tabIndex = 0;
     g.setAttribute('role', 'button');
     g.setAttribute('aria-label', `${info.name}${info.unmanaged ? ', unmanaged peer' : ''}` +
-      `${info.gone ? ', removed from Nodes' : ''}.`);
+      `${info.gone ? ', removed from Nodes' : ''}${info.placeholder ? ', placeholder' : ''}.`);
     g.addEventListener('mousemove', (event) => { if (!view.nodeDrag) App.tooltip(info.tooltip, event); });
     g.addEventListener('mouseleave', () => { if (!view.nodeDrag) App.hideTooltip(); });
     g.addEventListener('focus', () => {
@@ -1664,7 +1694,7 @@
     g.addEventListener('pointerdown', (event) => onNodePointerDown(event, node));
     // Opens the same Device Details modal as a Nodes row dblclick, without leaving Mapper.
     g.addEventListener('dblclick', (event) => {
-      if (info.unmanaged || info.gone) return;
+      if (info.unmanaged || info.gone || info.placeholder) return;
       event.preventDefault();
       event.stopPropagation();
       App.whenModuleReady('nodes').then((page) => page.openDeviceDialog(node.device_id))
@@ -2628,6 +2658,14 @@
     // until the operator removes the placement themselves, so its name
     // here is exactly as editable as a live device's.
     lines.push('', `Name        ${renameFieldHtml(node)}${renamedFromHtml(node)}`);
+    if (info.placeholder) {
+      lines.push('', 'Placeholder — not a device. Drawn for the diagram only; select it with a ' +
+        'device and press Connect to join them.');
+      lines.push(`Role        ${roleSelectHtml(node)}`);
+      lines.push('', `<button data-remove-node="${node.id}" data-requires-write="mapper"` +
+        `${App.canWrite('mapper') ? '' : ' disabled'}>Remove from map</button>`);
+      return lines.join('\n');
+    }
     if (info.gone) {
       lines.push('', 'This device has been removed from Nodes. Its placement is kept here ' +
         'in case it returns; nothing about it is live any more.');
@@ -3461,6 +3499,7 @@
       ['mp-align', !canWrite || view.selection.size < 2],
       ['mp-add-device', !canWrite || !hasMap],
       ['mp-add-neighbours', !canWrite || !hasMap],
+      ['mp-add-placeholder', !canWrite || !hasMap],
       ['mp-add-frame', !canWrite || !hasMap],
       ['mp-add-note', !canWrite || !hasMap],
       ['mp-snap', !canWrite || !hasMap],
@@ -3836,6 +3875,7 @@
     App.el('mp-map').onchange = (event) => selectMap(Number(event.target.value));
     App.el('mp-add-device').onclick = openAddDevice;
     App.el('mp-add-neighbours').onclick = openAddNeighbours;
+    App.el('mp-add-placeholder').onclick = openAddPlaceholder;
     App.el('mp-remove-node').onclick = removeSelected;
     App.el('mp-connect').onclick = openConnect;
     App.el('mp-align').onclick = alignDialog;

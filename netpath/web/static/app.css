@@ -1862,6 +1862,8 @@ body.kiosk .card.strip > .hint { overflow: visible; white-space: normal; }
    dash and the fail tone, rather than silently drawing as though the
    device were still there — the tooltip and detail pane say why. */
 .mp-node.gone .mp-node-box { stroke-dasharray: 1 4; stroke: var(--fail); }
+/* A placeholder: a logical box, not a device — dashed and muted so it never reads as monitored. */
+.mp-node.placeholder .mp-node-box { stroke-dasharray: 8 4; stroke: var(--canvas-muted); }
 .mp-node-label { fill: var(--canvas-text); font-family: var(--ui); font-size: var(--fs-2xs); }
 .mp-node-sub { fill: var(--canvas-muted); font-family: var(--mono); font-size: var(--fs-2xs); }
 .mp-node-icon { fill: none; stroke: var(--canvas-muted); stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; }

@@ -4623,6 +4623,33 @@ check("const where = end === 'both' ? `${escape(a.name)} and ${escape(b.name)}`"
       and ": escape(end === 'a' ? a.name : b.name);" in MAPPER98,
       "the row names the blocking switch, or both, escaped")
 
+# ---------------------------------------------------------------------------
+# 99. Placeholder blocks (5.42.0): an operator-created logical box, not a
+#     device, never polled, joinable to real devices with Connect.
+MAPPER99 = read("mapper.js")
+INDEX99 = read("index.html")
+APP_CSS99 = read("app.css")
+check('id="mp-add-placeholder" data-requires-write="mapper"' in INDEX99,
+      "the Placeholder button exists and is gated on mapper write")
+check("['mp-add-placeholder', !canWrite || !hasMap]," in MAPPER99,
+      "Placeholder is disabled with no map selected or no write access, in "
+      "the same toolbar-state table as every other mapper write control")
+check("if (node.placeholder) {" in MAPPER99,
+      "resolveNode branches on node.placeholder before the unmanaged check")
+check("gone: false, placeholder: true, role: node.role || ''," in MAPPER99,
+      "a placeholder resolves with placeholder: true and its own role override")
+check("if (info.unmanaged || info.gone || info.placeholder) return;" in MAPPER99,
+      "a placeholder's dblclick has nothing in Nodes to open, same as an "
+      "unmanaged peer or a device removed from Nodes")
+check(".mp-node.placeholder .mp-node-box { stroke-dasharray: 8 4; stroke: var(--canvas-muted); }"
+      in APP_CSS99,
+      "a placeholder draws with its own dash, distinct from .unmanaged and .gone")
+check("'Placeholder — not a device. Drawn for the diagram only; select it with a ' +\n"
+      "        'device and press Connect to join them.'" in MAPPER99,
+      "the detail pane explains what a placeholder is and how to join it")
+check("{ placeholder: true, label, x: pos.x, y: pos.y });" in MAPPER99,
+      "openAddPlaceholder POSTs placeholder: true with the trimmed label")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

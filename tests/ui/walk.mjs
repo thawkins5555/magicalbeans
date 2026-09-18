@@ -1414,6 +1414,75 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       return `${before} -> ${afterConnect} -> ${afterRemove}`;
     });
 
+  await check('Mapper: Placeholder adds a logical block, Connect joins it to a device, '
+    + 'Remove takes it off',
+    async () => {
+      await page.keyboard.press('Escape').catch(() => {});
+      await selectTab(page, 'mapper');
+      await settle(page, 1500);
+      const deviceIds = await page.evaluate(() => {
+        const vw = window.innerWidth, vh = window.innerHeight;
+        return [...document.querySelectorAll('#mp-svg .mp-node:not(.placeholder)')]
+          .map((g) => ({ id: g.dataset.nodeId, rect: g.getBoundingClientRect() }))
+          .filter((n) => n.rect.width > 0 && n.rect.right > 0 && n.rect.left < vw
+                       && n.rect.bottom > 0 && n.rect.top < vh)
+          .map((n) => n.id);
+      });
+      if (!deviceIds.length) return 'skipped: no device visible on the demo map';
+      const nodeSel = (id) => `#mp-svg .mp-node[data-node-id="${id}"]`;
+
+      const placeholderName = `Walk PH ${Date.now() % 100000}`;
+      await page.click('#mp-add-placeholder');
+      await page.waitForSelector('#modal:not([hidden]) #mpph-name', { timeout: 10000 });
+      await page.fill('#modal:not([hidden]) #mpph-name', placeholderName);
+      const added = page.waitForResponse((response) =>
+        /\/api\/mapper\/maps\/\d+\/nodes$/.test(response.url())
+        && response.request().method() === 'POST', { timeout: 10000 });
+      await page.click('#modal:not([hidden]) .modal-buttons button.primary');
+      const addResponse = await added;
+      assert(addResponse.ok(), `Add placeholder answered ${addResponse.status()}`);
+      await settle(page, 800);
+
+      const placeholderId = await page.evaluate((name) => {
+        const g = [...document.querySelectorAll('#mp-svg .mp-node.placeholder')]
+          .find((el) => el.querySelector('.mp-node-label')?.textContent === name);
+        return g ? g.dataset.nodeId : null;
+      }, placeholderName);
+      assert(placeholderId, `no .placeholder node with label "${placeholderName}" found on the canvas`);
+
+      await page.click(nodeSel(deviceIds[0]));
+      await sleep(200);
+      await page.click(nodeSel(placeholderId), { modifiers: ['Shift'] });
+      await page.waitForFunction(
+        () => !document.getElementById('mp-connect').disabled, { timeout: 10000 });
+
+      await page.click('#mp-connect');
+      await page.waitForSelector('#modal:not([hidden]) #mpc-label', { timeout: 10000 });
+      const linked = page.waitForResponse((response) =>
+        /\/api\/mapper\/maps\/\d+\/links$/.test(response.url())
+        && response.request().method() === 'POST', { timeout: 10000 });
+      await page.click('#modal:not([hidden]) .modal-buttons button.primary');
+      const linkResponse = await linked;
+      assert(linkResponse.ok(), `Connect answered ${linkResponse.status()}`);
+      await settle(page, 800);
+
+      const dispatched = await page.evaluate((id) => {
+        const g = document.querySelector(`#mp-svg .mp-node.placeholder[data-node-id="${id}"]`);
+        if (!g) return false;
+        g.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+        return true;
+      }, placeholderId);
+      assert(dispatched, 'could not find the placeholder node to click');
+      await page.waitForSelector('#mp-detail [data-remove-node]', { timeout: 10000 });
+      const removed = page.waitForResponse((response) =>
+        /\/api\/mapper\/maps\/\d+\/nodes\/\d+$/.test(response.url())
+        && response.request().method() === 'DELETE', { timeout: 10000 });
+      await page.click('#mp-detail [data-remove-node]');
+      const removeResponse = await removed;
+      assert(removeResponse.ok(), `Remove from map answered ${removeResponse.status()}`);
+      return `placeholder "${placeholderName}" added, connected, removed`;
+    });
+
   await check('Mapper: FiberView draws SM/MM/mismatch colours and a fanned, '
     + 'blocked parallel pair (5.36.0)',
     async () => {
