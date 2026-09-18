@@ -2706,7 +2706,7 @@
           const end = blocked.get(vlan);
           const where = end === 'both' ? `${escape(a.name)} and ${escape(b.name)}`
             : escape(end === 'a' ? a.name : b.name);
-          lines.push(`<span class="mp-vlan-blocked">${row}  (STP blocked on ${where})</span>`);
+          lines.push(`<span class="mp-vlan-blocked">${row}  (${where})</span>`);
         } else lines.push(`<span class="mp-vlan-pass">${row}</span>`);
       }
       if (!all) {

@@ -4496,8 +4496,8 @@ check("function stpBlockedVlans(link) {" in MAPPER96,
       "the blocked map is parsed from a_stp_vlans/b_stp_vlans")
 check("if (blocked === null) lines.push(row);" in MAPPER96,
       "a link with no blocking leaves its list uncoloured")
-check('<span class="mp-vlan-blocked">${row}  (STP blocked on ${where})</span>' in MAPPER96,
-      "a blocked VLAN says so in words as well as red, naming the end")
+check('<span class="mp-vlan-blocked">${row}  (${where})</span>' in MAPPER96,
+      "a blocked VLAN names the blocking switch beside the red, one line per VLAN")
 check("stpBlockingText(link, escape(a.name), escape(b.name), escape, false)" in MAPPER96,
       "the detail pane's STP footer drops the VLAN ids the list now shows")
 check("const suffix = (vlans) => (withVlans ? esc(stpVlanSuffix(vlans)) : '');" in MAPPER96,
