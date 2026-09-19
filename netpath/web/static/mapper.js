@@ -3745,11 +3745,7 @@
       URL.revokeObjectURL(url);
       canvas.toBlob((blob) => {
         if (!blob) { App.toast('Could not render the map to PNG.', 'fail'); return; }
-        const link = document.createElement('a');
-        link.href = URL.createObjectURL(blob);
-        link.download = `${(view.map && view.map.name) || 'map'}.png`;
-        link.click();
-        URL.revokeObjectURL(link.href);
+        App.download(blob, `${(view.map && view.map.name) || 'map'}.png`);
         App.toast('Map exported to PNG', 'ok');
       }, 'image/png');
     };

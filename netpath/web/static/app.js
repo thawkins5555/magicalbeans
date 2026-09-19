@@ -667,21 +667,27 @@ const App = (() => {
   const put = (path, body) => call(path, { method: 'PUT', body });
   const del = (path, body) => call(path, { method: 'DELETE', body });
 
+  // The blob-to-anchor trick every download in this app shares; the blob's
+  // type and the filename stay at each call site.
+  function download(blob, filename) {
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = filename;
+    link.click();
+    URL.revokeObjectURL(link.href);
+  }
+
   /* Every `.../export.csv` route answers JSON — {csv, filename, count,
      truncated, cap} — rather than a raw file: server.py's response
      machinery sends one buffered body per request with no
      Content-Disposition path, so this follows the precedent the OID walk
      download already set (nodes.js) rather than inventing a second way to
-     hand a file to a browser. saveCsv does the Blob-and-anchor trick every
-     download in this app now shares; exportCsv is the button handler every
-     tab's Export CSV button wires to — one fetch, one save, one toast. */
+     hand a file to a browser. saveCsv wraps `download` with the CSV blob
+     and its filename; exportCsv is the button handler every tab's Export
+     CSV button wires to — one fetch, one save, one toast. */
   function saveCsv(payload) {
-    const blob = new Blob([payload.csv], { type: 'text/csv;charset=utf-8' });
-    const link = document.createElement('a');
-    link.href = URL.createObjectURL(blob);
-    link.download = payload.filename || 'export.csv';
-    link.click();
-    URL.revokeObjectURL(link.href);
+    download(new Blob([payload.csv], { type: 'text/csv;charset=utf-8' }),
+             payload.filename || 'export.csv');
   }
 
   async function exportCsv(path, params) {
@@ -1333,6 +1339,34 @@ const App = (() => {
     const digits = text.replace(/[:\-.\s]/g, '');
     if (!digits || !/^[0-9a-fA-F]+$/.test(digits)) return text;
     return (digits.toLowerCase().match(/.{1,2}/g) || []).join(':');
+  }
+
+  /* Counters both collectors report only when they are non-zero, in the
+     order an operator cares about them. `kernel_dropped` first and always:
+     it is what the kernel discarded before this application saw it, the
+     number that tells the truth about an overloaded listener. */
+  const EXTRA_COUNTERS = [
+    ['kernel_dropped', 'dropped by the kernel'],
+    ['throttled', 'throttled per source'],
+    ['bad_auth', 'failed authentication'],
+    ['unverified', 'unverified'],
+    ['too_many_varbinds', 'over the varbind limit'],
+    ['tcp_refused', 'TCP connections refused'],
+    ['resampled', 'resampled'],
+  ];
+
+  function extraCounterParts(counters) {
+    const parts = [];
+    for (const [key, label] of EXTRA_COUNTERS) {
+      const n = Number(counters[key] || 0);
+      if (n > 0) parts.push(`${n.toLocaleString()} ${label}`);
+    }
+    // Not a fault and not hidden when zero: an operator wants to know how
+    // many senders are connected, including none.
+    if (counters.tcp_clients != null) {
+      parts.push(`${Number(counters.tcp_clients).toLocaleString()} TCP client(s)`);
+    }
+    return parts;
   }
 
   function rate(bytesTotal, seconds) {
@@ -4581,6 +4615,15 @@ const App = (() => {
     (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;',
               "'": '&#39;', '`': '&#96;' }[c]));
 
+  // A duplicate/upstream-suggestion match's confidence, colored the same way
+  // in nodes.js's discovery table and mapper.js's upstream-suggestions dialog.
+  const CONFIDENCE_COLOR = { high: 'var(--ok)', medium: 'var(--warn)', low: 'var(--muted)' };
+
+  function confidenceBadgeHtml(c) {
+    return `<span style="color:${CONFIDENCE_COLOR[c.confidence] || 'var(--muted)'}">${
+      escapeHtml(c.confidence)}</span>`;
+  }
+
   /* ------------------------------------------------- sortable hand tables
 
      Click-to-sort was the grid's trick alone: every plain <table> a module
@@ -4953,6 +4996,29 @@ const App = (() => {
     setHidden(el(barId), n === 0);
     if (n) setText(el(labelId), `${n} selected`);
     return n;
+  }
+
+  // alerts.js/configrx.js/nodes.js's identical bulk-checkbox toggle: only
+  // the one row is touched, not a full redraw. Caller handles tr absent
+  // (a select-all box) itself.
+  function bulkToggle({ id, tr, set, checkClass, tableId, total }) {
+    const on = !set.has(id);
+    if (on) set.add(id);
+    else set.delete(id);
+    if (tr) {
+      tr.classList.toggle('bulk-checked', on);
+      const box = tr.querySelector(checkClass);
+      if (box) box.checked = on;
+      refreshSelectAll(el(tableId), total, set.size);
+    }
+    return on;
+  }
+
+  /* configrx.js/nodes.js's identical "clear the bulk selection and redraw"
+     — each caller's own redraw (drawDevices/drawTable) stays theirs. */
+  function bulkClear(set, redraw) {
+    set.clear();
+    redraw();
   }
 
   /* One full-width row carrying the same look a detail pane's empty state
@@ -6296,22 +6362,25 @@ const App = (() => {
   const api = {
     state, pages, selectTab, whenModuleReady, loadState, refreshNow,
     buildRoute, setRoute, currentRoute: parseRoute,
-    get, post, put, del, saveCsv, exportCsv, deviceIndex, deviceLink,
+    get, post, put, del, saveCsv, exportCsv, download, deviceIndex, deviceLink,
     deviceNameLink,
     clock, stamp, span, duration, ago, when, timeCell, agoCell, isoLocal,
+    localInputValue,
     emptyText, stackedHistogram, plottedRange, filterBar, filterValues, clearFilters,
     timeZoneLabel, timeZoneTitle, countLabel,
-    bytes, rate, formatMac, fillRanges, wheelWindow,
+    bytes, rate, formatMac, fillRanges, wheelWindow, extraCounterParts,
     modal, modalToken, modalIsCurrent, pollWhileModal,
     closeModal, requestCloseModal, confirmDestructive, el, svgNode,
     setText, setHtml, setBg, setHidden, strip, wireToggle,
     tooltip, hideTooltip, toast, showModalError, clearModalError, requireFields,
     runJob, watchJob, settleButton, form, emptyRow, emptyState, loading, bulkBar,
+    bulkToggle, bulkClear,
     announce, desktopNotifyEnabled, setDesktopNotify, titleForAlerts,
     canStoreSecrets, credentialUnavailableHtml,
     registerHelp, helpLink,
     resetLayout, onRelayout, setTheme, currentTheme, tile, figure, figures, comboBox,
     drawSeriesChart, formatMetricValue, sparkline, RANGES, rangeDialog, rangeLabel,
+    niceCeiling,
     attachChartZoom,
     recallSort, rememberSort, restoreControls, rememberControls,
     rememberControl, savedControl, controlOrSaved, syncControls,
@@ -6319,6 +6388,7 @@ const App = (() => {
     grid, sortRows, canRead, canWrite, applyPermissions, accountModal, wireRowKeyboard,
     statusPatternDefs, statusPatternUrl, statusMark,
     visibleColumns, readColumnPicker, drawRows, escapeHtml,
+    confidenceBadgeHtml, CONFIDENCE_COLOR,
     windowSet, windowZoom, windowPan, loadExtra, extras,
     refreshSelectAll, columnPickerFieldset, wireColumnPickers,
     sortableTable,

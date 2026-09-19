@@ -1570,6 +1570,10 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       });
       if (!mapId) return 'skipped: no map selected on the demo Mapper';
 
+      // FiberView moves a fibre link's .blocking onto an overlay path with no
+      // data-link-id; the check above leaves it on when it is not skipped.
+      await page.uncheck('#mp-fiberview', { timeout: 2000 }).catch(() => {});
+
       const state = await waitForStpVlanBlockingLink(page, mapId);
       if (!state.present) return 'skipped: acc-sw-005 is not in this fleet';
       if (!state.ready && state.discovered === false) {

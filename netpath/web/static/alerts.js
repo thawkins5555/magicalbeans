@@ -86,6 +86,7 @@
   const escape = App.escapeHtml;
 
   const ago = (ts) => App.ago(ts, '\u2014');
+  const localInputValue = App.localInputValue;
 
   /* Fills in the two device-address links beside the object line once the
      ip lookup resolves \u2014 done after the pane is already on screen so
@@ -389,18 +390,9 @@
      one checkbox is what made ticking several alerts feel slow on a long
      list — the boxes themselves cost nothing. */
   function toggleChecked(id, tr) {
-    const on = !view.checked.has(id);
-    if (on) view.checked.add(id);
-    else view.checked.delete(id);
-    if (tr) {
-      tr.classList.toggle('bulk-checked', on);
-      const box = tr.querySelector('.alerts-check');
-      if (box) box.checked = on;
-      App.refreshSelectAll(App.el('alerts-table'), view.alerts.length,
-                           view.checked.size);
-      drawBulkBar();
-      return;
-    }
+    App.bulkToggle({ id, tr, set: view.checked, checkClass: '.alerts-check',
+                     tableId: 'alerts-table', total: view.alerts.length });
+    if (tr) { drawBulkBar(); return; }
     drawTable();
   }
 
@@ -904,12 +896,6 @@
       };
     }
     return box;
-  }
-
-  function localInputValue(date) {
-    const pad = (n) => String(n).padStart(2, '0');
-    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}` +
-      `T${pad(date.getHours())}:${pad(date.getMinutes())}`;
   }
 
   async function addWindowDialog() {

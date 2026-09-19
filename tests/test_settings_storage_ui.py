@@ -49,7 +49,9 @@ def read(name):
 
 INDEX = read("index.html")
 SETTINGS = read("settings.js")
-NODES_JS = read("nodes.js")
+# settingsDialog moved to nodes_settings.js (5.45.0); joined so js_function
+# below still finds it.
+NODES_JS = _source.static_text("nodes.js", "nodes_settings.js")
 CSS = read("app.css")
 
 RETENTION = INDEX[INDEX.index('<div id="settings-sub-retention"'):

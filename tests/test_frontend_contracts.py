@@ -20,7 +20,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _source import js_function, js_functions, js_const, css_rule, python_text
+from _source import js_function, js_functions, js_const, css_rule, python_text, static_text
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATIC = os.path.join(REPO_ROOT, "netpath", "web", "static")
@@ -1574,6 +1574,8 @@ ALLOWED_BARE_FIELDS = {
 }
 # mapper_upstream.js carries the upstream-suggestions dialog cut out of mapper.js.
 ALLOWED_BARE_FIELDS["mapper_upstream.js"] = ALLOWED_BARE_FIELDS["mapper.js"]
+# nodes_credentials.js carries the polling-profile dialogs cut out of nodes.js.
+ALLOWED_BARE_FIELDS["nodes_credentials.js"] = {"c.id"}
 
 
 def _template_literals(body):
@@ -1748,7 +1750,8 @@ check("if (folded) tip.push({ text: FOLDED_TEXT });" in _NF_BARS
 #      section exists, and why that is printed rather than passed over.
 NODE = shutil.which("node") or shutil.which("nodejs")
 
-_NF_HELPERS = (js_functions(_NETFLOW, "niceCeiling", "rateLabel", "windowEnd", "slotCovered",
+_NF_HELPERS = (js_function(APP, "niceCeiling")
+               + js_functions(_NETFLOW, "rateLabel", "windowEnd", "slotCovered",
                              "slotSeconds", "slotCount", "axisOf", "showFocusTip", "drawChart",
                              "slotTip")
                + js_const(_NETFLOW, "SLOT_MIN_FRACTION"))
@@ -2488,7 +2491,9 @@ check(_WL_REFRESH59.count("App.state.tab !== 'wireless'") == 2,
 # 49. NODES/APP (5.9.1 review): the frontend-core findings. The paged device
 #     list, the kiosk query string, the per-tick configuration fetches, the
 #     two browser-built CSVs and the three status lines nobody could hear.
-_N59 = read("nodes.js")
+# addProfile/editProfile/removeProfile/setDefaultProfile/profileStatus moved
+# to nodes_credentials.js (5.45.0); joined so the checks below still find them.
+_N59 = static_text("nodes.js", "nodes_credentials.js")
 # refresh() and the three helpers it was split into (readDeviceFilters,
 # reconcileSelection, drawDevicePage) are one contiguous region.
 _NODES_REFRESH59 = _slice59(_N59, "  function readDeviceFilters() {",
@@ -2752,7 +2757,9 @@ check(_OFFENDERS50.index("view.offendersFetchedAt = now;")
 
 
 # --- 51. 5.10.0: the firmware report, the HTTPS check and the Debug column ----
-NODES51 = read("nodes.js")
+# DETAIL_FIELDS moved to nodes_settings.js (5.45.0) with the rest of the
+# settings dialog; joined so the checks below still find it.
+NODES51 = static_text("nodes.js", "nodes_settings.js")
 NETPATH51 = read("netpath.js")
 DEBUG51 = read("debug.js")
 ALERTS51 = read("alerts.js")
@@ -4600,6 +4607,43 @@ check("'Placeholder — not a device. Drawn for the diagram only; select it with
       "the detail pane explains what a placeholder is and how to join it")
 check("{ placeholder: true, label, x: pos.x, y: pos.y });" in MAPPER99,
       "openAddPlaceholder POSTs placeholder: true with the trimmed label")
+
+# ---------------------------------------------------------------------------
+# 100. Review fixes (5.45.0): nodes.js's three lazy dialogs -- a help key
+#      nodes.js references must be registered in nodes.js itself, not left
+#      for a lazy extra to supply, and each click site actually loads its
+#      extra (and inits it) before calling in.
+NODES100 = read("nodes.js")
+_used_help_keys100 = set(re.findall(r"(?:helpLinkNamed|App\.helpLink)\('(nodes\.[\w.]+)'", NODES100))
+_registered_help_keys100 = set(re.findall(r"'(nodes\.[\w.]+)':\s*\{", NODES100))
+check(bool(_used_help_keys100) and _used_help_keys100 <= _registered_help_keys100,
+      "every nodes.* help key nodes.js references is registered in nodes.js "
+      "itself (missing: %s)"
+      % (", ".join(sorted(_used_help_keys100 - _registered_help_keys100)) or "none"))
+
+for _btn, _stem in (("nd-browse-oids", "nodes_oid_browser"), ("nd-settings", "nodes_settings"),
+                   ("nd-add-profile", "nodes_credentials"), ("nd-edit-profile", "nodes_credentials"),
+                   ("nd-remove-profile", "nodes_credentials"),
+                   ("nd-default-profile", "nodes_credentials")):
+    check(("App.el('%s').onclick = () => App.loadExtra('%s')" % (_btn, _stem)) in NODES100,
+          "%s's dialog is fetched through App.loadExtra('%s')" % (_btn, _stem))
+
+_ENTRY_CALLS100 = {
+    "nd-browse-oids": "App.extras.nodesOidBrowser.open()",
+    "nd-add-profile": "App.extras.nodesCredentials.addProfile()",
+    "nd-edit-profile": "App.extras.nodesCredentials.editProfile()",
+    "nd-remove-profile": "App.extras.nodesCredentials.removeProfile()",
+    "nd-default-profile": "App.extras.nodesCredentials.setDefaultProfile()",
+}
+for _btn, _entry in _ENTRY_CALLS100.items():
+    _click100 = _slice59(NODES100, "App.el('%s').onclick" % _btn, "'fail'));")
+    check(_before59(_click100, ".init(", _entry),
+          "%s's click handler inits its extra before calling %s" % (_btn, _entry))
+
+for _name in ("download", "bulkToggle", "bulkClear", "extraCounterParts", "niceCeiling",
+             "localInputValue", "confidenceBadgeHtml", "CONFIDENCE_COLOR"):
+    check(_name in _slice59(APP, "const api = {", "\n  };"),
+          "%s is exposed on App (the shared api object)" % _name)
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))

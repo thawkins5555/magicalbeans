@@ -4,6 +4,7 @@
    rather than App.pages and needs nothing of mapper.js's own state. */
 (() => {
   const escape = App.escapeHtml;
+  const confidenceBadgeHtml = App.confidenceBadgeHtml;
 
   /* ------------------------------------------------ upstream suggestions
 
@@ -27,7 +28,6 @@
      list is fleet-wide, so unlike everything in the action bar it works
      with no map selected and is not in drawToolbarState's gates. */
 
-  const CONFIDENCE_COLOR = { high: 'var(--ok)', medium: 'var(--warn)', low: 'var(--muted)' };
   const MATCH_KIND_LABEL = { chassis_mac: 'MAC address match', sys_name: 'name match' };
 
   // nodes.js's display-name precedence, copied for the same reason the
@@ -37,11 +37,6 @@
   function deviceDisplayName(d) {
     if (d.display_name_source === 'manual') return d.name || d.ip;
     return d.sys_name || d.name || d.ip;
-  }
-
-  function confidenceBadgeHtml(c) {
-    return `<span style="color:${CONFIDENCE_COLOR[c.confidence] || 'var(--muted)'}">${
-      escape(c.confidence)}</span>`;
   }
 
   /* What lets an operator say "yes, that is the uplink" without opening a

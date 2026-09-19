@@ -272,25 +272,15 @@
   /* Given the row, only that row is touched: redrawing the whole table to
      change one checkbox is what made picking several devices feel slow. */
   function toggleChecked(id, tr) {
-    const on = !view.devicesChecked.has(id);
-    if (on) view.devicesChecked.add(id);
-    else view.devicesChecked.delete(id);
-    if (tr) {
-      tr.classList.toggle('bulk-checked', on);
-      const box = tr.querySelector('.cx-check');
-      if (box) box.checked = on;
-      App.refreshSelectAll(App.el('cx-devices'), view.devices.length,
-                           view.devicesChecked.size);
-      drawBulkBar();
-      return;
-    }
+    App.bulkToggle({ id, tr, set: view.devicesChecked, checkClass: '.cx-check',
+                     tableId: 'cx-devices', total: view.devices.length });
+    if (tr) { drawBulkBar(); return; }
     drawDevices();
   }
 
 
   function bulkClearSelection() {
-    view.devicesChecked.clear();
-    drawDevices();
+    App.bulkClear(view.devicesChecked, drawDevices);
   }
 
   /* Shared by the single-device and bulk settings dialogs, which both take

@@ -568,7 +568,6 @@
   }
 
   function tableRows(store) {
-    const escape = App.escapeHtml;
     if (!store) return 'This service has not opened that database.';
     if (store.missing) return escape(store.note);
     // The basis line is not decoration: where dbstat is not compiled in the

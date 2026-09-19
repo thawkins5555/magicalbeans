@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.45.0 — Front-end tidy-up](#5450--front-end-tidy-up)
 - [5.44.0 — Backend restructure, dead code removed](#5440--backend-restructure-dead-code-removed)
 - [5.43.0 — Test hardening ahead of the restructure](#5430--test-hardening-ahead-of-the-restructure)
 - [5.42.0 — Mapper placeholder blocks, and a shorter blocked-VLAN row](#5420--mapper-placeholder-blocks-and-a-shorter-blocked-vlan-row)
@@ -177,6 +178,62 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.45.0 — Front-end tidy-up
+
+Nothing changes on screen. This is Phase 3 of the front-end half of the
+restructure (5.43.0 and 5.44.0 covered the backend). One accepted
+difference: the Nodes Settings dialog, the OID browser and the
+credential-profile dialogs (add / edit / remove / set default) now fetch a
+small script the first time each is opened in a session — the same
+mechanism the Mapper's upstream-suggestions dialog has used since 5.13.0 —
+and if that fetch fails the operator gets a toast ("Could not open
+settings: …" etc.) instead of a dialog.
+
+**`nodes.js` (8,043 lines) is down to 7,115.** Three click-to-open dialogs
+moved verbatim into their own lazily loaded files: `nodes_settings.js`
+(250 lines), `nodes_oid_browser.js` (310) and `nodes_credentials.js`
+(430), registered on `App.extras` and loaded with `App.loadExtra`.
+Considered and deliberately **not** moved, with reasons: temperature
+overrides (lazy loading would let the section header paint before its
+content — a visible change), scheduled reports and History (both render
+during page start-up, before any click), and interface drill-down/events
+(redrawn on every refresh tick). All Nodes help text (Ping, SNMP,
+SSH, WEB) stayed in `nodes.js` so every "?" works before any dialog has
+been opened; a contract test now requires it.
+
+**One copy instead of several, now on `App`.** `localInputValue`,
+`niceCeiling`, `extraCounterParts` (and its counter table),
+`confidenceBadgeHtml` plus `CONFIDENCE_COLOR`, `App.download` (the same
+blob-to-file routine CSV export, the debug log export, Mapper's PNG
+export and the OID walk save each had their own copy of), and
+`App.bulkToggle`/`App.bulkClear` (the row-selection logic Nodes, Alerts
+and ConfigRX each had their own copy of — each page keeps its own redraw).
+Every pair was compared character for character before merging.
+Deliberately **not** merged, because they behave differently today: how
+ConfigRX formats a size (stops at MB) versus `App.bytes` (goes to TB), the
+two device-group dropdown builders (different default label), and
+Dashboard's `displayName` null guard.
+
+**Seven unused id attributes removed from `index.html`** (the elements
+themselves are unchanged): `cx-config-header`, `dbg-workers-wrap`,
+`dbg-nodes-wrap`, `dbg-disc-wrap`, `dbg-dns-wrap`, `dbg-ipam-wrap`,
+`new-perm-tools`. A redundant inner `escape` alias was also removed from
+`settings.js`.
+
+**Tests.** The front-end contract suites now read the split files as one
+source. `tests/ui/walk.mjs`'s per-VLAN STP Mapper check now switches
+FiberView off first: when the preceding FiberView check had just run
+(rather than been skipped), it left FiberView on, which draws a fibre
+link's blocking pattern on an overlay path that check's selector could not
+see. This was a test-selector gap, not a product defect — Mapper's own
+behaviour was and is correct.
+
+Browser walk: 94/94, no console errors, page errors or failed requests for
+either an admin or a viewer account. `app.js`, `mapper.js` and `app.css`
+are unchanged by design.
+
+Full test suite: 176 of 184 suites passed, 2 skipped — the same result and the same build-machine environmental failures as 5.42.0 (test_ipam_dhcp_search passes when run on its own; it fails only when other tests run beside it). The nine front-end suites were rerun after the review fixes and pass.
 
 ### 5.44.0 — Backend restructure, dead code removed
 

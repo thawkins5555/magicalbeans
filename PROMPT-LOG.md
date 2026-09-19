@@ -1756,7 +1756,9 @@ scope.
   being kept so nothing gets accidentally "fixed" or changed along the
   way — that list gets reviewed with the operator at the end (5.47.0).
 
-**Status:** Phase 1 (test hardening) shipped as 5.43.0. Phase 2 (dead
-code/file removal plus backend restructure) is shipping as 5.44.0. No new
-operator prompt landed in between — just periodic "status?" checks and a
-request to check in every 10 minutes, not logged here as separate entries.
+**Status:** Phases 1 and 2 (test hardening, then dead code/file removal
+plus backend restructure) shipped as 5.43.0 and 5.44.0. Phase 3 (front-end
+tidy-up) is shipping as 5.45.0. No new operator prompt landed in between —
+just periodic "status?" checks, not logged here as separate entries. The
+operator also asked for a check-in every 10 minutes partway through; that
+request was later cancelled.

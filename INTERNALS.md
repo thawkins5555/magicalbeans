@@ -8539,13 +8539,15 @@ to live under. Nothing server-side moved with it: both routes stay
 account a Nodes write. The dialog therefore offers Apply against
 `App.canWrite('nodes')`, not against its own page's module, and the button
 is in the top strip rather than the action bar: `drawToolbarState` gates
-that bar on a selected map, and this list is fleet-wide. Two things were
-copied rather than moved with it, both because the Nodes page still has
-its own consumers: `CONFIDENCE_COLOR` and `confidenceBadgeHtml`, which the
-Discovery grid's "Same as" column and `duplicatesDialog` score into the
-same three tiers. `mapper.js` in turn carries its own copy of
-`displayName`'s precedence, for the same reason its device-status
-vocabulary is copied: neither lazy module may reach into the other.
+that bar on a selected map, and this list is fleet-wide. `CONFIDENCE_COLOR`
+and `confidenceBadgeHtml` were copied rather than moved with it, because
+the Nodes page still has its own consumers — the Discovery grid's "Same
+as" column and `duplicatesDialog` score into the same three tiers; 5.45.0
+merged the two copies into one on `App`, read by both `nodes.js` and
+`mapper_upstream.js` (see "Front-end tidy-up" below). `mapper.js` still
+carries its own copy of `displayName`'s precedence, for the same reason
+its device-status vocabulary is copied: neither lazy module may reach
+into the other.
 
 ### Interface flapping thresholds (`alertsdb.py`, `alertengine.py`)
 
@@ -14117,6 +14119,72 @@ nobody holds by default, and it neither uses the vendor table, the enable
 secret, nor `_pull_config` — a person at the terminal who needs privileged
 mode types `enable` themselves. The two features share exactly one thing,
 the host-key store.
+
+### Front-end tidy-up: three more extras, one copy of shared helpers (`nodes.js`, `nodes_settings.js`, `nodes_oid_browser.js`, `nodes_credentials.js`, `app.js`) — 5.45.0
+
+Nothing about the interface changed; this is the front-end half of the
+restructure 5.44.0 did for the backend. `nodes.js` (8,043 lines) is down to
+7,115. Three of its click-to-open dialogs moved verbatim into their own
+files, each fetched on demand the same way `mapper_upstream.js` has been
+since 5.13.0 (see the MAPPER section above for that mechanism):
+`nodes_settings.js` (250 lines, the Settings dialog),
+`nodes_oid_browser.js` (310, Browse OIDs) and `nodes_credentials.js` (430,
+the polling-profile Add/Edit/Remove/Set default dialogs). Each registers
+itself on `App.extras` under a camelCase name (`nodesSettings`,
+`nodesOidBrowser`, `nodesCredentials`) and is loaded with
+`App.loadExtra(stem)`, which fetches `/<stem>.js` once per session and
+resolves immediately on every call after. `nodes.js`'s click handlers call
+`loadExtra` then reach into `App.extras.<name>`; a fetch failure rejects
+the promise, so the handler's `.catch` toasts ("Could not open settings:
+…", "Could not open the OID browser: …", one per Add/Edit/Remove/Set
+default) instead of a dialog opening — the one thing an operator can
+notice about this release.
+
+**The rule for what may become an extra:** only a click-to-open dialog
+behind a small, explicit `ctx` object — never anything `init()`, a page's
+`refresh()`, or `applyRoute` reaches on its own. `nodes_oid_browser.js` and
+`nodes_credentials.js` take their `ctx` through an `init(ctx)` called
+fresh before every entry point (closure state such as `view` can have
+moved on between opens); `nodes_settings.js` takes it as `open(ctx)`'s
+argument directly, since it has no state to refresh between opens. This is
+why three dialogs already in `nodes.js` were deliberately left there
+rather than made a fourth, fifth and sixth extra: the temperature-override
+section header paints during `nodes.js`'s own init, before any click, so
+lazy-loading its body would show the heading first and its content a beat
+later — a visible change; scheduled reports and History also render at
+page start-up; and interface drill-down/events redraw on every refresh
+tick. The help text behind the always-visible SSH/WEB buttons stayed in
+`nodes.js` for the same reason — it must work before an operator has
+opened any dialog.
+
+**Helpers merged onto `App`, one copy instead of several,** each pair
+diffed character for character first: `App.localInputValue` (the
+`datetime-local` formatter every "Custom…" range picker reads back with
+`new Date(value).getTime()` — Alerts' maintenance windows and one of
+App's own), `App.niceCeiling` (chart Y-axis rounding), `App.extraCounterParts`
+and its `EXTRA_COUNTERS` table (the SNMP-receiver/collector counter
+phrases NetFlow and the Events page both format the same way),
+`App.confidenceBadgeHtml` plus `App.CONFIDENCE_COLOR` (was copied
+between `nodes.js`'s Discovery grid and `mapper_upstream.js`'s dialog —
+see the note in the MAPPER section above), `App.download` (the
+blob-to-anchor save CSV export, the debug log export, Mapper's PNG export
+and the OID walk save each rolled their own copy of), and
+`App.bulkToggle`/`App.bulkClear` (the row-selection logic Alerts,
+ConfigRX and Nodes each carried their own copy of — `bulkToggle` touches
+only the one row it is given, leaving a select-all box's full-table
+redraw to the caller, which is why that case stays each page's own code
+rather than a parameter here; `bulkClear` takes the caller's redraw
+function directly).
+
+Deliberately left as separate copies, because they disagree in behaviour
+today: ConfigRX's own size formatter stops at MB where `App.bytes` goes to
+TB, the two device-group dropdown builders default to a different label,
+and Dashboard's `displayName` carries its own null guard.
+
+Seven unused id attributes were removed from `index.html` (the elements
+they were on are unchanged): `cx-config-header`, `dbg-workers-wrap`,
+`dbg-nodes-wrap`, `dbg-disc-wrap`, `dbg-dns-wrap`, `dbg-ipam-wrap`,
+`new-perm-tools`. `settings.js` lost a redundant inner `escape` alias.
 
 ### The SSH window (`static/ssh.html`, `ssh.js`, `ssh.css`)
 

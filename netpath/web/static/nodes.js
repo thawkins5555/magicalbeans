@@ -114,6 +114,8 @@
   const escape = App.escapeHtml;
 
   const ago = App.ago;
+  const confidenceBadgeHtml = App.confidenceBadgeHtml;
+  const CONFIDENCE_COLOR = App.CONFIDENCE_COLOR;
 
   /* App.helpLink's own accessible name is the bare word "Help", the same on
      every "?" in the application — fine wherever only one appears on a
@@ -476,18 +478,9 @@
      several rows on a long list feel slow — the checkboxes themselves cost
      nothing. Given the row, only that row is touched. */
   function toggleChecked(id, tr) {
-    const on = !view.devicesChecked.has(id);
-    if (on) view.devicesChecked.add(id);
-    else view.devicesChecked.delete(id);
-    if (tr) {
-      tr.classList.toggle('bulk-checked', on);
-      const box = tr.querySelector('.nd-check');
-      if (box) box.checked = on;
-      App.refreshSelectAll(App.el('nodes-table'), view.devices.length,
-                           view.devicesChecked.size);
-      drawBulkBar();
-      return;
-    }
+    App.bulkToggle({ id, tr, set: view.devicesChecked, checkClass: '.nd-check',
+                     tableId: 'nodes-table', total: view.devices.length });
+    if (tr) { drawBulkBar(); return; }
     drawTable();
   }
 
@@ -497,8 +490,7 @@
   }
 
   function bulkClearSelection() {
-    view.devicesChecked.clear();
-    drawTable();
+    App.bulkClear(view.devicesChecked, drawTable);
   }
 
   async function bulkUpdate(fields) {
@@ -2462,304 +2454,6 @@
       '</div>';
   }
 
-  /* ------------------------------------------------------ OID browser */
-
-  /* What a device actually answers, decoded against every MIB this app
-     knows. Deliberately subtree-at-a-time rather than a walk of the whole
-     tree: a switch is tens of thousands of objects and minutes of GETNEXTs,
-     and nobody reads that. The three offered subtrees cover "what is this
-     box" and "what are its ports"; anything else is one box and one click. */
-  function oidBrowser() {
-    const deviceId = view.selected;
-    if (!deviceId) return;
-    const device = view.devices.find((d) => d.id === deviceId);
-    // Same ticket idiom the interface dialog uses: App.modal reuses one
-    // #modal-box, so a slow walk must not paint into whatever dialog is
-    // open by the time it lands.
-    let token = null;
-    const current = () => App.modalIsCurrent(token);
-
-    const box = App.modal(`Browse OIDs — ${displayName(device || {})}`, `
-      <div class="bar wrap">
-        <label>Start at <input id="oid-base" size="24" value="1.3.6.1.2.1.1"></label>
-        <button id="oid-walk">Walk from here</button>
-        <span id="oid-quick" class="hint"></span>
-        <span class="grow"></span>
-        <button id="oid-full">Download full walk</button>
-        <button id="oid-full-cancel" hidden>Cancel</button>
-      </div>
-      <div id="oid-full-status" class="hint" hidden></div>
-      <p class="hint">Each walk reads the device live over SNMP. Names come
-        from the MIBs uploaded under Profiles &amp; MIBs — an OID no MIB
-        describes is shown as its number rather than guessed at.</p>
-      <div id="oid-status" class="hint"></div>
-      <div class="table-wrap scrollbox large"><table id="oid-table"></table></div>`, [
-      { label: 'Close', onClick: App.closeModal },
-    ], { buttonsTop: true });
-    // Stamped by App.modal above; every paint below checks it first.
-    token = App.modalToken();
-    box.classList.add('wide');
-
-    const COLS = [
-      { key: 'oid', label: 'OID', width: 210 },
-      { key: 'name', label: 'Name', width: 200 },
-      { key: 'suffix', label: 'Index', width: 70 },
-      { key: 'type', label: 'Type', width: 90 },
-      { key: 'value', label: 'Value', width: 280 },
-      // The point of browsing is usually "which OID holds this?", and the
-      // answer is only useful if you can act on it. Setting the field from
-      // a row whose value is on screen is the difference between choosing an
-      // OID and guessing one.
-      { key: 'use', label: 'Use as', width: 150, sortable: false },
-    ];
-    let rows = [];
-    let sort = { key: 'oid', descending: false };
-
-    function draw() {
-      const table = App.grid(box.querySelector('#oid-table'),
-        { name: 'nodes-oids', caption: 'OID walk results',
-          columns: COLS, sort, onSort: (key, descending) => {
-          sort = { key, descending }; draw();
-        } });
-      const body = document.createElement('tbody');
-      // Sorted numerically by arc, not as text: "1.3.6.1.2.1.1.10" must not
-      // sort between ".1" and ".2".
-      const ordered = sort.key === 'oid'
-        ? rows.slice().sort((a, b) => (sort.descending ? -1 : 1) * oidCompare(a.oid, b.oid))
-        : App.sortRows(rows, sort.key, sort.descending, COLS);
-      for (const row of ordered) {
-        const tr = document.createElement('tr');
-        tr.innerHTML =
-          `<td>${escape(row.oid)}</td>` +
-          `<td>${row.name ? escape(row.name) : '<span class="hint">—</span>'}</td>` +
-          `<td>${escape(row.suffix || '')}</td>` +
-          `<td>${escape(row.type)}</td>` +
-          `<td>${escape(row.value)}</td>` +
-          '<td><button class="linkish oid-use-vendor">vendor</button> ' +
-          '<button class="linkish oid-use-location">location</button></td>';
-        tr.querySelector('.oid-use-vendor').onclick =
-          () => useOidFor('vendor_oid', row);
-        tr.querySelector('.oid-use-location').onclick =
-          () => useOidFor('location_oid', row);
-        body.appendChild(tr);
-      }
-      table.appendChild(body);
-      App.wireRowKeyboard(body);
-    }
-
-    async function walk(base) {
-      box.querySelector('#oid-base').value = base;
-      box.querySelector('#oid-status').textContent = `Walking ${base}…`;
-      rows = [];
-      draw();
-      let payload;
-      try {
-        payload = await App.get(`/api/nodes/devices/${deviceId}/oids`, { oid: base });
-      } catch (error) {
-        if (!current()) return;
-        box.querySelector('#oid-status').innerHTML =
-          `<span class="err">${escape(error.message)}</span>`;
-        return;
-      }
-      if (!current()) return;
-      rows = payload.rows || [];
-      // A walk that stopped early says so: a truncated list that looks
-      // complete is worse than no list.
-      const named = rows.filter((r) => r.name).length;
-      box.querySelector('#oid-status').innerHTML = rows.length
-        ? `${rows.length} object(s), ${named} named` +
-          (payload.complete ? '' :
-            ` · <span class="err">${escape(payload.stopped)}</span>`)
-        : `<span class="hint">Nothing under ${escape(base)}` +
-          (payload.complete ? '' : ` — ${escape(payload.stopped)}`) + '</span>';
-      draw();
-    }
-
-    App.get(`/api/nodes/devices/${deviceId}/oids`, {}).then((payload) => {
-      if (!current()) return;
-      const quick = box.querySelector('#oid-quick');
-      quick.textContent = '';
-      for (const base of payload.bases || []) {
-        const button = document.createElement('button');
-        button.textContent = base.label;
-        button.onclick = () => walk(base.oid);
-        quick.appendChild(button);
-      }
-    }).catch(() => {});
-
-    /* The whole device, as a file. Runs server-side as a background job —
-       a full walk of a core switch is tens of thousands of GETNEXTs and
-       minutes of SNMP, which is exactly why the table above browses one
-       subtree at a time — so this shows a live count and a cancel, and
-       downloads only once the job is finished. */
-    const fullBtn = box.querySelector('#oid-full');
-    const cancelBtn = box.querySelector('#oid-full-cancel');
-    const fullStatus = box.querySelector('#oid-full-status');
-    let watchTimer = null;                // the poll's stop function
-    // Starting a walk is a write (it drives the device over SNMP), and
-    // applyPermissions only ever runs over markup that already exists, so
-    // dynamically-built controls check canWrite themselves — see app.js.
-    // Disabled with a reason, not hidden: hiding taught a read-only operator
-    // that the feature simply is not there, the same failure applyPermissions
-    // itself moved away from for exactly this reason (see its own comment in
-    // app.js) — the button sits alone at the end of the bar with nothing
-    // after it, so disabling it in place costs nothing layout has to absorb.
-    if (!App.canWrite('nodes')) {
-      fullBtn.disabled = true;
-      fullBtn.title = 'Needs Nodes write';
-    }
-
-    function stopWatching() {
-      if (watchTimer) watchTimer();
-      watchTimer = null;
-      fullBtn.disabled = false;
-      cancelBtn.hidden = true;
-    }
-    window.addEventListener('modal-closed', stopWatching, { once: true });
-
-    function say(html, error) {
-      fullStatus.hidden = false;
-      fullStatus.innerHTML = error ? `<span class="err">${html}</span>` : html;
-    }
-
-    async function finishFullWalk() {
-      // download=1 hands over the text and drops the rows server-side, so a
-      // 100k-object walk does not sit in memory for the life of the process.
-      // Which is exactly why this must run once: a second call would find
-      // the rows already dropped and report an empty walk. The watch is
-      // stopped before the request, not after it.
-      const done = await App.get(`/api/nodes/devices/${deviceId}/oid-walk`,
-                                 { download: 1 });
-      if (!current()) return;
-      if (!done.text) { say('The walk produced nothing.', true); return; }
-      // Same Blob-and-anchor download debug.js uses; no server-side
-      // Content-Disposition anywhere in this app.
-      const blob = new Blob([done.text], { type: 'text/plain' });
-      const link = document.createElement('a');
-      link.href = URL.createObjectURL(blob);
-      link.download = done.filename || 'snmp-walk.txt';
-      link.click();
-      URL.revokeObjectURL(link.href);
-      const walkInfo = done.walk || {};
-      say(`Downloaded ${walkInfo.rows || 0} object(s) as ` +
-          `${escape(link.download)}` +
-          (walkInfo.complete ? '.' :
-            ` — <b>incomplete</b>: ${escape(walkInfo.stopped || '')}`));
-    }
-
-    async function pollFullWalk() {
-      let payload;
-      try {
-        payload = await App.get(`/api/nodes/devices/${deviceId}/oid-walk`);
-      } catch (error) {
-        stopWatching();
-        if (current()) say(escape(error.message), true);
-        return;
-      }
-      if (!current()) { stopWatching(); return; }
-      const walkInfo = payload.walk;
-      if (!walkInfo) { stopWatching(); return; }
-      if (walkInfo.state === 'failed') {
-        stopWatching();
-        say(escape(walkInfo.error || 'The walk failed.'), true);
-        return;
-      }
-      if (walkInfo.state === 'done') {
-        // Stop the interval BEFORE the download request: formatting a
-        // 100,000-row walk can take longer than the one-second tick, and a
-        // second finishFullWalk would race the first one's own cleanup.
-        stopWatching();
-        fullBtn.disabled = true;
-        say('Preparing the download…');
-        try {
-          await finishFullWalk();
-        } catch (error) {
-          if (current()) say(escape(error.message), true);
-        }
-        fullBtn.disabled = false;
-        return;
-      }
-      say(`Walking the whole device — ${walkInfo.rows} object(s) so far, ` +
-          `${Math.round(walkInfo.elapsed)}s elapsed.`);
-    }
-
-    fullBtn.onclick = async () => {
-      fullBtn.disabled = true;
-      cancelBtn.hidden = false;
-      say('Starting the walk…');
-      try {
-        await App.post(`/api/nodes/devices/${deviceId}/oid-walk`, {});
-      } catch (error) {
-        stopWatching();
-        say(escape(error.message), true);
-        return;
-      }
-      if (!current()) { stopWatching(); return; }
-      watchTimer = App.pollWhileModal(token, 1000,
-        () => { pollFullWalk().catch(() => {}); });
-      pollFullWalk().catch(() => {});
-    };
-
-    cancelBtn.onclick = async () => {
-      cancelBtn.disabled = true;
-      await App.del(`/api/nodes/devices/${deviceId}/oid-walk`, {}).catch(() => {});
-      cancelBtn.disabled = false;
-      // The job stops at its next request and reports "done" with a
-      // cancelled reason, so the rows walked so far still download — a
-      // cancel is "enough, give me what you have", not "throw it away".
-    };
-
-    box.querySelector('#oid-walk').onclick =
-      () => walk(box.querySelector('#oid-base').value.trim());
-    draw();
-    walk('1.3.6.1.2.1.1');
-  }
-
-  /* Sets the browsed OID as the open device's vendor or location source.
-
-     Applied straight away rather than through a confirm: it is a plain
-     device override, reversible by clearing the field in Edit, and this app
-     reserves confirmation dialogs for destructive actions. The browser stays
-     open — an operator setting one of the two usually wants the other — and
-     the status line says what happened, including the value the OID answered
-     with, so the choice is visibly the one that was made. */
-  async function useOidFor(field, row) {
-    const deviceId = view.selected;
-    const status = document.getElementById('oid-status');
-    if (!deviceId) return;
-    const what = field === 'vendor_oid' ? 'Vendor' : 'Location';
-    try {
-      await App.put(`/api/nodes/devices/${deviceId}`, { [field]: row.oid });
-    } catch (error) {
-      if (status) {
-        status.innerHTML = `<span class="err">${escape(error.message)}</span>`;
-      }
-      return;
-    }
-    if (status) {
-      status.innerHTML = `${what} now reads from <code>${escape(row.oid)}</code>` +
-        ` — currently <b>${escape(row.value)}</b>.` +
-        (field === 'vendor_oid'
-          ? ' <span class="hint">Displayed vendor only; ConfigRX and the' +
-            ' Cisco MAC-table read keep using the detected vendor.</span>'
-          : '');
-    }
-    await loadDetail();
-    App.refreshNow('nodes');
-  }
-
-  /* Numeric arc-by-arc, so 1.3.6.1.2.1.1.10 sorts after .9 rather than
-     between .1 and .2 the way string order would put it. */
-  function oidCompare(a, b) {
-    const x = String(a).split('.').map(Number);
-    const y = String(b).split('.').map(Number);
-    for (let i = 0; i < Math.max(x.length, y.length); i += 1) {
-      const d = (x[i] || 0) - (y[i] || 0);
-      if (d) return d;
-    }
-    return 0;
-  }
-
   /* One port, charted and detailed. `deviceId` is explicit: opened from the
      device dialog this is NOT necessarily the selected device, and reading
      view.selected here was what charted the wrong device's traffic.
@@ -3951,6 +3645,11 @@
     return raw === '' ? null : raw === '1';
   }
 
+  // Also used by nodes_credentials.js (via ctx) -- deviceOverrides below
+  // needs it locally too, so it stays here rather than moving with it.
+  const blankToNull = (text) =>
+    (String(text).trim() === '' ? null : Number(text));
+
   function deviceOverrides(box) {
     const val = (id) => box.querySelector(id).value.trim();
     const overrides = {};
@@ -3996,6 +3695,165 @@
     Object.assign(overrides, identityOidValues(box));
     return overrides;
   }
+
+  // The "?" texts for the polling-profile and device forms (App.helpLink):
+  // ping/snmp are read by both the override and profile forms, ssh/web by
+  // the always-visible device toolbar.
+  App.registerHelp({
+    'nodes.profile.ping': {
+      title: 'Ping',
+      html: `
+        <p>The <b>Ping</b> checkbox decides whether every device on this
+        profile is ICMP-pinged as part of each poll. It is on by default, and
+        a device's own edit form can override it per device with the Ping
+        selector there.</p>
+        <p><b>With it ticked</b>, each poll sends several ICMP probes to the
+        device, as many as <b>Ping probes per poll</b> says, waiting
+        <b>Ping timeout</b> for each. That produces three things: whether the
+        device answered at all, its round-trip time, and its packet-loss
+        percentage. The loss and response time are recorded as metrics, so
+        they feed the packet-loss chart in the device dialog and the built-in
+        "Packet loss to device high" and "Ping response time high" alert
+        rules. If the Nodes setting for ping interval is longer than the poll
+        interval, the probes run only on the polls that fall due and the last
+        result is carried forward in between.</p>
+        <p><b>With it unticked</b>, nothing pings the device. No loss or
+        response-time metrics are recorded, those two alert rules have nothing
+        to read, and the packet-loss chart says the device is not being
+        ping-probed.</p>
+        <p><b>It also changes what "down" means</b>, together with the SNMP
+        checkbox beside it:</p>
+        <ul>
+          <li><b>Both ticked:</b> the device is down only when ping and SNMP
+          have both failed. A box that answers ping but has a wrong community
+          string shows as up with an SNMP error, not as an outage. The
+          <b>Down needs both ping and SNMP to fail</b> selector on the same
+          form is what flips that rule for a profile where SNMP failing alone
+          should count as down.</li>
+          <li><b>Ping unticked, SNMP ticked:</b> SNMP is the only evidence, so
+          an SNMP failure is a failure of the device.</li>
+          <li><b>Ping ticked, SNMP unticked:</b> a ping-only device, judged
+          reachable by ping alone.</li>
+        </ul>
+        <p>The two fields under the checkbox and the down rule are per
+        profile, and blank ones inherit the Nodes settings.</p>`,
+    },
+    'nodes.profile.snmp': {
+      title: 'SNMP',
+      html: `
+        <p>The <b>SNMP</b> checkbox decides whether every device on this
+        profile is polled over SNMP as part of each poll, with the profile's
+        credentials (and any additional ones listed below). It is on by
+        default, and a device's own edit form can override it per device with
+        the SNMP selector there.</p>
+        <p><b>With it ticked</b>, each poll reads the device's identity
+        (sysDescr, sysName, sysObjectID, uptime, and the Vendor and Location
+        OIDs if set), its interface table with the traffic and error counters
+        that become per-port bandwidth, the CPU, memory and storage figures
+        its MIBs expose, and any custom MIB assigned to it. Vendor
+        identification, the scheduled MAC-table walk, the OID browser and the
+        port dialogs all depend on it.</p>
+        <p><b>With it unticked</b>, no SNMP request is ever sent to the
+        device: it is a ping-only device. It has no interfaces, no metrics
+        beyond ping loss and response time, no vendor, and no MAC table, and
+        it is judged up or down by ping alone, so the Ping checkbox must stay
+        on for it to be monitored at all.</p>
+        <p><b>Together with Ping it decides what "down" means:</b></p>
+        <ul>
+          <li><b>Both ticked:</b> down only when ping and SNMP have both
+          failed, unless <b>Down needs both ping and SNMP to fail</b> says
+          otherwise.</li>
+          <li><b>SNMP ticked, Ping unticked:</b> an SNMP failure is a failure
+          of the device.</li>
+          <li><b>SNMP unticked, Ping ticked:</b> reachable by ping alone.</li>
+        </ul>`,
+    },
+    'nodes.device.ssh': {
+      title: 'SSH',
+      html: `
+        <p><b>SSH</b> opens an interactive shell on the selected device in a
+        new window. It is a real terminal — whatever you type goes to the
+        device exactly as typed, and whatever it prints comes back. Nothing
+        is recorded but the fact that the session happened: the device's
+        event log gets one line when it opens and one when it closes, with
+        who opened it and from which address, and never a keystroke.</p>
+        <p><b>Which credential it uses.</b> The SSH username, port and
+        password ConfigRX already stores for the device, if there is one —
+        the same credential its configuration backups use. If none is
+        stored, or the device refuses it, the window asks for a username and
+        password. What you type there is used for that one connection and is
+        never stored, on the server or in the browser.</p>
+        <p><b>Host keys.</b> The first connection to a device records its
+        host key and says so. From then on the key is checked on every
+        connection, by ConfigRX's backups as well as this window. If a device
+        offers a different key, the connection is refused before anything is
+        sent and the window shows both fingerprints and when the old one was
+        first seen. That happens after a legitimate rebuild — and it is also
+        what an impersonated address looks like, so <b>Trust the new key</b>
+        is a deliberate choice, not a formality.</p>
+        <p><b>Who can use it.</b> Its own <b>SSH</b> permission module,
+        granted to nobody by default. ConfigRX write only ever means "may
+        back this device up", which is a much narrower thing than a shell,
+        so it is not enough on its own — an administrator grants SSH write
+        under Settings, per account.</p>`,
+    },
+    'nodes.device.web': {
+      title: 'WEB',
+      html: `
+        <p><b>WEB</b> opens the selected device's own web interface in a new
+        window. Until 5.1 it pointed the browser straight at the device,
+        which only works from a machine with a route to the management
+        plane. It now opens a short-lived <b>tunnel</b> on this server
+        instead: your browser talks to this machine, and this machine talks
+        to the device — the same reach the poller already has.</p>
+        <p><b>Where it goes.</b> The address, scheme and port come from the
+        device's own record — the <b>WEB INTERFACE</b> fields on Edit — and
+        from nowhere else. Blank means <code>http</code> on port 80. Nothing
+        the browser sends can change the destination.</p>
+        <p><b>How long it lasts.</b> The tunnel's port accepts connections
+        only from the address you are browsing from. It closes after 15
+        minutes with no traffic (or sooner, if your sign-in's idle timeout is
+        shorter), after a minute if nothing ever connects, when you sign out,
+        and the moment your <b>web</b> permission is taken away. <b>Close</b>
+        beside the button ends it at once.</p>
+        <p><b>What is recorded.</b> The device's event log gets one line when
+        a tunnel opens and one when it closes, with how many bytes crossed in
+        each direction — never what they were. Nothing a page contains is
+        read or kept.</p>
+        <p><b>Following its links.</b> For a device on <code>http</code>, the
+        tunnel reads the headers each side sends. The device is asked for its
+        own address, so it builds its pages against itself, and the rest of
+        the request agrees — which is what lets a device that checks where a
+        form was posted from accept your login. Every address it names on the
+        way back — a redirect, a refresh, a cookie's domain — is put back onto
+        the tunnel, so a link written out in full
+        (<code>http://10.2.0.7/status</code>) stays inside it, which it did
+        not before 5.4.</p>
+        <p><b>Except a jump to https.</b> If a device on <code>http</code>
+        answers by sending you to <code>https://</code>, that address is left
+        as the device wrote it and your browser steps outside the tunnel to
+        follow it — which only works from a machine that already has a route
+        to the device. The device is telling you its interface is on HTTPS:
+        set the <b>WEB INTERFACE</b> scheme on Edit to <code>https</code> and
+        the tunnel will carry it.</p>
+        <p><b>A device on https is different.</b> Its traffic is carried
+        without being read, so its certificate is its own — your browser will
+        name the device in the warning, not this server — but nothing in it
+        can be adjusted either. A link or redirect written out in full will
+        step outside the tunnel and try to reach the device directly, which
+        only works from a machine that already has a route to it. The same
+        is true of anything on <code>http</code> the tunnel cannot make
+        sense of, such as a page that upgrades to a WebSocket: from that
+        point the connection is carried unread as well.</p>
+        <p><b>One thing to remember.</b> The tunnel is on this host, so it
+        shares the browser's cookie jar with this application's own port —
+        sign out of the device's UI when you are done with it.</p>
+        <p><b>Who can use it.</b> Its own <b>web</b> permission, granted to
+        nobody by default and to no account on upgrade: opening a listening
+        port on this server into the management plane is not something the
+        old button could do, so nobody inherits it.</p>`,
+    },
+  });
 
   /* --------------------------------------------------------------- CSV */
 
@@ -5770,501 +5628,6 @@
     App.wireRowKeyboard(body);
   }
 
-  /* --------------------------------------------------- additional credentials
-     A profile's own version/community/v3-user fields above are its always-
-     present "primary" credential. This section manages the group_credentials
-     list the poller falls back to, in order, for a device on this profile
-     that doesn't answer the primary — a mix of vendors or SNMP versions on
-     one profile. Requires the profile to already exist (a new, unsaved
-     profile has nowhere to attach a credential row to yet — same rule the
-     device-level credential form already follows). */
-
-  function credentialSummary(c) {
-    const ver = { 0: 'v1', 1: 'v2c', 3: 'v3' }[c.snmp_version] || c.snmp_version;
-    const who = c.snmp_version === 3 ? (c.v3_user || '(no username)') : (c.community || '(no community)');
-    return `${ver} · ${who}`;
-  }
-
-  function credentialsListHtml(credentials) {
-    if (!credentials.length) return App.emptyState('No additional credentials yet.');
-    const rows = credentials.map((c) => `
-      <tr>
-        <td>${escape(c.label || '—')}</td>
-        <td>${escape(credentialSummary(c))}</td>
-        <td>${c.snmp_version === 3
-          ? escape((c.has_credential ? 'password stored' : 'no password yet') + levelText(c))
-          : ''}</td>
-        <td><button type="button" class="cred-remove" data-cred-id="${c.id}">Remove</button></td>
-      </tr>`).join('');
-    return `<table><caption class="sr-only">Stored credentials</caption><thead><tr><th scope="col">Label</th><th scope="col">Credential</th><th scope="col"></th><th scope="col"></th></tr></thead>
-      <tbody>${rows}</tbody></table>`;
-  }
-
-  function addCredentialFormHtml() {
-    return `
-      <label>Label <input id="nd-pc-label" placeholder="optional, e.g. “Cisco gear”"></label>
-      <label>SNMP version <select id="nd-pc-version">
-        <option value="0">v1</option>
-        <option value="1" selected>v2c</option>
-        <option value="3">v3</option>
-      </select></label>
-      <label>Community (v1/v2c) <input id="nd-pc-community"></label>
-      <label>v3 username <input id="nd-pc-v3user"></label>
-      <label>v3 auth protocol <select id="nd-pc-authproto">
-        ${v3AuthOptions()}
-      </select></label>
-      ${App.canStoreSecrets()
-        ? '<label>v3 auth password <input id="nd-pc-authpass" type="password"></label>'
-        : App.credentialUnavailableHtml('An SNMPv3 auth password')}
-      <label>v3 privacy protocol <select id="nd-pc-privproto">
-        ${v3PrivOptions()}
-      </select></label>
-      ${App.canStoreSecrets()
-        ? '<label>v3 privacy password <input id="nd-pc-privpass" type="password"></label>'
-        : App.credentialUnavailableHtml('An SNMPv3 privacy password')}
-      <button type="button" id="nd-pc-add">Add credential</button>
-      <p class="hint" id="nd-pc-status"></p>`;
-  }
-
-  function credentialsSectionHtml(g) {
-    if (!g.id) {
-      return `<fieldset><legend>ADDITIONAL CREDENTIALS</legend>
-        <p class="hint">Save this profile first, then reopen Edit to add more
-          credentials for it.</p></fieldset>`;
-    }
-    return `<fieldset><legend>ADDITIONAL CREDENTIALS</legend>
-      <p class="hint">Tried, in order, after the primary credential above,
-        for any device on this profile that doesn't answer it.</p>
-      <div id="nd-p-creds-list">${credentialsListHtml(g.credentials || [])}</div>
-      ${addCredentialFormHtml()}
-    </fieldset>`;
-  }
-
-  async function refreshCredentialsList(box, groupId) {
-    const payload = await App.get('/api/nodes/groups');
-    const g = (payload.groups || []).find((x) => x.id === groupId);
-    box.querySelector('#nd-p-creds-list').innerHTML = credentialsListHtml((g && g.credentials) || []);
-    wireCredentialRemoveButtons(box, groupId);
-  }
-
-  function wireCredentialRemoveButtons(box, groupId) {
-    for (const btn of box.querySelectorAll('.cred-remove')) {
-      btn.onclick = () => {
-        // Nested in the profile dialog, so reopen that on the way out —
-        // unsaved edits to the profile's own fields are lost, which is the
-        // same trade the wireless controller list already makes.
-        App.confirmDestructive('Remove credential',
-          '<p>Remove this stored SNMP credential from the profile?</p>' +
-          '<p class="hint">Devices in this profile stop trying it on their next ' +
-          'poll. Any device already using it falls back to the profile\'s other ' +
-          'credentials.</p>', 'Remove', async () => {
-            await App.del(`/api/nodes/groups/${groupId}/credentials/${btn.dataset.credId}`);
-            view.configAt = 0;
-          }, (confirmed) => { if (!confirmed) editProfile(); });
-      };
-    }
-  }
-
-  function wireCredentialsSection(box, groupId) {
-    const addBtn = box.querySelector('#nd-pc-add');
-    if (!addBtn) return;   // no groupId yet — the "save first" hint is shown instead
-    const status = box.querySelector('#nd-pc-status');
-    addBtn.onclick = async () => {
-      const fields = {
-        label: box.querySelector('#nd-pc-label').value.trim(),
-        snmp_version: Number(box.querySelector('#nd-pc-version').value),
-        community: box.querySelector('#nd-pc-community').value.trim(),
-        v3_user: box.querySelector('#nd-pc-v3user').value.trim(),
-        v3_auth_proto: box.querySelector('#nd-pc-authproto').value,
-        v3_priv_proto: box.querySelector('#nd-pc-privproto').value || null,
-      };
-      status.innerHTML = '';
-      addBtn.disabled = true;
-      try {
-        const credential = credentialBody(box, '#nd-pc-authpass', '#nd-pc-privpass', fields);
-        // The credential row and its optional v3 password are two
-        // separate requests — a DPAPI failure on the second (this
-        // machine can't encrypt a stored secret) must not make it look
-        // like "Add credential" silently did nothing: the row itself is
-        // still created and shown, just without a password stored yet.
-        const result = await App.post(`/api/nodes/groups/${groupId}/credentials`, fields);
-        if (credential) {
-          try {
-            await App.post(`/api/nodes/groups/${groupId}/credentials/${result.id}/secret`,
-              credential);
-          } catch (error) {
-            status.innerHTML = `<span class="err">Credential added, but its password ` +
-              `wasn't stored: ${escape(error.message)}</span>`;
-          }
-        }
-        await refreshCredentialsList(box, groupId);
-        view.configAt = 0;
-        // The password fields are absent on a host that cannot store secrets.
-        for (const id of ['nd-pc-label', 'nd-pc-community', 'nd-pc-v3user',
-          'nd-pc-authpass', 'nd-pc-privpass']) {
-          const field = box.querySelector(`#${id}`);
-          if (field) field.value = '';
-        }
-      } catch (error) {
-        status.innerHTML = `<span class="err">${escape(error.message)}</span>`;
-      } finally {
-        addBtn.disabled = false;
-      }
-    };
-    wireCredentialRemoveButtons(box, groupId);
-  }
-
-  function profileForm(g) {
-    const p = g || {};
-    return `
-      <label>Name <input id="nd-p-name" value="${escape(p.name || '')}" ${p.is_default ? 'readonly' : ''}></label>
-      <label>SNMP version <select id="nd-p-version">
-        <option value="0" ${p.snmp_version === 0 ? 'selected' : ''}>v1</option>
-        <option value="1" ${p.snmp_version === undefined || p.snmp_version === 1 ? 'selected' : ''}>v2c</option>
-        <option value="3" ${p.snmp_version === 3 ? 'selected' : ''}>v3</option>
-      </select></label>
-      <label>Community (v1/v2c) <input id="nd-p-community" value="${escape(p.community || 'public')}"></label>
-      <label>v3 username <input id="nd-p-v3user" value="${escape(p.v3_user || '')}"></label>
-      <label>v3 auth protocol <select id="nd-p-authproto">
-        ${v3AuthOptions(p.v3_auth_proto)}
-      </select></label>
-      ${App.canStoreSecrets()
-        ? `<label>v3 auth password <input id="nd-p-authpass" type="password"
-            placeholder="${p.has_credential ? 'stored — leave blank to keep' : ''}"></label>`
-        : App.credentialUnavailableHtml('An SNMPv3 auth password')}
-      <label>v3 privacy protocol <select id="nd-p-privproto">
-        ${v3PrivOptions(p.v3_priv_proto)}
-      </select></label>
-      ${App.canStoreSecrets()
-        ? `<label>v3 privacy password <input id="nd-p-privpass" type="password"
-            placeholder="${p.has_priv_credential ? 'stored — leave blank to keep' : ''}"></label>`
-        : App.credentialUnavailableHtml('An SNMPv3 privacy password')}
-      <p class="hint">${p.security_level ? `This profile's v3 requests go out at <b>${escape(p.security_level)}</b>. ` : ''}An
-        auth password alone is authNoPriv; add a privacy protocol and password for
-        authPriv (what PAN-OS and most firewalls provision). Setting the privacy
-        protocol to none drops the stored privacy password.</p>
-      <label>Poll interval <input id="nd-p-interval" type="number" min="10" value="${p.poll_interval_s || 120}"> s</label>
-      <label>SNMP timeout <input id="nd-p-timeout" type="number" step="0.5" min="0.5" value="${p.snmp_timeout_s || 3}"> s</label>
-      <label>SNMP retries <input id="nd-p-retries" type="number" min="0" value="${p.snmp_retries != null ? p.snmp_retries : 2}"></label>
-      <div class="row start">
-        <label class="check"><input type="checkbox" id="nd-p-ping" ${p.ping_enabled !== false ? 'checked' : ''}> Ping</label>${helpLinkNamed('nodes.profile.ping', 'Ping')}
-        <label class="check"><input type="checkbox" id="nd-p-snmp" ${p.snmp_enabled !== false ? 'checked' : ''}> SNMP</label>${helpLinkNamed('nodes.profile.snmp', 'SNMP')}
-      </div>
-      <label>Ping probes per poll <input id="nd-p-pingcount" type="number" min="1" max="20"
-        placeholder="inherit" value="${p.ping_count ?? ''}"></label>
-      <label>Ping timeout <input id="nd-p-pingtimeout" type="number" min="100" step="100"
-        placeholder="inherit" value="${p.ping_timeout_ms ?? ''}"> ms</label>
-      <label>Down needs both ping and SNMP to fail <select id="nd-p-pingonly">
-        <option value="" ${p.unreachable_ping_only == null ? 'selected' : ''}>Inherit the Nodes setting</option>
-        <option value="1" ${p.unreachable_ping_only === 1 ? 'selected' : ''}>Yes — SNMP failing alone is not down</option>
-        <option value="0" ${p.unreachable_ping_only === 0 ? 'selected' : ''}>No — SNMP failing alone is down</option>
-      </select></label>
-      <p class="hint">Blank ping fields inherit the Nodes settings.</p>
-      <label>Learn MAC addresses every <input id="nd-p-mactable" type="number" min="0"
-        step="60" placeholder="inherit" value="${p.mac_table_interval_s ?? ''}"> s</label>
-      <p class="hint">Walks each switch's forwarding table on this separate,
-        slower schedule so MAC addresses can be searched for in the Find box.
-        <b>0 switches it off</b>, and off is the default. A forwarding-table
-        walk uses GETBULK, so it now costs only a few dozen SNMP requests per
-        switch rather than hundreds to thousands — <b>300 (five minutes)</b>
-        is a sensible starting point.</p>
-      <label>Read the ARP cache every <input id="nd-p-arptable" type="number" min="0"
-        step="60" placeholder="inherit" value="${p.arp_table_interval_s ?? ''}"> s</label>
-      <p class="hint">Walks each router's ARP cache — which IP holds which MAC on
-        which routed interface — for the device's ARP tab and the Find box.
-        <b>Off by default</b>, and blank means off here rather than an hour: a
-        distribution router's cache runs to tens of thousands of rows where
-        an access switch's forwarding table runs to hundreds, so this is
-        switched on per profile for the routers that matter rather than
-        walked everywhere unasked. Entries age out on the same
-        <b>Forget a learned MAC after</b> clock as the MAC table.</p>
-      <label>Walk VLAN membership every <input id="nd-p-vlaninterval" type="number" min="0"
-        step="60" placeholder="inherit" value="${p.vlan_interval_s ?? ''}"> s</label>
-      <p class="hint">Per-port VLAN membership (Q-BRIDGE/CISCO-VTP, falling back to VLANs
-        seen in the MAC table) — MAPPER's strand colours come from this. <b>3600 (one
-        hour) is the shipped default</b>; an explicit 0 switches it off for every device
-        on this profile that does not override it.</p>
-      <label>Custom MIB <select id="nd-p-mib">${mibOptionsHtml(p.mib_file_id, true)}</select></label>
-      <p class="hint">Polls that MIB's own scalar objects for every device on this
-        profile (unless a device overrides it), shown under its own names.</p>
-      <fieldset><legend>IDENTITY</legend>
-        ${identityOidFieldsHtml(p, true)}
-      </fieldset>
-      ${credentialsSectionHtml(p)}`;
-  }
-
-  const blankToNull = (text) =>
-    (String(text).trim() === '' ? null : Number(text));
-
-  function profileFields(box) {
-    return {
-      name: box.querySelector('#nd-p-name').value.trim(),
-      snmp_version: Number(box.querySelector('#nd-p-version').value),
-      community: box.querySelector('#nd-p-community').value.trim(),
-      v3_user: box.querySelector('#nd-p-v3user').value.trim(),
-      v3_auth_proto: box.querySelector('#nd-p-authproto').value,
-      v3_priv_proto: box.querySelector('#nd-p-privproto').value || null,
-      poll_interval_s: Number(box.querySelector('#nd-p-interval').value),
-      snmp_timeout_s: Number(box.querySelector('#nd-p-timeout').value),
-      snmp_retries: Number(box.querySelector('#nd-p-retries').value),
-      ping_enabled: box.querySelector('#nd-p-ping').checked,
-      snmp_enabled: box.querySelector('#nd-p-snmp').checked,
-      // Blank means "inherit", which is NULL in the column, not 0 — a
-      // Number('') of 0 would read as "never ping".
-      ping_count: blankToNull(box.querySelector('#nd-p-pingcount').value),
-      ping_timeout_ms: blankToNull(box.querySelector('#nd-p-pingtimeout').value),
-      unreachable_ping_only: blankToNull(box.querySelector('#nd-p-pingonly').value),
-      // Blank inherits (NULL); an explicit 0 means "never walk", which is
-      // the shipped behaviour and a real choice, not the same as blank.
-      mac_table_interval_s: blankToNull(box.querySelector('#nd-p-mactable').value),
-      vlan_interval_s: blankToNull(box.querySelector('#nd-p-vlaninterval').value),
-      arp_table_interval_s: blankToNull(box.querySelector('#nd-p-arptable').value),
-      mib_file_id: Number(box.querySelector('#nd-p-mib').value) || null,
-      ...identityOidValues(box, true),
-    };
-  }
-
-  function addProfile() {
-    const box = App.modal('Add polling profile', profileForm({}), [
-      { label: 'Cancel', onClick: App.closeModal },
-      { label: 'Add', primary: true, onClick: async (box) => {
-        const fields = profileFields(box);
-        if (!fields.name) return;
-        const credential = credentialBody(box, '#nd-p-authpass', '#nd-p-privpass', fields);
-        const result = await App.post('/api/nodes/groups', fields);
-        if (credential) {
-          await App.post(`/api/nodes/groups/${result.id}/credential`, credential);
-        }
-        App.closeModal();
-        view.configAt = 0;
-        App.refreshNow('nodes');
-      } },
-    ]);
-    box.classList.add('wide');
-  }
-
-  /* The "?" texts for the polling-profile and device forms (App.helpLink).
-     Written for the operator, not the developer: what the control changes
-     and what stops happening when it is off. Keep them true to nodepoll's
-     _poll_device — the "down" rule at the end is quoted from its branches. */
-  App.registerHelp({
-    'nodes.profile.ping': {
-      title: 'Ping',
-      html: `
-        <p>The <b>Ping</b> checkbox decides whether every device on this
-        profile is ICMP-pinged as part of each poll. It is on by default, and
-        a device's own edit form can override it per device with the Ping
-        selector there.</p>
-        <p><b>With it ticked</b>, each poll sends several ICMP probes to the
-        device, as many as <b>Ping probes per poll</b> says, waiting
-        <b>Ping timeout</b> for each. That produces three things: whether the
-        device answered at all, its round-trip time, and its packet-loss
-        percentage. The loss and response time are recorded as metrics, so
-        they feed the packet-loss chart in the device dialog and the built-in
-        "Packet loss to device high" and "Ping response time high" alert
-        rules. If the Nodes setting for ping interval is longer than the poll
-        interval, the probes run only on the polls that fall due and the last
-        result is carried forward in between.</p>
-        <p><b>With it unticked</b>, nothing pings the device. No loss or
-        response-time metrics are recorded, those two alert rules have nothing
-        to read, and the packet-loss chart says the device is not being
-        ping-probed.</p>
-        <p><b>It also changes what "down" means</b>, together with the SNMP
-        checkbox beside it:</p>
-        <ul>
-          <li><b>Both ticked:</b> the device is down only when ping and SNMP
-          have both failed. A box that answers ping but has a wrong community
-          string shows as up with an SNMP error, not as an outage. The
-          <b>Down needs both ping and SNMP to fail</b> selector on the same
-          form is what flips that rule for a profile where SNMP failing alone
-          should count as down.</li>
-          <li><b>Ping unticked, SNMP ticked:</b> SNMP is the only evidence, so
-          an SNMP failure is a failure of the device.</li>
-          <li><b>Ping ticked, SNMP unticked:</b> a ping-only device, judged
-          reachable by ping alone.</li>
-        </ul>
-        <p>The two fields under the checkbox and the down rule are per
-        profile, and blank ones inherit the Nodes settings.</p>`,
-    },
-    'nodes.profile.snmp': {
-      title: 'SNMP',
-      html: `
-        <p>The <b>SNMP</b> checkbox decides whether every device on this
-        profile is polled over SNMP as part of each poll, with the profile's
-        credentials (and any additional ones listed below). It is on by
-        default, and a device's own edit form can override it per device with
-        the SNMP selector there.</p>
-        <p><b>With it ticked</b>, each poll reads the device's identity
-        (sysDescr, sysName, sysObjectID, uptime, and the Vendor and Location
-        OIDs if set), its interface table with the traffic and error counters
-        that become per-port bandwidth, the CPU, memory and storage figures
-        its MIBs expose, and any custom MIB assigned to it. Vendor
-        identification, the scheduled MAC-table walk, the OID browser and the
-        port dialogs all depend on it.</p>
-        <p><b>With it unticked</b>, no SNMP request is ever sent to the
-        device: it is a ping-only device. It has no interfaces, no metrics
-        beyond ping loss and response time, no vendor, and no MAC table, and
-        it is judged up or down by ping alone, so the Ping checkbox must stay
-        on for it to be monitored at all.</p>
-        <p><b>Together with Ping it decides what "down" means:</b></p>
-        <ul>
-          <li><b>Both ticked:</b> down only when ping and SNMP have both
-          failed, unless <b>Down needs both ping and SNMP to fail</b> says
-          otherwise.</li>
-          <li><b>SNMP ticked, Ping unticked:</b> an SNMP failure is a failure
-          of the device.</li>
-          <li><b>SNMP unticked, Ping ticked:</b> reachable by ping alone.</li>
-        </ul>`,
-    },
-    'nodes.device.ssh': {
-      title: 'SSH',
-      html: `
-        <p><b>SSH</b> opens an interactive shell on the selected device in a
-        new window. It is a real terminal — whatever you type goes to the
-        device exactly as typed, and whatever it prints comes back. Nothing
-        is recorded but the fact that the session happened: the device's
-        event log gets one line when it opens and one when it closes, with
-        who opened it and from which address, and never a keystroke.</p>
-        <p><b>Which credential it uses.</b> The SSH username, port and
-        password ConfigRX already stores for the device, if there is one —
-        the same credential its configuration backups use. If none is
-        stored, or the device refuses it, the window asks for a username and
-        password. What you type there is used for that one connection and is
-        never stored, on the server or in the browser.</p>
-        <p><b>Host keys.</b> The first connection to a device records its
-        host key and says so. From then on the key is checked on every
-        connection, by ConfigRX's backups as well as this window. If a device
-        offers a different key, the connection is refused before anything is
-        sent and the window shows both fingerprints and when the old one was
-        first seen. That happens after a legitimate rebuild — and it is also
-        what an impersonated address looks like, so <b>Trust the new key</b>
-        is a deliberate choice, not a formality.</p>
-        <p><b>Who can use it.</b> Its own <b>SSH</b> permission module,
-        granted to nobody by default. ConfigRX write only ever means "may
-        back this device up", which is a much narrower thing than a shell,
-        so it is not enough on its own — an administrator grants SSH write
-        under Settings, per account.</p>`,
-    },
-    'nodes.device.web': {
-      title: 'WEB',
-      html: `
-        <p><b>WEB</b> opens the selected device's own web interface in a new
-        window. Until 5.1 it pointed the browser straight at the device,
-        which only works from a machine with a route to the management
-        plane. It now opens a short-lived <b>tunnel</b> on this server
-        instead: your browser talks to this machine, and this machine talks
-        to the device — the same reach the poller already has.</p>
-        <p><b>Where it goes.</b> The address, scheme and port come from the
-        device's own record — the <b>WEB INTERFACE</b> fields on Edit — and
-        from nowhere else. Blank means <code>http</code> on port 80. Nothing
-        the browser sends can change the destination.</p>
-        <p><b>How long it lasts.</b> The tunnel's port accepts connections
-        only from the address you are browsing from. It closes after 15
-        minutes with no traffic (or sooner, if your sign-in's idle timeout is
-        shorter), after a minute if nothing ever connects, when you sign out,
-        and the moment your <b>web</b> permission is taken away. <b>Close</b>
-        beside the button ends it at once.</p>
-        <p><b>What is recorded.</b> The device's event log gets one line when
-        a tunnel opens and one when it closes, with how many bytes crossed in
-        each direction — never what they were. Nothing a page contains is
-        read or kept.</p>
-        <p><b>Following its links.</b> For a device on <code>http</code>, the
-        tunnel reads the headers each side sends. The device is asked for its
-        own address, so it builds its pages against itself, and the rest of
-        the request agrees — which is what lets a device that checks where a
-        form was posted from accept your login. Every address it names on the
-        way back — a redirect, a refresh, a cookie's domain — is put back onto
-        the tunnel, so a link written out in full
-        (<code>http://10.2.0.7/status</code>) stays inside it, which it did
-        not before 5.4.</p>
-        <p><b>Except a jump to https.</b> If a device on <code>http</code>
-        answers by sending you to <code>https://</code>, that address is left
-        as the device wrote it and your browser steps outside the tunnel to
-        follow it — which only works from a machine that already has a route
-        to the device. The device is telling you its interface is on HTTPS:
-        set the <b>WEB INTERFACE</b> scheme on Edit to <code>https</code> and
-        the tunnel will carry it.</p>
-        <p><b>A device on https is different.</b> Its traffic is carried
-        without being read, so its certificate is its own — your browser will
-        name the device in the warning, not this server — but nothing in it
-        can be adjusted either. A link or redirect written out in full will
-        step outside the tunnel and try to reach the device directly, which
-        only works from a machine that already has a route to it. The same
-        is true of anything on <code>http</code> the tunnel cannot make
-        sense of, such as a page that upgrades to a WebSocket: from that
-        point the connection is carried unread as well.</p>
-        <p><b>One thing to remember.</b> The tunnel is on this host, so it
-        shares the browser's cookie jar with this application's own port —
-        sign out of the device's UI when you are done with it.</p>
-        <p><b>Who can use it.</b> Its own <b>web</b> permission, granted to
-        nobody by default and to no account on upgrade: opening a listening
-        port on this server into the management plane is not something the
-        old button could do, so nobody inherits it.</p>`,
-    },
-  });
-
-  function editProfile() {
-    const g = view.groups.find((x) => x.id === view.groupSelected);
-    if (!g) return;
-    const box = App.modal(`Edit ${g.name}`, profileForm(g), [
-      { label: 'Cancel', onClick: App.closeModal },
-      { label: 'Save', primary: true, onClick: async (box) => {
-        const fields = profileFields(box);
-        const credential = credentialBody(box, '#nd-p-authpass', '#nd-p-privpass', fields);
-        await App.put(`/api/nodes/groups/${g.id}`, fields);
-        if (credential) {
-          await App.post(`/api/nodes/groups/${g.id}/credential`, credential);
-        }
-        App.closeModal();
-        view.configAt = 0;
-        App.refreshNow('nodes');
-      } },
-    ]);
-    box.classList.add('wide');
-    wireCredentialsSection(box, g.id);
-  }
-
-  function profileStatus(message, isError) {
-    const el = App.el('nd-profile-status');
-    el.innerHTML = isError ? `<span class="err">${escape(message)}</span>` : escape(message || '');
-    if (message) App.announce(message);
-  }
-
-  function removeProfile() {
-    const g = view.groups.find((x) => x.id === view.groupSelected);
-    if (!g) return;
-    // The refusal used to close the dialog and put the reason on the page
-    // behind it, where a profile the operator had just been editing was no
-    // longer on screen. It now stays in the dialog that asked.
-    App.confirmDestructive('Remove profile',
-      `<p>Remove <b>${escape(g.name)}</b>?${g.is_default
-        ? ' It is currently the default profile — another remaining profile becomes default in its place.'
-        : ' Devices using it fall back to the Default profile.'}</p>`,
-      'Remove',
-      () => App.del(`/api/nodes/groups/${g.id}`),
-      (confirmed) => {
-        if (!confirmed) return;
-        profileStatus('');
-        view.groupSelected = null;
-        view.configAt = 0;
-        App.refreshNow('nodes');
-      });
-  }
-
-  async function setDefaultProfile() {
-    const g = view.groups.find((x) => x.id === view.groupSelected);
-    if (!g || g.is_default) return;
-    try {
-      await App.post(`/api/nodes/groups/${g.id}/default`, {});
-    } catch (error) {
-      profileStatus(error.message, true);
-      return;
-    }
-    profileStatus(`${g.name} is now the default profile.`);
-    view.configAt = 0;
-    App.refreshNow('nodes');
-  }
-
   /* ---------------------------------------------------------- discovery */
 
   function drawDiscJobsTable() {
@@ -6394,17 +5757,6 @@
       (force ? force_result_ids : result_ids).push(id);
     }
     return { result_ids, force_result_ids };
-  }
-
-  /* The three tiers a duplicate pair and an upstream candidate are both
-     scored into. Two consumers here — the cell below and duplicatesDialog
-     — and a third in mapper.js's upstream-suggestions dialog, which keeps
-     its own copy rather than reach across modules for eight words. */
-  const CONFIDENCE_COLOR = { high: 'var(--ok)', medium: 'var(--warn)', low: 'var(--muted)' };
-
-  function confidenceBadgeHtml(c) {
-    return `<span style="color:${CONFIDENCE_COLOR[c.confidence] || 'var(--muted)'}">${
-      escape(c.confidence)}</span>`;
   }
 
   // `high` confidence is a known address on an existing device's own interfaces; `medium` is a name+sysObjectID match only.
@@ -7172,248 +6524,6 @@
     ]);
   }
 
-  /* ---------------------------------------------------------- settings */
-
-  // The identity fields the device detail header can show, in display
-  // order; the detail_fields setting is a comma-separated subset of these.
-  const DETAIL_FIELDS = [
-    ['sys_descr', 'System description (sysDescr)'],
-    ['sys_name', 'SNMP hostname (sysName)'],
-    ['sys_object_id', 'sysObjectID'],
-    ['sys_contact', 'Contact (sysContact)'],
-    ['sys_location', 'Location (sysLocation)'],
-    ['vendor', 'Vendor'],
-    ['snmp_version', 'SNMP version in use'],
-    ['sw_version', 'Software version'],
-    ['fw_version', 'Firmware / boot ROM version'],
-    ['sw_image', 'Software image (and boot file)'],
-  ];
-
-  function settingsDialog() {
-    const s = App.state.nodesSettings || {};
-    const { check, number } = App.form;
-    const detailChosen = new Set(String(s.detail_fields || '')
-      .split(',').map((f) => f.trim()).filter(Boolean));
-    const settingsBox = App.modal('Nodes settings', `
-      <fieldset><legend>POLLING</legend>
-        ${check('np-enabled', 'Run the poller', s.enabled)}
-        ${check('np-workers-auto', 'Size the poll pool automatically', s.poll_workers_auto)}
-        ${number('np-workers-min', 'Fewest poll worker threads', s.poll_workers_min, 'min=1 max=512')}
-        ${number('np-workers-max', 'Most poll worker threads', s.poll_workers_max, 'min=1 max=512')}
-        ${number('np-headroom', 'Spare capacity multiplier', s.poll_pool_headroom, 'min=1 max=4 step=0.1')}
-        <p class="hint">With this on (the default), the poller adds up how long each
-          device's polls actually take and how often each one is due, keeps enough
-          threads for that plus the spare capacity above, and never goes below the
-          fewest or above the most. It grows quickly and shrinks slowly. A fleet
-          that outgrows the maximum still raises the
-          <strong>poll_pool_saturated</strong> alert, which is the one case that
-          needs a person. Turn it off to set the number yourself below.</p>
-        ${number('np-workers', 'Poll worker threads (when not automatic)', s.poll_workers, 'min=1 max=512')}
-        ${number('np-macworkers', 'Table-walk threads', s.mac_walk_workers, 'min=1 max=32')}
-        <p class="hint">MAC, LLDP/CDP and VLAN walks run on their own small pool,
-          deliberately separate from the poll pool so a walk of a core switch can
-          never starve ordinary polling. Four is the shipped default.</p>
-        ${number('np-interval', 'Default poll interval', s.default_interval_s, 'min=10')} s
-        ${number('np-focus', 'Selected-device poll interval (0 = off)', s.focus_poll_interval_s, 'min=0')} s
-        ${number('np-timeout', 'Default SNMP timeout', s.default_snmp_timeout_s, 'min=0.5 step=0.5')} s
-        ${number('np-retries', 'Default SNMP retries', s.default_snmp_retries, 'min=0')}
-        ${number('np-downafter', 'Consecutive failures before "down"', s.down_after_failures, 'min=1')}
-        ${number('np-snmpfailafter', 'SNMP polls missed before "SNMP failing" alert',
-                 s.snmp_fail_alert_after, 'min=1')}
-        ${check('np-pingonly', 'A device is DOWN only when ping and SNMP both fail', s.unreachable_ping_only)}
-        <p class="hint">With this on (the default), a device that still answers ping
-          but whose SNMP is failing stays UP and shows its SNMP error, rather than
-          being reported as an outage it isn't having. Turn it off to treat SNMP
-          failing as down on its own. Overridable per device and per profile.</p>
-        ${check('np-v3verify', 'Verify the signature on every SNMPv3 reply',
-                s.v3_verify_replies !== false)}
-        <p class="hint">New in 5.8.0, and on by default. A signed request's reply
-          must come back signed with the same key, and an encrypted request's
-          reply encrypted; anything less is refused as a downgrade and the device
-          shows why. <b>Turning this off gives that up for every device</b> — an
-          unsigned answer is accepted, as every release before 5.8.0 accepted
-          it, though a reply that does carry a signature is still verified —
-          so use it only to
-          keep polling one agent or proxy that answers unsigned while you chase
-          that device, not as a fix.</p>
-      </fieldset>
-      <fieldset><legend>PING</legend>
-        ${number('np-pingcount', 'Probes per ping', s.ping_count, 'min=1 max=20')}
-        ${number('np-pingtimeout', 'Ping timeout', s.ping_timeout_ms, 'min=100 step=100')} ms
-        ${number('np-pinginterval', 'Ping every (0 = with every poll)', s.ping_interval_s, 'min=0')} s
-        <p class="hint">Every SNMP-polled device is pinged as well, and the results
-          become the <code>ping_loss_pct</code> and <code>ping_rtt_ms</code> metrics
-          the packet-loss and response-time alert rules watch. More than one probe per
-          poll is what makes loss measurable at all — a single probe can only ever say
-          0% or 100%. Both are overridable per device and per profile.</p>
-      </fieldset>
-      <fieldset><legend>SNMP TABLE WALKS</legend>
-        ${number('np-bulkreps', 'GETBULK rows per request (0 = GETNEXT only)',
-                 s.snmp_bulk_max_repetitions, 'min=0 step=5')}
-        ${number('np-tablewalkrows', 'Stop a table walk after',
-                 s.snmp_walk_max_rows, 'min=100 step=1000')} rows
-        <p class="hint">Every table walk — interfaces, MAC forwarding tables,
-          DOM sensors, and the OID browser's own per-subtree reads — uses
-          GETBULK on v2c/v3: one request answers this many rows instead of
-          one GETNEXT per row. 0 falls back to plain GETNEXT, for a device
-          whose agent mishandles GetBulk. A device answering "tooBig" is
-          retried automatically at half as many rows. v1 always uses
-          GETNEXT — GETBULK does not exist in that version of the
-          protocol.</p>
-      </fieldset>
-      <fieldset><legend>MAC ADDRESS &amp; ARP TABLES</legend>
-        ${number('np-macretention', 'Forget a learned MAC after',
-                 s.mac_table_retention_days, 'min=0 step=1')} days
-        <p class="hint">Which switches learn MAC addresses at all, and how
-          often, is set per polling profile (<b>Learn MAC addresses every</b>);
-          which routers have their ARP cache read is set the same way
-          (<b>Read the ARP cache every</b>) and is off by default. This is only
-          how long an entry stays searchable once no walk has refreshed it,
-          so a device dropped from the schedule stops answering the Find box
-          from a table nobody has confirmed since. ARP rows age out on this
-          same clock — it is the same "nothing has walked this device"
-          question, not a second one.</p>
-      </fieldset>
-      <fieldset><legend>FULL SNMP WALK</legend>
-        ${number('np-walkrows', 'Stop a full walk after',
-                 s.oid_walk_max_rows, 'min=100 step=1000')} objects
-        ${number('np-walkbudget', 'or after', s.oid_walk_budget_s,
-                 'min=10 step=10')} seconds
-        <p class="hint">Bounds on <b>Download full walk</b> in the OID browser.
-          Generous, because that runs as a background job with a progress
-          count and a cancel rather than in a dialog you are waiting on — but
-          real, so a device whose agent loops cannot walk forever. Whichever
-          bound stops a walk is named in the downloaded file's header.</p>
-      </fieldset>
-      <fieldset><legend>VENDOR IDENTIFICATION</legend>
-        ${check('np-vendorwalk', 'Identify a device\'s vendor by walking its enterprise arcs once',
-                s.vendor_walk_enabled !== false)}
-        ${number('np-vendorobjects', 'Stop the identification walk after',
-                 s.vendor_walk_max_objects, 'min=50 step=50')} objects
-        ${number('np-vendorbudget', 'or after', s.vendor_walk_budget_s,
-                 'min=5 step=5')} seconds
-        ${number('np-vendorparallel', 'At most', s.vendor_walk_parallel,
-                 'min=1 max=16')} walks at once
-        ${check('np-dischop', 'Discovery sweeps also list each device\'s enterprise arcs',
-                s.discovery_arc_hop !== false)}
-        <p class="hint">Runs once per device on its first successful poll, again
-          only if its sysObjectID changes, and behind <b>Re-identify</b> — never
-          on the steady-state poll cycle. A device that stops answering is
-          retried at most three times, an hour apart. The sweep's arc listing
-          is separate and cheap: one GETNEXT per enterprise arc a device
-          answers under, typically three to eight per device.</p>
-      </fieldset>
-      <fieldset><legend>DISCOVERY</legend>
-        <p class="hint">Every discovery sweep now uses a chosen polling
-          profile's own credentials — see the Profile picker on the
-          Discovery subtab.</p>
-        ${number('np-maxscan', 'Max addresses per subnet sweep', s.max_scan_addresses, 'min=1')}
-        ${number('np-discworkers', 'Addresses probed at once',
-                 s.discovery_workers, 'min=1 max=256')}
-        <p class="hint">How many addresses a sweep identifies in parallel. It
-          does not raise the packet rate — probes are still released at the
-          configured probes per second; the workers only overlap the waiting,
-          which is what a sweep of a large subnet spends nearly all its time
-          doing. The Start-discovery dialog can set a different figure for one
-          scan.</p>
-      </fieldset>
-      <fieldset><legend>DEVICE DETAILS</legend>
-        <p class="hint">Identity fields shown in a device's detail header.
-          IP, status and any SNMP error always show.</p>
-        ${DETAIL_FIELDS.map(([key, label]) =>
-          check(`np-df-${key}`, label, detailChosen.has(key))).join('')}
-      </fieldset>
-      ${App.columnPickerFieldset('DEVICE LIST COLUMNS', 'devices', COLUMNS,
-                                 s.table_columns)}
-      ${App.columnPickerFieldset('INTERFACE LIST COLUMNS', 'ifaces', IFACE_COLUMNS,
-                                 s.table_columns_ifaces)}
-      <fieldset><legend>STORAGE</legend>
-        ${number('np-sampledays', 'Keep raw samples for', s.sample_retention_days, 'min=1')} days
-        ${number('np-rollupdays', 'Keep hourly rollups for', s.rollup_retention_days, 'min=1')} days
-        ${number('np-if-sampledays', 'Keep per-port raw samples for', s.interface_sample_retention_days, 'min=1')} days
-        ${number('np-if-rollupdays', 'Keep per-port hourly rollups for', s.interface_rollup_retention_days, 'min=1')} days
-        <p class="hint">Raw samples are rolled up into hourly minimum, average
-          and maximum before the raw rows are dropped, so the rollup figure is
-          what decides how far back a wide chart can go. The first two fields
-          are the device-level tier — CPU, memory, reachability, the worst-port
-          summaries. The two below them are the per-interface tier, every
-          metric whose key ends in a port index: they are the great majority
-          of the rows in the metric history file, so they keep a shorter
-          history. Shortening either tier is a one-way door — history already
-          dropped does not come back if you raise the number again.</p>
-        ${number('np-eventdays', 'Keep events for', s.event_retention_days, 'min=1')} days
-        ${number('np-maxmib', 'Max MIB file size', Math.round((s.max_mib_bytes || 0) / 1024 / 1024), 'min=1')} MB
-        <p class="hint">A chart is drawn from raw samples while its window
-          fits inside that metric's own raw retention — ${s.sample_retention_days || 3}
-          days for a device-level metric, ${s.interface_sample_retention_days || 1}
-          for a per-port one; anything wider reads hourly rollups (min, average
-          and max per hour), which are summarised once an hour and kept for
-          ${s.rollup_retention_days || 400} days device-level and
-          ${s.interface_rollup_retention_days || 90} per port. So raw retention
-          decides how far back you can see every individual poll — not how far
-          back the chart goes. Raw samples are also capped at
-          ${(s.sample_row_cap_per_metric || 5000).toLocaleString()} per metric,
-          which at the default interval is roughly a week.</p>
-        <p class="hint">All four settings are ceilings, not guarantees: the
-          metric history file also has a size cap on Settings → Data &amp;
-          Retention, and when it is over that cap the oldest hourly rollups
-          go first and then, once those are at their floor, the oldest raw
-          samples, whichever tier they belong to. Settings shows how far back
-          the file still reaches.</p>
-      </fieldset>`, [
-      { label: 'Cancel', onClick: App.closeModal },
-      { label: 'Save', primary: true, onClick: (box, button) => App.runJob(button,
-        { queued: 'Saving…', done: 'Saved' }, (async () => {
-        const { on, num } = App.form.readers(box);
-        await App.post('/api/settings', { scope: 'nodes', values: {
-          enabled: on('#np-enabled'), poll_workers: num('#np-workers'),
-          poll_workers_auto: on('#np-workers-auto'),
-          poll_workers_min: num('#np-workers-min'),
-          poll_workers_max: num('#np-workers-max'),
-          poll_pool_headroom: num('#np-headroom'),
-          mac_walk_workers: num('#np-macworkers'),
-          default_interval_s: num('#np-interval'), focus_poll_interval_s: num('#np-focus'),
-          default_snmp_timeout_s: num('#np-timeout'),
-          default_snmp_retries: num('#np-retries'), down_after_failures: num('#np-downafter'),
-          snmp_fail_alert_after: num('#np-snmpfailafter'),
-          unreachable_ping_only: on('#np-pingonly'),
-          v3_verify_replies: on('#np-v3verify'),
-          ping_count: num('#np-pingcount'),
-          ping_timeout_ms: num('#np-pingtimeout'),
-          ping_interval_s: num('#np-pinginterval'),
-          mac_table_retention_days: num('#np-macretention'),
-          snmp_bulk_max_repetitions: num('#np-bulkreps'),
-          snmp_walk_max_rows: num('#np-tablewalkrows'),
-          oid_walk_max_rows: num('#np-walkrows'),
-          oid_walk_budget_s: num('#np-walkbudget'),
-          vendor_walk_enabled: on('#np-vendorwalk'),
-          vendor_walk_max_objects: num('#np-vendorobjects'),
-          vendor_walk_budget_s: num('#np-vendorbudget'),
-          vendor_walk_parallel: num('#np-vendorparallel'),
-          discovery_arc_hop: on('#np-dischop'),
-          max_scan_addresses: num('#np-maxscan'),
-          discovery_workers: Math.max(1, num('#np-discworkers') || 0),
-          detail_fields: DETAIL_FIELDS.map(([key]) => key)
-            .filter((key) => on(`#np-df-${key}`)).join(','),
-          table_columns: App.readColumnPicker(
-            box.querySelector('#cols-devices'), COLUMNS),
-          table_columns_ifaces: App.readColumnPicker(
-            box.querySelector('#cols-ifaces'), IFACE_COLUMNS),
-          sample_retention_days: num('#np-sampledays'),
-          rollup_retention_days: num('#np-rollupdays'),
-          interface_sample_retention_days: num('#np-if-sampledays'),
-          interface_rollup_retention_days: num('#np-if-rollupdays'),
-          event_retention_days: num('#np-eventdays'),
-          max_mib_bytes: num('#np-maxmib') * 1024 * 1024,
-        } });
-        await App.loadState();
-        App.closeModal();
-        App.refreshNow('nodes');
-        })()) },
-    ], { buttonsTop: true });
-    App.wireColumnPickers(settingsBox);
-  }
-
   /* ------------------------------------------------------------- pager */
 
   function drawPager() {
@@ -7828,7 +6938,13 @@
     // The "?" beside it, from the one helper that renders every help link.
     App.el('nd-ssh-help').innerHTML = App.helpLink('nodes.device.ssh');
     App.el('nd-web-help').innerHTML = App.helpLink('nodes.device.web');
-    App.el('nd-browse-oids').onclick = oidBrowser;
+    // The dialog is its own file (nodes_oid_browser.js), fetched on first use.
+    App.el('nd-browse-oids').onclick = () => App.loadExtra('nodes_oid_browser')
+      .then(() => {
+        App.extras.nodesOidBrowser.init({ view, displayName, loadDetail });
+        return App.extras.nodesOidBrowser.open();
+      })
+      .catch((error) => App.toast(`Could not open the OID browser: ${error.message}`, 'fail'));
     /* A poll is handed to a worker thread, so the POST returning means
        "queued", not "done" — which is why this button used to look inert for
        however long the device took to answer. Completion is the device's own
@@ -7899,10 +7015,28 @@
       loadStatusTimeline();
     };
     App.fillRanges(App.el('nd-d-range'), 'Last hour', undefined, { custom: true });
-    App.el('nd-add-profile').onclick = addProfile;
-    App.el('nd-edit-profile').onclick = editProfile;
-    App.el('nd-remove-profile').onclick = removeProfile;
-    App.el('nd-default-profile').onclick = setDefaultProfile;
+    // The profile dialogs are their own file (nodes_credentials.js), fetched
+    // on first use; each button loads it (a cached no-op after the first)
+    // then re-inits it with the current closure state before calling in.
+    const credentialsCtx = () => ({ view, credentialBody, v3AuthOptions,
+      v3PrivOptions, helpLinkNamed, levelText, mibOptionsHtml,
+      identityOidFieldsHtml, identityOidValues, blankToNull });
+    App.el('nd-add-profile').onclick = () => App.loadExtra('nodes_credentials')
+      .then(() => { App.extras.nodesCredentials.init(credentialsCtx());
+                   return App.extras.nodesCredentials.addProfile(); })
+      .catch((error) => App.toast(`Could not add a profile: ${error.message}`, 'fail'));
+    App.el('nd-edit-profile').onclick = () => App.loadExtra('nodes_credentials')
+      .then(() => { App.extras.nodesCredentials.init(credentialsCtx());
+                   return App.extras.nodesCredentials.editProfile(); })
+      .catch((error) => App.toast(`Could not edit this profile: ${error.message}`, 'fail'));
+    App.el('nd-remove-profile').onclick = () => App.loadExtra('nodes_credentials')
+      .then(() => { App.extras.nodesCredentials.init(credentialsCtx());
+                   return App.extras.nodesCredentials.removeProfile(); })
+      .catch((error) => App.toast(`Could not remove this profile: ${error.message}`, 'fail'));
+    App.el('nd-default-profile').onclick = () => App.loadExtra('nodes_credentials')
+      .then(() => { App.extras.nodesCredentials.init(credentialsCtx());
+                   return App.extras.nodesCredentials.setDefaultProfile(); })
+      .catch((error) => App.toast(`Could not set the default profile: ${error.message}`, 'fail'));
     App.el('nd-upload-mib').onclick = uploadMib;
     App.el('nd-mib-catalog').onclick = () => { mibCatalog().catch(() => {}); };
     App.el('nd-resolve-all').onclick = async () => {
@@ -7925,7 +7059,10 @@
       view.configAt = 0;
       App.refreshNow('nodes');
     };
-    App.el('nd-settings').onclick = settingsDialog;
+    // The dialog is its own file (nodes_settings.js), fetched on first use.
+    App.el('nd-settings').onclick = () => App.loadExtra('nodes_settings')
+      .then(() => App.extras.nodesSettings.open({ COLUMNS, IFACE_COLUMNS }))
+      .catch((error) => App.toast(`Could not open settings: ${error.message}`, 'fail'));
     App.wireToggle('nd-toggle', 'nodes', '/api/nodes/collector',
       () => App.refreshNow('nodes'));
     App.el('disc-start').onclick = startDiscovery;

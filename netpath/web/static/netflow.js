@@ -108,6 +108,8 @@
   const escape = App.escapeHtml;
 
   const ago = App.ago;
+  const niceCeiling = App.niceCeiling;
+  const extraCounterParts = App.extraCounterParts;
 
   // How many flow records the table asks the server for. The select's three
   // labels and its title are written from this in init(), so the number
@@ -257,16 +259,6 @@
   }
 
   /* ------------------------------------------------------------- chart */
-
-  function niceCeiling(value) {
-    if (value <= 0) return 1;
-    const exponent = Math.floor(Math.log10(value));
-    const base = 10 ** exponent;
-    for (const step of [1, 1.5, 2, 2.5, 3, 4, 5, 7.5, 10]) {
-      if (value <= step * base) return step * base;
-    }
-    return 10 * base;
-  }
 
   function rateLabel(bits) {
     for (const unit of ['bps', 'Kbps', 'Mbps', 'Gbps', 'Tbps']) {
@@ -1031,34 +1023,6 @@
 
   /* The collector strip is read from the shared state poll, so it keeps
      ticking at the usual rate while the charts below refresh far less often. */
-
-  /* Counters the collector reports only when they are non-zero, in the order
-     an operator cares about them. `kernel_dropped` first and always: it is
-     messages the kernel discarded before this application saw them, which is
-     the number that tells the truth about an overloaded listener. */
-  const EXTRA_COUNTERS = [
-    ['kernel_dropped', 'dropped by the kernel'],
-    ['throttled', 'throttled per source'],
-    ['bad_auth', 'failed authentication'],
-    ['unverified', 'unverified'],
-    ['too_many_varbinds', 'over the varbind limit'],
-    ['tcp_refused', 'TCP connections refused'],
-    ['resampled', 'resampled'],
-  ];
-
-  function extraCounterParts(counters) {
-    const parts = [];
-    for (const [key, label] of EXTRA_COUNTERS) {
-      const n = Number(counters[key] || 0);
-      if (n > 0) parts.push(`${n.toLocaleString()} ${label}`);
-    }
-    // Not a fault and not hidden when zero: an operator wants to know how
-    // many senders are connected, including none.
-    if (counters.tcp_clients != null) {
-      parts.push(`${Number(counters.tcp_clients).toLocaleString()} TCP client(s)`);
-    }
-    return parts;
-  }
 
   /* A5: "history: raw 13h · minute 2.0d (3m behind) · hourly 41d" — how
      far back each tier reaches, from FlowDatabase.coverage(). The minute
