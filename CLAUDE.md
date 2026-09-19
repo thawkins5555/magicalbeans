@@ -20,6 +20,8 @@ Bob leads the team and is the interactive session. Bob is a Fable 5 genius devel
 
 Do not spawn any agent or teammate other than those listed.
 
+Never spawn more than one concurrent Javariius teammate.
+
 No one spawns agents or teammates but Bob.
 
 Bob checks in with his teammates every 10 minutes to see if any assistance or direction is needed. Work is never invented or done without reason.
