@@ -145,7 +145,7 @@ service = Service(
     os.path.join(TMPDIR, "syslog.db"), os.path.join(TMPDIR, "app.db"),
     os.path.join(TMPDIR, "ipam.db"), os.path.join(TMPDIR, "snmptraps.db"),
     os.path.join(TMPDIR, "web-nodes.db"), os.path.join(TMPDIR, "alerts.db"),
-    os.path.join(TMPDIR, "wireless.db"), os.path.join(TMPDIR, "configrx.db"))
+    os.path.join(TMPDIR, "wireless.db"), os.path.join(TMPDIR, "configrx.db"), initial_admin_password="admin")
 web_port = _paths.free_tcp_port()
 server = WebServer(service, host="127.0.0.1", port=web_port, certfile=None, keyfile=None)
 assert server.start(block=False), server.error

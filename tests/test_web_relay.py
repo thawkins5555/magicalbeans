@@ -74,7 +74,7 @@ service = Service(
     os.path.join(TMPDIR, "syslog.db"), os.path.join(TMPDIR, "app.db"),
     os.path.join(TMPDIR, "ipam.db"), os.path.join(TMPDIR, "snmptraps.db"),
     os.path.join(TMPDIR, "nodes.db"), os.path.join(TMPDIR, "alerts.db"),
-    os.path.join(TMPDIR, "wireless.db"), os.path.join(TMPDIR, "configrx.db"))
+    os.path.join(TMPDIR, "wireless.db"), os.path.join(TMPDIR, "configrx.db"), initial_admin_password="admin")
 service.start()
 # Relays follow the UI's own bind address (webrelay.relay_bind_host), so
 # pinning the UI here is what keeps every relay on loopback — and a loopback
@@ -1093,6 +1093,25 @@ try:
     check("...and refuses any other, exactly as a device relay's does",
           not live_ap._admit(("10.4.4.4", 51000)))
     service.web_relays.close(ap_relay2["session_id"], "test teardown")
+
+    # ------------------------------------------------ unsafe relay targets
+    print("a relay target is checked the same way an SSH target is")
+    for bad_ip in ("0.0.0.0", "169.254.1.1", "224.0.0.1", "255.255.255.255",
+                  "::ffff:169.254.1.1", "::ffff:0.0.0.0", "2852039166"):
+        try:
+            service.web_relays.open_target(bad_ip, "http", 80, "safety-test", "127.0.0.1")
+            check(f"a relay to {bad_ip} is refused", False, "no exception raised")
+        except ValueError as exc:
+            check(f"a relay to {bad_ip} is refused", "Refusing to open a tunnel" in str(exc),
+                  str(exc))
+    for ok_ip in ("127.0.0.1", "203.0.113.5"):
+        try:
+            allowed = service.web_relays.open_target(
+                ok_ip, "http", 80, "safety-test", "127.0.0.1")
+            check(f"a relay to {ok_ip} is still allowed", True)
+            service.web_relays.close(allowed["session_id"], "test teardown")
+        except ValueError as exc:
+            check(f"a relay to {ok_ip} is still allowed", False, str(exc))
 
     # --------------------------------------------------------------- shutdown
     print("shutdown")

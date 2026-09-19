@@ -24,7 +24,7 @@ service = Service(
     os.path.join(TMPDIR, "syslog.db"), os.path.join(TMPDIR, "app.db"),
     os.path.join(TMPDIR, "ipam.db"), os.path.join(TMPDIR, "snmptraps.db"),
     os.path.join(TMPDIR, "nodes.db"), os.path.join(TMPDIR, "alerts.db"),
-    os.path.join(TMPDIR, "wireless.db"), os.path.join(TMPDIR, "configrx.db"))
+    os.path.join(TMPDIR, "wireless.db"), os.path.join(TMPDIR, "configrx.db"), initial_admin_password="admin")
 service.start()
 
 port = free_tcp_port()
@@ -166,6 +166,26 @@ try:
     check("token.issue and token.revoke are audited too",
           "token.issue" in actions and "token.revoke" in actions,
           str(sorted(set(actions))))
+
+    # A script hammering an expired token must not fill the audit log one
+    # row per call -- the 401 is unconditional, but the audit is once per
+    # token per window (mirrors LoginThrottle.announce_lockout in auth.py).
+    for _ in range(5):
+        status, payload, _h, _r = call("GET", "/api/nodes/devices", bearer=expiring_token)
+        check("...and every repeat is still refused", status == 401, f"{status} {payload}")
+    status, payload, _h, _r = call("GET", "/api/audit?limit=5000", token=admin_token)
+    expired_rows = [e for e in payload.get("events", []) if e["action"] == "token.expired_use"]
+    check("...but repeated use within the window adds no further audit rows",
+          len(expired_rows) == 1, len(expired_rows))
+
+    service._expired_token_audited[expiring_id] = 0.0
+    status, payload, _h, _r = call("GET", "/api/nodes/devices", bearer=expiring_token)
+    check("still refused once the announce window is reset", status == 401,
+          f"{status} {payload}")
+    status, payload, _h, _r = call("GET", "/api/audit?limit=5000", token=admin_token)
+    expired_rows = [e for e in payload.get("events", []) if e["action"] == "token.expired_use"]
+    check("...and a NEW window audits it again",
+          len(expired_rows) == 2, len(expired_rows))
 
     # ---------------------------------------------------- no secret leaks
     print("the token itself never reappears anywhere")

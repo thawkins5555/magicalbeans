@@ -39,7 +39,7 @@ DB_NAMES = ("netpath", "flows", "syslog", "app", "ipam", "snmptraps", "nodes",
 def new_service(subdir):
     data_dir = os.path.join(TMPDIR, subdir)
     os.makedirs(data_dir, exist_ok=True)
-    return Service(*[os.path.join(data_dir, name + ".db") for name in DB_NAMES])
+    return Service(*[os.path.join(data_dir, name + ".db") for name in DB_NAMES], initial_admin_password="admin")
 
 
 def seed_traces(service, target_id, old_n, new_n, cutoff_days):

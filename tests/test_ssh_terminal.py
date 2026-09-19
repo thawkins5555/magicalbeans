@@ -234,7 +234,7 @@ service = Service(
     os.path.join(TMPDIR, "syslog.db"), os.path.join(TMPDIR, "app.db"),
     os.path.join(TMPDIR, "ipam.db"), os.path.join(TMPDIR, "snmptraps.db"),
     os.path.join(TMPDIR, "nodes.db"), os.path.join(TMPDIR, "alerts.db"),
-    os.path.join(TMPDIR, "wireless.db"), os.path.join(TMPDIR, "configrx.db"))
+    os.path.join(TMPDIR, "wireless.db"), os.path.join(TMPDIR, "configrx.db"), initial_admin_password="admin")
 
 web_port = free_tcp_port()
 server = WebServer(service, host="127.0.0.1", port=web_port, certfile=None, keyfile=None)
@@ -1211,6 +1211,17 @@ try:
         again.permissions_for("olduser")
     again.close()
     print("PASS: revoking ssh afterwards is not undone on the next start")
+
+    # _unsafe_destination is the gate _connect() checks before dialling.
+    for bad_ip in ("0.0.0.0", "::", "169.254.1.1", "224.0.0.1",
+                  "255.255.255.255", "::ffff:169.254.1.1", "::ffff:0.0.0.0",
+                  "2852039166"):
+        assert sshterm._unsafe_destination(bad_ip) is not None, bad_ip
+    for ok_ip in ("127.0.0.1", "203.0.113.5"):
+        assert sshterm._unsafe_destination(ok_ip) is None, ok_ip
+    print("PASS: _unsafe_destination refuses unspecified/link-local/multicast/"
+          "broadcast addresses (including IPv4-mapped IPv6 and a non-literal "
+          "numeric host) and allows loopback and ordinary ones")
 
 finally:
     for listener in ("stub", "stub2", "replacement"):

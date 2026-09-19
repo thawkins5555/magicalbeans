@@ -460,7 +460,7 @@ service = Service(
     os.path.join(TMPDIR, "syslog.db"), os.path.join(TMPDIR, "app.db"),
     os.path.join(TMPDIR, "ipam.db"), os.path.join(TMPDIR, "snmptraps.db"),
     os.path.join(TMPDIR, "nodes.db"), os.path.join(TMPDIR, "alerts.db"),
-    os.path.join(TMPDIR, "wireless.db"), os.path.join(TMPDIR, "configrx.db"))
+    os.path.join(TMPDIR, "wireless.db"), os.path.join(TMPDIR, "configrx.db"), initial_admin_password="admin")
 service.start()
 
 http_port = free_tcp_port()
@@ -753,7 +753,7 @@ def empty_password_and_session_case_checks():
         os.path.join(auth_tmpdir, "syslog.db"), os.path.join(auth_tmpdir, "app.db"),
         os.path.join(auth_tmpdir, "ipam.db"), os.path.join(auth_tmpdir, "snmptraps.db"),
         os.path.join(auth_tmpdir, "nodes.db"), os.path.join(auth_tmpdir, "alerts.db"),
-        os.path.join(auth_tmpdir, "wireless.db"), os.path.join(auth_tmpdir, "configrx.db"))
+        os.path.join(auth_tmpdir, "wireless.db"), os.path.join(auth_tmpdir, "configrx.db"), initial_admin_password="admin")
     auth_service.start()
 
     try:
@@ -843,6 +843,35 @@ def session_client_binding_checks():
 
 
 session_client_binding_checks()
+
+
+def session_sweep_checks():
+    """Expired sessions are dropped on create()/active(), not only when the
+    same token is presented again -- and the sweep is bounded per call."""
+    print("SessionStore: expired sessions are swept, in bounded batches")
+    store = SessionStore(idle_minutes=240, max_hours=12)
+    token = store.create("erin", client="10.0.0.1")
+    with store._lock:
+        store._sessions[token]["last_seen"] -= (store.idle_seconds + 1)
+    check("active() no longer lists a session past its idle timeout",
+          not any(s["username"] == "erin" for s in store.active()))
+    check("...and it is actually gone from storage, not just filtered out",
+          token not in store._sessions)
+
+    store2 = SessionStore(idle_minutes=240, max_hours=12)
+    tokens = [store2.create(f"user{i}") for i in range(store2._SWEEP_LIMIT * 3)]
+    with store2._lock:
+        for t in tokens:
+            store2._sessions[t]["last_seen"] -= (store2.idle_seconds + 1)
+    store2.create("fresh")
+    remaining = len(store2._sessions)
+    check("a single create() call sweeps only up to the bound, not everything",
+          remaining > 1, remaining)
+    check("...but does make progress towards clearing the backlog",
+          remaining < len(tokens) + 1, remaining)
+
+
+session_sweep_checks()
 
 sys.exit(1 if failures else 0)
 

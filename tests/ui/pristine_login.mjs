@@ -4,8 +4,16 @@
  * forced password-change prompt, on the very first poll after signing in
  * with the shipped admin/admin, before the operator has clicked anything.
  *
- *   python3 -m netpath --headless --port 8471 --db <scratch>/pristine.db &
- *   node tests/ui/pristine_login.mjs --base http://127.0.0.1:8471
+ *   python3 -m netpath --headless --port 8471 --db <scratch>/pristine.db \
+ *       --initial-admin-password <same-value> &
+ *   node tests/ui/pristine_login.mjs --base http://127.0.0.1:8471 \
+ *       --password <same-value>
+ *
+ * From 5.48.0 a fresh install seeds `admin` with a random password rather
+ * than the fixed admin/admin this check used to sign in with, so the caller
+ * must start the server with --initial-admin-password (or
+ * NETPATH_INITIAL_ADMIN_PASSWORD) and pass that same value here with
+ * --password.
  *
  * Do NOT run demo/seed.py against this instance first — seed.py's own first
  * step changes the admin password and clears must_change, which is exactly
@@ -55,7 +63,7 @@ function loadPlaywright() {
 }
 
 function parseArgs(argv) {
-  const args = { base: 'http://127.0.0.1:8443', timeout: 20000 };
+  const args = { base: 'http://127.0.0.1:8443', timeout: 20000, password: 'admin' };
   for (let i = 0; i < argv.length; i += 1) {
     if (!argv[i].startsWith('--')) continue;
     const name = argv[i].slice(2);
@@ -108,7 +116,7 @@ async function main() {
 
     await page.goto(`${args.base}/login`, { waitUntil: 'domcontentloaded' });
     await page.fill('#username', 'admin');
-    await page.fill('#password', 'admin');
+    await page.fill('#password', args.password);
     await Promise.all([
       page.waitForURL((url) => !url.pathname.startsWith('/login'), { timeout: args.timeout })
         .catch(() => {}),

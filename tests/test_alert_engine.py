@@ -1891,4 +1891,114 @@ finally:
     nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
 
 
+# =================================================================== C5
+print("\nC5 — a system occurrence is not lost when a later tick stage fails")
+
+nodes, alerts, snmp, syslog, ipam, engine = build()
+try:
+    engine._tick()
+    engine.system_occurrence("smtp_failing", "smtp", "Alert email", severity=2,
+                             message="SMTP is down")
+    real_active_windows = alerts.active_windows
+    alerts.active_windows = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+    try:
+        engine._tick()
+        raised = False
+    except RuntimeError:
+        raised = True
+    finally:
+        alerts.active_windows = real_active_windows
+    assert raised, "the patched active_windows() should have failed the whole tick"
+    assert open_rows(alerts, "smtp_failing", "smtp") == [], \
+        "the failed tick must not have applied the occurrence"
+    ok("a tick that fails after draining a system occurrence does not apply it")
+
+    engine._tick()
+    assert len(open_rows(alerts, "smtp_failing", "smtp")) == 1
+    ok("...but the occurrence is re-queued rather than dropped: the very "
+       "next tick still raises it")
+finally:
+    nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+
+# =================================================================== C6
+print("\nC6 — a deterministic failure in one tick stage does not stop the others")
+
+nodes, alerts, snmp, syslog, ipam, engine = build()
+try:
+    engine._tick()
+    did = add_device(nodes, "10.14.0.2", "acc-sw-guard")
+
+    class CountingLog:
+        def __init__(self):
+            self.rows = []
+
+        def add(self, kind, message, detail=""):
+            self.rows.append(message)
+
+    log = CountingLog()
+    engine.log = log
+
+    real_dhcp = engine._evaluate_dhcp_thresholds
+    engine._evaluate_dhcp_thresholds = lambda *a, **k: (_ for _ in ()).throw(
+        RuntimeError("dhcp stage boom"))
+    try:
+        go_down(nodes, did)
+        engine._tick()
+        ok("_tick() itself does not raise when one evaluator stage does")
+        assert open_rows(alerts, "device_down", did), \
+            "an unrelated stage (device-down drain) must still have run"
+        ok("...and the unrelated device_down alert still opened")
+
+        failed = [m for m in log.rows if "evaluate_dhcp_thresholds" in m]
+        assert len(failed) == 1, failed
+        ok("the failing stage is logged once")
+
+        engine._tick()
+        still_one = [m for m in log.rows if "evaluate_dhcp_thresholds" in m]
+        assert len(still_one) == 1, still_one
+        ok("...and NOT again on the next tick while the same error persists")
+    finally:
+        engine._evaluate_dhcp_thresholds = real_dhcp
+
+    engine._tick()
+    recovered = [m for m in log.rows
+                if "evaluate_dhcp_thresholds" in m and "recovered" in m]
+    assert len(recovered) == 1, log.rows
+    ok("...and once the stage works again, recovery is logged once too")
+finally:
+    nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+
+# =================================================================== C7
+print("\nC7 — a raise inside the system-occurrence clears loop does not "
+     "drop the pending occurrence")
+
+nodes, alerts, snmp, syslog, ipam, engine = build()
+try:
+    engine._tick()
+    engine.system_occurrence("smtp_failing", "smtp", "Alert email", severity=2,
+                             message="SMTP is down")
+    # A queued clear (for an unrelated entity) so the clears loop inside
+    # _drain_system_occurrences actually runs and hits the patched method --
+    # unlike C5's active_windows(), this raise is inside a _stage()-wrapped
+    # call, so _tick() itself must not raise.
+    engine.clear_system_occurrence("smtp_failing", "smtp-other")
+    real_rule_by_key = alerts.rule_by_key
+    alerts.rule_by_key = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+    try:
+        engine._tick()
+    finally:
+        alerts.rule_by_key = real_rule_by_key
+    assert open_rows(alerts, "smtp_failing", "smtp") == [], \
+        "the occurrence must not be applied while its own drain is failing"
+    ok("a tick whose clears loop raises does not apply the pending occurrence")
+
+    engine._tick()
+    assert len(open_rows(alerts, "smtp_failing", "smtp")) == 1
+    ok("...but it is delivered on the very next tick, exactly once")
+finally:
+    nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+
 print(f"\nALL {len(PASSED)} ALERT-ENGINE ASSERTIONS PASSED")

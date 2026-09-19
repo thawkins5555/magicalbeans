@@ -301,7 +301,8 @@ def report_reason(response) -> tuple[str, str]:
 
 def counter_rate(previous: int | None, previous_ts: float, current: int | None,
                  current_ts: float, bit_width: int, *,
-                 speed_bps: float | None = None) -> float | None:
+                 speed_bps: float | None = None,
+                 max_rate: float | None = None) -> float | None:
     """Per-second rate (units of the counter, e.g. bytes/sec for an octet
     counter) from two counter samples, handling wraparound and rejecting
     nonsense. A 32-bit counter that decreased is assumed to have wrapped
@@ -310,7 +311,10 @@ def counter_rate(previous: int | None, previous_ts: float, current: int | None,
     realistic speed. If speed_bps is given (bits/sec) and the implied rate
     would exceed ~1.3x it, the sample is treated as a reset rather than a
     multi-wrap and None is returned — this is why ifXTable's 64-bit
-    counters (nodeoids.IFX_TABLE) are preferred whenever present."""
+    counters (nodeoids.IFX_TABLE) are preferred whenever present.
+
+    max_rate is the same idea in the counter's own units, for a counter
+    (errors/discards) speed_bps says nothing about -- see max_event_rate."""
     if previous is None or current is None:
         return None
     dt = current_ts - previous_ts
@@ -325,7 +329,27 @@ def counter_rate(previous: int | None, previous_ts: float, current: int | None,
         rate = (modulus - previous + current) / dt
     if speed_bps and rate * 8 > speed_bps * 1.3:
         return None
+    if max_rate is not None and rate > max_rate:
+        return None
     return rate
+
+
+# Minimum Ethernet frame on the wire (64 bytes + 8-byte preamble/SFD +
+# 12-byte gap): line rate divided by this is the fastest packet rate a link
+# can physically carry.
+_MIN_FRAME_BITS = 84 * 8
+# Absolute ceiling regardless of link speed: a 32-bit counter reset can only
+# fake ~71M/s at a 60s poll, well under any fast port's own packet-rate cap.
+_MAX_EVENT_RATE_NO_SPEED = 2_000_000.0
+
+
+def max_event_rate(speed_bps: float | None) -> float:
+    """The counter_rate max_rate ceiling for a non-octet (events/sec)
+    counter: the interface's own packet rate, capped at the absolute limit
+    above so a fast port's own ceiling can't outrun what a reset can fake."""
+    if not speed_bps:
+        return _MAX_EVENT_RATE_NO_SPEED
+    return min(speed_bps / _MIN_FRAME_BITS, _MAX_EVENT_RATE_NO_SPEED)
 
 
 IF_SPEED_SENTINEL = 4_294_967_295

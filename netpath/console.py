@@ -255,6 +255,26 @@ class ConsoleWindow(QMainWindow):
         self.timer.timeout.connect(self._refresh)
         self.timer.start(1000)
         self._refresh()
+        self._show_initial_admin_notice()
+
+    def _show_initial_admin_notice(self) -> None:
+        """A fresh install's one-time password, shown here because nobody
+        can sign in yet to read it off the event log and stdout is not
+        visible under pythonw.exe. Must never stop the console starting."""
+        notice = self.service.take_initial_admin_notice()
+        if not notice:
+            return
+        try:
+            box = QMessageBox(QMessageBox.Icon.Information,
+                              "Initial administrator account", notice, parent=self)
+            box.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse
+                | Qt.TextInteractionFlag.TextSelectableByKeyboard)
+            box.exec()
+        except Exception:                                   # noqa: BLE001
+            # Already taken (and thus cleared) above -- put it back rather
+            # than lose the only copy of the password to a dialog failure.
+            self.service._initial_admin_notice = notice
 
     # ------------------------------------------------------------------- ui
 

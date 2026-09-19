@@ -627,9 +627,9 @@ class VendorSensorPsuMixin:
         # unbounded walks (bridge ports, then the forwarding table) after
         # the budget was already spent, which is how a dialog a human is
         # waiting on ran for minutes.
-        deadline = time.time() + self._VLAN_WALK_BUDGET_S
+        deadline = time.monotonic() + self._VLAN_WALK_BUDGET_S
         for vlan in sorted(vlans, key=int)[:self._MAX_VLAN_CONTEXTS]:
-            if time.time() > deadline:
+            if time.monotonic() > deadline:
                 break
             scoped = {**config, "community": f"{community}@{vlan}"}
             ports = target_ports
@@ -807,9 +807,9 @@ class VendorSensorPsuMixin:
         entries = []
         answered = False
         # See _cisco_vlan_fdb: the budget goes into the walks themselves.
-        deadline = time.time() + self._VLAN_WALK_BUDGET_S
+        deadline = time.monotonic() + self._VLAN_WALK_BUDGET_S
         for vlan in sorted(vlans, key=int)[:self._MAX_VLAN_CONTEXTS]:
-            if time.time() > deadline:
+            if time.monotonic() > deadline:
                 break
             scoped = {**config, "community": f"{community}@{vlan}"}
             mapping = port_map
@@ -859,11 +859,11 @@ class VendorSensorPsuMixin:
         ordered = sorted(vlans, key=int)
         sliced = ordered[:self._MAX_VLAN_CONTEXTS]
         complete = True
-        deadline = time.time() + self._VLAN_WALK_BUDGET_S
+        deadline = time.monotonic() + self._VLAN_WALK_BUDGET_S
         rows: dict[int, dict] = {}
         answered = False
         for vlan in sliced:
-            if time.time() > deadline:
+            if time.monotonic() > deadline:
                 complete = False
                 break
             scoped = {**config, "community": f"{community}@{vlan}"}

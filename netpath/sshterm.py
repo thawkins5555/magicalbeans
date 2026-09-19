@@ -8,6 +8,7 @@ binary (terminal bytes) — see INTERNALS.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import threading
@@ -123,6 +124,30 @@ def _int_in(value, low: int, high: int, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return max(low, min(high, number))
+
+
+_BROADCAST = ipaddress.IPv4Address("255.255.255.255")
+
+
+def _unsafe_destination(host: str) -> str | None:
+    """Why `host` must not be dialled, or None if it is fine. Loopback is
+    allowed -- the demo fleet and tests reach devices at 127.0.0.x."""
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return "not a literal IP address"
+    # is_unspecified/is_link_local don't see through an IPv4-mapped IPv6
+    # address (e.g. ::ffff:169.254.1.1) on every Python build; unwrap first.
+    addr = getattr(addr, "ipv4_mapped", None) or addr
+    if addr.is_unspecified:
+        return "an unspecified address"
+    if addr.is_link_local:
+        return "a link-local address"
+    if addr.is_multicast:
+        return "a multicast address"
+    if addr == _BROADCAST:
+        return "the broadcast address"
+    return None
 
 
 def stored_host_key(service, host: str, port: int) -> dict | None:
@@ -533,6 +558,11 @@ class SshSession:
         `hostkeys.HostKeyChanged`) or 'failed' (already reported to the
         page)."""
         import paramiko
+
+        unsafe = _unsafe_destination(self.host)
+        if unsafe is not None:
+            self._error(f"Refusing to connect to {self.host}: {unsafe}.")
+            return "failed", None
 
         self._status("connecting", f"Connecting to {self.host}:{self.port}…")
         store = hostkeys.HostKeyStore(self.service.configrx_db)

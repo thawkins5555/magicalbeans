@@ -65,7 +65,7 @@ class VlanMixin:
         # The budget goes INTO each walk (see _cisco_vlan_fdb's own
         # comment on why): checking only between walks would let the last
         # one of eight start after the budget was already spent.
-        deadline = time.time() + _VLAN_WALK_BUDGET_S
+        deadline = time.monotonic() + _VLAN_WALK_BUDGET_S
         answered = False
         complete = True
 
@@ -459,7 +459,7 @@ class VlanMixin:
         _walk_column already walks a table column — a GETNEXT and a fresh
         socket per row put a fleet-wide first identification in the hours.
         """
-        deadline = time.time() + budget_s
+        deadline = time.monotonic() + budget_s
         rows: list[dict] = []
         retained = 0
         stopped = "end of subtree"
@@ -478,7 +478,7 @@ class VlanMixin:
                     stopped = (f"stopped at the {self._WALK_MAX_BYTES}-byte "
                                f"limit after {len(rows)} row(s)")
                     break
-                if time.time() > deadline:
+                if time.monotonic() > deadline:
                     stopped = f"stopped after {budget_s:.0f}s"
                     break
                 try:

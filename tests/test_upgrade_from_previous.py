@@ -745,6 +745,30 @@ check("...so what makes a second call safe is not the guard but the write "
 shipped_order.close()
 
 
+# ------------------- part 8: dropping ix_interfaces_device on upgrade
+# ix_interfaces_device duplicated the leading column of interfaces' own
+# UNIQUE(device_id, if_index); _migrate now drops it the same idempotent way
+# it already drops the three device_id indexes in part 6.
+ifc = os.path.join(work, "ifc_index")
+os.makedirs(ifc, exist_ok=True)
+ifc_path = os.path.join(ifc, "nodes.db")
+NodesDatabase(ifc_path).close()
+conn = sqlite3.connect(ifc_path)
+conn.executescript("CREATE INDEX IF NOT EXISTS ix_interfaces_device ON interfaces(device_id);")
+conn.commit()
+conn.close()
+ifc_db = NodesDatabase(ifc_path)
+ifc_idx = {r["name"] for r in ifc_db._conn.execute(
+    "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'interfaces'").fetchall()}
+check("reopening drops the duplicate index, leaving the UNIQUE constraint's "
+      "own autoindex to serve device_id lookups",
+      "ix_interfaces_device" not in ifc_idx, ifc_idx)
+plan = " ".join(str(r[-1]) for r in ifc_db._conn.execute(
+    "EXPLAIN QUERY PLAN SELECT * FROM interfaces WHERE device_id = ?", (1,)).fetchall())
+check("...and an interfaces-by-device_id query is served by that autoindex",
+      "sqlite_autoindex_interfaces" in plan, plan)
+ifc_db.close()
+
 print()
 print("FAILURES:", FAILS if FAILS else "none")
 sys.exit(1 if FAILS else 0)

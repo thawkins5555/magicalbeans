@@ -348,8 +348,8 @@ class VendorIdentifyMixin:
         link-event history with them.
         """
         interval = float(config.get("poll_interval_s") or 120)
-        deadline = time.time() + max(self._INTERFACE_BUDGET_FLOOR_S,
-                                     self._INTERFACE_BUDGET_FRACTION * interval)
+        deadline = time.monotonic() + max(self._INTERFACE_BUDGET_FLOOR_S,
+                                          self._INTERFACE_BUDGET_FRACTION * interval)
         indexes, complete, reason = self._walk_indexes(
             device, config, nodeoids.IF_TABLE["if_index"], raise_on_timeout=True)
         if not indexes:
@@ -388,7 +388,7 @@ class VendorIdentifyMixin:
         session = self._session_for(device, config)
         try:
             for if_index in wanted:
-                if time.time() > deadline:
+                if time.monotonic() > deadline:
                     abandoned = "the poll's interface budget ran out"
                     break
                 if consecutive_timeouts >= self._INTERFACE_GIVE_UP_TIMEOUTS:
@@ -499,12 +499,12 @@ class VendorIdentifyMixin:
         return rows, complete, reason, note
 
     def _table_walk_deadline(self, config: dict, interval_key: str) -> float:
-        """Wall-clock budget for one table walk, off its own cadence rather than poll_interval_s (which cut an hourly walk off at 60s); falls back to poll_interval_s, so it only widens the budget."""
+        """Monotonic-clock budget for one table walk, off its own cadence rather than poll_interval_s (which cut an hourly walk off at 60s); falls back to poll_interval_s, so it only widens the budget."""
         interval = float(config.get(interval_key) or 0)
         if interval <= 0:
             interval = float(config.get("poll_interval_s") or 120)
-        return time.time() + max(self._WALK_BUDGET_FLOOR_S,
-                                 self._WALK_BUDGET_FRACTION * interval)
+        return time.monotonic() + max(self._WALK_BUDGET_FLOOR_S,
+                                      self._WALK_BUDGET_FRACTION * interval)
 
     def _walk_column(self, device, config: dict, base_oid: str,
                      raise_on_timeout: bool = False,
@@ -577,8 +577,8 @@ class VendorIdentifyMixin:
         max_rows = self._walk_limits()[0]
         if deadline is None:
             interval = float(config.get("poll_interval_s") or 120)
-            deadline = time.time() + max(self._WALK_BUDGET_FLOOR_S,
-                                         self._WALK_BUDGET_FRACTION * interval)
+            deadline = time.monotonic() + max(self._WALK_BUDGET_FLOOR_S,
+                                              self._WALK_BUDGET_FRACTION * interval)
         # GETBULK does not exist in v1, so whether to use it is decided on
         # the configured version with 0 (v1) the only value that says no —
         # an absent version means v2c, the same default `_walk_request`,
@@ -602,8 +602,9 @@ class VendorIdentifyMixin:
                     complete = False
                     reason = hit_cap
                     break
-                if deadline is not None and time.time() > deadline:
-                    # The caller's own wall-clock budget. Checked inside
+                if deadline is not None and time.monotonic() > deadline:
+                    # The caller's own budget, on the monotonic clock so a
+                    # backward wall-clock step cannot strand it. Checked inside
                     # the walk, not only between walks: a Cisco per-VLAN
                     # sweep that checked only between VLANs could run two
                     # unbounded walks past the budget it was given.

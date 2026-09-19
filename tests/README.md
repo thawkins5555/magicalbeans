@@ -95,6 +95,21 @@ pre-rewrite code did, checked row for row against `tests/_old_series_maintenance
 a frozen copy of the old code kept only for this comparison and for
 `bench_prune.py --oracle` — never imported from product code).
 
+5.48.0 added three suites: `test_first_run_password.py` (a fresh install
+refuses `admin`/`admin`, the printed one-time password actually signs in and
+owes a password change, the banner is not repeated on a second start against
+the same database, an explicit `--initial-admin-password` is honoured on a
+fresh store and ignored once one already has users, and the plaintext never
+reaches the database file or any event-log line but the one banner),
+`test_nodepoll_monotonic_budget.py` (a poll/walk budget deadline is pinned to
+`time.monotonic()`, not `time.time()`, by freezing the wall clock at a
+wildly wrong value throughout the wait — a regression back to wall-clock
+deadline math would hang rather than silently pass), and
+`test_ping_subprocess_fallback.py` (the subprocess ping fallback in
+`ipam_scan.py` and `tracer.py` requires a genuine `TTL=` reply for IPv4
+rather than trusting `ping.exe`'s exit code alone, and decodes localised
+Windows ping output with `errors="replace"` instead of raising).
+
 One family is worth calling out by name: `test_frontend_contracts.py`,
 `test_time_contracts.py`, `test_layout_contracts.py`, `test_design_tokens.py`
 and `test_static_headers.py` read the shipped JS/HTML/CSS as text rather than

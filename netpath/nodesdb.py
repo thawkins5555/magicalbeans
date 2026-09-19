@@ -213,7 +213,6 @@ CREATE TABLE IF NOT EXISTS interfaces (
     last_seen_ts    REAL NOT NULL,
     UNIQUE(device_id, if_index)
 );
-CREATE INDEX IF NOT EXISTS ix_interfaces_device ON interfaces(device_id);
 
 -- The alarm/warning limits a transceiver publishes about ITSELF, learned by
 -- polling (nodepoll._poll_environment) rather than configured: an optic's
@@ -1394,9 +1393,11 @@ class NodesDatabase(SqliteStore):
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS ix_interfaces_phys_addr_nocase"
             " ON interfaces(phys_addr COLLATE NOCASE)")
-        # Duplicates of the PRIMARY KEYs they sat beside; upgraded databases
+        # Duplicates of the PRIMARY KEYs (or, for ix_interfaces_device, the
+        # UNIQUE(device_id, if_index)) they sat beside; upgraded databases
         # keep them until this runs.
-        for name in ("ix_vlans_device", "ix_vlan_ports_device", "ix_port_vlans_device"):
+        for name in ("ix_vlans_device", "ix_vlan_ports_device", "ix_port_vlans_device",
+                     "ix_interfaces_device"):
             self._conn.execute(f"DROP INDEX IF EXISTS {name}")
 
         # One row per device whose history is still being deleted; reserves the id.

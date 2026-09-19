@@ -32,7 +32,7 @@ service = Service(
     os.path.join(TMPDIR, "syslog.db"), os.path.join(TMPDIR, "app.db"),
     os.path.join(TMPDIR, "ipam.db"), os.path.join(TMPDIR, "snmptraps.db"),
     os.path.join(TMPDIR, "nodes.db"), os.path.join(TMPDIR, "alerts.db"),
-    os.path.join(TMPDIR, "wireless.db"), os.path.join(TMPDIR, "configrx.db"))
+    os.path.join(TMPDIR, "wireless.db"), os.path.join(TMPDIR, "configrx.db"), initial_admin_password="admin")
 web_port = _paths.free_tcp_port()
 server = WebServer(service, host="127.0.0.1", port=web_port, certfile=None, keyfile=None)
 assert server.start(block=False), server.error
@@ -314,6 +314,15 @@ try:
           and metrics.get("poe_consumption_w", {}).get("last_value") == 214.0, metrics)
     check("...and the topology-change counter alongside them",
           metrics.get("stp_topology_changes", {}).get("last_value") == 5.0, metrics)
+
+    status, key_payload = call("GET", f"/api/nodes/devices/{core_id}/metrics",
+                                {"key": "poe_budget_w"}, token=admin)
+    check("?key= narrows the metrics list to just that one metric",
+          [m["key"] for m in key_payload["metrics"]] == ["poe_budget_w"], key_payload)
+    status, missing_payload = call("GET", f"/api/nodes/devices/{core_id}/metrics",
+                                    {"key": "no_such_metric"}, token=admin)
+    check("...and an unknown key comes back as an empty list, not an error",
+          missing_payload["metrics"] == [], missing_payload)
 
     # ---------------------------------------------------------- RF via series
     print("RF metrics reachable through the ordinary series endpoint")

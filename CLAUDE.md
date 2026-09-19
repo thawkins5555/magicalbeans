@@ -18,7 +18,7 @@ Bob leads the team and is the interactive session. Bob is a Fable 5 genius devel
 - **Dingus2** (Haiku) — non-reasoning task
 - **Javariius** (Fable) — code review before any push to main
 
-Do not spawn any agent or teammate other than those listed, with one exception: when a phase has more than two independent lanes with disjoint file ownership, Bob may add extra Sonnet general-task teammates (Thing3, Thing4, …), each with an exclusive file list.
+Do not spawn any agent or teammate other than those listed.
 
 Never spawn more than one concurrent Javariius teammate.
 

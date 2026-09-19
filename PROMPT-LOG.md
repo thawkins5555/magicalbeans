@@ -1820,3 +1820,35 @@ beyond this note.
 **Files changed for 5.47.0's documentation:** `netpath/__init__.py`
 (version), `CHANGELOG.md`, `FEATURES.md`, `INTERNALS.md`, `RUNBOOK.md`,
 `tests/README.md`, and this file.
+
+## 5.48.0 — First-run administrator password, and the rest of the low-severity review items
+
+Second release out of the phase-5 review plan (see 5.47.0 above): the
+first-run `admin`/`admin` fix that 5.47.0 deferred, plus the remaining
+low-severity items from the same review — session sweeping, the alert
+engine's per-stage guard, the WEB relay/SSH terminal destination checks,
+the mail header sanitiser, the expired-token audit throttle, and a handful
+of smaller correctness and performance fixes. See `CHANGELOG.md` for the
+full operator-visible list.
+
+**"Let's go back to the old limit of just Thing1 and Thing2."** Partway
+through this release the extra Sonnet teammates (Thing3/Thing4) added
+during the 5.46.0 performance phase ran into the account's session limit
+a second time, stalling every lane at once rather than just the one
+teammate that hit it. The operator withdrew the standing permission for
+extra teammates and asked for the roster to go back to the two named ones.
+`CLAUDE.md`'s team section was restored to name only the original roster
+(Bob, Testy, Fisty, Dora, Thing1, Thing2, Stephen_King, Dingus1, Dingus2,
+Javariius) as the only agents that may ever be spawned.
+
+**Browser walk run from a detached driver.** The walk had been getting
+killed mid-run by the harness's background-task limiter on this low-memory
+box before it could finish all 94 checks. It is now launched with a
+detached process (output to a log file, not the harness's own background
+task tracking) so it survives to completion regardless of how long it
+takes or how much else is running at the time.
+
+**Files changed for 5.48.0's documentation:** `netpath/__init__.py`
+(version), `CHANGELOG.md`, `FEATURES.md`, `INTERNALS.md`,
+`tests/README.md`, and this file. `README.md`, `RUNBOOK.md` and
+`demo/README.md` were updated separately for the same release.

@@ -555,10 +555,26 @@ def ping_once(ip: str, timeout_ms: int = 800) -> bool:
     try:
         completed = subprocess.run(
             _ping_command(ip, timeout_ms), capture_output=True, text=True,
-            timeout=(timeout_ms / 1000) + 2, **hidden())
+            errors="replace", timeout=(timeout_ms / 1000) + 2, **hidden())
     except (subprocess.TimeoutExpired, OSError):
         return False
-    return completed.returncode == 0
+    return _genuine_reply(completed, ip)
+
+
+def _genuine_reply(completed, ip: str) -> bool:
+    """Whether a ping subprocess actually heard an echo reply, not just
+    exited 0 -- ping.exe returns 0 for "Destination host unreachable" too,
+    an intermediate router's ICMP error rather than a reply from `ip`.
+    IPv6 ping.exe replies carry no TTL= field at all, so this can only
+    check exit code there -- an IPv6 "unreachable" reply is not currently
+    distinguished from a real one."""
+    if completed.returncode != 0:
+        return False
+    if not IS_WINDOWS or not _is_ipv4(ip):
+        return True
+    from .tracer import _WIN_PING_REPLY
+    output = (completed.stdout or "") + "\n" + (completed.stderr or "")
+    return bool(_WIN_PING_REPLY.search(output))
 
 
 def ping_many(ip: str, count: int = 3,
@@ -603,10 +619,10 @@ def ping_many(ip: str, count: int = 3,
         try:
             completed = subprocess.run(
                 _ping_command(ip, timeout_ms), capture_output=True, text=True,
-                timeout=(timeout_ms / 1000) + 2, **hidden())
+                errors="replace", timeout=(timeout_ms / 1000) + 2, **hidden())
         except (subprocess.TimeoutExpired, OSError):
             continue
-        if completed.returncode != 0:
+        if not _genuine_reply(completed, ip):
             continue
         received += 1
         match = pattern.search((completed.stdout or "") + "\n" +
@@ -632,7 +648,7 @@ def read_arp_table() -> dict[str, str]:
         return {}
     try:
         completed = subprocess.run(command, capture_output=True, text=True,
-                                   timeout=10, **hidden())
+                                   errors="replace", timeout=10, **hidden())
     except (subprocess.TimeoutExpired, OSError):
         # TimeoutExpired is a SubprocessError, not an OSError, so the one
         # failure this call arranges for itself was the one it did not

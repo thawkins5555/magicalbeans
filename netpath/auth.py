@@ -30,7 +30,19 @@ KEY_BYTES = 32
 
 MIN_PASSWORD_LENGTH = 12
 DEFAULT_USER = "admin"
+# Not used by the product (a fresh install seeds a random password instead,
+# see generate_initial_password); kept as a fixed one for the test suites.
 DEFAULT_PASSWORD = "admin"
+
+# Unambiguous on screen and read aloud: no 0/O, 1/l/I, or other look-alikes.
+_INITIAL_PASSWORD_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz"
+
+
+def generate_initial_password() -> str:
+    """A random first-run admin password: four dash-joined 5-char groups."""
+    groups = ["".join(secrets.choice(_INITIAL_PASSWORD_ALPHABET) for _ in range(5))
+              for _ in range(4)]
+    return "-".join(groups)
 
 # Not a serious dictionary — just the handful that turn up in real breaches of
 # small internal tools, plus the ones this application invites by existing.
@@ -200,9 +212,14 @@ def check_username(username: str) -> str:
 class SessionStore:
     """In-memory sessions, with an idle timeout and an absolute lifetime."""
 
+    # Sessions examined per create()/active() call to drop expired ones —
+    # bounded so a large table costs a fixed amount of work, not a full
+    # scan; entries not yet due are cycled to the back and rechecked later.
+    _SWEEP_LIMIT = 50
+
     def __init__(self, idle_minutes: int = 240, max_hours: int = 12, log=None):
         self._lock = threading.Lock()
-        self._sessions: dict[str, dict] = {}
+        self._sessions: "OrderedDict[str, dict]" = OrderedDict()
         self.idle_seconds = idle_minutes * 60
         self.max_seconds = max_hours * 3600
         self.log = log
@@ -212,10 +229,22 @@ class SessionStore:
             self.idle_seconds = max(1, int(idle_minutes)) * 60
             self.max_seconds = max(1, int(max_hours)) * 3600
 
+    def _sweep_expired(self, now: float) -> None:
+        """Called with the lock held."""
+        for _ in range(min(self._SWEEP_LIMIT, len(self._sessions))):
+            token, session = next(iter(self._sessions.items()))
+            expired = (now - session["last_seen"] > self.idle_seconds
+                      or now - session["created"] > self.max_seconds)
+            if expired:
+                del self._sessions[token]
+            else:
+                self._sessions.move_to_end(token)
+
     def create(self, username: str, client: str = "", agent: str = "") -> str:
         token = secrets.token_urlsafe(32)
         now = time.time()
         with self._lock:
+            self._sweep_expired(now)
             self._sessions[token] = {"username": username, "created": now,
                                      "last_seen": now, "client": client,
                                      "agent": agent[:120]}
@@ -284,6 +313,7 @@ class SessionStore:
     def active(self) -> list[dict]:
         now = time.time()
         with self._lock:
+            self._sweep_expired(now)
             return [
                 {"username": s["username"], "client": s["client"],
                  "agent": s["agent"], "created": s["created"],

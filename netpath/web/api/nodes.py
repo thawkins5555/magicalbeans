@@ -2671,7 +2671,12 @@ def get_nodes_device_interfaces_export(service, params, body, device_id) -> dict
 
 def get_nodes_device_metrics(service, params, body, device_id) -> dict:
     _require(service.nodes_db.device(device_id), "device")
-    rows = service.nodes_db.metrics(device_id)
+    key = params.get("key")
+    if key:
+        row = service.nodes_db.metric_by_key(device_id, key)
+        rows = [row] if row else []
+    else:
+        rows = service.nodes_db.metrics(device_id)
     return {"metrics": [
         {"id": r["id"], "key": r["key"], "label": r["label"], "unit": r["unit"],
          "kind": r["kind"], "last_value": r["last_value"], "last_ts": r["last_ts"]}

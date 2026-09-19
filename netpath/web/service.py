@@ -17,8 +17,8 @@ from pathlib import Path
 
 from ..alertengine import AlertEngine
 from ..alertsdb import AlertsDatabase
-from ..auth import (DEFAULT_PASSWORD, DEFAULT_USER, LoginThrottle,
-                    SessionStore, hash_password)
+from ..auth import (DEFAULT_USER, LoginThrottle, SessionStore,
+                    generate_initial_password, hash_password)
 from ..appdb import AppDatabase, migrate_from
 from ..collector import Collector
 from ..configrx import ConfigRxWorker
@@ -47,6 +47,10 @@ from ..wirelessdb import WirelessDatabase
 from ..worker import Worker
 
 MAINTENANCE_INTERVAL_S = 900
+
+# How often a still-in-use expired API token gets a fresh audit row, rather
+# than one on every single request an unattended script keeps making with it.
+EXPIRED_TOKEN_AUDIT_WINDOW_S = 3600
 
 # When a capped database is close enough to its cap to be worth an alert,
 # and when that stops being true. Trimming keeps a busy store just under its
@@ -364,14 +368,15 @@ class Service:
     def __init__(self, db_path: str, flow_db_path: str, syslog_db_path: str,
                  app_db_path: str, ipam_db_path: str, snmp_db_path: str,
                  nodes_db_path: str, alerts_db_path: str,
-                 wireless_db_path: str, configrx_db_path: str):
+                 wireless_db_path: str, configrx_db_path: str,
+                 initial_admin_password: str | None = None):
         self._open_stores(db_path, flow_db_path, syslog_db_path, app_db_path,
                           ipam_db_path, snmp_db_path, nodes_db_path,
                           alerts_db_path, wireless_db_path, configrx_db_path)
         self._load_settings()
         self._init_restart_state()
         self._build_workers()
-        self._open_sessions()
+        self._open_sessions(initial_admin_password)
         self._init_maintenance_state()
         # Bumped by every write to something /api/config carries. The
         # browser refetches /api/config only when this number moves.
@@ -396,6 +401,10 @@ class Service:
         # _cached_extra_targets.
         self._extra_targets_cache: tuple[float, list] | None = None
         self._extra_targets_generation = 0
+        # authenticate_api_token's expired-token audit, once per token per
+        # window rather than once per request -- see EXPIRED_TOKEN_AUDIT_WINDOW_S.
+        self._expired_token_audited: dict[int, float] = {}
+        self._expired_token_audited_lock = threading.Lock()
 
     def _open_stores(self, db_path: str, flow_db_path: str, syslog_db_path: str,
                      app_db_path: str, ipam_db_path: str, snmp_db_path: str,
@@ -531,7 +540,7 @@ class Service:
         # standalone (tests, scripts) with this left unset.
         self.node_poller.alert_engine = self.alert_engine
 
-    def _open_sessions(self) -> None:
+    def _open_sessions(self, initial_admin_password: str | None = None) -> None:
         self.sessions = SessionStore(
             idle_minutes=int(self.settings.get("session_idle_minutes", 10)),
             max_hours=int(self.settings.get("session_max_hours", 12)),
@@ -545,7 +554,10 @@ class Service:
         # (a tunnel belongs to a signed-in user) and after nodes_db (the
         # target comes from the device row).
         self.web_relays = WebRelayRegistry(self)
-        self._ensure_default_user()
+        # Set by _ensure_default_user only when it actually creates the
+        # account; see take_initial_admin_notice for the console's use of it.
+        self._initial_admin_notice: str | None = None
+        self._ensure_default_user(initial_admin_password)
 
     def _init_maintenance_state(self) -> None:
         self._stop = threading.Event()
@@ -572,24 +584,41 @@ class Service:
         self._flow_coverage_warned_ts = 0.0   # A5 log throttle; 0.0 lets the first lagging pass log
         self.started_at = time.time()
 
-    def _ensure_default_user(self) -> None:
-        """Create admin/admin on a fresh install, flagged to be changed.
-
-        The account exists so there is a way in; the flag exists so the first
-        thing anyone does is replace it.
-        """
+    def _ensure_default_user(self, initial_admin_password: str | None = None) -> None:
+        """Seed the first administrator account on a fresh install, flagged
+        to be changed: a random password (or `initial_admin_password`, for
+        automation), stored only as a hash and printed/logged once here —
+        whatever captures that output may retain it, so must-change matters."""
         if self.app_db.user_count():
             return
-        self.app_db.add_user(DEFAULT_USER, hash_password(DEFAULT_PASSWORD),
+        password = initial_admin_password or generate_initial_password()
+        self.app_db.add_user(DEFAULT_USER, hash_password(password),
                              must_change=True)
         # There is no one else yet to grant this account access, so it
         # starts with everything — the same grant an upgrading install's
         # existing accounts are backfilled to.
         self.app_db.set_permissions(
             DEFAULT_USER, {m: permissions.WRITE for m in permissions.MODULES})
-        self.log.add(SYSTEM, f"Created the default {DEFAULT_USER} account. "
-                             f"Change its password before this is reachable "
-                             f"by anyone else.")
+        banner = (
+            f"\n{'=' * 64}\n"
+            f"  Initial administrator account created.\n"
+            f"    Username: {DEFAULT_USER}\n"
+            f"    Password: {password}\n"
+            f"  Shown once, here, on this start only. Change it at first "
+            f"sign-in.\n"
+            f"{'=' * 64}\n")
+        print(banner)
+        self.log.add(SYSTEM, f"Created the default {DEFAULT_USER} account "
+                             f"(username: {DEFAULT_USER}, password: {password}). "
+                             f"Shown once; change it at first sign-in.")
+        # For run_console, where stdout is invisible; see take_initial_admin_notice.
+        self._initial_admin_notice = banner
+
+    def take_initial_admin_notice(self) -> str | None:
+        """The first-run banner text, exactly once. None on every call but
+        the first after a fresh install actually seeded the account."""
+        notice, self._initial_admin_notice = self._initial_admin_notice, None
+        return notice
 
     # --------------------------------------------------------- authentication
 
@@ -707,12 +736,26 @@ class Service:
         if not ldapclient.constant_time_hash_eq(row["token_hash"], token_hash):
             return None
         if row["expires_ts"] is not None and time.time() > row["expires_ts"]:
-            self.app_db.audit(row["username"], client, "token.expired_use",
-                              target=str(row["id"]),
-                              detail=f"label={row['label']}")
+            if self._announce_expired_token(row["id"]):
+                self.app_db.audit(row["username"], client, "token.expired_use",
+                                  target=str(row["id"]),
+                                  detail=f"label={row['label']}")
             return None
         self.app_db.touch_api_token(row["id"], row["last_used_ts"])
         return row["username"]
+
+    def _announce_expired_token(self, token_id: int) -> bool:
+        """True the first time this token is seen expired since its last
+        announced use, so a script that keeps calling with it every few
+        seconds writes one audit row an hour rather than one a call --
+        the same reasoning as LoginThrottle.announce_lockout in auth.py."""
+        now = time.time()
+        with self._expired_token_audited_lock:
+            last = self._expired_token_audited.get(token_id, 0.0)
+            if now - last < EXPIRED_TOKEN_AUDIT_WINDOW_S:
+                return False
+            self._expired_token_audited[token_id] = now
+            return True
 
     # ------------------------------------------------------------- lifecycle
 

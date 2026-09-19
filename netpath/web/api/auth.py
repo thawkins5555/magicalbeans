@@ -356,8 +356,8 @@ def post_heartbeat(service, params, body) -> dict:
 def _first_run(service) -> bool:
     """Whether this is a fresh install nobody has signed in to yet.
 
-    The seeded admin/admin account exists, is the only account, still owes
-    its password change and has never signed in. The sign-in page says so,
+    The seeded admin account exists, is the only account, still owes its
+    password change and has never signed in. The sign-in page says so,
     because a first-run administrator otherwise faces a blank form with no
     hint that a default account exists at all. It is deliberately not a
     password check — that would be a full scrypt on every unauthenticated

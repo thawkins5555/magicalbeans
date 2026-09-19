@@ -2284,6 +2284,23 @@
       arcLines + walk + mib + learned + suggest + override;
   }
 
+  // Polls `check()` once per elapsed second the tab is visible, up to
+  // `seconds` visible seconds, stopping early the first time `check()`
+  // resolves to something other than undefined. A hidden tab still sleeps
+  // (so it notices promptly when the tab comes back) but spends neither a
+  // request nor a second of the budget while backgrounded.
+  async function pollVisibleSeconds(seconds, current, check) {
+    let elapsed = 0;
+    while (elapsed < seconds && current()) {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      if (document.hidden) continue;
+      elapsed++;
+      const result = await check();
+      if (result !== undefined) return result;
+    }
+    return undefined;
+  }
+
   function renderVendorSection(box, device, deviceId, current) {
     const holder = box.querySelector('#ndd-vendor');
     if (!holder) return;
@@ -2309,17 +2326,17 @@
       // Poll the job until it finishes, then re-render from the stored
       // verdict. The seq token stops a late answer painting into whatever
       // dialog replaced this one.
-      for (let i = 0; i < 90 && current(); i++) {
-        await new Promise((resolve) => setTimeout(resolve, 1000));
+      await pollVisibleSeconds(90, current, async () => {
         let status;
         try { status = await App.get(`/api/nodes/devices/${deviceId}/identify`); }
-        catch (error) { break; }
-        if (!current()) return;
+        catch (error) { return true; }
+        if (!current()) return true;
         const job = status.job;
-        if (!job || job.state === 'done' || job.state === 'failed') break;
+        if (!job || job.state === 'done' || job.state === 'failed') return true;
         const live = holder.querySelector('#ndd-reidentify');
         if (live) live.textContent = `Identifying… (${job.objects || 0} objects)`;
-      }
+        return undefined;
+      });
       if (current()) refresh().catch(() => {});
     };
     const paintSnapshotLine = (meta) => {
@@ -2380,14 +2397,13 @@
         install.textContent = 'Install failed';
         return;
       }
-      for (let i = 0; i < 120 && current(); i++) {
-        await new Promise((resolve) => setTimeout(resolve, 1000));
+      await pollVisibleSeconds(120, current, async () => {
         let status;
         try { status = await App.get('/api/nodes/mib-catalog/status'); }
-        catch (error) { break; }
+        catch (error) { return true; }
         const job = status.job;
-        if (!job || !['running', 'starting', 'queued'].includes(job.state)) break;
-      }
+        return (!job || !['running', 'starting', 'queued'].includes(job.state)) ? true : undefined;
+      });
       view.configAt = 0;
       if (current()) refresh().catch(() => {});
     };

@@ -147,7 +147,7 @@ def main() -> int:
     db_names = ("netpath", "flows", "syslog", "app", "ipam", "snmptraps",
                 "nodes", "alerts", "wireless", "configrx")
     service = Service(*[os.path.join(data_dir, name + ".db")
-                        for name in db_names])
+                        for name in db_names], initial_admin_password="admin")
     # The tag the gated stop records, so the ordering check can say which
     # save's restart ran without reaching into the executor.
     service.syslog._settings_tag = lambda: service.syslog_settings.get(

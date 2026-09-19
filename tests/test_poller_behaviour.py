@@ -15,7 +15,7 @@ from _paths import tmpdir
 
 from netpath import nodeoids
 from netpath.nodesdb import NodesDatabase
-from netpath.nodepoll import NodePoller, counter_rate, detect_reboot
+from netpath.nodepoll import NodePoller, counter_rate, detect_reboot, max_event_rate
 import netpath.nodepoll as nodepoll_mod
 from netpath.snmppoll import decode_response
 from netpath.trapdecode import (
@@ -60,6 +60,52 @@ def test_counter_rate_width_matters():
     check(rate_64 is None,
           "64-bit width on the same decreasing pair returns None (a reset, not a wrap) "
           f"(got {rate_64})")
+
+
+def test_counter_rate_caps_error_discard_reset_spikes():
+    """ifInErrors/ifOutErrors and their discard counterparts get no
+    speed_bps, so a genuine reset with no reboot and no discontinuity
+    marker used to read as a wrap: a mid-range 32-bit counter dropping to
+    near 0 over one ordinary poll interval computes a rate in the tens of
+    millions/sec, which max_rate must now refuse -- while a real,
+    plausible wrap (a small counter increase past the boundary) still
+    comes through."""
+    dt = 60.0
+    speed_bps = 1_000_000_000   # a plain 1G port
+    ceiling = max_event_rate(speed_bps)
+    check(0 < ceiling < 2_000_000,
+          f"a 1G port's packet-rate ceiling is a real, bounded number ({ceiling})")
+
+    # A reset (not a wrap): the counter was mid-range and dropped to near
+    # zero because the agent zeroed it, not because it counted all the
+    # way to 2**32. counter_rate's wrap arithmetic reads the gap back up
+    # to the modulus as real traffic -- tens of millions/sec on a
+    # one-minute poll.
+    reset_rate = counter_rate(3_000_000_000, 0.0, 500, dt, 32,
+                              max_rate=ceiling)
+    check(reset_rate is None,
+          f"a reset misread as a wrap is rejected by the packet-rate "
+          f"ceiling, not reported as a rate ({reset_rate})")
+
+    # A plausible wrap: a counter within the ceiling's own bound both
+    # before and after wrapping must still be accepted.
+    plausible_previous = 4_294_967_290
+    plausible_current = 1_000_000
+    plausible = ((2 ** 32) - plausible_previous + plausible_current) / dt
+    assert plausible < ceiling, "test setup: the plausible case must sit under the ceiling"
+    wrap_rate = counter_rate(plausible_previous, 0.0, plausible_current, dt, 32,
+                             max_rate=ceiling)
+    check(wrap_rate is not None and abs(wrap_rate - plausible) < 1e-6,
+          f"a wrap within the interface's own packet-rate ceiling is still "
+          f"accepted ({wrap_rate})")
+
+    # No speed known at all: still capped, at the conservative absolute ceiling.
+    no_speed_ceiling = max_event_rate(None)
+    no_speed_rate = counter_rate(3_000_000_000, 0.0, 500, dt, 32,
+                                 max_rate=no_speed_ceiling)
+    check(no_speed_rate is None,
+          f"the same reset is rejected with no interface speed known, "
+          f"against the absolute ceiling ({no_speed_rate})")
 
 
 # ------------------------------------------------------- in-process stub agent
@@ -609,7 +655,7 @@ def test_fortipoll_walk_terminates_on_stuck_oid():
     base_oid = "1.3.6.1.4.1.12356.101.14.1.1.2"
     calls = {"n": 0}
 
-    def fake_get_next(controller, config, oid, session):
+    def fake_get_next(controller, config, oid, session, verify_replies=True):
         calls["n"] += 1
         # First call advances into the table (one real row); every call
         # after that echoes the same row back, exactly the misbehaviour
@@ -1087,7 +1133,7 @@ def test_a_truncated_mac_table_never_reaches_storage():
         # Budget comes off mac_table_interval_s (1800s), not the 120s poll interval.
         fdb_deadlines = [deadline for oid, deadline in seen if oid == qbridge]
         budget = fdb_deadlines[0] if fdb_deadlines else None
-        remaining = (budget - time.time()) if budget else 0.0
+        remaining = (budget - time.monotonic()) if budget else 0.0
         check(remaining > 300,
               f"the FDB walk is given a budget off its own hourly cadence, not "
               f"half a two-minute poll interval ({remaining:.0f}s left)")
@@ -1439,11 +1485,10 @@ def test_wireless_ap_ping_uses_perf_counter():
     db = WirelessDatabase(os.path.join(tmpdir("wireless_review_pingclock_"), "wireless.db"))
     try:
         poller = WirelessPoller(db)
-        poller._ping_deadline = float("inf")   # so a frozen clock never "expires" it
         real_time = time.time
         time.time = lambda: 1000.0             # a true constant, not just offset
         try:
-            rtt = poller._ping_ap("127.0.0.1", "online")
+            rtt = poller._ping_ap("127.0.0.1", "online", float("inf"))
         finally:
             time.time = real_time
         check(rtt is not None and rtt > 0,
@@ -1653,6 +1698,72 @@ def test_deleting_a_device_drops_every_cache_keyed_on_it():
         db.close()
 
 
+def test_forget_devices_sweeps_every_per_device_container_mechanically():
+    """The hand-picked list above already caught five omissions once; a
+    sixth (_sw_walk_state) still got past it, because a hand-picked list
+    only knows about the caches someone remembered to add to it. This
+    scans NodePoller's own instance dict instead: every dict/set attribute
+    it finds is a per-device cache unless it is named below, so a future
+    cache that forgets to register with _forget_devices fails here without
+    anyone having to remember to update this test too."""
+    db = NodesDatabase(os.path.join(tmpdir("poller_review_forget3_"), "nodes.db"))
+    try:
+        poller = NodePoller(db)
+        sentinel = 999999
+
+        # Declared per-device but deliberately outside _forget_devices'
+        # sweep -- each already self-clears without it:
+        not_swept = {
+            "_queued", "_started",             # in-flight; a finally the
+                                                # instant the poll ends
+                                                # clears these, and drain()
+                                                # still needs _started
+            "_mac_running", "_lldp_running",   # in-flight walk flags, the
+            "_vlan_running", "_arp_running",   # same shape and reason
+            "_configs",                        # wholly replaced every
+                                                # generation -- its key set
+                                                # IS the "keep" argument
+            "_discovery_jobs",                 # keyed by discovery job
+                                                # id, not device id
+            "counters", "_autoscale",          # string-keyed, not per-device
+            "_walk_settings",
+        }
+
+        class _stub:
+            running = False
+
+        swept = []
+        for name, value in list(vars(poller).items()):
+            if name in not_swept or not isinstance(value, (dict, set)):
+                continue
+            swept.append(name)
+            if isinstance(value, set):
+                value.add(sentinel)
+            else:
+                # A tuple key so a dict keyed (device_id, extra) is
+                # exercised the same as one keyed by device_id alone --
+                # _forget_devices' own tuple-keyed loop reads key[0].
+                value[(sentinel, "x")] = _stub()
+
+        check(len(swept) >= 20,
+              f"the scan actually found NodePoller's per-device caches ({len(swept)})")
+
+        poller._forget_devices(set())
+
+        leaked = []
+        for name in swept:
+            value = getattr(poller, name)
+            for key in value:
+                owner = key[0] if isinstance(key, tuple) else key
+                if owner == sentinel:
+                    leaked.append(name)
+                    break
+        check(not leaked,
+              f"_forget_devices sweeps every per-device dict/set ({leaked})")
+    finally:
+        db.close()
+
+
 # ------------------------------------------- a secret in an error message
 
 def test_a_refused_community_is_not_printed():
@@ -1690,6 +1801,7 @@ def test_a_refused_community_is_not_printed():
 
 def main():
     test_counter_rate_width_matters()
+    test_counter_rate_caps_error_discard_reset_spikes()
     test_format_ticks_divides_by_a_hundred()
     test_reboot_note_is_human_units()
     test_reboot_uptimes_refuses_the_legacy_sentence()
@@ -1718,6 +1830,7 @@ def main():
     test_configrx_loop_survives_a_database_error()
     test_only_an_unencodable_oid_is_reported_as_an_oid_fault()
     test_deleting_a_device_drops_every_cache_keyed_on_it()
+    test_forget_devices_sweeps_every_per_device_container_mechanically()
     test_a_refused_community_is_not_printed()
 
     if FAILURES:

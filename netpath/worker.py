@@ -111,8 +111,8 @@ class Worker:
 
     def drain(self, timeout_s: float = 3.0) -> bool:
         """Wait for self.inflight() to empty. True if it did."""
-        deadline = time.time() + timeout_s
-        while time.time() < deadline:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
             if not self.inflight():
                 return True
             time.sleep(0.05)

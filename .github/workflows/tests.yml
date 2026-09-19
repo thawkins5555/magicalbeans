@@ -75,6 +75,9 @@ jobs:
       APP_PORT: "8443"
       CONTROL_PORT: "8099"
       FLEET_COUNT: "50"
+      # 5.48.0: a fresh install seeds admin with a random password instead
+      # of admin/admin, so CI supplies its own known value on first start.
+      NETPATH_INITIAL_ADMIN_PASSWORD: "netpath-ci-first-run-only"
 
     steps:
       - uses: actions/checkout@v4
@@ -132,7 +135,8 @@ jobs:
         if: hashFiles('tests/ui/pristine_login.mjs') != ''
         run: |
           # Must run before seeding, which clears must_change; this step only observes.
-          node tests/ui/pristine_login.mjs --base "http://127.0.0.1:$APP_PORT"
+          node tests/ui/pristine_login.mjs --base "http://127.0.0.1:$APP_PORT" \
+              --password "$NETPATH_INITIAL_ADMIN_PASSWORD"
 
       - name: Seed devices, profiles and targets
         run: |

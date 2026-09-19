@@ -56,7 +56,7 @@ DB_NAMES = ("netpath", "flows", "syslog", "app", "ipam", "snmptraps", "nodes",
 DATA_DIR = os.path.join(TMPDIR, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
-SERVICE = Service(*[os.path.join(DATA_DIR, name + ".db") for name in DB_NAMES])
+SERVICE = Service(*[os.path.join(DATA_DIR, name + ".db") for name in DB_NAMES], initial_admin_password="admin")
 PORT = _paths.free_tcp_port()
 SERVER = WebServer(SERVICE, host="127.0.0.1", port=PORT)
 if not SERVER.start(block=False):
@@ -789,6 +789,20 @@ def main() -> int:
     chunked.close()
     check("D6 a chunked body is 411, not an empty body", response.status == 411,
           str(response.status))
+
+    # NaN/Infinity: a Python json.dumps extension, not valid JSON -- a body
+    # that carries one must be refused rather than handed to a route as a
+    # float; non-finite numbers are refused.
+    nan_group_id = SERVICE.nodes_db.ensure_default_group()
+    nan_device_id = SERVICE.nodes_db.add_device("10.20.30.99", name="nan-probe",
+                                                 group_id=nan_group_id)
+    for literal in ("NaN", "Infinity", "-Infinity"):
+        status, _h, payload = req(
+            "POST", "/api/alerts/mute",
+            raw=(f'{{"entity_id": "{nan_device_id}", "hours": {literal}}}').encode(),
+            cookie=admin_cookie)
+        check(f"D6 a JSON body containing {literal} is refused as 400, not 500",
+              status == 400, f"{status} {payload}")
 
     check("D6 the general body cap is 16 MiB",
           SERVER.httpd.RequestHandlerClass.MAX_BODY_BYTES == 16 * 1024 * 1024)

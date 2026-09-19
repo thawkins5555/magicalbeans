@@ -1074,7 +1074,7 @@ class NodePoller(Worker, DiscoveryMixin, PollMixin, VendorIdentifyMixin, Environ
                       self._stack_power_read, self._stack_power_capable,
                       self._sensor_diag_ts, self._snmp_backoff,
                       self._snmp_failing_count, self._get_batch,
-                      self._poll_cost):
+                      self._poll_cost, self._sw_walk_state):
             for device_id in [k for k in list(cache) if k not in keep]:
                 cache.pop(device_id, None)
         # Tuple-keyed, so not in the loop above.

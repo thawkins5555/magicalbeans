@@ -2460,6 +2460,32 @@ harness depends on, since `demo/bin/ping` is a PATH stand-in that makes a
 simulated `127.0.0.x` device look down and any real ICMP path would bypass
 PATH and get the kernel's own loopback reply.
 
+### The `ping.exe` fallback needs a genuine reply, not just exit code 0: `_genuine_reply` (`ipam_scan.py`, `tracer.py`) — 5.48.0
+
+Two faults in the subprocess fallback both call sites (`ipam_scan.ping_once`/
+`ping_many`, and `tracer.ping`/`_run`) share, since both eventually shell
+out to the same `ping.exe`/`ping` binary when the socket/`IcmpSendEcho`
+paths are unavailable:
+
+- **Exit code 0 is not proof of a reply.** Windows's `ping.exe` returns 0
+  for "Destination host unreachable" — an intermediate router's ICMP
+  error, not an answer from the target — so a probe reading exit code
+  alone could call a genuinely down IPv4 host "up". `_genuine_reply`
+  (`ipam_scan.py`) additionally requires a `TTL=` field in the output for
+  an IPv4 destination, via `tracer._WIN_PING_REPLY` — a regex on the one
+  field label `ping.exe` never localises, unlike `time=` (which becomes,
+  for example, `temps=` on a French install). IPv6 `ping.exe` output
+  carries no TTL field at all, so IPv6 keeps the plain exit-code check —
+  an IPv6 "unreachable" reply is not currently distinguished from a real
+  one, a known gap rather than an oversight.
+- **Undecodable bytes must not raise.** `subprocess.run(..., text=True)`
+  with no `errors=` raises `UnicodeDecodeError` on a byte the process's
+  output encoding can't decode — something a localised Windows server's
+  OEM code page can produce in `ping`'s own output. Both call sites now
+  pass `errors="replace"` so a byte like that becomes a replacement
+  character instead of an exception, and a reply carrying one still counts
+  as a genuine reply rather than crashing the calling poll.
+
 ### What the server measures about itself (`server.py`, `sqlitebase.py`) — 5.5.0
 
 Two numbers the application computed and then discarded.
@@ -3063,6 +3089,18 @@ only if that lands inside the ceiling. The quirk is real and per-linecard:
 an agent answering `ifHighSpeed = 10,000,000` for a 10 Gb/s port produced
 1e13, which `App.rate` correctly rendered as "10.0 Tbps", and drove that
 port's utilisation — `100 * in_bps * 8 / speed_bps` — to near zero.
+
+**`max_event_rate(speed_bps)` — 5.48.0.** `ifInErrors`/`ifOutErrors` (and
+any other events/sec, non-octet counter) had no plausibility ceiling of
+their own and inherited none from the octet-counter check above, so a
+32-bit error/discard counter resetting (a linecard reload, a counter
+overflow bug) read as a single-sample burst of however many events the
+32-bit range spans. `max_event_rate` gives `counter_rate` a ceiling for
+these counters specifically: the interface's own packet rate at the
+minimum Ethernet frame size (`speed_bps / (84 * 8)`), or
+`_MAX_EVENT_RATE_NO_SPEED` (2,000,000 events/s) when no speed is known at
+all — far above any real error/discard rate and far below what a 32-bit
+reset misread as a wrap works out to at ordinary poll intervals.
 
 Two readings trip those rules legitimately, and each is exempted by
 something checkable rather than by loosening the rule:
@@ -4245,6 +4283,21 @@ metrics and no error at all. `_get_batch` joins the per-device caches
 `_access_denied`, `_downgraded` and `_method_seeded`, and pops finished
 discovery jobs (a finished sweep otherwise kept its settings dict, an `_owners`
 entry per address swept and a dead `Thread` for the life of the process).
+
+**Walk budgets moved off the wall clock — 5.48.0.** Every walk-budget
+deadline in `identify_mixin.py` (`_table_walk_deadline`, the interface
+budget in the LLDP/CDP walk, and the inline check inside
+`_walk_column_detail`), the VLAN-context budgets in
+`vendor_sensor_psu_mixin.py`'s Cisco per-VLAN walks and `vlan_mixin.py`,
+and `Worker.drain()` (`worker.py`) — the shared "wait for in-flight work to
+finish" call every worker's stop path uses — now compute their deadline
+from `time.monotonic()` rather than `time.time()`. An NTP correction, a
+daylight-saving change or a suspended VM resuming used to strand these:
+a backward step past the deadline made the check pass immediately (budget
+looks already spent) or a forward step could leave the loop waiting far
+longer than intended, depending on which way the wall clock moved.
+`time.monotonic()` only ever advances, so the budget always covers exactly
+the real time it was meant to.
 
 ### ARP cache walk (`nodeoids.py`, `nodepoll/arp_mixin.py`, `nodesdb.py`, `nodes.js`) — 5.7.0
 
@@ -5526,6 +5579,15 @@ an index in SQLite. They answered nothing the table's own index did not,
 and cost a B-tree write per row on every VLAN walk. They are gone from
 `SCHEMA` and dropped in `_migrate`; the lookups they were added for read
 exactly as they did.
+
+**A fourth, `ix_interfaces_device`, dropped the same way — 5.48.0.** Same
+reasoning, one table over: `interfaces` already carries `UNIQUE(device_id,
+if_index)`, which SQLite backs with its own index and which leads with
+`device_id` the same way a leading-column PRIMARY KEY does, so the
+standalone index on `device_id` alone answered nothing the unique index
+didn't already cover. Dropped alongside the other three in the same
+`_migrate` loop; it was never part of `SCHEMA`, so nothing recreates it on
+a fresh install either.
 
 **Four bounded accessors** replace the reads the route still made outside
 its own device list — `metrics_for_devices(ids, keys)` (the badge values;
@@ -7531,6 +7593,43 @@ ticks: 210 metric rows read instead of 10,500. Deleted-device clean-up and
 stale-sample handling, which need to see every device regardless of
 activity, run on the 60-second full pass rather than on a dirty-only tick.
 
+### Each tick stage runs under its own guard: `_stage`, `_dirty_carry`, the system-occurrence snapshot/commit (`alertengine.py`) — 5.48.0
+
+**`_stage(name, fn, *args)`** wraps every drain and evaluator call in
+`_tick()` — `drain_device_events`, `drain_traps`, `evaluate_thresholds`,
+`drain_pending` and the rest — in its own `try/except`. A stage that raises
+is counted (`counters["stage_errors"]`), logged once (not once per tick,
+via `_stage_errors` remembering the last message seen for that stage) and
+made to log again once the same message recurs after a change, and
+contributes no occurrences for that tick; every other stage still runs.
+Recovery is logged too, once, the moment a previously-failing stage
+succeeds again. `db.rules()`/`active_windows()`/`quiet_device_ids()`/
+`muted_entity_ids()` are deliberately outside this guard — those feed the
+match/mute step every occurrence gathered so far is about to go through,
+and a silent empty-list fallback there would misfire or drop alerts rather
+than simply retrying next tick.
+
+**`_dirty_carry`** stops a threshold-evaluation failure from losing track of
+which devices needed re-checking. `take_dirty_devices()` on both
+`nodesdb`/`alertsdb` is destructive — it swaps the tracked set for an empty
+one — so `_evaluate_thresholds` unions in `_dirty_carry` before draining,
+clears it, and if `_scan_thresholds` then raises, puts the drained set back
+into `_dirty_carry` before re-raising. The next tick's dirty pass picks
+those devices back up instead of waiting out `_THRESHOLD_FULL_PASS_S` (60 s)
+for the next full pass to notice a real breach.
+
+**System occurrences/clears** (`system_occurrence`/`clear_system_occurrence`,
+used for engine-internal conditions like SMTP/SMS delivery failing) have no
+persisted cursor to fall back on, so they can't simply be re-read after a
+failed tick the way a database-backed source can. `_drain_system_occurrences`
+snapshots the pending lists without removing them and records the snapshot
+in `_system_pending_inflight`/`_system_clears_inflight`; `_commit_system_drain`,
+called only after every occurrence gathered that tick has been applied (or
+deliberately skipped) and `_flush_cursors` has run, is what actually drops
+that snapshot. A tick that fails before reaching that point leaves the
+snapshot in place, so the next tick's drain hands out the same items again
+rather than losing them.
+
 ### Per-device threshold overrides, and a cross-match bug (`alertsdb.py`, `alertengine.py`, `alertrules.py`) — 4.54.0
 
 `alertsdb.device_thresholds` is one table for every threshold-kind rule
@@ -8923,6 +9022,19 @@ regardless of whether email is enabled or currently rate-limited;
 "evaluate rules" and "send email" are deliberately independent so a
 misconfigured or over-quota mail server never blinds the Alerts page
 itself.
+
+### Header sanitising: `clean_header` (`alertmail.py`) — 5.48.0
+
+Every header value that carries operator-typed text through to an email —
+the subject, and the `smtp_from_name` display name — is passed through
+`clean_header()` first, which collapses any control character (CR, LF and
+the rest of `\x00`–`\x1f`, `\x7f`) to a single space. A device name, alert
+rule name or group name with an embedded CR/LF used to reach
+`EmailMessage` unescaped; `EmailMessage` raises on that rather than folding
+it, which reached `MailQueue`'s circuit breaker (`_mail_breaker` above) and
+opened the `smtp_failing` system alert for every alert email, not just the
+one with the offending name, until the queue was fixed or a service
+restart cleared it.
 
 ### Text messages (Twilio) (`alertmail.py`, `alertsdb.py`, `alertengine.py`) — 5.19.0
 
@@ -10479,6 +10591,23 @@ acknowledged inform's own varbind-list bytes back verbatim — via
 while parsing — rather than re-encoding the varbinds from their decoded
 Python values, so nothing can be lost in a round trip through the decoder.
 
+### Ku is cached separately from the localized key: `_password_to_key`, `_KU_CACHE` (`trapdecode.py`) — 5.48.0
+
+The localized-key cache above (`_KEY_CACHE`, keyed on `(protocol,
+password, engine_id)`) bounds itself at `_KEY_CACHE_MAX` (256) entries — but
+a fleet's distinct SNMPv3 engine ids run into the thousands while its
+distinct credentials stay in the tens, so that cache's own turnover was
+evicting entries constantly, and every eviction meant redoing the
+expensive part — 1 MiB of repeated-password hashing per RFC 3414 A.2 — on
+the next poll of every device sharing that credential. `_password_to_key`
+now caches just that step, keyed on `(protocol, password)` alone, in its
+own bounded `_KU_CACHE` (also 256 entries, in practice never full since
+credentials vastly outnumber the cache size); `localized_key()` calls it
+before the cheap engine-specific localisation step. Same derivation, same
+output — the resulting keys are byte-identical to the unsplit version,
+checked against the RFC 3414 A.2.1/A.2.2 reference vectors — just without
+redoing the 1 MiB hash on every engine-id eviction.
+
 ### Listener (`snmptrapd.py`)
 
 Same `udpsock.UdpReceiver` base as NetFlow's and Syslog's collectors
@@ -11434,8 +11563,37 @@ password change (`put_account_password` in `web/api/auth.py`): a wrong
 check and back-off delay run before the hashing slot is taken, exactly as
 they do for a sign-in attempt.
 
-### TACACS+ AAA sign-in (`tacacsclient.py`, `web/service.py`,
-`web/api/auth.py`) — 5.22.0
+### First-run administrator seeding, and the session sweep (`web/service.py`, `auth.py`, `console.py`, `__main__.py`) — 5.48.0
+
+**No more `admin`/`admin`.** `Service._ensure_default_user` runs once at
+startup and returns immediately if `app_db.user_count()` is non-zero — an
+upgraded database with existing accounts (including a leftover seeded
+`admin` from before this change) is never touched. On a genuinely empty
+database it calls `auth.generate_initial_password()` (four dash-joined
+5-character groups drawn from `_INITIAL_PASSWORD_ALPHABET`, which excludes
+`0/O`, `1/l/I` and other look-alikes so the banner can be typed back
+correctly), or uses the caller-supplied `initial_admin_password` instead —
+threaded through from `__main__.py`'s `--initial-admin-password` flag or
+the `NETPATH_INITIAL_ADMIN_PASSWORD` environment variable, popped from
+`os.environ` in `build_service` so it never reaches a child process this
+one spawns. The password is hashed and stored, granted every module at
+`WRITE` (there is no one else yet to scope it down), and shown exactly
+once: printed to stdout, written as one `SYSTEM` event-log line, and held
+in `self._initial_admin_notice` for `take_initial_admin_notice()` to hand
+out once — `run_console` (no visible stdout under `pythonw.exe`) calls this
+from `MainWindow._show_initial_admin_notice`, which shows it in a
+`QMessageBox` with selectable text and puts the notice back if the dialog
+itself fails, so a display glitch can't cost the only copy of the
+password. The plaintext is never written anywhere else — not settings, not
+a later log line.
+
+**`SessionStore._sweep_expired`** is called from both `create()` and
+`active()`, examining a bounded number of sessions per call (cycling
+unexpired ones to the back of an `OrderedDict` rather than scanning the
+whole table) and dropping any past its idle timeout or absolute lifetime.
+This is what keeps the active-sessions list (Settings → who's signed in)
+from listing a session nobody has touched in hours, and keeps memory
+bounded on a server that is never restarted.
 
 **`tacacsclient.py`** is a minimal RFC 8907 client, stdlib-only, modelled
 on `ldapclient.py`'s own shape: an error hierarchy
@@ -12689,6 +12847,29 @@ failure. `tests/test_cached_poll_singleflight.py` pins this by racing
 twenty threads through a cold key and counting how many times `compute()`
 actually ran.
 
+### Expired API tokens are audited hourly, not per request: `_announce_expired_token` (`web/service.py`) — 5.48.0
+
+`authenticate_api_token` already refused a request bearing an expired
+token; the gap was the audit trail filling up when an unattended script
+kept calling with one anyway. `_announce_expired_token(token_id)` tracks,
+per token id, the last time that token's expiry was written to the audit
+log (`_expired_token_audited`, guarded by its own lock) and returns `True`
+only once `EXPIRED_TOKEN_AUDIT_WINDOW_S` (3,600 s) has passed since the
+last one — the same once-an-hour reasoning `LoginThrottle.announce_lockout`
+already uses for a locked-out address. The 401 itself is unaffected; only
+the audit row is throttled.
+
+### Non-finite JSON numbers are refused: `_reject_json_constant` (`web/server.py`)
+
+`json.loads`'s `parse_constant` hook, left at its default, silently accepts
+`NaN`/`Infinity`/`-Infinity` as numbers — a Python extension to JSON that
+the standard does not define — and hands one to a route handler that never
+expected anything but a finite number. `_reject_json_constant` raises a
+plain `ValueError` instead, which reaches the request body parser through
+the same path a malformed body already takes, so the request is answered
+400 rather than reaching a handler with a value it has no way to validate
+against.
+
 ### Backup deletion and in-flight state (`configrxdb.py`, `configrx.py`)
 
 `delete_backup` / `delete_backups` sit beside `prune`, which was previously
@@ -13619,6 +13800,18 @@ unconfigured tile's device field stays blank on purpose, and
 Full keyboard support (arrows, Enter, Escape, Tab-to-close) and ARIA
 (`role="combobox"`/`"listbox"`, `aria-activedescendant`) come with it,
 which the plain `<input list>` never had consistently across browsers.
+
+### A `device_metric` tile fetches one metric, not the device's whole list (`web/api/nodes.py`, `web/static/dashboard.js`) — 5.48.0
+
+`get_nodes_device_metrics` (`GET /api/nodes/devices/<id>/metrics`) now
+takes an optional `key` query param: given one, it looks the single metric
+up directly (`NodesDatabase.metric_by_key`, the same indexed
+`(device_id, key)` lookup the dashboard batch-series route already uses)
+instead of returning every metric the device has and letting the caller
+find the one it wanted. The `device_metric` tile's `fetch()` in
+`dashboard.js` passes `{ key: cfg.metric_key }` rather than no params at
+all — a tile showing one interface counter on a device with fifty no
+longer pulls the other forty-nine over the wire just to discard them.
 
 ### Tab bar: flat groups, icon collapse, the overflow fade (`index.html`, `app.css`, `app.js`) — 4.49.0
 
@@ -14784,6 +14977,26 @@ raises the tab that is already open; `noopener` cannot be in the feature
 string for that reason, so `opener` is cleared on the handle instead. A
 refused POST closes the window it claimed.
 
+### Destination validation shared by the SSH terminal and the WEB relay: `_unsafe_destination` (`sshterm.py`, `webrelay.py`) — 5.48.0
+
+`_unsafe_destination(host)` lives in `sshterm.py` and is imported into
+`webrelay.py` (`from .sshterm import _unsafe_destination`) so both dialling
+paths refuse the same set of addresses the same way, rather than keeping
+two lists to fall out of sync. It parses `host` as an IP literal — a bare
+hostname is refused outright ("not a literal IP address"), since neither
+path resolves a name before dialling — then checks, in order: unspecified
+(`0.0.0.0`/`::`), link-local, multicast, and the IPv4 broadcast address
+(`255.255.255.255`). Before any of those checks it unwraps an IPv4-mapped
+IPv6 form (`::ffff:169.254.1.1` and the like) back to its IPv4 address
+first, because `ipaddress`'s own `is_unspecified`/`is_link_local` do not
+see through that mapping on every Python build. Loopback is deliberately
+exempt — the demo fleet and the test suites reach devices at `127.0.0.x`,
+and a device legitimately proxying back to itself is a real case. `sshterm.py`'s
+`_connect()` calls it on `self.host` before opening the paramiko session;
+`webrelay.py`'s `_open()` calls it on `target_ip` before opening the tunnel;
+either returns a reason string the caller reports back and refuses to
+proceed on `None`.
+
 ### Vendored frontend libraries (`static/vendor/`)
 
 The CSP is `default-src 'self'` and these installs routinely have no route
@@ -14807,6 +15020,20 @@ them was needed rather than optional. Updating one means
 dropping in the new release's bundle and editing the version in the README.
 xterm injects its own `<style>` at runtime, which the CSP's `style-src
 'self' 'unsafe-inline'` already allowed.
+
+### Re-identify and MIB-install progress polling pauses when the tab is hidden: `pollVisibleSeconds` (`nodes.js`) — 5.48.0
+
+The re-identify job poll (up to 90 elapsed seconds) and the MIB-catalog
+install poll (up to 120) used to be a plain `for` loop: one `/api/…`
+request a second regardless of whether the browser tab was in front of
+anyone, for as long as the loop ran. `pollVisibleSeconds(seconds, current,
+check)` replaces both loops: it still sleeps once a second so it notices
+promptly when the tab comes back, but skips the request and does not count
+the second against the budget while `document.hidden` is true. `check()`
+returns `undefined` to keep polling or anything else to stop — `true` on
+job-done/failed/error, matching what the old `break` did — and `current()`
+still gates the whole thing exactly as before, so a closed dialog stops
+polling immediately either way.
 
 ### Opening the window, and Remove's new home (`nodes.js`)
 

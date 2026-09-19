@@ -351,6 +351,31 @@ _KEY_CACHE_MAX = 256
 _KEY_CACHE: collections.OrderedDict = collections.OrderedDict()
 _KEY_CACHE_LOCK = threading.Lock()
 
+# Ku (RFC 3414 A.2), cached per (protocol, password): a fleet's distinct
+# engine ids evict _KEY_CACHE far more often than its credentials change.
+_KU_CACHE_MAX = 256
+_KU_CACHE: collections.OrderedDict = collections.OrderedDict()
+_KU_CACHE_LOCK = threading.Lock()
+
+
+def _password_to_key(proto: str, ctor, password: str) -> bytes:
+    """RFC 3414 A.2.1/A.2.2 Ku for one (protocol, password) -- see
+    localized_key, which localises this to an engine."""
+    key = (proto, password)
+    with _KU_CACHE_LOCK:
+        cached = _KU_CACHE.get(key)
+        if cached is not None:
+            _KU_CACHE.move_to_end(key)
+            return cached
+    raw = password.encode("utf-8")
+    repeated = raw * (1048576 // len(raw) + 1)
+    ku = ctor(repeated[:1048576]).digest()
+    with _KU_CACHE_LOCK:
+        _KU_CACHE[key] = ku
+        while len(_KU_CACHE) > _KU_CACHE_MAX:
+            _KU_CACHE.popitem(last=False)
+    return ku
+
 
 def localized_key(proto: str, password: str, engine_id: bytes) -> bytes | None:
     """RFC 3414 A.2.1/A.2.2 password-to-key, then localisation to one engine.
@@ -359,7 +384,7 @@ def localized_key(proto: str, password: str, engine_id: bytes) -> bytes | None:
     derivation the trap verifier does and the 1 MiB hash is expensive
     enough that two caches would be two costs. Keyed on (protocol,
     password, engine), so a password change or a re-keyed agent simply
-    misses.
+    misses -- Ku itself is cached separately, see _password_to_key.
     """
     entry = AUTH_PROTOCOLS.get(proto)
     if entry is None or not password:
@@ -371,9 +396,7 @@ def localized_key(proto: str, password: str, engine_id: bytes) -> bytes | None:
         if cached is not None:
             _KEY_CACHE.move_to_end(key)
             return cached
-    raw = password.encode("utf-8")
-    repeated = raw * (1048576 // len(raw) + 1)
-    ku = ctor(repeated[:1048576]).digest()
+    ku = _password_to_key(proto, ctor, password)
     localized = ctor(ku + engine_id + ku).digest()
     # Two threads missing on the same key both hash and both store the
     # same bytes; that is one wasted hash, not a wrong key.

@@ -138,10 +138,24 @@ The console is not the interface — it shows whether the server is up, who is
 connected, and the RAM and CPU the service process is using, and lets you
 change the port, restart, or open a browser. Closing it stops the service.
 
-Signing in is required. A fresh install starts with **admin / admin** — the
-sign-in page says so until someone has signed in — and insists on a new
-password. Accounts are managed on the Settings tab and are local by
-default; from 4.47.0 an account can instead be bound to an LDAP directory
+Signing in is required. A fresh install has no accounts at all: on first
+start the server creates one **admin** account with a random password —
+four dash-separated groups of unambiguous characters — prints it once in a
+console banner, writes one event-log line, and insists on a new password
+before anything else. Only a hash of that password is ever stored, so once
+someone has signed in and changed it the banner (wherever it was captured —
+a service manager's log, a terminal scrollback) is worthless. The desktop
+console shows the same one-time password in an information dialog as well,
+for a headless-looking window with no visible console output. For a
+scripted install, `--initial-admin-password` (or the
+`NETPATH_INITIAL_ADMIN_PASSWORD` environment variable) sets a known
+password instead of a random one — honoured only while no accounts exist
+yet, and never left sitting in the process environment afterwards.
+Upgrading an existing database is unaffected: its accounts and passwords
+carry over untouched, including a never-used seeded `admin` account from
+before this change if one is still sitting there — change it. Accounts are
+managed on the Settings tab and are local by default; from 4.47.0 an
+account can instead be bound to an LDAP directory
 (**auth_source: ldap**), verified against the directory on every sign-in
 rather than a locally stored hash, and from 5.22.0 to a TACACS+ AAA
 server instead (**auth_source: tacacs**) the same way — see

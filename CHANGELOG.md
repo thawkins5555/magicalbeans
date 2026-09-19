@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.48.0 — First-run administrator password; low-severity fixes](#5480--first-run-administrator-password-low-severity-fixes)
 - [5.47.0 — Review fixes: security, correctness, history maintenance](#5470--review-fixes-security-correctness-history-maintenance)
 - [5.46.0 — Performance](#5460--performance)
 - [5.45.0 — Front-end tidy-up](#5450--front-end-tidy-up)
@@ -180,6 +181,102 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.48.0 — First-run administrator password; low-severity fixes
+
+**Operator-visible**
+
+1. **A fresh install no longer has an `admin` / `admin` account.** On first
+   start with no accounts at all, the server creates one **admin** account
+   with a random password — four dash-separated groups of unambiguous
+   characters — prints it once in a console banner, writes one event-log
+   line, and requires it to be changed at first sign-in. Only a hash of the
+   password is ever stored, so the banner (wherever it ends up captured —
+   journald, an NSSM stdout log, a terminal) is worthless once someone has
+   signed in and changed it. The desktop console shows the same one-time
+   password once as well, in an information dialog with selectable text —
+   this dialog could not be exercised on the build machine (no PySide6
+   there) and is worth one manual check before relying on it. For an
+   unattended install, `--initial-admin-password <value>` or the
+   `NETPATH_INITIAL_ADMIN_PASSWORD` environment variable sets a known
+   password instead of a random one; either is honoured only while no
+   accounts exist yet, and the environment variable is removed from the
+   process's own environment once read. **Upgrade note:** an existing
+   database is untouched by this change — an upgraded install keeps its
+   accounts and passwords exactly as they were, including a never-used
+   seeded `admin` account if one is still sitting there from before (change
+   it). The sign-in page's hint has been reworded to match.
+2. **The WEB relay and SSH terminal now refuse to connect to a destination
+   that isn't a usable, specific device address**: unspecified (`0.0.0.0` /
+   `::`), link-local, multicast, broadcast, or an IPv4-mapped IPv6 form of
+   any of those, and a relay target that isn't an IP literal at all.
+   Loopback is still allowed, for a device that legitimately proxies back
+   to itself.
+3. **Requests carrying a non-finite JSON number** (`NaN`, `Infinity`) are
+   answered with 400 instead of being processed.
+
+**Correctness / robustness** (no operator action needed)
+
+4. Expired web sessions are now swept out of memory instead of lingering
+   until something else touched them, and no longer appear in the active
+   session list.
+5. One alert-engine stage failing (thresholds, maintenance, notifications,
+   and so on) no longer stops every other stage for that tick. Each stage
+   is now guarded on its own; a stage that keeps failing is re-logged once
+   an hour rather than once a tick, and system alert transitions and
+   pending threshold work are preserved for the next tick rather than
+   dropped.
+6. An expired API token is now audited once per hour of continued use
+   rather than on every single request that presents it.
+7. Control characters in a device name, an alert rule name, or the "From"
+   display name can no longer make the mail library refuse to build the
+   message — a failure that used to trip the mail circuit-breaker and
+   silence alert email generally.
+8. Per-device caches are now fully cleared when a device is deleted; a
+   mechanical test now checks every cache is covered, not just the ones
+   remembered by hand. Deleted wireless controllers and trace targets are
+   also forgotten properly.
+9. Wireless per-poll values are no longer shared between two controllers
+   that happen to be polled at the same time.
+10. A 32-bit error/discard counter resetting no longer reads as a one-sample
+    traffic spike: the plausibility ceiling for these counters is now
+    `min(interface speed / 672, 2,000,000)` events per second.
+11. SNMP walk budgets, and the shared drain that services them, now use the
+    monotonic clock rather than wall-clock time, so a clock step no longer
+    throws off how long a walk is allowed to run.
+12. SNMPv3 key derivation now caches the expensive password-to-key step per
+    credential rather than recomputing it on every poll; the derived keys
+    are byte-identical to before (checked against the RFC 3414 reference
+    vectors).
+13. The `ping.exe` fallback path now requires a genuine `TTL=` reply before
+    counting a probe as a success for IPv4 — Windows's `ping.exe` exits 0
+    even for "Destination host unreachable" from an intermediate router.
+    IPv6 replies carry no TTL field, so IPv6 keeps the plain exit-code
+    rule.
+14. Child-process output (ping, traceroute, and similar) is now decoded
+    tolerantly on a localised Windows install instead of raising on
+    unexpected bytes.
+15. A dashboard single-metric tile now fetches just that one metric
+    (`?key=`) instead of the device's whole metric list.
+16. The Nodes page's re-identify and MIB-install progress polling now
+    pauses while the browser tab is hidden, resuming promptly when it's
+    shown again.
+17. The redundant `ix_interfaces_device` index is dropped on upgrade — the
+    table's existing unique index already serves the same queries.
+
+**Tests.** Three new suites: `test_first_run_password.py`,
+`test_nodepoll_monotonic_budget.py` and `test_ping_subprocess_fallback.py`.
+Browser walk: 94/94, no console errors, page errors or failed requests for
+either an admin or a viewer account. Full suite: 205 of 206 suites passed, 2
+skipped — the one failure, `test_ipam_dhcp_search`, is a known
+timing-sensitive suite that passes when run on its own.
+The code review's findings were fixed after that run and the suites covering them re-run individually, all passing: test_web_security, test_ssh_terminal, test_web_relay, test_alert_engine, test_first_run_password, test_ping_subprocess_fallback, test_frontend_contracts, test_alertmail_severity_subject, test_upgrade_from_previous, test_api_tokens. The review caught, before release, that the stricter ping.exe reply check would have read every IPv6 device as down on Windows (IPv6 replies carry no TTL field); the check now applies to IPv4 only.
+
+**Not in this release.** Self-update package verification remains deferred
+by the operator. GETBULK interface polling, spanning-tree walk cadence,
+down-port sample storage, and the low-risk poll/API performance set are
+planned follow-up releases. Debug-page colours for the five unstyled event
+categories are awaiting an operator decision.
 
 ### 5.47.0 — Review fixes: security, correctness, history maintenance
 

@@ -8,7 +8,7 @@ from ..eventlog import ERROR, NODES
 from ..ipam_scan import ping_many
 from ..nodesdb import NodesDatabase
 from ..snmppoll import PDU_GET, Response, SnmpAccessDenied, SnmpDowngrade, SnmpError, SnmpTimeout, SnmpUnsupported, build_request
-from ._decode import _DEVICE_MAX_KEYS, _INTERFACE_METRICS, _inet_address_text, _int_keyed, _interface_reassigned, counter_rate, detect_reboot
+from ._decode import _DEVICE_MAX_KEYS, _INTERFACE_METRICS, _inet_address_text, _int_keyed, _interface_reassigned, counter_rate, detect_reboot, max_event_rate
 from ._session import Credential, SnmpBadOid, _AuthFailure, _CREDENTIAL_VERDICTS, _Session, _assemble, _credential_contradicted, _error_specificity, access_denied_reason, credential_for, security_level, snmp_version_of, v3_exchange
 
 
@@ -573,19 +573,23 @@ class PollMixin:
                         sample_ts, out_bits, speed_bps=row.get("speed_bps"))
                     # ifInErrors/ifOutErrors and ifInDiscards/ifOutDiscards
                     # are 32-bit counters; the rate is events per second
-                    # between polls.
+                    # between polls. Capped at the interface's own packet
+                    # rate the same way the octet counters above are
+                    # capped at its bit rate, or a 32-bit reset with no
+                    # reboot/discontinuity marker reads as a wrap.
+                    max_events = max_event_rate(row.get("speed_bps"))
                     in_err_rate = counter_rate(
                         prior["last_in_errors"], since, row.get("in_errors"),
-                        sample_ts, 32)
+                        sample_ts, 32, max_rate=max_events)
                     out_err_rate = counter_rate(
                         prior["last_out_errors"], since, row.get("out_errors"),
-                        sample_ts, 32)
+                        sample_ts, 32, max_rate=max_events)
                     in_disc_rate = counter_rate(
                         prior["last_in_discards"], since, row.get("in_discards"),
-                        sample_ts, 32)
+                        sample_ts, 32, max_rate=max_events)
                     out_disc_rate = counter_rate(
                         prior["last_out_discards"], since, row.get("out_discards"),
-                        sample_ts, 32)
+                        sample_ts, 32, max_rate=max_events)
                 speed_bps = row.get("speed_bps")
                 # counter_rate already refuses any rate implying more than
                 # 1.3x speed_bps (treating that as a reset rather than a

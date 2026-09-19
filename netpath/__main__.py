@@ -72,6 +72,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="path to the ConfigRX SQLite file (defaults next to --db)")
     parser.add_argument("--add", action="append", default=[], metavar="HOST",
                         help="add a destination on startup (repeatable)")
+    parser.add_argument("--initial-admin-password", default=None,
+                        help="admin password to seed a fresh install with, "
+                             "instead of a random one (also read from "
+                             "NETPATH_INITIAL_ADMIN_PASSWORD; only used when "
+                             "no accounts exist yet — for scripted installs)")
 
     web = parser.add_argument_group("web server")
     web.add_argument("--headless", "--web", dest="headless", action="store_true",
@@ -137,11 +142,20 @@ def build_service(args):
     """Open the databases, seed any destinations, and start the collectors."""
     from .web import Service
 
+    # The CLI flag wins over the environment variable, matching --host/--port
+    # above; both are honoured only on a fresh install with no accounts yet.
+    # Popped, not just read: every traceroute/ping/DHCP subprocess this
+    # process spawns copies os.environ, and the password has no business
+    # reaching any of them.
+    initial_admin_password = (args.initial_admin_password
+                              or os.environ.pop("NETPATH_INITIAL_ADMIN_PASSWORD", None)
+                              or None)
     service = Service(args.db, flow_path_for(args), syslog_path_for(args),
                       app_path_for(args), ipam_path_for(args),
                       snmp_path_for(args), nodes_path_for(args),
                       alerts_path_for(args), wireless_path_for(args),
-                      configrx_path_for(args))
+                      configrx_path_for(args),
+                      initial_admin_password=initial_admin_password)
     existing = {row["host"] for row in service.db.targets()}
     for host in args.add:
         if host not in existing:

@@ -533,7 +533,7 @@ def test_real_dpapi_through_the_dhcp_credential_route():
     os.makedirs(data_dir, exist_ok=True)
     db_names = ("netpath", "flows", "syslog", "app", "ipam", "snmptraps",
                 "nodes", "alerts", "wireless", "configrx")
-    service = Service(*[os.path.join(data_dir, n + ".db") for n in db_names])
+    service = Service(*[os.path.join(data_dir, n + ".db") for n in db_names], initial_admin_password="admin")
     port = _paths.free_tcp_port()
     server = WebServer(service, host="127.0.0.1", port=port)
     if not server.start(block=False):

@@ -316,6 +316,17 @@ def _https_opener():
         _RefuseRedirects, urllib.request.HTTPSHandler(context=tls_context()))
 
 
+_HEADER_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def clean_header(text: str) -> str:
+    """A header value with CR, LF and other control characters collapsed to
+    a single space -- operator-typed text (a device/rule/group name, the
+    From display name) reaches a header unescaped, and EmailMessage raises
+    outright on an embedded CR/LF rather than folding it."""
+    return _HEADER_CONTROL_CHARS.sub(" ", str(text or ""))
+
+
 def send(smtp_settings: dict, password: str | None, to_addrs: list[str],
         subject: str, body: str, is_html: bool = False,
         attachments: list[tuple[str, bytes, str, str]] | None = None) -> None:
@@ -337,7 +348,7 @@ def send(smtp_settings: dict, password: str | None, to_addrs: list[str],
     timeout = float(smtp_settings.get("smtp_timeout_s", 15.0))
     username = str(smtp_settings.get("smtp_username", "") or "")
     from_addr = str(smtp_settings.get("smtp_from", "") or username)
-    from_name = str(smtp_settings.get("smtp_from_name", "") or "")
+    from_name = clean_header(smtp_settings.get("smtp_from_name", "") or "")
 
     if verify:
         context = tls_context()
@@ -347,7 +358,7 @@ def send(smtp_settings: dict, password: str | None, to_addrs: list[str],
         context = ssl._create_unverified_context()
 
     message = EmailMessage()
-    message["Subject"] = subject
+    message["Subject"] = clean_header(subject)
     message["From"] = formataddr((from_name, from_addr)) if from_name else from_addr
     message["To"] = ", ".join(to_addrs)
     if is_html:

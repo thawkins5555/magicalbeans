@@ -39,6 +39,14 @@ from .worker import Worker, ago
 
 TICK_S = 5.0
 
+# Caps a persistently failing tick from growing the system-occurrence queue
+# without bound; oldest dropped first.
+_SYSTEM_OCCURRENCES_CAP = 1000
+
+# Re-log interval for a stage stuck on the same error, so it does not age
+# out of the event ring while alerts stay stalled.
+_STAGE_ERROR_RELOG_S = 3600.0
+
 # device_events kinds that exist only to back the status timeline's split
 # SNMP/ping lanes (see nodesdb.device_method_segments) and carry no alert
 # meaning of their own — snmp_ok/ping_ok flipping is already covered by
@@ -224,6 +232,16 @@ class AlertEngine(Worker):
         self._system_lock = threading.Lock()
         self._system_occurrences: list[Occurrence] = []
         self._system_clears: list[tuple[str, str]] = []
+        # Last snapshot handed out by _drain_system_occurrences, dropped only
+        # once its tick fully succeeds -- see _commit_system_drain.
+        self._system_pending_inflight: list[Occurrence] = []
+        self._system_clears_inflight: list[tuple[str, str]] = []
+        # Dirty devices a failed threshold scan must not lose -- see
+        # _evaluate_thresholds.
+        self._dirty_carry: set[int] = set()
+        # Per-stage last error and when it was last logged -- see _stage.
+        self._stage_errors: dict[str, str] = {}
+        self._stage_error_logged_ts: dict[str, float] = {}
         self.counters = {"evaluated": 0, "opened": 0, "resolved": 0,
                          "emails_sent": 0, "suppressed": 0, "send_errors": 0,
                          "rolled_up": 0, "muted": 0, "rule_muted": 0,
@@ -314,21 +332,24 @@ class AlertEngine(Worker):
         self.counters["backlog"] = 0
         self._parent_conditions = {}
         self._upstream_outage_cache = {}
+        # Each stage is independent -- see _stage. Not applied below to
+        # db.rules()/active_windows()/quiet_device_ids()/muted_entity_ids():
+        # a lossy fallback there would silently misfire rather than retry.
         occurrences = []
-        occurrences += self._drain_device_events(settings)
-        occurrences += self._drain_interface_events(settings)
-        occurrences += self._drain_traps(settings)
-        occurrences += self._drain_syslog(settings)
-        occurrences += self._drain_ipam_conflicts(settings)
-        occurrences += self._drain_ap_events(settings)
-        occurrences += self._drain_system_occurrences()
-        occurrences += self._evaluate_thresholds(settings)
-        occurrences += self._evaluate_dhcp_thresholds(settings)
-        occurrences += self._evaluate_netpath_thresholds(settings)
-        occurrences += self._evaluate_netpath_https(settings)
+        occurrences += self._stage("drain_device_events", self._drain_device_events, settings)
+        occurrences += self._stage("drain_interface_events", self._drain_interface_events, settings)
+        occurrences += self._stage("drain_traps", self._drain_traps, settings)
+        occurrences += self._stage("drain_syslog", self._drain_syslog, settings)
+        occurrences += self._stage("drain_ipam_conflicts", self._drain_ipam_conflicts, settings)
+        occurrences += self._stage("drain_ap_events", self._drain_ap_events, settings)
+        occurrences += self._stage("drain_system_occurrences", self._drain_system_occurrences)
+        occurrences += self._stage("evaluate_thresholds", self._evaluate_thresholds, settings)
+        occurrences += self._stage("evaluate_dhcp_thresholds", self._evaluate_dhcp_thresholds, settings)
+        occurrences += self._stage("evaluate_netpath_thresholds", self._evaluate_netpath_thresholds, settings)
+        occurrences += self._stage("evaluate_netpath_https", self._evaluate_netpath_https, settings)
         rules = [r for r in self.db.rules() if r["enabled"]]
         self._rules_by_key = {r["key"]: r for r in rules if r["key"]}
-        occurrences += self._drain_pending()
+        occurrences += self._stage("drain_pending", self._drain_pending)
         # Read once per tick rather than per occurrence, and usually empty —
         # when nothing is muted the gate below costs one dict truth test.
         # window_covered is folded in here rather than left for _muted to ask
@@ -381,6 +402,9 @@ class AlertEngine(Worker):
         self._sweep_expired(settings)
         self._sweep_renotify(settings)
         self._sweep_notify_rollup(settings)
+        # Only once the tick has fully succeeded -- an unguarded exception
+        # above skips this and the drain retries next tick. See _drain_system_occurrences.
+        self._commit_system_drain()
 
     # -------------------------------------------------- system occurrences
 
@@ -406,6 +430,7 @@ class AlertEngine(Worker):
             extra=dict(extra or {}))
         with self._system_lock:
             self._system_occurrences.append(occurrence)
+            del self._system_occurrences[:-_SYSTEM_OCCURRENCES_CAP]
 
     def clear_system_occurrence(self, rule_key: str, entity_id: str) -> None:
         """The other half: the condition has ended, so resolve its alert on
@@ -415,18 +440,34 @@ class AlertEngine(Worker):
             self._system_clears.append((rule_key, str(entity_id)))
 
     def _drain_system_occurrences(self) -> list[Occurrence]:
+        """Snapshot without removing -- this queue has no persisted cursor,
+        so _commit_system_drain() drops it only once the tick that consumed
+        it fully succeeds; until then a retry re-drains the same items."""
         with self._system_lock:
-            pending = self._system_occurrences
-            clears = self._system_clears
-            self._system_occurrences = []
-            self._system_clears = []
+            pending = list(self._system_occurrences)
+            clears = list(self._system_clears)
+        # Assigned only after the loop below succeeds, so a raise here
+        # leaves the previous (already-committed) inflight value in place.
         for rule_key, entity_id in clears:
             rule = self.db.rule_by_key(rule_key)
             if rule is None:
                 continue
             if self.db.resolve_by_dedup(f"{rule['key']}:system:{entity_id}", by=""):
                 self.counters["resolved"] += 1
+        self._system_pending_inflight = pending
+        self._system_clears_inflight = clears
         return pending
+
+    def _commit_system_drain(self) -> None:
+        """Drop exactly the slice _drain_system_occurrences last handed out;
+        anything queued since is left untouched."""
+        pending, clears = self._system_pending_inflight, self._system_clears_inflight
+        if not pending and not clears:
+            return
+        self._system_pending_inflight, self._system_clears_inflight = [], []
+        with self._system_lock:
+            del self._system_occurrences[:len(pending)]
+            del self._system_clears[:len(clears)]
 
     def _mail_result(self, job, ok: bool, error: str) -> None:
         """One delivery finished, on the mail worker's thread. AlertsDatabase
@@ -513,6 +554,27 @@ class AlertEngine(Worker):
             self.clear_system_occurrence("sms_failing", "sms")
 
     # ------------------------------------------------------- drain plumbing
+
+    def _stage(self, name: str, fn, *args) -> list:
+        """Run one tick stage in isolation, so a deterministic exception in
+        one evaluator does not stop the others. Logged once per distinct
+        error, again hourly while it persists, and once on recovery."""
+        try:
+            result = fn(*args)
+        except Exception as exc:
+            message = f"Alert engine stage '{name}' failed: {exc or exc.__class__.__name__}"
+            now = time.time()
+            if (self._stage_errors.get(name) != message
+                    or now - self._stage_error_logged_ts.get(name, 0.0) >= _STAGE_ERROR_RELOG_S):
+                self.log.add(ERROR, message, detail=traceback.format_exc())
+                self._stage_error_logged_ts[name] = now
+            self._stage_errors[name] = message
+            self.counters["stage_errors"] = self.counters.get("stage_errors", 0) + 1
+            return []
+        if self._stage_errors.pop(name, None) is not None:
+            self._stage_error_logged_ts.pop(name, None)
+            self.log.add(ALERTS, f"Alert engine stage '{name}' recovered")
+        return result or []
 
     def _advance_cursor(self, source: str, value: int) -> None:
         """Remember how far `source` was drained, without writing it yet.
@@ -1319,8 +1381,21 @@ class AlertEngine(Worker):
         full_pass = (now - self._threshold_full_pass_ts >= self._THRESHOLD_FULL_PASS_S
                     or generation != self._threshold_generation_seen)
         dirty = self.nodes_db.take_dirty_devices() | self.db.take_dirty_devices()
+        dirty |= self._dirty_carry
+        self._dirty_carry = set()
         if not full_pass and not dirty:
             return occurrences
+        try:
+            return self._scan_thresholds(settings, rules, now, generation, full_pass,
+                                         dirty, occurrences)
+        except Exception:
+            # take_dirty_devices() already emptied the tracked set -- carry
+            # these forward so a scan failure does not drop a real breach.
+            self._dirty_carry |= dirty
+            raise
+
+    def _scan_thresholds(self, settings, rules, now, generation, full_pass, dirty,
+                         occurrences) -> list[Occurrence]:
         # Per-device overrides, read once per TICK for every rule at once
         # rather than once per rule. Keyed by device even for an interface
         # target: an override tuned for a hot closet is about the switch,

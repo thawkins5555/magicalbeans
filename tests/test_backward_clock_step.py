@@ -91,6 +91,50 @@ def test_nodepoll_walk_schedulers():
         db.close()
 
 
+def test_nodepoll_walk_budget_uses_monotonic():
+    """_table_walk_deadline (identify_mixin.py; vlan_mixin.py and
+    vendor_sensor_psu_mixin.py budget their own VLAN/STP walks off the
+    identical time.monotonic() + budget shape) must not derive a walk's
+    deadline from the wall clock -- a backward step mid-poll would either
+    strand the walk (deadline already "passed") or hand it an unbounded
+    budget, depending on which way the step went."""
+    from netpath.nodepoll.identify_mixin import VendorIdentifyMixin
+
+    class FakeTime:
+        def __init__(self):
+            self.mono = 1_000.0
+            self.wall = 2_000_000.0
+
+        def monotonic(self):
+            return self.mono
+
+        def time(self):
+            return self.wall
+
+    fake = FakeTime()
+    restore = _paths.patch_nodepoll("time", fake)
+    try:
+        mixin = VendorIdentifyMixin()
+        config = {"mac_table_interval_s": 3600}
+        expected_budget = max(VendorIdentifyMixin._WALK_BUDGET_FLOOR_S,
+                              VendorIdentifyMixin._WALK_BUDGET_FRACTION * 3600)
+        before = mixin._table_walk_deadline(config, "mac_table_interval_s")
+        check(before == fake.mono + expected_budget,
+              "the deadline is time.monotonic() plus the budget")
+
+        # A one-hour backward wall-clock step; only 5 s of real (monotonic)
+        # time actually elapse on the poll worker in between.
+        fake.wall -= 3600
+        fake.mono += 5.0
+        after = mixin._table_walk_deadline(config, "mac_table_interval_s")
+        check(after == before + 5.0,
+              "...so the backward wall-clock step changes nothing about "
+              "the budget -- only elapsed monotonic time does "
+              f"(before={before}, after={after})")
+    finally:
+        restore()
+
+
 def test_fortipoll_schedule_pass():
     db = WirelessDatabase(os.path.join(tmpdir("bm7_fortipoll_"), "wireless.db"))
     try:
@@ -112,6 +156,33 @@ def test_fortipoll_schedule_pass():
               f"WirelessPoller._schedule_pass: a 1h backward step does not "
               f"strand a controller past its own interval "
               f"(due={due}, stepped_now={stepped_now})")
+    finally:
+        db.close()
+
+
+def test_fortipoll_forgets_deleted_controllers():
+    """A deleted controller never appears in _schedule_pass' own loop over
+    db.controllers(), so without a sweep its _next_run entry and v3 engine
+    state (EngineCache, keyed by controller id here) are kept forever."""
+    db = WirelessDatabase(os.path.join(tmpdir("bm7_fortipoll_forget_"), "wireless.db"))
+    try:
+        controller_id = db.add_controller("c1", "10.2.0.2", snmp_version=3,
+                                          community="")
+        poller = WirelessPoller(db)
+        poller._executor = None   # poll_now no-ops without a pool; only scheduling matters
+        poller._schedule_pass()   # warm: seeds _next_run
+        poller._engines.set(controller_id, b"engine", 1, 100)
+        check(controller_id in poller._next_run and
+              poller._engines.get(controller_id) is not None,
+              "sanity: both caches are seeded before the delete")
+
+        db.remove_controller(controller_id)
+        poller._schedule_pass()
+
+        check(controller_id not in poller._next_run,
+              "a deleted controller's next-run entry is dropped")
+        check(poller._engines.get(controller_id) is None,
+              "a deleted controller's v3 engine state is dropped")
     finally:
         db.close()
 
@@ -169,6 +240,29 @@ def test_monitor_loop():
         db.close()
 
 
+def test_monitor_forgets_deleted_targets():
+    """HttpsChecker._loop already drops a deleted target's _next_run entry;
+    Monitor._loop (traceroute scheduling) did not."""
+    folder = tmpdir("bm7_monitor_forget_")
+    db = Database(os.path.join(folder, "netpath.db"))
+    try:
+        target_id = db.add_target("192.0.2.9", interval_s=60)
+        mon = monitor_mod.Monitor(db, workers=1)
+        mon._next_run[target_id] = time.time() + 60
+        db.remove_target(target_id)
+        thread = threading.Thread(target=mon._loop, daemon=True)
+        mon._stop.clear()
+        thread.start()
+        time.sleep(0.2)
+        mon._stop.set()
+        thread.join(timeout=3)
+        check(target_id not in mon._next_run,
+              "Monitor._loop drops a deleted target's next-run entry")
+        mon._executor.shutdown(wait=False, cancel_futures=True)
+    finally:
+        db.close()
+
+
 def test_https_checker_loop():
     folder = tmpdir("bm7_https_")
     db = Database(os.path.join(folder, "netpath.db"))
@@ -221,9 +315,12 @@ def test_syslogd_token_bucket():
 def main():
     test_nodepoll_schedule_pass()
     test_nodepoll_walk_schedulers()
+    test_nodepoll_walk_budget_uses_monotonic()
     test_fortipoll_schedule_pass()
+    test_fortipoll_forgets_deleted_controllers()
     test_ipam_worker_tick()
     test_monitor_loop()
+    test_monitor_forgets_deleted_targets()
     test_https_checker_loop()
     test_syslogd_token_bucket()
 

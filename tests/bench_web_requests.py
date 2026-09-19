@@ -565,7 +565,7 @@ def run(folder, devices, tabs, iterations):
     data_dir = os.path.join(folder, "fleet-%d" % devices)
     os.makedirs(data_dir, exist_ok=True)
     service = Service(*[os.path.join(data_dir, name + ".db")
-                        for name in DB_NAMES])
+                        for name in DB_NAMES], initial_admin_password="admin")
     started = time.monotonic()
     device_ids = seed(service, devices)
     seeded_s = time.monotonic() - started

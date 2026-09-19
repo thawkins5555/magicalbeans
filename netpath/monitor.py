@@ -177,7 +177,8 @@ class Monitor(Worker):
         while not self._stop.is_set():
             try:
                 now = time.time()
-                for target in self.db.targets():
+                targets = self.db.targets()
+                for target in targets:
                     if not target["enabled"]:
                         continue
                     due = self._next_run.get(target["id"])
@@ -194,6 +195,11 @@ class Monitor(Worker):
                             self._record_overrun(target, now)
                         else:
                             self._submit(target["id"])
+                # A deleted target never appears above, so without this its
+                # next-run entry is kept forever.
+                live = {t["id"] for t in targets}
+                for gone in [tid for tid in self._next_run if tid not in live]:
+                    self._next_run.pop(gone, None)
             except Exception as exc:
                 import traceback
                 self._loop_errors += 1

@@ -4849,6 +4849,79 @@ else:
           "...but a draw({ ifChanged: true }) call right after, same HTML, "
           "does not (got: %s)" % _result)
 
+# nodes.js: the re-identify and MIB-install job polls share pollVisibleSeconds
+# instead of a hidden-tab-blind for loop, each keeping its original visible
+# budget (90s / 120s).
+_NODES_POLL = read("nodes.js")
+check("async function pollVisibleSeconds(seconds, current, check) {" in _NODES_POLL,
+      "nodes.js defines pollVisibleSeconds")
+_POLLFN = js_function(_NODES_POLL, "pollVisibleSeconds")
+check("if (document.hidden) continue;" in _POLLFN
+      and _POLLFN.index("if (document.hidden) continue;") < _POLLFN.index("elapsed++;")
+      and _POLLFN.index("elapsed++;") < _POLLFN.index("await check()"),
+      "...a hidden tab skips both the elapsed-second count and the check() "
+      "call, but still awaits its sleep so a re-shown tab is noticed promptly")
+check("await pollVisibleSeconds(90, current, async () => {" in _NODES_POLL,
+      "re-identify polls for up to 90 visible seconds")
+check("await pollVisibleSeconds(120, current, async () => {" in _NODES_POLL,
+      "MIB install polls for up to 120 visible seconds")
+
+# A real run of pollVisibleSeconds: a fake setTimeout advances one simulated
+# tick per call, and document.hidden is scripted per tick, so the test
+# controls exactly which ticks are "hidden" without a real 1s wait.
+_POLL_HARNESS = """
+'use strict';
+%(pollVisibleSeconds)s
+
+function run(hiddenTicks, seconds, stopAfterChecks) {
+  let ticks = 0;
+  let checks = 0;
+  global.document = { hidden: false };
+  global.setTimeout = (fn) => { ticks++; document.hidden = ticks <= hiddenTicks; fn(); };
+  const current = () => true;
+  return pollVisibleSeconds(seconds, current, async () => {
+    checks++;
+    if (stopAfterChecks && checks >= stopAfterChecks) return 'stopped';
+    return undefined;
+  }).then((result) => ({ ticks, checks, result: result === undefined ? null : result }));
+}
+
+(async () => {
+  const timedOut = await run(3, 3, 0);
+  const stoppedEarly = await run(2, 5, 2);
+  console.log(JSON.stringify({ timedOut, stoppedEarly }));
+})();
+"""
+
+if NODE is None:
+    print("SKIP  pollVisibleSeconds's hidden-tab proof (node not on this machine)")
+else:
+    _script = _POLL_HARNESS % {"pollVisibleSeconds": _POLLFN}
+    _folder = tempfile.mkdtemp(prefix="poll_visible_")
+    try:
+        _path = os.path.join(_folder, "run.js")
+        with open(_path, "w", encoding="utf-8") as _handle:
+            _handle.write(_script)
+        _out = subprocess.run([NODE, _path], capture_output=True, text=True,
+                              encoding="utf-8", timeout=30)
+        _result = ({"error": _out.stderr.strip()[:400]} if _out.returncode != 0
+                   else json.loads(_out.stdout))
+    finally:
+        shutil.rmtree(_folder, ignore_errors=True)
+    _timedOut = _result.get("timedOut", {})
+    _stoppedEarly = _result.get("stoppedEarly", {})
+    check(_timedOut.get("ticks") == 6 and _timedOut.get("checks") == 3
+          and _timedOut.get("result") is None,
+          "3 hidden ticks issue no check() and do not count toward a 3-second "
+          "visible budget -- the poll still needs 3 more (visible) ticks and "
+          "then gives up, exactly as if the tab had been visible throughout "
+          "(got: %s)" % _timedOut)
+    check(_stoppedEarly.get("ticks") == 4 and _stoppedEarly.get("checks") == 2
+          and _stoppedEarly.get("result") == "stopped",
+          "2 hidden ticks are skipped, then the poll resumes and stops the "
+          "moment check() resolves, before its visible budget is spent "
+          "(got: %s)" % _stoppedEarly)
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

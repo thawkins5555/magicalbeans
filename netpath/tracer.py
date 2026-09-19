@@ -417,6 +417,7 @@ def _run(command: list[str], budget: float):
         command,
         capture_output=True,
         text=True,
+        errors="replace",
         timeout=budget,
         env=env,
         # Otherwise every trace flashes a console window when the parent
@@ -437,6 +438,11 @@ def _rejected_parallel(completed, output: str) -> bool:
 
 _UNIX_PING_TIME = re.compile(r"time[=<]\s*([\d.]+)\s*ms", re.IGNORECASE)
 _WIN_PING_TIME = re.compile(r"time[=<]\s*(\d+)\s*ms", re.IGNORECASE)
+# ping.exe's field labels are localised ("time=" becomes e.g. "temps=" on a
+# French install), but "TTL=" is not -- it stays the marker of a genuine
+# echo reply, as opposed to an intermediate router's "Destination host
+# unreachable", which ping.exe reports with exit code 0 all the same.
+_WIN_PING_REPLY = re.compile(r"\bTTL=", re.IGNORECASE)
 
 
 @dataclass
@@ -467,6 +473,7 @@ def ping(ip: str, timeout_s: float = 1.5) -> PingResult:
             command,
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=timeout_s + 2,
             **hidden(),
         )

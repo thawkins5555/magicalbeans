@@ -766,6 +766,14 @@ class LengthRequired(ValueError):
     body gets."""
 
 
+def _reject_json_constant(token: str):
+    """json.loads' parse_constant hook: without it NaN/Infinity/-Infinity
+    parse as numbers (a Python extension, not valid JSON) and reach a
+    handler that never expected one. A plain ValueError, not
+    JSONDecodeError, so _body's except below does not swallow it."""
+    raise ValueError(f"{token} is not a valid JSON number")
+
+
 # How many source addresses the access log remembers at once. Unbounded,
 # every address that ever made a request would stay for the life of the
 # process with its user-agent string — every port scanner, health check and
@@ -1147,8 +1155,8 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length)
         self._body_consumed = True
         try:
-            body = json.loads(raw.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
+            body = json.loads(raw.decode("utf-8"), parse_constant=_reject_json_constant)
+        except (json.JSONDecodeError, UnicodeDecodeError):
             return {}
         if not isinstance(body, dict):
             return {}

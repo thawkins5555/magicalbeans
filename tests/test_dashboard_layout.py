@@ -42,7 +42,7 @@ def db_paths():
     return [os.path.join(TMPDIR, name + ".db") for name in DB_NAMES]
 
 
-service = Service(*db_paths())
+service = Service(*db_paths(), initial_admin_password="admin")
 web_port = _paths.free_tcp_port()
 server = WebServer(service, host="127.0.0.1", port=web_port, certfile=None, keyfile=None)
 assert server.start(block=False), server.error
@@ -186,7 +186,7 @@ try:
     status, payload = call("PUT", "/api/dashboard/layout",
                            {"layout": custom_layout}, token=admin)
     check("setup: saved a layout to persist", status == 200, (status, payload))
-    reopened = Service(*db_paths())
+    reopened = Service(*db_paths(), initial_admin_password="admin")
     try:
         reread = api_mod.get_dashboard_layout(
             reopened, {"_username": DEFAULT_USER}, None)

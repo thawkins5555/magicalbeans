@@ -459,9 +459,9 @@
         const windowS = cfg.window_s || 86400;
         const [device, metrics] = await Promise.all([
           App.get(`/api/nodes/devices/${cfg.device_id}`),
-          App.get(`/api/nodes/devices/${cfg.device_id}/metrics`),
+          App.get(`/api/nodes/devices/${cfg.device_id}/metrics`, { key: cfg.metric_key }),
         ]);
-        const m = (metrics.metrics || []).find((x) => x.key === cfg.metric_key);
+        const m = (metrics.metrics || [])[0];
         const pinned = cfg.t0 != null && cfg.t1 != null;
         const t1 = pinned ? cfg.t1 : Date.now() / 1000;
         const t0 = pinned ? cfg.t0 : t1 - windowS;

@@ -33,7 +33,7 @@ service = Service(
     os.path.join(TMPDIR, "syslog.db"), os.path.join(TMPDIR, "app.db"),
     os.path.join(TMPDIR, "ipam.db"), os.path.join(TMPDIR, "snmptraps.db"),
     os.path.join(TMPDIR, "nodes.db"), os.path.join(TMPDIR, "alerts.db"),
-    os.path.join(TMPDIR, "wireless.db"), os.path.join(TMPDIR, "configrx.db"))
+    os.path.join(TMPDIR, "wireless.db"), os.path.join(TMPDIR, "configrx.db"), initial_admin_password="admin")
 service.start()
 
 port = free_tcp_port()
@@ -610,7 +610,7 @@ def nodes_api_fixes_checks():
         os.path.join(tmp_dir, "syslog.db"), os.path.join(tmp_dir, "app.db"),
         os.path.join(tmp_dir, "ipam.db"), os.path.join(tmp_dir, "snmptraps.db"),
         os.path.join(tmp_dir, "nodes.db"), os.path.join(tmp_dir, "alerts.db"),
-        os.path.join(tmp_dir, "wireless.db"), os.path.join(tmp_dir, "configrx.db"))
+        os.path.join(tmp_dir, "wireless.db"), os.path.join(tmp_dir, "configrx.db"), initial_admin_password="admin")
     web_port = free_tcp_port()
     server = WebServer(service, host="127.0.0.1", port=web_port,
                        certfile=None, keyfile=None)

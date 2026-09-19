@@ -20,6 +20,7 @@ import time
 
 from . import permissions, udpsock
 from .eventlog import NODES
+from .sshterm import _unsafe_destination
 
 log = logging.getLogger(__name__)
 
@@ -490,6 +491,9 @@ class WebRelayRegistry:
               username: str, client_ip: str, token: str, host_header: str, *,
               device_id: int | None = None, ap_id: int | None = None,
               subject: str = "") -> dict:
+        unsafe = _unsafe_destination(target_ip)
+        if unsafe is not None:
+            raise ValueError(f"Refusing to open a tunnel to {target_ip}: {unsafe}.")
         client_ip = udpsock.normalise_source(str(client_ip or ""))
         if not client_ip:
             raise ValueError(

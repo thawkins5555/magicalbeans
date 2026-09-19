@@ -76,8 +76,12 @@ python -m netpath --headless --port 8443
 py -m netpath --headless --port 8443
 ```
 
-Then open `http://<host>:8443/` and sign in. A fresh install starts with
-**admin / admin** and will insist on a new password before anything else.
+Then open `http://<host>:8443/` and sign in. A fresh install creates one
+**admin** account with a random password, printed once to the console and
+once to the event log at that first start, and will insist on a new
+password before anything else. For a scripted install, pass
+`--initial-admin-password` (or set `NETPATH_INITIAL_ADMIN_PASSWORD`) instead
+of reading the console — honoured only while no accounts exist yet.
 
 Pass `--cert` and `--key` to serve TLS. Without a certificate the session
 cookie travels in the clear, so on anything but a trusted segment, set one up.
@@ -159,8 +163,10 @@ being watched. About twenty minutes, most of it waiting for a poll.
 1. **Start the service** (see [Install and run](#install-and-run) above), bound
    to loopback first: `--host 127.0.0.1`. Open it up deliberately once the
    admin password is changed and, ideally, a certificate is in place.
-2. **Sign in as `admin`/`admin`.** The server refuses every API call except
-   sign-out and the password change itself until you pick a new one. Then,
+2. **Sign in as `admin`**, with the password printed to the console (and the
+   event log) when the service first started. The server refuses every API
+   call except sign-out and the password change itself until you pick a new
+   one. Then,
    straight away, make yourself a second account with the `admin` capability
    on **Settings → Users** — one account is one lost password away from a
    stopped service.

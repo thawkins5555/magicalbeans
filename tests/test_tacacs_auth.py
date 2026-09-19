@@ -512,7 +512,7 @@ def db_paths(tag):
     return [os.path.join(d, name + ".db") for name in DB_NAMES]
 
 
-service = Service(*db_paths("main"))
+service = Service(*db_paths("main"), initial_admin_password="admin")
 service.start()
 
 http_port = free_tcp_port()

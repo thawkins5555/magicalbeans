@@ -66,12 +66,6 @@ class WirelessPoller(Worker):
         self._queued_futures: dict[int, "Future"] = {}
         self._next_run: dict[int, float] = {}
         self._lock = threading.Lock()
-        # Reset per controller in _poll_controller; defined here so the
-        # helper is safe to call before a poll has started.
-        self._ping_deadline = 0.0
-        # v3_verify_replies, read once per controller poll and carried for
-        # every GETNEXT of that poll — nodepoll keeps it the same way.
-        self._verify_replies = True
         # db.settings(), rebuilt when db._settings_generation moves (see
         # _cached_settings) instead of read 3x per controller poll.
         self._settings_state: tuple[int, dict] | None = None
@@ -200,7 +194,8 @@ class WirelessPoller(Worker):
             return
         interval = max(10, int(settings.get("poll_interval_s", 60)))
         now = time.time()
-        for controller in self.db.controllers():
+        controllers = self.db.controllers()
+        for controller in controllers:
             controller_id = controller["id"]
             if not controller["enabled"]:
                 self._next_run.pop(controller_id, None)
@@ -214,6 +209,12 @@ class WirelessPoller(Worker):
             if now >= due:
                 self._next_run[controller_id] = now + interval
                 self.poll_now(controller_id)
+        # A deleted controller never appears in the loop above, so without
+        # this its _next_run entry and v3 engine state are kept forever.
+        live = {c["id"] for c in controllers}
+        for gone in [cid for cid in self._next_run if cid not in live]:
+            self._next_run.pop(gone, None)
+        self._engines.forget(live)
 
     def _run_one(self, controller_id: int) -> None:
         try:
@@ -255,7 +256,7 @@ class WirelessPoller(Worker):
 
     # --------------------------------------------------------------- polling
 
-    def _ping_ap(self, ip: str, status: str) -> float | None:
+    def _ping_ap(self, ip: str, status: str, ping_deadline: float = float("inf")) -> float | None:
         """Round-trip to one AP, or None.
 
         None means "no reading", which the column shows as blank: an AP that
@@ -263,10 +264,13 @@ class WirelessPoller(Worker):
         would sort it to the top of the fastest devices. An offline AP is not
         probed at all — the controller has already said it is gone, and
         waiting out a timeout per absent AP is what would make the sweep slow.
+
+        ping_deadline is the caller's, not self's: two controllers polled
+        concurrently on the pool must not share one deadline.
         """
         if not ip or status != "online":
             return None
-        if time.time() > self._ping_deadline:
+        if time.time() > ping_deadline:
             return None
         started = time.perf_counter()   # time.time() ticks at 15.6 ms on Windows, quantising a LAN round trip
         try:
@@ -278,28 +282,36 @@ class WirelessPoller(Worker):
 
     def _poll_controller(self, controller) -> None:
         config = dict(controller)
-        self._verify_replies = bool(self._cached_settings().get("v3_verify_replies", True))
+        # Local to this poll, not self: controllers are polled concurrently
+        # on the pool, and a shared attribute here would let one
+        # controller's poll silently answer with another's setting.
+        verify_replies = bool(self._cached_settings().get("v3_verify_replies", True))
         # One budget for the whole controller's sweep, so a rack of
         # unreachable APs cannot add a timeout each to the cycle.
-        self._ping_deadline = time.time() + PING_BUDGET_S
+        ping_deadline = time.time() + PING_BUDGET_S
         try:
-            names = self._walk_column(controller, config, oids.WTP_CONFIG_NAME)
-            macs = self._walk_column(controller, config, oids.WTP_SESSION_MAC)
-            ips = self._walk_column(controller, config, oids.WTP_SESSION_IP)
-            states = self._walk_column(controller, config, oids.WTP_SESSION_CONNECTION_STATE)
-            models = self._walk_column(controller, config, oids.WTP_SESSION_MODEL)
-            stations = self._walk_column(controller, config, oids.WTP_SESSION_STATION_COUNT)
-            uptimes = self._walk_column(controller, config, oids.WTP_SESSION_UPTIME)
+            names = self._walk_column(controller, config, oids.WTP_CONFIG_NAME, verify_replies)
+            macs = self._walk_column(controller, config, oids.WTP_SESSION_MAC, verify_replies)
+            ips = self._walk_column(controller, config, oids.WTP_SESSION_IP, verify_replies)
+            states = self._walk_column(
+                controller, config, oids.WTP_SESSION_CONNECTION_STATE, verify_replies)
+            models = self._walk_column(controller, config, oids.WTP_SESSION_MODEL, verify_replies)
+            stations = self._walk_column(
+                controller, config, oids.WTP_SESSION_STATION_COUNT, verify_replies)
+            uptimes = self._walk_column(controller, config, oids.WTP_SESSION_UPTIME, verify_replies)
             session_uptimes = self._walk_column(
-                controller, config, oids.WTP_SESSION_SESSION_UPTIME)
-            profiles = self._walk_column(controller, config, oids.WTP_SESSION_PROFILE)
-            modes = self._walk_column(controller, config, oids.WTP_RADIO_MODE)
-            bssids = self._walk_column(controller, config, oids.WTP_RADIO_BSSID)
-            channels = self._walk_column(controller, config, oids.WTP_RADIO_CHANNEL)
-            powers = self._walk_column(controller, config, oids.WTP_RADIO_OPERATING_POWER)
-            radio_stations = self._walk_column(controller, config, oids.WTP_RADIO_STATION_COUNT)
+                controller, config, oids.WTP_SESSION_SESSION_UPTIME, verify_replies)
+            profiles = self._walk_column(
+                controller, config, oids.WTP_SESSION_PROFILE, verify_replies)
+            modes = self._walk_column(controller, config, oids.WTP_RADIO_MODE, verify_replies)
+            bssids = self._walk_column(controller, config, oids.WTP_RADIO_BSSID, verify_replies)
+            channels = self._walk_column(controller, config, oids.WTP_RADIO_CHANNEL, verify_replies)
+            powers = self._walk_column(
+                controller, config, oids.WTP_RADIO_OPERATING_POWER, verify_replies)
+            radio_stations = self._walk_column(
+                controller, config, oids.WTP_RADIO_STATION_COUNT, verify_replies)
             widths = self._walk_column(
-                controller, config, oids.WTP_PROFILE_RADIO_CHANNEL_WIDTH)
+                controller, config, oids.WTP_PROFILE_RADIO_CHANNEL_WIDTH, verify_replies)
         except SnmpError as exc:
             self.db.record_poll(controller["id"], ok=False, error=str(exc))
             self.log.add(ERROR, f"Wireless controller {controller['name']} unreachable",
@@ -315,7 +327,7 @@ class WirelessPoller(Worker):
         now = time.time()
         seen: set[tuple[str, str]] = set()
         # This sweep's history samples, one executemany each at the end (record_samples).
-        self._history_sample_s = float(self._cached_settings().get("history_sample_s", 300))
+        history_sample_s = float(self._cached_settings().get("history_sample_s", 300))
         ap_sample_rows: list[tuple] = []
         radio_sample_rows: list[tuple] = []
         for suffix, mac in macs.items():
@@ -338,7 +350,7 @@ class WirelessPoller(Worker):
                 model=models.get(suffix) or "",
                 mac_address=_format_mac(mac),
                 ip=ip,
-                response_ms=self._ping_ap(ip, status),
+                response_ms=self._ping_ap(ip, status, ping_deadline),
                 station_count=_as_int(stations.get(suffix)),
                 profile=profile,
                 # No reading, no timestamp: the two are only true together.
@@ -373,7 +385,8 @@ class WirelessPoller(Worker):
             self.db.replace_radios(ap_id, radios, controller_id=controller["id"],
                                    wtp_id=wtp_id, vdom=vdom, name=name)
             self._append_history(ap_id, status, _as_int(stations.get(suffix)),
-                                 radios, now, ap_sample_rows, radio_sample_rows)
+                                 radios, now, ap_sample_rows, radio_sample_rows,
+                                 history_sample_s)
 
         if ap_sample_rows or radio_sample_rows:
             self.db.record_samples(ap_sample_rows, radio_sample_rows)
@@ -392,11 +405,12 @@ class WirelessPoller(Worker):
                                f"missed   {ap['missed_polls']} consecutive poll(s)")
 
     def _append_history(self, ap_id, status, station_count, radios, now,
-                        ap_sample_rows: list[tuple], radio_sample_rows: list[tuple]) -> None:
+                        ap_sample_rows: list[tuple], radio_sample_rows: list[tuple],
+                        history_sample_s: float = 300.0) -> None:
         """Appends one ap_samples row and one radio_samples row per radio, unless
         this AP's last sample is younger than history_sample_s."""
         last = self.db.last_sample_ts(ap_id)
-        if last is not None and (now - last) < self._history_sample_s:
+        if last is not None and (now - last) < history_sample_s:
             return
         ap_sample_rows.append((ap_id, now, 1 if status == "online" else 0, station_count))
         for radio in radios:
@@ -406,14 +420,16 @@ class WirelessPoller(Worker):
 
     # ------------------------------------------------------------ SNMP layer
 
-    def _walk_column(self, controller, config: dict, base_oid: str) -> dict[str, object]:
+    def _walk_column(self, controller, config: dict, base_oid: str,
+                     verify_replies: bool = True) -> dict[str, object]:
         values: dict[str, object] = {}
         current = base_oid
         # One socket for the whole walk, not one per row.
         session = _Session(controller["ip"], SNMP_PORT, 3.0, 2)
         try:
             for _ in range(4096):
-                response = self._snmp_get_next(controller, config, current, session)
+                response = self._snmp_get_next(
+                    controller, config, current, session, verify_replies)
                 if not response.varbinds:
                     break
                 vb = response.varbinds[0]
@@ -446,7 +462,8 @@ class WirelessPoller(Worker):
             session.close()
         return values
 
-    def _snmp_get_next(self, controller, config: dict, oid: str, session: "_Session"):
+    def _snmp_get_next(self, controller, config: dict, oid: str, session: "_Session",
+                       verify_replies: bool = True):
         """One GETNEXT on a session the caller owns (opened and closed once
         for the whole walk in _walk_column, not once per row)."""
         version = snmp_version_of(config)
@@ -473,7 +490,7 @@ class WirelessPoller(Worker):
                 engine=self._engines.current(controller_id),
                 ip=controller["ip"], learned=learned,
                 priv_proto=credential.priv_proto, priv_password=credential.priv_password,
-                verify_replies=self._verify_replies)
+                verify_replies=verify_replies)
         except _AuthFailure:
             self._engines.invalidate(controller_id)
             raise

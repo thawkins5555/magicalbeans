@@ -184,6 +184,91 @@ check("...but its builtin_subject/builtin_body (what 'Reset to built-in' "
       dict(untouched))
 db.close()
 
+# --------------------------------------- CR/LF in a device or rule name
+#
+# A device/rule name is operator-typed and lands in the rendered Subject
+# unescaped. email.message.EmailMessage raises outright on an embedded
+# CR/LF rather than folding it, so a name carrying one used to fail every
+# send and, after five of them, open the mail breaker.
+
+check("clean_header collapses CR, LF and other control characters, "
+      "leaving the rest of the name alone",
+      alertmail.clean_header("core-sw1\r\nX-Test: injected")
+      == "core-sw1  X-Test: injected",
+      alertmail.clean_header("core-sw1\r\nX-Test: injected"))
+
+
+class _StubSMTP:
+    """Stands in for smtplib.SMTP so send() runs for real up to the point
+    of touching a socket -- proving EmailMessage accepts the header."""
+    sent = []
+
+    def __init__(self, host, port, timeout=None):
+        pass
+
+    def ehlo(self):
+        pass
+
+    def starttls(self, context=None):
+        pass
+
+    def login(self, username, password):
+        pass
+
+    def send_message(self, message):
+        _StubSMTP.sent.append(message)
+
+    def quit(self):
+        pass
+
+
+real_smtp_cls = alertmail.smtplib.SMTP
+alertmail.smtplib.SMTP = _StubSMTP
+breaker_events = []
+mail_queue = alertmail.MailQueue(
+    on_breaker=lambda is_open, error: breaker_events.append((is_open, error)))
+try:
+    for _ in range(5):
+        mail_queue.submit(alertmail.MailJob(
+            settings={"smtp_host": "mail.example.test", "smtp_port": 587,
+                      "smtp_security": "starttls", "smtp_verify_cert": False},
+            password=None, to_addrs=["ops@example.test"],
+            subject="core-sw1\r\nX-Test: injected is down", body="body"))
+    mail_queue.wait_idle(5.0)
+    check("five alerts for a name carrying CR/LF are all accepted by the "
+          "mail library, not raised as header-injection errors",
+          len(_StubSMTP.sent) == 5, len(_StubSMTP.sent))
+    check("...so the breaker never opens for them",
+          breaker_events == [], breaker_events)
+    check("...and the CR/LF never reaches the header actually sent",
+          all("\r" not in str(m["Subject"]) and "\n" not in str(m["Subject"])
+              for m in _StubSMTP.sent),
+          [str(m["Subject"]) for m in _StubSMTP.sent])
+finally:
+    mail_queue.stop()
+    alertmail.smtplib.SMTP = real_smtp_cls
+
+# The From display name (smtp_from_name, operator-set) is built into a
+# header the same way; it needs the same cleaning.
+alertmail.smtplib.SMTP = _StubSMTP
+_StubSMTP.sent = []
+try:
+    alertmail.send(
+        {"smtp_host": "mail.example.test", "smtp_port": 587,
+         "smtp_security": "starttls", "smtp_verify_cert": False,
+         "smtp_from": "alerts@example.test",
+         "smtp_from_name": "Ops\r\nX-Test: injected"},
+        None, ["ops@example.test"], "subject", "body")
+    check("a From display name carrying CR/LF is accepted, not raised as "
+          "a header-injection error",
+          len(_StubSMTP.sent) == 1, _StubSMTP.sent)
+    check("...and the CR/LF never reaches the header actually sent",
+          "\r" not in str(_StubSMTP.sent[0]["From"])
+          and "\n" not in str(_StubSMTP.sent[0]["From"]),
+          str(_StubSMTP.sent[0]["From"]) if _StubSMTP.sent else None)
+finally:
+    alertmail.smtplib.SMTP = real_smtp_cls
+
 print()
 print("FAILURES:", FAILS if FAILS else "none")
 raise SystemExit(1 if FAILS else 0)

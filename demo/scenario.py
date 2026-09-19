@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import secrets
 import signal
 import subprocess
 import sys
@@ -355,6 +356,10 @@ class Scenario:
         self.notes: list[str] = []
         self._plan: list[dict] | None = None
         self._log_handle = open(self.run_log, "a", encoding="utf-8")
+        # The random password a fresh install would otherwise only print to
+        # its own console/event log; generated once here so start_app() and
+        # run_seed() can agree on it without either reading the other's output.
+        self._initial_admin_password = secrets.token_urlsafe(16)
 
     # -- logging ----------------------------------------------------------
 
@@ -494,6 +499,7 @@ class Scenario:
         # answers, so a "down" device would look up. Force the subprocess
         # path so the shim keeps deciding.
         env["NETPATH_PING_MODE"] = "subprocess"
+        env["NETPATH_INITIAL_ADMIN_PASSWORD"] = self._initial_admin_password
         # ...and the shim has to be told where the fleet is. It defaults to
         # 8099 (demo/bin/ping's fleet_alive), which is this file's own
         # default control port, so at default settings everything worked and
@@ -524,7 +530,8 @@ class Scenario:
         argv = [sys.executable, "-u", seed, "--base", self.base,
                 "--count", str(self.count), "--out", self.out,
                 "--workers", str(self.args.workers),
-                "--ssh-base-port", str(self.ssh_base_port)]
+                "--ssh-base-port", str(self.ssh_base_port),
+                "--initial-admin-password", self._initial_admin_password]
         if getattr(self.args, "topology", False):
             argv.append("--topology")
         if getattr(self.args, "defaults", False):
@@ -558,7 +565,8 @@ class Scenario:
         from seed import read_creds
         creds = read_creds(creds_path)
         self.client = Client(self.base)
-        self.client.login("admin", creds.get("admin_password", "admin"))
+        self.client.login("admin", creds.get("admin_password",
+                                             self._initial_admin_password))
         self.log("[ok] API client signed in as admin")
 
     def wait_for_first_cycle(self) -> dict:

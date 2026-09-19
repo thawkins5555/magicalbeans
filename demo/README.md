@@ -187,8 +187,12 @@ PATH="$PWD/demo/bin:$PATH" python3 -m netpath --headless \
     --host 127.0.0.1 --port 8443 --db demo/out/data/netpath.db
 ```
 
-Wait for `SappiWhere serving on http://127.0.0.1:8443/`. First sign-in is
-`admin` / `admin`, which forces a password change.
+Wait for `SappiWhere serving on http://127.0.0.1:8443/`. A fresh install
+seeds `admin` with a random password, printed once to the console and once
+to the event log, and forces a password change at first sign-in. Pass
+`--initial-admin-password <value>` (or set `NETPATH_INITIAL_ADMIN_PASSWORD`)
+for a known password instead — `demo/seed.py --initial-admin-password` (or
+the same env var) needs the same value to sign in on a first run.
 
 **3. Seeding**
 

@@ -406,8 +406,12 @@ NETPATH_WEB_PAGES = {
 SITES = ("Site-A", "Site-B", "Site-C")
 
 
-def step_login(client: Client, log: SeedLog, creds_path: str) -> dict:
-    """1. Sign in, clearing the forced first-run password change if needed."""
+def step_login(client: Client, log: SeedLog, creds_path: str,
+              initial_password: str = "") -> dict:
+    """1. Sign in, clearing the forced first-run password change if needed.
+    A fresh install's password is random and unknown to this script, so a
+    true first run needs `initial_password` -- the same value the server
+    was started with; creds.txt covers every run after that."""
     client.step = "1-login"
     creds = read_creds(creds_path)
     admin_password = creds.get("admin_password", "")
@@ -419,23 +423,33 @@ def step_login(client: Client, log: SeedLog, creds_path: str) -> dict:
                   "must_change=%s" % payload.get("must_change"))
             return {"password": admin_password, "changed": False}
         except ApiError as exc:
-            print("[1] stored admin password rejected (%s); trying admin/admin"
-                  % exc.status)
+            print("[1] stored admin password rejected (%s); trying "
+                  "--initial-admin-password" % exc.status)
 
-    payload = client.login("admin", "admin")
+    if not initial_password:
+        raise SystemExit(
+            "[1] no usable credential in %s and no --initial-admin-password "
+            "given: this is a fresh install and its random admin password "
+            "was never told to this script. Pass --initial-admin-password "
+            "with the same value the server was started with (see "
+            "--initial-admin-password / NETPATH_INITIAL_ADMIN_PASSWORD in "
+            "`python -m netpath --help`)." % creds_path)
+
+    payload = client.login("admin", initial_password)
     must_change = bool(payload.get("must_change"))
-    print("[1] login admin/admin -> ok, must_change=%s" % must_change)
+    print("[1] login admin (initial password) -> ok, must_change=%s"
+          % must_change)
     if not must_change:
-        creds["admin_password"] = "admin"
+        creds["admin_password"] = initial_password
         write_creds(creds_path, creds)
-        return {"password": "admin", "changed": False}
+        return {"password": initial_password, "changed": False}
 
     new = strong_password()
     # Changing your OWN password needs the current one; it then destroys
     # every session for the account (netpath/web/api.py:4037-4064), so the
     # cookie we hold is dead the moment this returns.
     client.post("/api/password", {"username": "admin",
-                                  "current_password": "admin",
+                                  "current_password": initial_password,
                                   "new_password": new})
     creds["admin_password"] = new
     write_creds(creds_path, creds)
@@ -1197,6 +1211,14 @@ def main(argv=None) -> int:
                         help="fleet size to seed (default 250)")
     parser.add_argument("--out", default=os.path.join(HERE, "out"),
                         help="output directory (default demo/out)")
+    parser.add_argument("--initial-admin-password",
+                        default=os.environ.get("NETPATH_INITIAL_ADMIN_PASSWORD", ""),
+                        help="the admin password the target server was "
+                             "started with (--initial-admin-password or "
+                             "NETPATH_INITIAL_ADMIN_PASSWORD there); needed "
+                             "only on a genuinely fresh install with no "
+                             "creds.txt yet — falls back to the "
+                             "NETPATH_INITIAL_ADMIN_PASSWORD env var")
     parser.add_argument("--workers", type=int, default=32,
                         help="nodes poll_workers to set; 0 leaves the default. "
                              "Ignored with --defaults")
@@ -1251,7 +1273,8 @@ def main(argv=None) -> int:
               "interval, worker, threshold, grace or email-cap override")
     started = time.time()
     try:
-        summary["login"] = step_login(client, log, creds_path)
+        summary["login"] = step_login(client, log, creds_path,
+                                      args.initial_admin_password)
         ids = step_groups_and_profiles(client, log, args.defaults)
         summary["groups"] = ids
         summary["devices"] = step_devices(client, log, plan, ids["sites"],

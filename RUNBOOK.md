@@ -603,9 +603,15 @@ mechanism built for this.
 4. **Stuck on "you must change your password"?** That is the server refusing
    every other route until the change is done, which is correct. Change it.
 5. **The last admin password is genuinely lost.** Stop the service, delete the
-   `users` table from `app.db`, start it: the default `admin`/`admin` account
-   is recreated with full access and must change its password immediately.
-   On Linux:
+   `users` table from `app.db`, start it: a fresh `admin` account is
+   recreated with full access and a new random password — printed once to
+   the console and once to the event log, the same as any other fresh
+   install — and must change it immediately. Running as a Windows service
+   (NSSM) with no console open, that banner reaches the service's stdout
+   log if one is configured (`nssm set SappiWhere AppStdout <path>`) —
+   otherwise pass `--initial-admin-password` (or set
+   `NETPATH_INITIAL_ADMIN_PASSWORD`) for a known value instead, the
+   deterministic option for an unattended install. On Linux:
    ```
    systemctl stop sappiwhere
    sqlite3 ~/.local/share/netpath-monitor/app.db "DROP TABLE users;"

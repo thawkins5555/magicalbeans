@@ -169,7 +169,7 @@ def test_startup_floor() -> None:
     service = None
     try:
         service = Service(db_path, paths[0], paths[1], app_db_path, paths[2],
-                           paths[3], paths[4], paths[5], paths[6], paths[7])
+                           paths[3], paths[4], paths[5], paths[6], paths[7], initial_admin_password="admin")
         check("startup a poisoned trace_workers/dns_workers DB still constructs Service",
               True)
         check("startup poisoned trace_workers falls back to the default",
@@ -193,7 +193,7 @@ def main() -> int:
     os.makedirs(data_dir, exist_ok=True)
     db_names = ("netpath", "flows", "syslog", "app", "ipam", "snmptraps",
                 "nodes", "alerts", "wireless", "configrx")
-    service = Service(*[os.path.join(data_dir, name + ".db") for name in db_names])
+    service = Service(*[os.path.join(data_dir, name + ".db") for name in db_names], initial_admin_password="admin")
     port = _paths.free_tcp_port()
     server = WebServer(service, host="127.0.0.1", port=port)
     if not server.start(block=False):
