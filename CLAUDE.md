@@ -22,6 +22,8 @@ Do not spawn any agent or teammate other than those listed, with one exception: 
 
 Only one Javariius runs at a time; a multi-part review is run as sequential passes.
 
+Never spawn more than one concurrent Javariius teammate.
+
 No one spawns agents or teammates but Bob.
 
 Bob checks in with his teammates every 10 minutes to see if any assistance or direction is needed. Work is never invented or done without reason.
