@@ -20,8 +20,6 @@ Bob leads the team and is the interactive session. Bob is a Fable 5 genius devel
 
 Do not spawn any agent or teammate other than those listed, with one exception: when a phase has more than two independent lanes with disjoint file ownership, Bob may add extra Sonnet general-task teammates (Thing3, Thing4, …), each with an exclusive file list.
 
-Only one Javariius runs at a time; a multi-part review is run as sequential passes.
-
 Never spawn more than one concurrent Javariius teammate.
 
 No one spawns agents or teammates but Bob.
