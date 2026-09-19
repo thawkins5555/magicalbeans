@@ -13,7 +13,7 @@ import random
 import sys
 import time
 
-import _paths  # noqa: F401
+import _paths
 from _paths import tmpdir
 
 from netpath import nodepoll
@@ -220,16 +220,16 @@ def focus_unjittered(clock):
 
 def main():
     clock = Clock(T0)
-    real_time, real_random = nodepoll.time, nodepoll.random
-    nodepoll.time = clock
-    nodepoll.random = random.Random(7)
+    restore_time = _paths.patch_nodepoll("time", clock)
+    restore_random = _paths.patch_nodepoll("random", random.Random(7))
     try:
         restart_spread(clock)
         never_polled_still_immediate(clock)
         phase_break(clock)
         focus_unjittered(clock)
     finally:
-        nodepoll.time, nodepoll.random = real_time, real_random
+        restore_time()
+        restore_random()
 
     print()
     if FAILURES:

@@ -335,12 +335,11 @@ UCD_MEM_AVAIL = "1.3.6.1.4.1.2021.4.6.0"
 UCD_LOAD1 = "1.3.6.1.4.1.2021.10.1.3.1"
 
 # hrStorageTable's type column names what a row IS — nodepoll._host_resources_
-# disk_pct (nodepoll.py:2012-2039) only ever counts a row typed
+# disk_pct (nodepoll/poll_mixin.py) only ever counts a row typed
 # hrStorageFixedDisk as "the disk"; every existing caller of host_resources()
 # below wants a RAM/appdata figure with no disk semantics, so that stays the
 # default and only the new Windows personas pass a type explicitly.
 HR_STORAGE_RAM = "1.3.6.1.2.1.25.2.1.2"
-HR_STORAGE_VIRTUAL_MEMORY = "1.3.6.1.2.1.25.2.1.3"
 HR_STORAGE_FIXED_DISK = "1.3.6.1.2.1.25.2.1.4"
 HR_SYSTEM_UPTIME = "1.3.6.1.2.1.25.1.1.0"
 HR_SW_RUN = "1.3.6.1.2.1.25.4.2.1"
@@ -468,8 +467,7 @@ def host_resources(cpus: int, storages) -> dict:
     storage_type_oid)] — the type OID defaults to HR_STORAGE_RAM, which is
     what every caller before the Windows personas wanted (a memory or
     app-data figure with no "disk" semantics); pass HR_STORAGE_FIXED_DISK
-    (or HR_STORAGE_VIRTUAL_MEMORY) explicitly for a row that should count as
-    one of those instead.
+    explicitly for a row that should count as a disk instead.
     """
     entries: dict = {}
     for cpu in range(1, cpus + 1):
@@ -762,7 +760,7 @@ def entity_sensors(port_sensors: dict, parent_label: str | None = None,
     parent entity to an ifIndex — the mapping nodepoll.read_dom() (the
     interface dialog's on-demand DOM read) requires to find a transceiver's
     sensors, but NOT the whole-device ENTITY-SENSOR-MIB walk in
-    nodepoll._poll_environment (nodepoll.py:3081), which was written
+    nodepoll._poll_environment (nodepoll/environment_mixin.py), which was written
     specifically because a chassis sensor with no port to be "on" — an
     environmental monitor's temperature/humidity probes — needed a path
     that does not depend on it.
@@ -929,11 +927,11 @@ def lldp_neighbor(if_index: int, sys_name: str, chassis_id, port_id: str,
     an opaque key, so timeMark is fixed at 0 and remIndex at 1 — this demo
     never puts two neighbours on one port.
 
-    chassis_id defaults to a MAC (subtype 4,
-    nodeoids.LLDP_CHASSIS_SUBTYPE_MAC_ADDRESS) — pass bytes from
-    _mac_for() so nodesdb's chassis-MAC join actually resolves rather
-    than only the sysName one; a caller with no real MAC to offer can
-    pass a string and chassis_id_subtype=7 (locallyAssigned) instead.
+    chassis_id defaults to a MAC (subtype 4, lldpRemChassisIdSubtype's
+    MAC-address enumeration) — pass bytes from _mac_for() so nodesdb's
+    chassis-MAC join actually resolves rather than only the sysName one;
+    a caller with no real MAC to offer can pass a string and
+    chassis_id_subtype=7 (locallyAssigned) instead.
     """
     suffix = f"0.{if_index}.{rem_index}"
     return {
@@ -2021,7 +2019,7 @@ def _build_apc_ups(wrap32: bool, ports: int, vlan: str | None) -> dict:
     # Deliberately does NOT answer upsEstimatedMinutesRemaining (.1.2.3.0) —
     # some real APC firmware leaves it at 0 or unset and only populates the
     # PowerNet-MIB equivalent, which is exactly the gap
-    # nodepoll._apc_runtime_fallback (nodepoll.py:2242) exists to cover: it
+    # nodepoll._apc_runtime_fallback (nodepoll/poll_mixin.py) exists to cover: it
     # is tried only when the standard scalar did not answer, and only on
     # APC's own arc. This persona is what exercises that fallback rather
     # than only the ordinary path — see eaton_ups for the ordinary path on a
@@ -2257,10 +2255,10 @@ def _build_printer_mfp(wrap32: bool, ports: int, vlan: str | None) -> dict:
 
 def _build_windows_server(wrap32: bool, ports: int, vlan: str | None) -> dict:
     # HOST-RESOURCES-MIB, answered in full, to demonstrate a specific
-    # asymmetry: nodepoll._poll_vendor_health (nodepoll.py:2086-2148) falls
+    # asymmetry: nodepoll._poll_vendor_health (nodepoll/poll_mixin.py) falls
     # back to nodeoids.GENERIC_HEALTH's hrProcessorLoad column_avg for
     # cpu_pct when nothing better answered, and disk_pct always comes from
-    # _host_resources_disk_pct (nodepoll.py:2036-2063), filtered to rows
+    # _host_resources_disk_pct (nodepoll/poll_mixin.py), filtered to rows
     # typed hrStorageFixedDisk (nodeoids.HR_STORAGE_FIXED_DISK) — both of
     # which this persona answers, so CPU and disk populate. mem_pct has NO
     # such HOST-RESOURCES fallback anywhere in nodepoll.py: it comes only

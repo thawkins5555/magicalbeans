@@ -197,7 +197,7 @@ def _get_body(table, dev: DeviceState, oids, now: float, version: int):
     SNMPv1 has no per-varbind exception markers: an object the agent does
     not implement spoils the WHOLE request with noSuchName and the varbind
     list echoed back as nulls. That is exactly the behaviour
-    nodepoll._poll_snmp_scalars' long comment (nodepoll.py:1231-1265) says
+    nodepoll._poll_snmp_scalars' long comment (nodepoll/poll_mixin.py) says
     it splits its identity GET to survive, so the v1 persona reproduces it
     rather than answering the modern way.
     """

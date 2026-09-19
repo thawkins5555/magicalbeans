@@ -189,7 +189,6 @@ class Client:
         data = None
         if method in ("POST", "PUT", "DELETE"):
             data = json.dumps(body if body is not None else {}).encode("utf-8")
-        last = None
         for attempt in (1, 2):
             try:
                 conn = self._connection()
@@ -205,7 +204,6 @@ class Client:
                           len(blob))
                 break
             except (http.client.HTTPException, OSError) as exc:
-                last = exc
                 self.close()
                 if attempt == 2:
                     result = (0, {"error": "%s: %s" % (type(exc).__name__, exc)},

@@ -1064,9 +1064,8 @@ own subtabs.
   first start** — the full IF-MIB, IP-MIB, TCP-MIB, UDP-MIB, ENTITY-MIB,
   ENTITY-SENSOR-MIB, BRIDGE-MIB, P-BRIDGE-MIB, Q-BRIDGE-MIB, LLDP-MIB,
   POWER-ETHERNET-MIB, HOST-RESOURCES-MIB, UCD-SNMP-MIB, SNMPv2-MIB and
-  the SMI/TC/IANA type modules they import — plus a hand-written IF-MIB
-  core subset kept from earlier releases and enterprise-number roots for
-  around twenty common vendors. They load through the exact same
+  the SMI/TC/IANA type modules they import — plus enterprise-number roots
+  for around twenty common vendors. They load through the exact same
   upload/parse path described below, so they're indistinguishable from an
   upload afterward, and a real vendor MIB uploaded later resolves its
   parent enterprise arc immediately instead of reporting it unresolved

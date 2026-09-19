@@ -101,6 +101,23 @@ class Worker:
         `deadline`. Overridden by workers that also drain in-flight work."""
         self._join(timeout=max(0.0, deadline - time.monotonic()))
 
+    def _finish_stop_draining(self, deadline: float) -> None:
+        """finish_stop for a worker that also drains in-flight work: join,
+        then wait the smaller of the deadline and the in-flight budget --
+        min, not shutdown()'s max; the budget is a ceiling, not a promise."""
+        self._join(timeout=max(0.0, deadline - time.monotonic()))
+        self.drain(min(max(0.0, deadline - time.monotonic()),
+                       self._inflight_budget_s()))
+
+    def drain(self, timeout_s: float = 3.0) -> bool:
+        """Wait for self.inflight() to empty. True if it did."""
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            if not self.inflight():
+                return True
+            time.sleep(0.05)
+        return not self.inflight()
+
     def _bump(self, key: str, by: int = 1) -> None:
         """counters[...] += 1 from a pool worker is a read-modify-write on a
         shared dict; under the lock the totals stay exact."""

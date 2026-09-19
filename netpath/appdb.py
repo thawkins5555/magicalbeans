@@ -14,7 +14,7 @@ import time
 
 from . import sqlitebase
 from .sqlitebase import (LIKE_ESCAPE, SqliteStore, id_chunks, like_contains,
-                         like_prefix, reclaim)
+                         like_prefix, marks_for, reclaim)
 
 log_module = logging.getLogger(__name__)
 
@@ -892,7 +892,7 @@ class AppDatabase(SqliteStore):
         found: dict[str, str | None] = {}
         with self._lock:
             for batch in id_chunks(ips):
-                marks = ",".join("?" * len(batch))
+                marks = marks_for(batch)
                 rows = self._conn.execute(
                     f"SELECT ip, hostname FROM hostnames WHERE ip IN ({marks})", batch
                 ).fetchall()
@@ -948,7 +948,7 @@ class AppDatabase(SqliteStore):
         known: set[str] = set()
         with self._lock:
             for batch in id_chunks(ips):
-                marks = ",".join("?" * len(batch))
+                marks = marks_for(batch)
                 rows = self._conn.execute(
                     f"SELECT ip FROM hostnames WHERE ip IN ({marks})"
                     f" AND resolved_ts >= ?", (*batch, cutoff)).fetchall()
@@ -986,7 +986,7 @@ class AppDatabase(SqliteStore):
         found: dict[str, tuple[int | None, str | None]] = {}
         with self._lock:
             for batch in id_chunks(ips):
-                marks = ",".join("?" * len(batch))
+                marks = marks_for(batch)
                 rows = self._conn.execute(
                     f"SELECT ip, asn, org FROM asn_cache WHERE ip IN ({marks})",
                     batch).fetchall()
@@ -1004,7 +1004,7 @@ class AppDatabase(SqliteStore):
         known: set[str] = set()
         with self._lock:
             for batch in id_chunks(ips):
-                marks = ",".join("?" * len(batch))
+                marks = marks_for(batch)
                 rows = self._conn.execute(
                     f"SELECT ip FROM asn_cache WHERE ip IN ({marks})"
                     f" AND resolved_ts >= ?", (*batch, cutoff)).fetchall()
@@ -1137,7 +1137,7 @@ def migrate_from(app_db: AppDatabase, legacy_path: str, log=None) -> dict:
                 if not rows:
                     continue
                 columns = rows[0].keys()
-                marks = ",".join("?" * len(columns))
+                marks = marks_for(columns)
                 target.executemany(
                     f"INSERT OR REPLACE INTO {table}"
                     f" ({','.join(columns)}) VALUES ({marks})",
@@ -1168,7 +1168,7 @@ def migrate_from(app_db: AppDatabase, legacy_path: str, log=None) -> dict:
                          f"removed from netpath.db.")
                     return counts
             if global_keys:
-                marks = ",".join("?" * len(global_keys))
+                marks = marks_for(global_keys)
                 actual = target.execute(
                     f"SELECT COUNT(*) AS n FROM settings WHERE key IN ({marks})",
                     global_keys).fetchone()["n"]
@@ -1185,7 +1185,7 @@ def migrate_from(app_db: AppDatabase, legacy_path: str, log=None) -> dict:
         for table in movable:
             source.execute(f"DROP TABLE IF EXISTS {table}")
         if global_keys:
-            marks = ",".join("?" * len(global_keys))
+            marks = marks_for(global_keys)
             source.execute(f"DELETE FROM settings WHERE key IN ({marks})",
                            global_keys)
         source.commit()

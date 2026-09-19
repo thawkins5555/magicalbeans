@@ -323,16 +323,9 @@ THEME = dict(re.findall(r'^([A-Z_]+) = QColor\("(#[0-9A-Fa-f]{6})"\)', theme_src
 PAIRS = {
     "--bg": "BG", "--panel": "PANEL", "--raised": "PANEL_RAISED",
     "--hairline": "HAIRLINE", "--grid": "GRID", "--text": "TEXT",
-    "--muted": "TEXT_MUTED", "--dim": "TEXT_DIM", "--line": "LINE",
+    "--muted": "TEXT_MUTED", "--line": "LINE",
     "--data-neutral": "DATA_NEUTRAL", "--accent": "ACCENT", "--accent-hover": "ACCENT_HOVER",
-    "--ok": "OK", "--warn": "WARN", "--fail": "FAIL", "--blocked": "BLOCKED",
-    "--overrun": "OVERRUN", "--error": "ERROR", "--nodata": "NODATA",
-    "--canvas": "CANVAS", "--canvas-panel": "CANVAS_PANEL",
-    "--canvas-hairline": "CANVAS_HAIRLINE", "--canvas-grid": "CANVAS_GRID",
-    "--canvas-text": "CANVAS_TEXT", "--canvas-muted": "CANVAS_TEXT_MUTED",
-    "--canvas-faint": "CANVAS_TEXT_FAINT", "--canvas-accent": "CANVAS_ACCENT",
-    "--canvas-ok": "CANVAS_OK", "--canvas-warn": "CANVAS_WARN",
-    "--canvas-fail": "CANVAS_FAIL", "--canvas-blocked": "CANVAS_BLOCKED",
+    "--ok": "OK", "--warn": "WARN", "--fail": "FAIL", "--error": "ERROR",
 }
 for token_name, const in PAIRS.items():
     check(THEME.get(const, "").upper() == tok(token_name).upper(),
@@ -343,7 +336,6 @@ check(len(series_hex) == 8, "theme.py SERIES has the web's eight hues")
 for index, colour in enumerate(series_hex, 1):
     check(colour.upper() == tok("--cat-%d" % index).upper(),
           "theme.py SERIES[%d] == --cat-%d" % (index - 1, index))
-check("SERIES_OTHER = DATA_NEUTRAL" in theme_src, "theme.py SERIES_OTHER is DATA_NEUTRAL")
 check(not re.search(r"^TEXT_FAINT = ", theme_src, re.M), "theme.py has no TEXT_FAINT")
 stylesheet = theme_src[theme_src.index("STYLESHEET"):]
 loose = re.findall(r"#[0-9A-Fa-f]{6}\b", stylesheet)

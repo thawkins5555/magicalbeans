@@ -10,7 +10,8 @@ from __future__ import annotations
 import sqlite3
 import time
 
-from .sqlitebase import SqliteStore, reclaim
+from .snmpformat import detect_reboot
+from .sqlitebase import SqliteStore, marks_for, reclaim
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS controllers (
@@ -200,7 +201,7 @@ class WirelessDatabase(SqliteStore):
             if key in overrides:
                 cols.append(key)
                 vals.append(overrides[key])
-        marks = ",".join("?" * len(vals))
+        marks = marks_for(vals)
         with self._lock:
             cur = self._conn.execute(
                 f"INSERT INTO controllers({','.join(cols)}) VALUES ({marks})", vals)
@@ -248,7 +249,7 @@ class WirelessDatabase(SqliteStore):
         now = time.time()
         cols = ["controller_id", "wtp_id", "vdom", "last_seen_ts", "missed_polls"] + list(fields)
         vals = [controller_id, wtp_id, vdom, now, 0] + list(fields.values())
-        marks = ",".join("?" * len(vals))
+        marks = marks_for(vals)
         update_clause = ", ".join(f"{k} = excluded.{k}" for k in
                                   ("last_seen_ts", "missed_polls", *fields))
         with self._lock:
@@ -326,8 +327,6 @@ class WirelessDatabase(SqliteStore):
 
     def _record_reboot(self, controller_id, wtp_id, vdom, previous, fields) -> None:
         """Records ap_rebooted when fgWcWtpSessionWtpUpTime falls, via Nodes' detect_reboot."""
-        from .nodepoll import detect_reboot
-
         ticks = fields.get("uptime_ticks")
         read_at = fields.get("uptime_ts")
         if ticks is None or not read_at or previous["uptime_ticks"] is None:
@@ -613,7 +612,7 @@ class WirelessDatabase(SqliteStore):
                         "UPDATE access_points SET missed_polls = ? WHERE id = ?",
                         (missed, row["id"]))
             if stale_ids:
-                marks = ",".join("?" * len(stale_ids))
+                marks = marks_for(stale_ids)
                 self._conn.execute(
                     f"DELETE FROM access_points WHERE id IN ({marks})", stale_ids)
             self._conn.commit()

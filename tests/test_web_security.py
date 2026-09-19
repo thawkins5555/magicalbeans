@@ -2330,8 +2330,8 @@ end
     # finished. The wait is bounded now and the refusal says when to come
     # back.
     held = [api_mod._LOGIN_SLOTS.acquire(timeout=5) for _ in range(4)]
-    real_wait = api_mod._LOGIN_SLOT_WAIT_S
-    api_mod._LOGIN_SLOT_WAIT_S = 0.1
+    real_wait = api_mod.auth._LOGIN_SLOT_WAIT_S
+    api_mod.auth._LOGIN_SLOT_WAIT_S = 0.1
     try:
         started = time.time()
         status, head, payload = req("POST", "/api/login",
@@ -2339,7 +2339,7 @@ end
                                      "password": "Corr3ct-Horse-Battery"})
         elapsed = time.time() - started
     finally:
-        api_mod._LOGIN_SLOT_WAIT_S = real_wait
+        api_mod.auth._LOGIN_SLOT_WAIT_S = real_wait
         for got in held:
             if got:
                 api_mod._LOGIN_SLOTS.release()

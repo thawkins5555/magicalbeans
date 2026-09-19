@@ -20,7 +20,7 @@ import os
 import socket
 import time
 
-import _paths  # noqa: F401  (puts the repo root and tests/ on sys.path)
+import _paths
 
 import netpath.nodepoll as nodepoll_mod
 from netpath.alertrules import (PUBLISHED_HYSTERESIS, PUBLISHED_THRESHOLD_RULES,
@@ -192,7 +192,7 @@ print()
 print("entSensorThresholdTable: the walk, the two-scale decode, the gates")
 
 stub, port = _paths.spawn_stub("stub_agent_ups_env.py", "cisco_dom_thresholds")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     nodes, _alerts, _engine = build("walk")
     did = cisco_device(nodes, "cisco-sw")
@@ -306,7 +306,7 @@ finally:
 
 # --- a cut-short walk must KEEP what is stored ---------------------------
 stub, port = _paths.spawn_stub("stub_agent_ups_env.py", "cisco_dom_thresholds")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     nodes, _alerts, _engine = build("cut_short")
     did = cisco_device(nodes, "cisco-sw")
@@ -341,7 +341,7 @@ finally:
 
 # --- gating: a Cisco device with no optics, and a non-Cisco device --------
 stub, port = _paths.spawn_stub("stub_agent_ups_env.py", "sensors")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     nodes, _alerts, _engine = build("gate_no_optics")
     gid = nodes.ensure_default_group()

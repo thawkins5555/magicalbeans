@@ -54,7 +54,6 @@ PRIV_PROTOCOLS = {
 }
 
 SALT_LEN = 8          # msgPrivacyParameters, RFC 3826 s3.1.2.1
-IV_LEN = 16           # engineBoots(4) || engineTime(4) || salt(8)
 KEY_LEN = 16
 
 

@@ -5,6 +5,7 @@ Workstream B."""
 import socket
 import time
 
+import _paths
 from _paths import spawn_stub, tmpdir
 
 TMP = tmpdir("mac_tables_")
@@ -63,7 +64,7 @@ def check(name, ok, detail=""):
 
 # ------------------------------------------------------- 1. request counts
 stub, port = spawn_stub("stub_agent_fdb.py", "big")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("counts")
     did = device_against(db, port, version=1, name="big-sw")
@@ -97,7 +98,7 @@ finally:
 
 # ------------------------------------------------------ 2. tooBig fallback
 stub, port = spawn_stub("stub_agent_fdb.py", "bulk-toobig")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("toobig")
     did = device_against(db, port, version=1, name="toobig-sw")
@@ -114,7 +115,7 @@ finally:
 
 # --------------------------------------------------- 3. v1 stays on GETNEXT
 stub, port = spawn_stub("stub_agent_fdb.py", "big")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("v1walk")
     did = device_against(db, port, version=0, name="v1-sw")
@@ -132,7 +133,7 @@ finally:
 
 # ----------------------------------------------------- 4. the row cap
 stub, port = spawn_stub("stub_agent_fdb.py", "big")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("cap")
     did = device_against(db, port, version=1, name="cap-sw")
@@ -149,7 +150,7 @@ finally:
 
 # --------------------------------------------- 5. history: present/absent
 stub, port = spawn_stub("stub_agent_fdb.py", "dot1q")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("history")
     did = device_against(db, port, version=1, name="hist-sw")

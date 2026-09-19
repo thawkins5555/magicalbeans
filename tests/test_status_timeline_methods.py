@@ -25,7 +25,7 @@ import sys
 import tempfile
 import time
 
-import _paths  # noqa: F401  (repo root + tests dir on sys.path)
+import _paths
 
 from netpath.nodesdb import NodesDatabase
 from netpath.nodepoll import NodePoller
@@ -62,7 +62,7 @@ def run_poller_section():
     time.sleep(0.1)
 
     import netpath.nodepoll as nodepoll_mod
-    nodepoll_mod.DEFAULT_SNMP_PORT = agent.port
+    _paths.patch_nodepoll("DEFAULT_SNMP_PORT", agent.port)
 
     group_id = db.ensure_default_group()
     # ping_enabled=0, same reasoning test_nodepoll_e2e.py's stub device uses:
@@ -150,7 +150,7 @@ def run_upgrade_seeding_section():
     time.sleep(0.1)
 
     import netpath.nodepoll as nodepoll_mod
-    nodepoll_mod.DEFAULT_SNMP_PORT = agent.port
+    _paths.patch_nodepoll("DEFAULT_SNMP_PORT", agent.port)
 
     ping_available = shutil.which("ping") is not None
     group_id = db.ensure_default_group()
@@ -246,7 +246,7 @@ def run_snmp_fail_alert_after_reset_section():
     time.sleep(0.1)
 
     import netpath.nodepoll as nodepoll_mod
-    nodepoll_mod.DEFAULT_SNMP_PORT = agent.port
+    _paths.patch_nodepoll("DEFAULT_SNMP_PORT", agent.port)
 
     group_id = db.ensure_default_group()
     device_id = db.add_device("127.0.0.1", "fail-count-reset-stub", group_id=group_id,

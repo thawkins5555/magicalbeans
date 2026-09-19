@@ -183,14 +183,14 @@ try:
     # ------------------------------------------------------------------ 2
     # It is a cache, not a no-op: many polls in one window cost one compute.
     print("/api/state: N polls in one window cost one compute")
-    real_state_counts = api._state_counts
+    real_state_counts = api._shared._state_counts
     calls = []
 
     def counting_state_counts(svc):
         calls.append(time.time())
         return real_state_counts(svc)
 
-    api._state_counts = counting_state_counts
+    api._shared._state_counts = counting_state_counts
     try:
         # Let any in-flight window expire so the count below starts clean.
         time.sleep(api.STATE_COUNTS_TTL_S + 0.2)
@@ -207,7 +207,7 @@ try:
         check("and the window after the TTL recomputes them",
               len(calls) >= 1 and len(calls) <= 2, len(calls))
     finally:
-        api._state_counts = real_state_counts
+        api._shared._state_counts = real_state_counts
 
     # The counts must still be TRUE, not merely cheap: a device added now
     # shows up on the far side of one TTL.

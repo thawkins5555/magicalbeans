@@ -9,6 +9,7 @@ import os
 import socket
 import time
 
+import _paths
 from _paths import spawn_stub, tmpdir
 
 TMP = tmpdir("ups_env_")
@@ -64,7 +65,7 @@ def device_against(db: NodesDatabase, name: str, **overrides) -> int:
 # ============================================================== § 1 UPS-MIB
 
 stub, port = spawn_stub("stub_agent_ups_env.py", "ups")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_nodes_db("ups")
     did = device_against(db, "ups-1")
@@ -102,7 +103,7 @@ finally:
 # ---------------------------------- not a UPS: the two table walks never run
 
 stub, port = spawn_stub("stub_agent_ups_env.py", "no_ups")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_nodes_db("no_ups")
     did = device_against(db, "not-a-ups")
@@ -133,7 +134,7 @@ finally:
 # --------------------------------------------------- APC TimeTicks fallback
 
 stub, port = spawn_stub("stub_agent_ups_env.py", "apc_ups")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_nodes_db("apc_ups")
     did = device_against(db, "apc-ups-1")
@@ -189,7 +190,7 @@ db.close()
 # ============================================= § 3 device-level sensor visibility
 
 stub, port = spawn_stub("stub_agent_ups_env.py", "sensors")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_nodes_db("sensors")
     did = device_against(db, "env-mon-1")
@@ -248,7 +249,7 @@ finally:
 # ---------------------------- no humidity sensor: default is chassis, not ambient
 
 stub, port = spawn_stub("stub_agent_ups_env.py", "sensors_no_humidity")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_nodes_db("sensors_no_humidity")
     did = device_against(db, "switch-with-a-sensor")
@@ -279,7 +280,7 @@ finally:
 # ------------------------ no ENTITY-SENSOR-MIB at all: never probed again
 
 stub, port = spawn_stub("stub_agent_ups_env.py", "no_ups")   # no sensor OIDs either
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_nodes_db("no_sensors")
     did = device_against(db, "plain-switch")

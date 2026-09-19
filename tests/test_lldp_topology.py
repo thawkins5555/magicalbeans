@@ -6,6 +6,7 @@ import os
 import sqlite3
 import time
 
+import _paths
 from _paths import spawn_stub, tmpdir
 
 TMP = tmpdir("lldp_topology_")
@@ -41,7 +42,7 @@ def device_against(db: NodesDatabase, port: int, *, vendor: str = "",
 
 # ------------------------------------------------------- 1. plain LLDP walk
 stub, port = spawn_stub("stub_agent_l2.py", "lldp")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("lldp")
     did = device_against(db, port, vendor="", name="lldp-sw")
@@ -70,7 +71,7 @@ finally:
 
 # --------------------------------------- 1b. lldpRemManAddrTable parsing
 stub, port = spawn_stub("stub_agent_l2.py", "lldp_manaddr")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("lldp_manaddr")
     did = device_against(db, port, vendor="", name="manaddr-sw")
@@ -94,7 +95,7 @@ finally:
 
 # ------------------------------------- 1c. lldpLocPortTable -> ifIndex
 stub, port = spawn_stub("stub_agent_l2.py", "lldp_locport")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("lldp_locport")
     did = device_against(db, port, vendor="", name="locport-sw")
@@ -138,7 +139,7 @@ finally:
 
 # ------------------------------------------------- 2. CDP-only fallback
 stub, port = spawn_stub("stub_agent_l2.py", "cdp")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("cdp")
     did = device_against(db, port, vendor="cisco", name="cdp-sw")
@@ -163,7 +164,7 @@ finally:
 
 # ---------------------------------------------- 3. CDP supplements LLDP
 stub, port = spawn_stub("stub_agent_l2.py", "lldp_and_cdp")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("both")
     did = device_against(db, port, vendor="cisco", name="both-sw")
@@ -178,7 +179,7 @@ finally:
 
 # ------------------------------------------- 4. neither table -> None
 stub, port = spawn_stub("stub_agent_l2.py", "no_l2")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("none")
     did = device_against(db, port, vendor="cisco", name="none-sw")

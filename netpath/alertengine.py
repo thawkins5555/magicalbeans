@@ -1209,6 +1209,64 @@ class AlertEngine(Worker):
                         self._notify_clear(resolved, cleared_rule, settings)
         return occurrences
 
+    def _threshold_targets(self, device_id, rule, children, metrics_by_device_key) -> list:
+        """The (entity_kind, entity_id, if_index, metric) targets `rule`
+        judges for this device -- one per child port/sensor when the device
+        reports children for this family, else the device itself."""
+        child_rows = children.get((device_id, rule["source_kind"]))
+        if child_rows:
+            child_kind = "sensor" if rule["source_kind"] in SENSOR_FAMILIES else "interface"
+            return [(child_kind, f"{device_id}:{if_index}", if_index, metric)
+                   for if_index, metric in sorted(child_rows)]
+        return [("device", str(device_id), None,
+                metrics_by_device_key.get((device_id, rule["source_kind"])))]
+
+    def _skip_disabled_override(self, rule, device_id, override) -> bool:
+        """True, after resolving anything already open, if a per-device
+        override turns this rule off for this device.
+
+        enabled=0 means this rule never fires for THIS device, so whatever
+        is open must be resolved now rather than frozen at its last value --
+        unlike a rule disabled globally or a device removed entirely, both
+        bigger, rarer actions. by='' so it reads as automatic, not a hand
+        resolve: re-enabling and breaching again must open a fresh alert,
+        not find itself permanently suppressed. Both entity shapes are
+        resolved, not just this tick's targets -- the device may have
+        alerted per port yesterday and device-wide before that.
+
+        Skipping before the streak is touched at all -- and never writing it
+        into live_streaks -- means turning it back on later starts a fresh
+        streak rather than resuming whatever was counted before it was
+        switched off.
+        """
+        if override is None or override["enabled"]:
+            return False
+        resolved = self.db.resolve_by_dedup(
+            f"{rule['key']}:device:{device_id}", by="")
+        if resolved:
+            self.counters["resolved"] += 1
+        self.counters["resolved"] += len(
+            self.db.resolve_by_dedup_prefix(
+                f"{rule['key']}:interface:{device_id}:", by=""))
+        return True
+
+    def _skip_fallback_covered(self, rule, device_id, published_devices,
+                               children) -> bool:
+        """True, after resolving anything already open, if this rule is
+        covered by a published-threshold fallback and so steps aside --
+        judged sensor by sensor instead, the same way an override-disabled
+        rule does."""
+        covered_by = FALLBACK_OF.get(rule["key"] or "")
+        if covered_by is None:
+            return False
+        if not any(device_id in published_devices.get(family, ())
+                   or children.get((device_id, family))
+                   for family in covered_by):
+            return False
+        if self.db.resolve_by_dedup(f"{rule['key']}:device:{device_id}", by=""):
+            self.counters["resolved"] += 1
+        return True
+
     def _evaluate_thresholds(self, settings) -> list[Occurrence]:
         """Device metrics against their threshold rules, per port where the
         device reports per port.
@@ -1304,53 +1362,18 @@ class AlertEngine(Worker):
             label = None
             interfaces = None
             for rule in rules:
-                child_rows = children.get((device_id, rule["source_kind"]))
-                if child_rows:
-                    child_kind = "sensor" if rule["source_kind"] in SENSOR_FAMILIES else "interface"
-                    targets = [(child_kind, f"{device_id}:{if_index}", if_index, metric)
-                               for if_index, metric in sorted(child_rows)]
-                else:
-                    targets = [("device", str(device_id), None,
-                                metrics_by_device_key.get(
-                                    (device_id, rule["source_kind"])))]
+                targets = self._threshold_targets(
+                    device_id, rule, children, metrics_by_device_key)
                 # An override row for a device Nodes no longer knows about is
                 # harmless by construction: this loop only ever looks one up
                 # for a device_id it already pulled from metrics_by_device_key
                 # / devices_by_ids above, so a deleted device's leftover row
                 # is simply never fetched, let alone acted on.
                 override = overrides_by_rule.get(rule["id"], {}).get(device_id)
-                if override is not None and not override["enabled"]:
-                    # enabled=0 means this rule never fires for THIS device,
-                    # so whatever is open must be resolved now rather than
-                    # frozen at its last value -- unlike a rule disabled
-                    # globally or a device removed entirely, both bigger,
-                    # rarer actions. by='' so it reads as automatic, not a
-                    # hand resolve: re-enabling and breaching again must open
-                    # a fresh alert, not find itself permanently suppressed.
-                    # Both entity shapes are resolved, not just this tick's
-                    # targets -- the device may have alerted per port
-                    # yesterday and device-wide before that.
-                    resolved = self.db.resolve_by_dedup(
-                        f"{rule['key']}:device:{device_id}", by="")
-                    if resolved:
-                        self.counters["resolved"] += 1
-                    self.counters["resolved"] += len(
-                        self.db.resolve_by_dedup_prefix(
-                            f"{rule['key']}:interface:{device_id}:", by=""))
-                    # Skip before touching the streak at all, and never
-                    # written into live_streaks below, so turning it back on
-                    # later starts a fresh streak rather than resuming
-                    # whatever was counted before it was switched off.
+                if self._skip_disabled_override(rule, device_id, override):
                     continue
-                covered_by = FALLBACK_OF.get(rule["key"] or "")
-                if covered_by is not None and any(
-                        device_id in published_devices.get(family, ())
-                        or children.get((device_id, family))
-                        for family in covered_by):
-                    # Judged sensor by sensor instead; the fallback rule
-                    # steps aside the same way the override-disabled branch does.
-                    if self.db.resolve_by_dedup(f"{rule['key']}:device:{device_id}", by=""):
-                        self.counters["resolved"] += 1
+                if self._skip_fallback_covered(rule, device_id, published_devices,
+                                              children):
                     continue
                 base_threshold = rule["threshold"]
                 base_clear = rule["clear_threshold"]

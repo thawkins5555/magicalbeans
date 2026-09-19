@@ -6,6 +6,7 @@ import socket
 import sys
 import time
 
+import _paths
 from _paths import free_tcp_port, spawn_stub, tmpdir
 
 TMPDIR = tmpdir("custom_mib_e2e_")
@@ -14,7 +15,7 @@ import netpath.nodepoll as nodepoll_mod
 # The stub answers GET/GETNEXT for the system group, an empty ifTable and
 # the custom MIB's scalar (testScalar = 42) on a free loopback port.
 stub, STUB_PORT = spawn_stub("stub_agent_get_getnext.py")
-nodepoll_mod.DEFAULT_SNMP_PORT = STUB_PORT
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", STUB_PORT)
 
 from netpath.web import Service, WebServer
 from netpath.auth import DEFAULT_PASSWORD, DEFAULT_USER
@@ -159,7 +160,7 @@ from netpath.nodepoll import NodePoller
 from netpath.nodesdb import NodesDatabase
 
 big_stub, big_port = spawn_stub("stub_agent_toobig.py", "10")
-nodepoll_mod.DEFAULT_SNMP_PORT = big_port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", big_port)
 try:
     db = NodesDatabase(os.path.join(TMPDIR, "toobig.db"))
     group_id = db.ensure_default_group()

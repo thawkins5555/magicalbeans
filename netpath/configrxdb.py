@@ -15,7 +15,7 @@ import time
 import zlib
 
 from . import configrx_redact
-from .sqlitebase import SqliteStore, id_chunks, reclaim
+from .sqlitebase import SqliteStore, id_chunks, marks_for, reclaim
 
 # RETURNING (SQLite 3.35) is what makes the targeted FTS delete in
 # _delete_search_lines possible instead of a whole-index rebuild.
@@ -580,7 +580,7 @@ class ConfigRxDatabase(SqliteStore):
         removed = 0
         with self._lock:
             for chunk in id_chunks(backup_ids):
-                marks = ",".join("?" * len(chunk))
+                marks = marks_for(chunk)
                 cur = self._conn.execute(
                     f"DELETE FROM backups WHERE id IN ({marks})", chunk)
                 removed += cur.rowcount or 0
@@ -604,7 +604,7 @@ class ConfigRxDatabase(SqliteStore):
                         (device_id,))]
                     stale = ids[retention_count_per_device:]
                     for chunk in id_chunks(stale):
-                        marks = ",".join("?" * len(chunk))
+                        marks = marks_for(chunk)
                         cur = self._conn.execute(
                             f"DELETE FROM backups WHERE id IN ({marks})", chunk)
                         removed += cur.rowcount or 0
@@ -727,7 +727,7 @@ class ConfigRxDatabase(SqliteStore):
             # other IN here. `limit` is the total, not per chunk.
             rows: list[sqlite3.Row] = []
             for chunk in id_chunks(device_ids):
-                marks = ",".join("?" * len(chunk))
+                marks = marks_for(chunk)
                 rows.extend(self._conn.execute(
                     sql.format(where=f" AND c.device_id IN ({marks})"),
                     (fts_query, *chunk, limit - len(rows))).fetchall())
@@ -751,7 +751,7 @@ class ConfigRxDatabase(SqliteStore):
             # Chunked for search_fts_match's reason; sorted so the chunks
             # arrive in the device order the caller groups on.
             for chunk in id_chunks(sorted(set(device_ids))):
-                marks = ",".join("?" * len(chunk))
+                marks = marks_for(chunk)
                 rows.extend(self._conn.execute(
                     sql.format(where=f" WHERE device_id IN ({marks})"),
                     chunk).fetchall())

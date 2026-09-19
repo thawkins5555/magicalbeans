@@ -125,7 +125,7 @@ except mibparse.MibTooLarge:
 # in 4.36.1 (with one correction, noted below), so it is an oracle for the
 # rewrite rather than a snapshot of it.
 
-print("H1  the 21 shipped MIBs parse to the objects they always did")
+print("H1  the 20 shipped MIBs parse to the objects they always did")
 
 with open(EXPECTED_PATH) as handle:
     expected = json.load(handle)
@@ -158,7 +158,7 @@ for name in shipped:
         differing = {k: (want[k], got[k]) for k in want if want[k] != got[k]}
         check(f"{name} parses as expected", False, str(differing))
     elif name == shipped[-1]:
-        check("all 21 shipped MIBs parse to the same module, object set, OIDs, "
+        check("all 20 shipped MIBs parse to the same module, object set, OIDs, "
               "syntax, enums, imports and resolution as before", True,
               f"{sum(e['object_count'] for e in expected.values())} objects")
 

@@ -85,7 +85,8 @@ RULES = [
     ("Telnet transport must not be enabled",
      configrx_compliance.RuleKind.MUST_NOT_MATCH, r"transport input telnet"),
 ]
-# Index of the one rule that is scoped, not fleet-wide — see build_rule_set.
+# Index of the one rule that is scoped, not fleet-wide — see
+# build_scoped_port_security_rule_set.
 PORT_SECURITY_RULE_INDEX = 2
 
 # The literal secret value acc-legacy's plaintext-password line carries —
@@ -122,21 +123,6 @@ def pull_real_capture(persona_name: str, vendor_key: str) -> tuple[str, str]:
     cleaned = configrx._clean_output(raw)
     problem = configrx._capture_problem(cleaned, ended)
     return cleaned, problem
-
-
-def build_rule_set(db: ConfigRxDatabase, access_group_id: int) -> int:
-    rule_set_id = configrx_compliance.add_rule_set(db, "Plant baseline — day one")
-    for i, (description, kind, pattern) in enumerate(RULES):
-        scope_note = " (scoped to Access Switches)" if i == PORT_SECURITY_RULE_INDEX else ""
-        configrx_compliance.add_rule(db, rule_set_id, description + scope_note, kind, pattern, ordinal=i)
-    # The port-security rule is the only one scoped; add_rule_set/rules
-    # above are fleet-wide by construction (this function creates ONE rule
-    # set with all five rules, matching how an operator would actually
-    # write a baseline — "everything but the switch-only rule applies to
-    # everything"). Scoping happens at RULE SET granularity in this
-    # module's current shape, not per-rule, so the scoped rule gets its
-    # own one-rule set instead, and evaluate_all is called once per set.
-    return rule_set_id
 
 
 def build_scoped_port_security_rule_set(db: ConfigRxDatabase, access_group_id: int) -> int:

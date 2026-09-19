@@ -16,7 +16,7 @@ from urllib.parse import urlparse
 
 from . import alertmail, alertrules
 from .sqlitebase import (LIKE_ESCAPE, SqliteStore, hist_add, hist_buckets,
-                         id_chunks, like_contains, reclaim)
+                         id_chunks, like_contains, marks_for, reclaim)
 
 log = logging.getLogger(__name__)
 
@@ -1920,7 +1920,7 @@ class AlertsDatabase(SqliteStore):
             if field_key in fields and field_key != "name":
                 cols.append(field_key)
                 vals.append(fields[field_key])
-        marks = ",".join("?" * len(vals))
+        marks = marks_for(vals)
         with self._lock:
             cur = self._conn.execute(
                 f"INSERT INTO rules({','.join(cols)}) VALUES ({marks})", vals)
@@ -2372,7 +2372,7 @@ class AlertsDatabase(SqliteStore):
         changed = 0
         with self._lock:
             for chunk in id_chunks(alert_ids):
-                marks = ",".join("?" * len(chunk))
+                marks = marks_for(chunk)
                 cursor = self._conn.execute(
                     f"UPDATE alerts SET state='resolved', resolved_ts=?,"
                     f" resolved_by=? WHERE id IN ({marks})"
@@ -2675,7 +2675,7 @@ class AlertsDatabase(SqliteStore):
         with self._lock:
             already = set()
             for chunk in id_chunks(ids):
-                marks = ",".join("?" * len(chunk))
+                marks = marks_for(chunk)
                 already.update(row[0] for row in self._conn.execute(
                     f"SELECT device_id FROM device_maintenance"
                     f" WHERE ended_ts IS NULL AND device_id IN ({marks})",
@@ -2726,7 +2726,7 @@ class AlertsDatabase(SqliteStore):
         cleared: set[int] = set()
         with self._lock:
             for chunk in id_chunks(ids):
-                marks = ",".join("?" * len(chunk))
+                marks = marks_for(chunk)
                 open_ids = [row[0] for row in self._conn.execute(
                     f"SELECT device_id FROM device_maintenance"
                     f" WHERE ended_ts IS NULL AND device_id IN ({marks})",
@@ -3093,7 +3093,7 @@ class AlertsDatabase(SqliteStore):
         changed = 0
         with self._lock:
             for chunk in id_chunks(alert_ids):
-                marks = ",".join("?" * len(chunk))
+                marks = marks_for(chunk)
                 cursor = self._conn.execute(
                     f"UPDATE alerts SET state='acked', acked_ts=?, acked_by=?"
                     f" WHERE id IN ({marks}) AND state='open'",
@@ -3159,7 +3159,7 @@ class AlertsDatabase(SqliteStore):
             self._conn.commit()
             resolved: list[sqlite3.Row] = []
             for chunk in id_chunks([row["id"] for row in rows]):
-                marks = ",".join("?" * len(chunk))
+                marks = marks_for(chunk)
                 resolved.extend(self._conn.execute(
                     f"SELECT * FROM alerts WHERE id IN ({marks})", chunk
                 ).fetchall())
@@ -3326,7 +3326,7 @@ class AlertsDatabase(SqliteStore):
         changed = 0
         with self._lock:
             for chunk in id_chunks(alert_ids):
-                marks = ",".join("?" * len(chunk))
+                marks = marks_for(chunk)
                 cursor = self._conn.execute(
                     f"UPDATE alerts SET state='open', acked_ts=NULL,"
                     f" acked_by=NULL, ack_note=NULL WHERE id IN ({marks})"

@@ -361,6 +361,33 @@ class Service:
                  app_db_path: str, ipam_db_path: str, snmp_db_path: str,
                  nodes_db_path: str, alerts_db_path: str,
                  wireless_db_path: str, configrx_db_path: str):
+        self._open_stores(db_path, flow_db_path, syslog_db_path, app_db_path,
+                          ipam_db_path, snmp_db_path, nodes_db_path,
+                          alerts_db_path, wireless_db_path, configrx_db_path)
+        self._load_settings()
+        self._init_restart_state()
+        self._build_workers()
+        self._open_sessions()
+        self._init_maintenance_state()
+        # Bumped by every write to something /api/config carries. The
+        # browser refetches /api/config only when this number moves.
+        # Monotonic within a process; a restart starting again from 1 is
+        # fine, because the client compares for inequality, not order.
+        self.config_version = 1
+        # bump_config() runs on request threads — every settings save, every
+        # collector toggle, every user create — and `+= 1` is a read, an add
+        # and a store, so two saves at once could both read N and both write
+        # N+1. One of the two operators would then never be told to refetch.
+        self._config_lock = threading.Lock()
+        # Per-poll figures that are expensive to compute and cannot usefully
+        # change faster than an operator can read them: storage sizes (30
+        # stat() calls) and the reverse-DNS cache fill (three queries).
+        self._poll_cache: dict[str, tuple[float, object]] = {}
+
+    def _open_stores(self, db_path: str, flow_db_path: str, syslog_db_path: str,
+                     app_db_path: str, ipam_db_path: str, snmp_db_path: str,
+                     nodes_db_path: str, alerts_db_path: str,
+                     wireless_db_path: str, configrx_db_path: str) -> None:
         self.log = EventLog()
         self.log.add(SYSTEM, "Event log started")
         self.app_db = AppDatabase(app_db_path)
@@ -395,6 +422,8 @@ class Service:
         # configrx_db_path already resolved to.
         self.mapper_db = MapperDatabase(
             str(Path(configrx_db_path).parent / "mapper.db"))
+
+    def _load_settings(self) -> None:
         # Global keys and NetPath keys, merged for reading. Each store filters
         # this dict down to what it owns when it is written back.
         self.settings = {**self.app_db.settings(), **self.db.settings()}
@@ -418,6 +447,7 @@ class Service:
         self.configrx_settings = self.configrx_db.settings()
         self.mapper_settings = self.mapper_db.settings()
 
+    def _init_restart_state(self) -> None:
         # Where a settings save's worker restart actually runs (see
         # _DEFERRED_SCOPES and apply_settings). One thread, so restarts stay
         # in the order they were asked for and two saves can never overlap
@@ -435,6 +465,7 @@ class Service:
         self._restarts_pending = 0
         self._restarts_closed = False
 
+    def _build_workers(self) -> None:
         self.hop_prober = HopProber(self.db, log=self.log)
         self.https_checker = HttpsChecker(self.db, log=self.log)
         self.monitor = Monitor(
@@ -487,6 +518,7 @@ class Service:
         # standalone (tests, scripts) with this left unset.
         self.node_poller.alert_engine = self.alert_engine
 
+    def _open_sessions(self) -> None:
         self.sessions = SessionStore(
             idle_minutes=int(self.settings.get("session_idle_minutes", 10)),
             max_hours=int(self.settings.get("session_max_hours", 12)))
@@ -501,6 +533,7 @@ class Service:
         self.web_relays = WebRelayRegistry(self)
         self._ensure_default_user()
 
+    def _init_maintenance_state(self) -> None:
         self._stop = threading.Event()
         self._maintenance_thread: threading.Thread | None = None
         self._rollup_thread: threading.Thread | None = None
@@ -524,20 +557,6 @@ class Service:
         self._rollup_lock = threading.Lock()
         self._flow_coverage_warned_ts = 0.0   # A5 log throttle; 0.0 lets the first lagging pass log
         self.started_at = time.time()
-        # Bumped by every write to something /api/config carries. The
-        # browser refetches /api/config only when this number moves.
-        # Monotonic within a process; a restart starting again from 1 is
-        # fine, because the client compares for inequality, not order.
-        self.config_version = 1
-        # bump_config() runs on request threads — every settings save, every
-        # collector toggle, every user create — and `+= 1` is a read, an add
-        # and a store, so two saves at once could both read N and both write
-        # N+1. One of the two operators would then never be told to refetch.
-        self._config_lock = threading.Lock()
-        # Per-poll figures that are expensive to compute and cannot usefully
-        # change faster than an operator can read them: storage sizes (30
-        # stat() calls) and the reverse-DNS cache fill (three queries).
-        self._poll_cache: dict[str, tuple[float, object]] = {}
 
     def _ensure_default_user(self) -> None:
         """Create admin/admin on a fresh install, flagged to be changed.
@@ -1606,22 +1625,18 @@ class Service:
         it."""
         return self._stop.is_set()
 
-    def _run_maintenance_body(self, force: bool = False) -> None:
+    def _maintenance_trace(self, force: bool) -> None:
         # A forced pass gets a short budget on netpath.db (the only store
         # here with per-hop rows at fleet volume) so a burst of settings
         # saves can't stall on a backlog; it still does enough retention
         # work that saves can't outrun what retention enforces.
-        # Checked between every stage below, not just once two thirds of the
-        # way down as it used to be: each stage is budgeted at up to
-        # TRIM_BUDGET_S, so a sweep that could not see the flag until after
-        # five of them held the shutdown's maintenance lock for minutes.
-        if self._stopping():
-            return
         prune_budget = FORCED_PRUNE_BUDGET_S if force else TRIM_BUDGET_S
         self.db.prune(float(self.settings.get("trace_retention_days", 90)),
                       budget_s=prune_budget)
         self._trim_db("max_trace_db_mb", self.db, "Trace database",
                       "oldest traces", budget_s=prune_budget)
+
+    def _maintenance_flow_rollup(self) -> None:
         # Before the prune, not after: the backfill summarises raw flows, and
         # pruning first would delete a bucket before it had been summarised.
         # A chart wider than a quarter of an hour reads the rollups rather
@@ -1636,8 +1651,8 @@ class Service:
                                  f"NetFlow: summarised the stored history "
                                  f"into the {ROLLUP_TIER_NAMES[tier]} rollups "
                                  f"({written} row(s) on this pass)")
-        if self._stopping():
-            return
+
+    def _maintenance_flow_prune(self) -> None:
         self.flow_db.drop_legacy_indexes()
         self.flow_db.prune(
             float(self.flow_settings.get("retention_days", 14)),
@@ -1653,8 +1668,7 @@ class Service:
         self._trim_db("max_flow_db_mb", self.flow_db, "Flow database",
                       "oldest flow records")
 
-        if self._stopping():
-            return
+    def _maintenance_syslog_snmp(self) -> None:
         self.syslog_db.prune(
             float(self.syslog_settings.get("retention_days", 30)),
             int(self.syslog_settings.get("max_rows", 20_000_000)))
@@ -1666,8 +1680,7 @@ class Service:
         self.app_db.prune_asn_cache(
             max(float(self.settings.get("asn_cache_days", 30)) * 4, 90))
 
-        if self._stopping():
-            return
+    def _maintenance_ipam(self) -> None:
         self.ipam_db.prune_hosts(
             float(self.ipam_settings.get("host_retention_days", 30)))
         self.ipam_db.prune_conflicts(
@@ -1677,16 +1690,13 @@ class Service:
         self.ipam_db.prune_scope_history(
             float(self.ipam_settings.get("dhcp_history_days", 35)))
 
-        if self._stopping():
-            return
+    def _maintenance_syslog_snmp_trim(self) -> None:
         self._trim_db("max_syslog_db_mb", self.syslog_db, "Syslog database",
                       "oldest messages")
         self._trim_db("max_snmp_db_mb", self.snmp_db, "SNMP trap database",
                       "oldest traps")
 
-        if self._stopping():
-            return
-
+    def _maintenance_wireless_configrx(self) -> None:
         self.wireless_db.prune_ap_events()
         self.wireless_db.prune_history(
             float(self.wireless_settings.get("history_days", 35)))
@@ -1703,9 +1713,7 @@ class Service:
         self._trim_db("max_ipam_db_mb", self.ipam_db, "IPAM database",
                       "oldest scan records")
 
-        if self._stopping():
-            return
-
+    def _maintenance_nodes(self) -> None:
         # Before the prune, not after: compact_rollup summarises complete
         # hours of raw samples into samples_hourly, and pruning first would
         # delete an hour before it had been summarised. A chart wider than
@@ -1770,13 +1778,50 @@ class Service:
                       "Nodes metric history",
                       "oldest hourly rollups and samples")
 
-        if self._stopping():
-            return
-
+    def _maintenance_alerts(self) -> None:
         self.alerts_db.prune(
             float(self.alerts_settings.get("retention_days", 180)))
         self._trim_db("max_alerts_db_mb", self.alerts_db, "Alerts database",
                       "oldest resolved alerts")
+
+    def _run_maintenance_body(self, force: bool = False) -> None:
+        # Checked between every stage below, not just once two thirds of the
+        # way down as it used to be: each stage is budgeted at up to
+        # TRIM_BUDGET_S, so a sweep that could not see the flag until after
+        # five of them held the shutdown's maintenance lock for minutes.
+        if self._stopping():
+            return
+        self._maintenance_trace(force)
+        self._maintenance_flow_rollup()
+
+        if self._stopping():
+            return
+        self._maintenance_flow_prune()
+
+        if self._stopping():
+            return
+        self._maintenance_syslog_snmp()
+
+        if self._stopping():
+            return
+        self._maintenance_ipam()
+
+        if self._stopping():
+            return
+        self._maintenance_syslog_snmp_trim()
+
+        if self._stopping():
+            return
+        self._maintenance_wireless_configrx()
+
+        if self._stopping():
+            return
+        self._maintenance_nodes()
+
+        if self._stopping():
+            return
+
+        self._maintenance_alerts()
 
         self._sample_storage_alerts()
         self._optimize_stores()

@@ -8,6 +8,7 @@ import socket
 import sqlite3
 import time
 
+import _paths
 from _paths import spawn_stub, tmpdir
 
 TMP = tmpdir("arp_tables_")
@@ -81,7 +82,7 @@ def by_ip(entries):
 
 # ---------------------------------------------- 1. the legacy table alone
 stub, port = spawn_stub("stub_agent_l2.py", "arp")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("legacy")
     did = device_against(db, port, name="legacy-rtr")
@@ -119,7 +120,7 @@ finally:
 
 # ---------------------------------------- 2. the successor table as fallback
 stub, port = spawn_stub("stub_agent_l2.py", "arp_physical")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("modern")
     did = device_against(db, port, name="modern-rtr")
@@ -153,7 +154,7 @@ finally:
 
 # ------------------------------------------ 3. both tables: legacy wins
 stub, port = spawn_stub("stub_agent_l2.py", "arp_both")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("both")
     did = device_against(db, port, name="both-rtr")
@@ -175,7 +176,7 @@ finally:
 
 # ----------------------------------------------- 4. neither table at all
 stub, port = spawn_stub("stub_agent_l2.py", "no_arp")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("none")
     did = device_against(db, port, name="l2-only-sw")
@@ -206,7 +207,7 @@ finally:
 
 # ---------------------------------- 5. GETBULK cost and the row-cap guard
 stub, port = spawn_stub("stub_agent_l2.py", "arp_big")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("big")
     did = device_against(db, port, name="big-rtr")
@@ -256,7 +257,7 @@ finally:
 
 # --------------------------------------------- 6. history: present/absent
 stub, port = spawn_stub("stub_agent_l2.py", "arp")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("history")
     did = device_against(db, port, name="hist-rtr")

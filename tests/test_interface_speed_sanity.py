@@ -8,7 +8,7 @@ Reuses test_poller_behaviour's one-interface stub agent rather than growing a
 second copy of it: the scenarios here differ only in the two speed columns."""
 import os
 
-import _paths  # noqa: F401  (puts the repo root on sys.path)
+import _paths
 from _paths import tmpdir
 
 from netpath.nodepoll import (
@@ -138,7 +138,7 @@ def _speed_and_util(prefix, *, if_speed, if_high_speed, bump_bytes, if_type=6):
     agent.start()
     tmp = tmpdir(prefix)
     db = NodesDatabase(os.path.join(tmp, "nodes.db"))
-    nodepoll_mod.DEFAULT_SNMP_PORT = agent.port
+    _paths.patch_nodepoll("DEFAULT_SNMP_PORT", agent.port)
     try:
         group_id = db.ensure_default_group()
         device_id = db.add_device("127.0.0.1", "speed-stub", group_id=group_id,

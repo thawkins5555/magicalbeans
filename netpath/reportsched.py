@@ -18,7 +18,6 @@ from . import csvout
 from . import report as reportmod
 from .eventlog import SYSTEM
 
-CADENCES = ("daily", "weekly", "monthly")
 KINDS = ("availability", "top_metrics", "firmware", "sfp", "psu")
 
 # Body text formats a period as whole days; 20 rows is what an inbox reads

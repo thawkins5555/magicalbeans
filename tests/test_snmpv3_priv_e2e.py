@@ -31,7 +31,7 @@ import time
 
 os.environ.setdefault("NETPATH_SECRET_PASSPHRASE", "snmpv3-priv-e2e-suite")
 
-import _paths  # noqa: F401  (puts the repo root on sys.path)
+import _paths
 from _paths import spawn_stub, tmpdir
 
 from netpath import snmpcrypt
@@ -121,7 +121,7 @@ print("\n-- an authPriv poll, GETBULK ifTable walk included")
 stats = os.path.join(TMP, "walk.json")
 stub, port = spawn_stub("stub_agent_iftable.py", "v3", "--auth-pass", AUTH,
                         "--priv-pass", PRIV, "--interfaces", "40", "--stats", stats)
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db, gid, did = new_db("walk", AUTH, PRIV)
     poller = NodePoller(db)
@@ -182,7 +182,7 @@ print("\n-- engine restart between two authPriv polls")
 stats = os.path.join(TMP, "resync.json")
 stub, port = spawn_stub("stub_agent_iftable.py", "v3", "--auth-pass", AUTH,
                         "--priv-pass", PRIV, "--bump-boots-at", "0.5", "--stats", stats)
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db, gid, did = new_db("resync", AUTH, PRIV)
     poller = NodePoller(db)
@@ -213,7 +213,7 @@ print("\n-- a wrong privacy password is decryptionErrors, not wrongDigests")
 stats = os.path.join(TMP, "wrongpriv.json")
 stub, port = spawn_stub("stub_agent_iftable.py", "v3", "--auth-pass", AUTH,
                         "--priv-pass", PRIV, "--stats", stats)
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db, gid, did = new_db("wrongpriv", AUTH, WRONG)
     poller = NodePoller(db)
@@ -263,7 +263,7 @@ print("\n-- a tampered reply is refused by the new verification")
 stats = os.path.join(TMP, "tamper.json")
 stub, port = spawn_stub("stub_agent_iftable.py", "v3", "--auth-pass", AUTH,
                         "--priv-pass", PRIV, "--tamper-reply", "--stats", stats)
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db, gid, did = new_db("tamper", AUTH, PRIV)
     poller = NodePoller(db)
@@ -285,7 +285,7 @@ finally:
 print("\n-- an unsigned reply to a signed request is a downgrade, with an off switch")
 stub, port = spawn_stub("stub_agent_iftable.py", "v3", "--auth-pass", AUTH,
                         "--unsigned-replies")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db, gid, did = new_db("downgrade", AUTH, None)
     poller = NodePoller(db)

@@ -5,6 +5,7 @@ the cut-short rule that keeps stored per-VLAN detail rather than write a
 partial view."""
 import time
 
+import _paths
 from _paths import spawn_stub, tmpdir
 
 TMP = tmpdir("stp_vlan_")
@@ -74,7 +75,7 @@ def mark_cisco(db: NodesDatabase, did: int) -> None:
 # --------------------------------------------------------- the per-VLAN merge
 
 stub, port = spawn_stub("stub_agent_l2.py", "pvst")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("pvst")
     did = device_against(db, port, "pvst-sw")
@@ -116,7 +117,7 @@ finally:
 # ------------------------------------------------- non-Cisco device: no '@'
 
 stub, port = spawn_stub("stub_agent_l2.py", "pvst")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("pvst_noncisco")
     did = device_against(db, port, "generic-sw")
@@ -145,7 +146,7 @@ finally:
 # ------------------------------------------------------------- v3: skipped
 
 stub, port = spawn_stub("stub_agent_l2.py", "pvst")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("pvst_v3")
     did = device_against(db, port, "v3-sw")
@@ -169,7 +170,7 @@ finally:
 # ------------------------------------------ latch: no VTP table, re-probed
 
 stub, port = spawn_stub("stub_agent_l2.py", "pvst_no_vtp")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("pvst_no_vtp")
     did = device_against(db, port, "no-vtp-sw")
@@ -214,7 +215,7 @@ finally:
 # --------------------------------------------- cut short: stored detail kept
 
 stub, port = spawn_stub("stub_agent_l2.py", "pvst-slow")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("pvst_slow")
     did = device_against(db, port, "slow-sw")
@@ -248,7 +249,7 @@ finally:
 # ------------------------------------------- F1: no VLAN-1 member ports
 
 stub, port = spawn_stub("stub_agent_l2.py", "pvst-empty1")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("pvst_empty1")
     did = device_against(db, port, "empty1-sw")
@@ -273,7 +274,7 @@ finally:
 # ------------------------- F1b: no scalars, but a VLAN context answers
 
 stub, port = spawn_stub("stub_agent_l2.py", "pvst-no-scalars")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("pvst_no_scalars")
     did = device_against(db, port, "no-scalars-sw")
@@ -301,7 +302,7 @@ finally:
 # --------------------------------------- F3: 50 VLANs, sliced to 48
 
 stub, port = spawn_stub("stub_agent_l2.py", "pvst-50vlan")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("pvst_50vlan")
     did = device_against(db, port, "vlan50-sw")
@@ -330,7 +331,7 @@ finally:
 # --------------------------- F4: non-forwarding states must not collapse
 
 stub, port = spawn_stub("stub_agent_l2.py", "pvst-disabled")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("pvst_disabled")
     did = device_against(db, port, "disabled-sw")
@@ -353,7 +354,7 @@ finally:
 # ------------------------------- F5: global-only port keeps global state
 
 stub, port = spawn_stub("stub_agent_l2.py", "pvst-orphan")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("pvst_orphan")
     did = device_against(db, port, "orphan-sw")
@@ -380,7 +381,7 @@ finally:
 # --------------------------- F6: 2+ non-forwarding states, no global value
 
 stub, port = spawn_stub("stub_agent_l2.py", "pvst-mixed")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("pvst_mixed")
     did = device_against(db, port, "mixed-sw")
@@ -405,7 +406,7 @@ finally:
 # --------------------------- v1: noSuchName at the column's last row
 
 stub, port = spawn_stub("stub_agent_l2.py", "pvst")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("pvst_v1")
     did = device_against(db, port, "v1-sw")

@@ -7,6 +7,7 @@ support reports nothing for any of the three metrics rather than erroring.
 """
 import time
 
+import _paths
 from _paths import spawn_stub, tmpdir
 
 TMP = tmpdir("hr_mem_")
@@ -57,7 +58,7 @@ def device_against(db: NodesDatabase, name: str, **overrides) -> int:
 # ---------------------------------------------------- a Windows-class host
 
 stub, port = spawn_stub("stub_agent_host_resources.py", "windows")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("windows")
     did = device_against(db, "win-host-1")
@@ -114,7 +115,7 @@ finally:
 # --------------------------------------------- a device with no HOST-RESOURCES
 
 stub, port = spawn_stub("stub_agent_host_resources.py", "no_hr")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("no_hr")
     did = device_against(db, "no-hr-device")

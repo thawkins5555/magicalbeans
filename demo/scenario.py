@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Run the whole SappiWhere demo: fleet, app, seed, incidents, UI walk.
+"""Run the whole SappiWhere demo: fleet, app, seed, incidents.
 
     python3 demo/scenario.py --count 250 --out demo/out
-    python3 demo/scenario.py --count 25  --out demo/out --fast --skip-ui
+    python3 demo/scenario.py --count 25  --out demo/out --fast
 
 Owns every process it starts (an SMTP sink, `demo/fleet.py`, the app run
 with `PATH=demo/bin:$PATH` so it picks up the scripted ping/traceroute
-shims, `demo/seed.py`, the incident steps, then `demo/ui_walk.mjs`) and
-stops them all in a `finally` even when a step raises.
+shims, `demo/seed.py`, the incident steps) and stops them all in a
+`finally` even when a step raises.
 
 Around every incident step it snapshots `/api/state`, `/api/debug`, open
 alerts, the mail sink's message count and the app's CPU%/RSS, writing
@@ -19,7 +19,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 import signal
 import subprocess
 import sys
@@ -997,36 +996,6 @@ class Scenario:
             return {"events": events}
         self.maybe_step(9, "recovery (flaps stop, auth restored)", recovery, 150)
 
-    # -- UI walk ----------------------------------------------------------
-
-    def run_ui(self) -> dict:
-        walk = os.path.join(HERE, "ui_walk.mjs")
-        node = shutil.which("node")
-        if not node:
-            self.notes.append("node is not on PATH — the UI walk was skipped")
-            return {"skipped": "node not found"}
-        if not os.path.exists(walk):
-            return {"skipped": "demo/ui_walk.mjs not found"}
-        ui_out = os.path.join(self.out, "ui")
-        argv = [node, walk, "--base", self.base,
-                "--creds", os.path.join(self.out, "creds.txt"),
-                "--out", ui_out, "--tag", str(self.count)]
-        self.log("[ui] %s" % " ".join(argv))
-        log_path = os.path.join(self.out, "ui-walk-%d.log" % self.count)
-        with open(log_path, "w", encoding="utf-8") as handle:
-            result = subprocess.run(argv, cwd=REPO, stdout=handle,
-                                    stderr=subprocess.STDOUT, check=False)
-        metrics = {}
-        try:
-            with open(os.path.join(ui_out, "metrics-%d.json" % self.count),
-                      encoding="utf-8") as handle:
-                metrics = json.load(handle)
-        except (OSError, ValueError):
-            pass
-        self.log("[ui] exit=%d" % result.returncode)
-        return {"returncode": result.returncode, "metrics": metrics,
-                "log": os.path.basename(log_path)}
-
     # -- reporting --------------------------------------------------------
 
     def write_results(self, extra: dict) -> None:
@@ -1124,24 +1093,6 @@ class Scenario:
                     % (run["persona"], run["port"], run["vendor"],
                        run.get("why", ""), outcome))
             lines.append("")
-        ui_metrics = (extra.get("ui") or {}).get("metrics") or {}
-        if ui_metrics:
-            lines.extend([
-                "## UI walk",
-                "",
-                "- Nodes table filled %s/%s rows in %s ms after "
-                "`App.refreshNow('nodes')`."
-                % (ui_metrics.get("nodes_table_rows"),
-                   ui_metrics.get("device_count"),
-                   ui_metrics.get("nodes_fill_ms")),
-                "- `/api/nodes/devices` payload: %s bytes in %s ms."
-                % (ui_metrics.get("devices_payload_bytes"),
-                   ui_metrics.get("devices_payload_ms")),
-                "- Long tasks observed: %s (longest %s ms)."
-                % (ui_metrics.get("longtask_entries_observed"),
-                   ui_metrics.get("longtask_longest_ms")),
-                "",
-            ])
         if self.notes:
             lines.append("## Notes")
             lines.append("")
@@ -1183,10 +1134,6 @@ class Scenario:
             extra["first_cycle"] = self.wait_for_first_cycle()
             extra["configrx_platforms"] = self.configrx_platforms()
             self.incidents()
-            if not self.args.skip_ui:
-                extra["ui"] = self.run_ui()
-            else:
-                extra["ui"] = {"skipped": "--skip-ui"}
             return 0
         except Exception as exc:                            # noqa: BLE001
             self.notes.append("run aborted: %s: %s" % (type(exc).__name__, exc))
@@ -1223,8 +1170,6 @@ def main(argv=None) -> int:
                              "poll interval; --ping-interval 300 is the "
                              "usual remedy to measure against the shipped "
                              "default")
-    parser.add_argument("--skip-ui", action="store_true",
-                        help="do not run demo/ui_walk.mjs at the end")
     parser.add_argument("--fast", action="store_true",
                         help="scale every wait down 4x for a dry run")
     parser.add_argument("--topology", action="store_true",

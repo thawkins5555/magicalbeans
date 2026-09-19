@@ -359,7 +359,7 @@ def stub(interface_counts, polls: int) -> int:
             proc, port = spawn_stub("stub_agent_iftable.py", "ok",
                                     "--interfaces", str(interfaces))
             try:
-                nodepoll.DEFAULT_SNMP_PORT = port
+                _paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
                 # snmp_version=1 is v2c here (0=v1, 1=v2c, 3=v3 — nodesdb's
                 # own column comment), which is what this stub speaks.
                 # ping_enabled=0: 127.0.0.1 answers ICMP on any machine with
@@ -385,7 +385,7 @@ def stub(interface_counts, polls: int) -> int:
             finally:
                 proc.kill()
     finally:
-        nodepoll.DEFAULT_SNMP_PORT = real_port
+        _paths.patch_nodepoll("DEFAULT_SNMP_PORT", real_port)
         db.close()
 
     print("\nthe synthetic distribution this bench assumes, for comparison:")

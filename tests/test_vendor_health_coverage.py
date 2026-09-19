@@ -4,6 +4,7 @@ had cpu_pct/temp_chassis_c but no mem_pct). Both decoded off real BER wire
 responses through the actual poll path (nodepoll._poll_vendor_health), not
 asserted by inspection.
 """
+import _paths
 from _paths import spawn_stub, tmpdir
 
 TMP = tmpdir("vendor_health_")
@@ -35,7 +36,7 @@ def device_against(db: NodesDatabase, name: str, **overrides) -> int:
 # ------------------------------------------------------------------- Cisco
 
 stub, port = spawn_stub("stub_agent_vendor_health.py", "cisco")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("cisco")
     did = device_against(db, "cisco-sw-1")
@@ -60,7 +61,7 @@ finally:
 # ----------------------------------------------------------------- Juniper
 
 stub, port = spawn_stub("stub_agent_vendor_health.py", "juniper")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("juniper")
     did = device_against(db, "juniper-sw-1")
@@ -95,7 +96,7 @@ finally:
 # row, both when a real arc was found and when it deliberately was not.
 
 stub, port = spawn_stub("stub_agent_vendor_health.py", "cisco")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("vendor_arc_real")
     did = device_against(db, "cisco-sw-2")

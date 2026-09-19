@@ -69,7 +69,8 @@ netpath/
   nodeoids.py      built-in polled-metric OID catalog for the Nodes poller;
                    also the OID constants for FortiGate Wireless Controller
                    polling
-  nodepoll.py      NodePoller: the per-device SNMP/ping scheduler
+  nodepoll/        NodePoller: the per-device SNMP/ping scheduler, as a
+                   package — see "Package layout" under Nodes below
   swversion.py     pure sysDescr/vendor-OID parser: splits a device's
                    software version, image and boot-image file — 5.10.0
   nodesdb.py       nodes.db: devices, profiles, interfaces, state
@@ -135,7 +136,8 @@ netpath/
   web/
     __init__.py    exports Service and WebServer
     service.py     Service: owns every database and background worker
-    api.py         JSON endpoint handlers, one function per route
+    api/           JSON endpoint handlers, one function per route, as a
+                   package — see "Package layout" under Web layer below
     server.py      HTTP(S) server, routing, sessions, static files
     wsock.py       RFC 6455 WebSocket framing, server side, stdlib only
     static/        the browser interface
@@ -449,7 +451,7 @@ in-flight promise so opening four rows costs one request, not four.
 column on `metrics`, backfilled by the series store's first `_migrate`
 (`UPDATE metrics SET scope = 1 WHERE key LIKE '%.%'`) and set at creation
 time in `record_metric_samples`. The discriminator is a dot in the
-metric's key — `nodepoll.py`'s own documented per-port naming convention
+metric's key — `nodepoll/`'s own documented per-port naming convention
 — rather than the `if_` prefix: six device-level worst-port summaries
 (`if_in_errors_max`, and its siblings) are bare `if_*` keys an alert rule
 reads directly, and the five `sfp_*` families are per-port without being
@@ -684,6 +686,35 @@ MIB is not history, and trimming it would silently stop traps decoding.
 
 ## Nodes
 
+### Package layout (`nodepoll/`) — 5.44.0
+
+`netpath/nodepoll.py` (9,387 lines, one file) is now the package
+`netpath/nodepoll/`:
+
+- `poller.py` — the `NodePoller` class itself: the constructor (now seven
+  named setup steps rather than one long one), start/stop/drain/shutdown,
+  the scheduling loop, autoscale, and `_forget_devices`.
+- One mixin per concern, all mixed into `NodePoller`: `discovery_mixin.py`
+  (subnet/device discovery jobs), `poll_mixin.py` (the main per-device poll
+  cycle, identity, software version, health), `identify_mixin.py` (vendor
+  and custom-MIB identification, interface and custom-MIB walks),
+  `environment_mixin.py` (sensors, fans, PSUs, transceiver/DOM, PoE, STP),
+  `vendor_sensor_psu_mixin.py` (vendor-specific sensor/PSU tables, MAC/FDB
+  reads), `arp_mixin.py`, `lldp_cdp_mixin.py`, `vlan_mixin.py`.
+- Shared helpers: `_consts.py`, `_decode.py`, `_session.py` (the SNMPv3
+  session, credentials and USM exchange), `_jobs.py` (background job
+  bookkeeping for walks and identification).
+- `__main__.py` — the built-in self-test still runs the same way,
+  `python -m netpath.nodepoll`.
+
+`nodepoll/__init__.py` re-exports every name, so `NodePoller` and every
+method below are imported exactly as they were from the single file.
+**The one thing this changes for anyone touching tests:** a suite that
+used to patch a name directly on `netpath.nodepoll` must now patch the
+submodule that actually reads it — `tests/_paths.patch_nodepoll` does
+this for the whole suite, and the sections below name the submodule each
+function actually lives in.
+
 ### Wire format (`snmppoll.py`)
 
 Every BER/ASN.1 primitive (`Reader`, tag constants, `_signed`/`_unsigned`/
@@ -783,7 +814,7 @@ from `session.next_request_id()` instead of the builder's fixed 1, and
 `v3_exchange` passes the msgID it sent alongside the request id. RFC 3412 §7.2
 is what has the receiver match this field.
 
-### Vendor identification (`vendorid.py`, `enterprises.py`, `nodepoll.py`)
+### Vendor identification (`vendorid.py`, `enterprises.py`, `nodepoll/`)
 
 **The arc hop.** Vendor identity lives entirely under `1.3.6.1.4.1`. A
 GETNEXT at `1.3.6.1.4.1` lands on the first object under the first populated
@@ -886,9 +917,9 @@ honest fix is a test that asserts each `VERIFIED` arc against a checked-in
 extract of the IANA registry, which would turn the claim into something CI
 keeps true; until that exists the docstring is the claim, and it is wrong.
 
-### mib_file_auto: an assigned MIB is not an override (`nodesdb.py`, `nodepoll.py`, `web/api.py`) — 5.18.0
+### mib_file_auto: an assigned MIB is not an override (`nodesdb.py`, `nodepoll/poll_mixin.py`, `web/api/nodes.py`) — 5.18.0
 
-`_auto_assign_mib` (`nodepoll.py`) writes `devices.mib_file_id` — the same
+`_auto_assign_mib` (`nodepoll/poll_mixin.py`) writes `devices.mib_file_id` — the same
 column a hand-picked MIB uses — the first time a device's own vendor
 identification names one and no preference exists yet. `mib_file_id` is
 also an `_OVERRIDE_COLUMNS` entry, and `override_fields`/`_OVERRIDES_SQL`
@@ -931,7 +962,7 @@ one of those files cannot be told apart from an old auto-assignment, and
 the "a person choosing a MIB, even one that matches, is still a real
 choice" rule above still governs it.
 
-### Identity OIDs (`nodesdb.py`, `nodepoll.py`, `nodeoids.py`)
+### Identity OIDs (`nodesdb.py`, `nodepoll/poll_mixin.py`, `nodeoids.py`)
 
 `vendor_oid` and `location_oid` are ordinary members of `_OVERRIDE_COLUMNS`
 and `_GROUP_EDITABLE`, so `effective_config()` resolves device-over-profile
@@ -939,7 +970,7 @@ for free and no new merge path exists. NULL means today's behaviour, which is
 the whole backward-compatibility story.
 
 Deliberately *not* reusing `oid_set`: that column is declared, migrated,
-round-tripped by the API and read by nothing (`nodepoll.py` never mentions
+round-tripped by the API and read by nothing (`nodepoll/` never mentions
 it), and its schema comment promises a different feature — "comma-separated
 metric keys". A pre-carved seat is not an invitation to sit in it with
 something else.
@@ -1011,11 +1042,11 @@ away; it is now stored, because an IANA arc assignment and a sysDescr
 substring guess are not equally trustworthy and the header used to present
 them identically.
 
-### ifName and the LLDP local-port map (`nodeoids.py`, `nodepoll.py`, `nodesdb.py`) — 5.18.0
+### ifName and the LLDP local-port map (`nodeoids.py`, `nodepoll/lldp_cdp_mixin.py`, `nodesdb.py`) — 5.18.0
 
 **A Neighbours row's Local port used to read "if 12" whenever LLDP's own
 port numbering didn't line up with the port table.** `_neighbor_local_port_
-labeler` (`web/api.py`) names a local port by looking `if_index` up in
+labeler` (`web/api/_shared.py`) names a local port by looking `if_index` up in
 `interfaces.descr`/`alias`, falling back to `"if N"` when nothing has that
 index — and LLDP's own `lldpRemLocalPortNum` is the *neighbour's* local
 port number, which several vendors' agents number independently of the
@@ -1036,7 +1067,7 @@ title are unchanged, since the operator only asked for the Neighbours
 label to shorten, not for the interfaces list's own Descr column.
 
 **The local-port-number mismatch itself is fixed at the source, not papered
-over in the labeler.** `_walk_lldp` (`nodepoll.py`) now also walks
+over in the labeler.** `_walk_lldp` (`nodepoll/lldp_cdp_mixin.py`) now also walks
 `lldpLocPortTable`'s `lldpLocPortIdSubtype` and `lldpLocPortId`
 (`nodeoids.LLDP_LOC_PORT_ID_SUBTYPE`/`LLDP_LOC_PORT_ID`) and
 `lldpLocPortDesc` (`LLDP_LOC_PORT_DESC`), once per polling pass, and builds
@@ -1054,7 +1085,7 @@ kept out of `complete`, the same as the management-address walk it sits
 beside: a device that doesn't answer it degrades to identity mapping
 rather than failing the poll.
 
-### Software version and image (`swversion.py`, `nodepoll._poll_software_version`) — 5.10.0
+### Software version and image (`swversion.py`, `nodepoll/poll_mixin.py`'s `_poll_software_version`) — 5.10.0
 
 Pure and dependency-free — no I/O, no SNMP, no database — `swversion.py`
 takes the enterprise arc `vendorid.py` already worked out, the `sys_descr`
@@ -1173,7 +1204,7 @@ outright, then `sysName`, then a manual name stored without that marker
 then the bare IP; `firmware_inventory()`'s `device`/`name_source` fields
 and the firmware report's Device column both come from it.
 
-### UPS and environmental health (`nodeoids.py`, `nodepoll.py`, `alertsdb.py`) — 4.49.0
+### UPS and environmental health (`nodeoids.py`, `nodepoll/`, `alertsdb.py`) — 4.49.0
 
 Two new best-effort reads ride the ordinary poll, both added because a plant
 site is full of devices that are not routers or switches: `_poll_ups_health`
@@ -1442,7 +1473,7 @@ this protection since 5.1.0 (`if port_map:`); this is the same guarantee for
 the two states the entity table alone can see.
 
 **5.25.0 adds a third medium, `'copper'`, decided by text first and the
-wire itself second.** `_sfp_slot_media` (`nodepoll.py`) runs the module
+wire itself second.** `_sfp_slot_media` (`nodepoll/environment_mixin.py`) runs the module
 text it already has (`entPhysicalDescr`, `entPhysicalModelName`) through
 a second regex, `_COPPER_TEXT`:
 
@@ -1512,7 +1543,7 @@ that port optic or copper, exactly the same "advisory only" treatment
 `'sfp'`/`'sfp_empty'` already had — a slow device does not flicker a
 copper badge off and back every five minutes either.
 
-### The cage scan runs without a sensor answer, and says why a port stayed unbadged: `_cage_capable`/`_cage_read`, `_log_media_diag` (`nodepoll.py`) — 5.35.0
+### The cage scan runs without a sensor answer, and says why a port stayed unbadged: `_cage_capable`/`_cage_read`, `_log_media_diag` (`nodepoll/environment_mixin.py`) — 5.35.0
 
 **Decoupling the cage scan from the sensor gate.** `_poll_environment`
 used to `return` the moment `_walk_sensor_columns` came back empty —
@@ -1564,7 +1595,7 @@ cage scan is even reached, a `port_map` that came back empty with no
 empty — the plain-host latch, which reads an ENTITY-MIB-less device the
 same way whether the cage scan proper ever ran. A walk cut short with zero
 rows so far proves nothing on either path and leaves the latch as it was.
-`poll_now` (`nodepoll.py`) drops `_cage_read` alongside
+`poll_now` (`nodepoll/poller.py`) drops `_cage_read` alongside
 `_mau_read`/`_sensor_read` on a manual poll, so a fresh probe is not stuck
 behind a stale hour-old timestamp; `_cage_capable` is left untouched
 there, consistent with `_mau_capable` — the capability latch outlives a
@@ -1714,7 +1745,7 @@ metric as absent, since a temperature reading doesn't change between one
 poll and the next the way an interface counter does, so there's nothing to
 buy by re-walking it as often.
 
-### Scheduler (`nodepoll.py`)
+### Scheduler (`nodepoll/poller.py`)
 
 `NodePoller` is shaped like NetPath's own `Monitor`, not `IpamWorker` —
 deliberately, because Nodes typically manages far more devices than IPAM
@@ -1990,7 +2021,7 @@ devices rather than requiring an in-use guard — unlike losing a polling
 profile, losing an organizational folder is harmless.
 
 **Bulk device operations** (`bulk_update_devices`/`bulk_remove_devices`,
-`nodesdb.py`; `post_nodes_devices_bulk_update`/`_bulk_delete`, `api.py`):
+`nodesdb.py`; `post_nodes_devices_bulk_update`/`_bulk_delete`, `web/api/nodes.py`):
 one `UPDATE ... WHERE id IN (...)` for an edit, inside a single
 lock/commit per call, the same "operate on a list of ids from one
 request" shape `post_nodes_discovery_promote`'s `result_ids` list already
@@ -2002,7 +2033,7 @@ already uses — no separate "clear" endpoint. `bulk_remove_devices` no
 longer does one `DELETE ... WHERE id IN (...)`, from 5.10.0 — see *Device
 delete: an asynchronous purge*, below, for what it does instead and why.
 
-### Device delete: an asynchronous purge (`nodesdb.py`, `web/service.py`, `web/api.py`, `console.py`) — 5.10.0
+### Device delete: an asynchronous purge (`nodesdb.py`, `web/service.py`, `web/api/nodes.py`, `console.py`) — 5.10.0
 
 A device delete is the one write whose size is set by how long the
 device was polled — up to millions of sample rows for a long-polled
@@ -2011,7 +2042,7 @@ lock: the poll cycle, every other read and the browser's own 30-second
 request timeout all waited on it, and a chassis with enough history could
 make the delete itself look like the failure.
 
-`delete_nodes_device`/`post_nodes_devices_bulk_delete` (`api.py`) no
+`delete_nodes_device`/`post_nodes_devices_bulk_delete` (`web/api/nodes.py`) no
 longer delete anything directly. They call `alerts_db.forget_device`,
 `configrx_db.forget_device` and `mapper_db.forget_device` (unchanged —
 these were already small), then `nodesdb.request_device_removal(ids)`,
@@ -2214,7 +2245,7 @@ through. `set_default_group()` is a two-statement transaction (clear the
 old default, set the new one) with no in-use check, since making a
 profile default moves no devices.
 
-### The poll pool sizes itself (`nodepoll.py`) — 5.5.0
+### The poll pool sizes itself (`nodepoll/poller.py`) — 5.5.0
 
 **Why it is a Little's Law sum and not a feedback loop.** How many workers a
 fleet needs is a quantity this codebase can compute rather than discover: the
@@ -2279,7 +2310,7 @@ time and is `None` only when auto-sizing is off or `start()` never
 ran — which is how `tests/test_poll_write_path.py` drives `_note_saturation`,
 and why the gate reads poller state rather than the database.
 
-### A draining pool still counts towards capacity: `_draining`, `_pool_capacity` (`nodepoll.py`) — 5.38.0
+### A draining pool still counts towards capacity: `_draining`, `_pool_capacity` (`nodepoll/poller.py`) — 5.38.0
 
 **The busy/queued line's denominator was wrong the moment a shrink
 happened.** `pool_state()` read `workers` straight off
@@ -2318,7 +2349,7 @@ that was never resized mid-poll sees `_draining` stay empty and
 worker count in the reported total until its threads actually exit, and
 that `poller._draining` empties itself once they do.
 
-### A down device backs off SNMP, never ping (`nodepoll.py`) — 5.5.0
+### A down device backs off SNMP, never ping (`nodepoll/poller.py`) — 5.5.0
 
 A device that is not answering costs about thirty times one that is — every
 ping timeout plus every SNMP timeout times its retries — so a device already
@@ -2589,7 +2620,7 @@ CISCO-ENVMON-MIB power-supply/fan/temperature state
 (`_read_cisco_envmon`); `read_dom_all` is the same entity list filtered
 to rows that resolved to a port, the device-wide counterpart of
 `read_dom` above, carrying the same `limits`/`limits_source` pair. Two routes back them, `GET
-/api/nodes/devices/<id>/hardware` and `.../dom` (`api.py`,
+/api/nodes/devices/<id>/hardware` and `.../dom` (`web/api/nodes.py`,
 `server.py`), read by the device dialog's HARDWARE SENSORS and DOM / SFP
 SENSORS sections (`nodes.js`); both walk only while that dialog is open,
 same reasoning as `read_dom`.
@@ -2692,7 +2723,7 @@ column is needed. Entries are deduplicated on the `(mac, vlan)` pair,
 since the same address legitimately appears in several VLANs.
 
 Note that **the MIB catalog cannot widen any of this**: the poller uses
-hardcoded numeric OIDs throughout (`nodepoll.py`, `nodeoids.py`) and
+hardcoded numeric OIDs throughout (`nodepoll/`, `nodeoids.py`) and
 uploaded MIBs only ever supply display names.
 Adding Q-BRIDGE and the Cisco path is what changed the coverage.
 
@@ -2868,7 +2899,7 @@ Named rather than numbered, because "error-status 5" told an operator
 nothing.
 
 **Diagnostics: the Test button's walk, and `_Session.dropped`**
-(`web/api.py post_nodes_device_test`, `_test_ifindex_walk`,
+(`web/api/nodes.py`'s `post_nodes_device_test`, `_test_ifindex_walk`,
 `nodepoll._with_dropped`). The Test button issued a GET of six system
 scalars and nothing else, so it reported OK against every mechanism above:
 a walk that times out part way, an agent that answers `genErr` for the
@@ -2947,7 +2978,7 @@ standard-tree sysObjectID would otherwise be reported as missing a
 "system MIB" that does not exist.
 
 **Per-poll debug logging**: `eventlog.NODES` had been imported into
-`nodepoll.py` since the Alerts build and never once used. `_poll_device`
+`nodepoll/poll_mixin.py` since the Alerts build and never once used. `_poll_device`
 now logs one `NODES`-category event per poll with a structured `detail`
 (ping/SNMP outcome, interfaces found, metrics found or the exact
 `snmp_error` text on failure, elapsed time) — the same
@@ -3077,7 +3108,7 @@ and only with the request id sent; the import of `_Session` is
 function-local, which is what keeps the cycle away — `nodepoll` imports
 this module at module level)
 against whichever addresses answered, trying every v1/v2c community drawn
-from a caller-chosen polling profile (`api.py`'s `post_nodes_discovery`
+from a caller-chosen polling profile (`web/api/nodes_credentials.py`'s `post_nodes_discovery`
 resolves the profile's primary credential plus its `group_credentials`
 alternates into a comma-separated community list before calling in,
 reusing the same `[primary] + group_credentials(...)` shape
@@ -3106,7 +3137,7 @@ probe cache — and a comma-separated field would be a second, weaker
 credential list beside it, one that could not carry a version and would
 make a community legitimately containing a comma unusable. The refusal's
 message points at that feature. It is applied in `nodesdb` rather than
-`api.py` so every write path gets it (`add_device`, `update_device`,
+`web/api/` so every write path gets it (`add_device`, `update_device`,
 `bulk_update_devices`, `add_devices_bulk`, `update_group`,
 `add_group_credential`, `update_group_credential`), and a `ValueError` from
 there already becomes a 400 in `web/server.py`. Because no stored community
@@ -3183,7 +3214,7 @@ so this no longer applies.
 
 The `device`/`subnet` kind still exists internally (it decides "try SNMP
 even without a ping reply") but is derived server-side by
-`api.py`'s `_discovery_kind_for()` from the target string alone — a bare
+`web/api/nodes_credentials.py`'s `_discovery_kind_for()` from the target string alone — a bare
 address or /32 is a device probe, any other valid CIDR a subnet sweep —
 so the UI no longer offers a kind picker. `_candidate_communities()`
 lost its `["public"]` fallback: an empty community list (a v3-only
@@ -3269,7 +3300,7 @@ lowest address, and both calls happened inside `_record`'s lock together
 with the INSERT whose id `register_addresses` stored —
 `test_nodediscover_workers.py` ran two addresses of one device into
 `_record` off a barrier to pin exactly that. Through 5.27.0
-`get_nodes_discovery_job` (`api.py`) only ever built its `results` list
+`get_nodes_discovery_job` (`web/api/nodes_credentials.py`) only ever built its `results` list
 from `primaries` — rows with no `folded_into_result_id` — so a folded
 row's own JSON was never even built and `drawDiscResultsTable` had
 nothing to draw it from: the sweep's own primary/fold decision, made by
@@ -3301,11 +3332,11 @@ into the other; `test_nodediscover_workers.py`'s barrier race, which used
 to pin the fold, now pins the opposite — that both rows land, neither
 carrying a `folded_into_result_id`, and the job counts both as
 identified. `folded_into_result_id` stays queryable on an old row but
-`_discovery_result_json` (`api.py`) no longer reads or returns it, nor
+`_discovery_result_json` (`web/api/nodes.py`) no longer reads or returns it, nor
 `folded_into_ip` or an `addresses` list — a result's JSON carries only the
 one address (`ip`) it was actually probed on.
 
-### Device identity, addresses and merge (`nodesdb.py`, `nodepoll.py`, `web/api.py`) — 5.0.0, current shape from 5.29.0
+### Device identity, addresses and merge (`nodesdb.py`, `nodepoll/`, `web/api/_shared.py`) — 5.0.0, current shape from 5.29.0
 
 `devices.ip` is UNIQUE and, until 5.0, was the whole of a device's
 identity. A router reached on its loopback and again on a management
@@ -3368,7 +3399,7 @@ and `device_id_for_address(ip, configured=True)` are unchanged
 IP-conflict detection — still reads every source unfiltered, but from
 5.29.0 that filter is a no-op safety net rather than a real distinction,
 since there is nothing else left in the table to filter out. `_device_index`
-(`api.py`) builds `by_address` off `address_owners(configured=True)`;
+(`web/api/_shared.py`) builds `by_address` off `address_owners(configured=True)`;
 `_duplicate_conflict` (the 409 check) and bulk import's alias lookup both
 call `device_id_for_address`/`address_owners` with `configured=True` for
 the same reason. `duplicate_candidates`'s two alias self-joins add
@@ -3401,7 +3432,7 @@ the other leak found in the same pass; the `trim_to_size` docstring's
 stale claim about what it covers is corrected to match.
 
 **Confidence, and what each level may do.** `_discovery_duplicate` in
-`api.py` grades every discovery result against `_device_index(service)`
+`web/api/_shared.py` grades every discovery result against `_device_index(service)`
 (one pass over the fleet per listing: primary IPs, aliases, and a
 `(sysName, sysObjectID)` map). Through 5.28.0 it took an `addresses` list
 built from the probed address plus whatever the sweep's own walk had
@@ -3472,7 +3503,7 @@ id into one list or the other before posting — but the check it sorts
 on is `duplicate_of_device_id` alone now; through 5.28.0 it also checked
 `folded_into_result_id`, and that check is simply gone, since nothing
 sets the field on a new row any more. `promote(job_id, result_ids,
-force=False, force_ids=())` (`nodepoll.py`) is correspondingly plainer:
+force=False, force_ids=())` (`nodepoll/discovery_mixin.py`) is correspondingly plainer:
 forced ids are still processed first (so an address a later, unforced
 row would otherwise have folded onto still gets its own row), but there
 is no primary to swap a result for — every result already is its own
@@ -3613,10 +3644,10 @@ renders it, since a button spec knows nothing about permissions, and then
 `applyPermissions()` is re-run so a revoked grant settles on the open
 dialog instead of leaving an irreversible control enabled.
 
-### Interface names and the default gateway on Addresses (`nodeoids.py`, `nodepoll.py`, `nodesdb.py`, `web/api.py`, `web/static/nodes.js`) — 5.30.0
+### Interface names and the default gateway on Addresses (`nodeoids.py`, `nodepoll/poll_mixin.py`, `nodesdb.py`, `web/api/nodes.py`, `web/static/nodes.js`) — 5.30.0
 
 **Naming the interface.** `_device_addresses_json(row, aliases, names=None)`
-(`api.py`) gained a third, optional argument: `names`, `{if_index:
+(`web/api/nodes.py`) gained a third, optional argument: `names`, `{if_index:
 interfaces row}`. `_interface_label(names, if_index)` looks the address's
 `if_index` up in it and returns the interface's `descr` if it has one, else
 its `name`, else `""` — the same descr-then-name precedence the interface
@@ -3630,7 +3661,7 @@ each call the new `nodesdb.interface_labels(device_id)` — a `{if_index:
 row}` projection of just `if_index`/`descr`/`name`, in place of the full
 `interfaces()` read those two call sites no longer pay for — and pass it
 through. The device-list builder's own `_device_addresses_json` call
-(`api.py` ~4132, one per row on every page of the Devices grid) still
+(`web/api/nodes.py`, one per row on every page of the Devices grid) still
 passes no `names` at all, and rightly so: that list's `addresses` only
 feed the IP column's "+N other addresses" hint (`r.addresses.map(a =>
 a.ip)` in `nodes.js`'s `deviceIpCell`), which never reads `interface` at
@@ -3646,7 +3677,8 @@ the interfaces table, or an em dash when there is no `if_index` at all.
 `0.0.0.0`, `1.3.6.1.2.1.4.24.4.1.4.0.0.0.0.0.0.0.0`) and
 `IP_ROUTE_NEXTHOP_DEFAULT` (the older RFC1213 `ipRouteNextHop.0.0.0.0`,
 `1.3.6.1.2.1.4.21.1.7.0.0.0.0`), a GET fallback for a device that never
-populated the newer table. `nodepoll.NodePoller._refresh_default_gateway`
+populated the newer table. `NodePoller._refresh_default_gateway`
+(`nodepoll/poll_mixin.py`)
 is called from the end of `_refresh_addresses` — the same hourly
 `ipAddrTable` walk, on the same `_ADDRESS_REFRESH_S` (3600 s) cadence, not
 a separate timer:
@@ -3691,7 +3723,7 @@ differently from an operator's chair. `index.html` adds the `#nd-addr-gateway`
 paragraph above the address table and updates the subtab's own hint text to
 mention the default route alongside the hourly address read.
 
-### A third route table, then a ConfigRX fallback (`nodeoids.py`, `nodepoll.py`, `configrx.py`, `configrxdb.py`, `web/api.py`, `nodes.js`) — 5.35.0
+### A third route table, then a ConfigRX fallback (`nodeoids.py`, `nodepoll/poll_mixin.py`, `configrx.py`, `configrxdb.py`, `web/api/nodes.py`, `nodes.js`) — 5.35.0
 
 `_refresh_default_gateway` gained a middle leg: `ipCidrRouteTable`
 (the 5.30.0 walk above) is deprecated and answers nothing on IOS 15.x and
@@ -3725,7 +3757,7 @@ the second pattern or to `""`. `ConfigRxWorker._store_backup` calls it
 and stores the result with the new `configrxdb.set_config_gateway
 (device_id, text)` on *every* backup, changed or not, so a device backed
 up only once still has a value on file; `"device_config.config_gateway"`
-(`TEXT`, `ensure_columns` migration) holds it. `api.py`'s
+(`TEXT`, `ensure_columns` migration) holds it. `web/api/nodes.py`'s
 `get_nodes_device` reads SNMP's own `devices.default_gateway` first and,
 only when that is empty, looks up `configrx_db.device_config(device_id)`
 and takes its `config_gateway` if any — a `"config_gateway" in
@@ -3882,14 +3914,11 @@ group that is a name rather than a row id.
 
 ### Bundled default MIBs (`netpath/mibs/`, `Service._seed_default_mibs`)
 
-Twenty-one files ship under `netpath/mibs/`, about 900 KB in total. Three
-are hand-authored: `enterprise-roots.mib` (public IANA Private Enterprise
+Twenty files ship under `netpath/mibs/`, about 900 KB in total. Two are
+hand-authored: `enterprise-roots.mib` (public IANA Private Enterprise
 Number arcs for ~20 common vendors, matching `trapdecode.WELL_KNOWN`'s own
-number-to-name table), `enterprise-roots-2.mib` and `if-mib-core.mib` (an OBJECT-TYPE subset of RFC
-2863's IF-MIB covering exactly the columns `nodeoids.IF_TABLE`/`IFX_TABLE`
-already poll — kept although the full IF-MIB now ships too, because a
-device may be pinned to it by `mib_file_id`). The other eighteen are the
-standard IETF modules verbatim: SNMPv2-SMI/TC/MIB, IANAifType-MIB,
+number-to-name table) and `enterprise-roots-2.mib`. The other eighteen are
+the standard IETF modules verbatim: SNMPv2-SMI/TC/MIB, IANAifType-MIB,
 INET-ADDRESS-MIB, IF-MIB, IP-MIB, TCP-MIB, UDP-MIB, HOST-RESOURCES-MIB,
 UCD-SNMP-MIB, ENTITY-MIB, ENTITY-SENSOR-MIB, BRIDGE-MIB, P-BRIDGE-MIB,
 Q-BRIDGE-MIB, LLDP-MIB and POWER-ETHERNET-MIB. These are RFC text, freely
@@ -4021,7 +4050,7 @@ and what the final segment's status is), keyed off `devices.snmp_ok`/
 `ping_ok` for the live end-of-window status, and returns `{"snmp":
 [...], "ping": [...]}` with `None` in place of a method's list when it
 has never once recorded a transition — a method not polled at all, or
-history from before this version. `get_nodes_device_timeline` (`api.py`)
+history from before this version. `get_nodes_device_timeline` (`web/api/nodes_series.py`)
 adds this as `methods`, plus `methods_enabled` (from the device's
 effective config, not the per-poll `polling` flag) so the frontend can
 tell "never split" from "no transitions yet" before any have been
@@ -4133,7 +4162,7 @@ The lookup runs only on a deliberate search — Enter in the Find box sets
 five-second refresh, because a dialog that reopens itself every five
 seconds is unusable.
 
-### Walk bounds, one session per interface read, and custom-MIB chunking (`nodepoll.py`) — 5.9.1
+### Walk bounds, one session per interface read, and custom-MIB chunking (`nodepoll/`) — 5.9.1
 
 Three limits the walker did not have. `_WALK_MAX_BYTES` (4 MiB of retained
 values, counted as `len(str(value))`) stops a walk that the row cap cannot:
@@ -4170,7 +4199,7 @@ metrics and no error at all. `_get_batch` joins the per-device caches
 discovery jobs (a finished sweep otherwise kept its settings dict, an `_owners`
 entry per address swept and a dead `Thread` for the life of the process).
 
-### ARP cache walk (`nodeoids.py`, `nodepoll.py`, `nodesdb.py`, `nodes.js`) — 5.7.0
+### ARP cache walk (`nodeoids.py`, `nodepoll/arp_mixin.py`, `nodesdb.py`, `nodes.js`) — 5.7.0
 
 Nothing polled a switch or router's own ARP cache before this release —
 the only ARP-flavoured code in the app was `ipam_scan.py`'s reconciliation
@@ -4283,7 +4312,7 @@ explicit `0` alone) was invisible to this query, so the sentence
 under-reported on exactly the installs that had never touched the
 setting. The literal now reads `3600`, matching `_merge_config` exactly.
 
-### Global find chains an IP to the switch port; the CSV export's Name column (`nodesdb.py`, `web/api.py`) — 5.21.0
+### Global find chains an IP to the switch port; the CSV export's Name column (`nodesdb.py`, `web/api/nodes.py`) — 5.21.0
 
 **`mac_locations_for(macs, limit=200)`** is `mac_locations()`'s own query
 run against a set of exact, normalised MACs (`WHERE m.mac IN (...)`)
@@ -4294,7 +4323,7 @@ at 8: a caller asking about more MACs than that has stopped asking a
 specific question. Both functions share one `SELECT`, including the
 `uplink`/`uplink_to` subqueries, so the two cannot drift on a field.
 
-**`get_nodes_arp_search`** (`web/api.py`) chains address-matched rows on
+**`get_nodes_arp_search`** (`web/api/nodes.py`) chains address-matched rows on
 to that query. After building its existing ARP-cache `locations` list
 exactly as before, it walks the same `rows` a second time collecting the
 distinct MACs of entries whose `ip` starts with the lowered needle —
@@ -4348,7 +4377,7 @@ so it inherits the heading's size — a line in the body would render as
 `.section` at 11px. The 5s refresh re-sets that whole `<h2>` from
 `ifaceTitle`, so both lines are rebuilt together and cannot drift apart.
 
-### Priority ports: `interface_flags`, the priority gate, and one `link_up` clearing two rules (`nodesdb.py`, `alertrules.py`, `alertengine.py`, `web/api.py`, `nodes.js`) — 5.23.0
+### Priority ports: `interface_flags`, the priority gate, and one `link_up` clearing two rules (`nodesdb.py`, `alertrules.py`, `alertengine.py`, `web/api/nodes.py`, `nodes.js`) — 5.23.0
 
 `interface_flags(device_id, if_index, priority)` is a small standalone
 table, not a column on `interfaces` — a re-walk replaces the interface
@@ -4398,7 +4427,7 @@ calls it for the same decrypt it always did, and `reportsched.run_due`
 answer can never drift from what Alerts' own notification path already
 checks for the identical settings.
 
-### Spanning-tree blocking alerts: `update_interface_stp` records the event, two rules read it (`nodesdb.py`, `alertrules.py`, `alertsdb.py`, `nodepoll.py`) — 5.38.0
+### Spanning-tree blocking alerts: `update_interface_stp` records the event, two rules read it (`nodesdb.py`, `alertrules.py`, `alertsdb.py`, `nodepoll/identify_mixin.py`) — 5.38.0
 
 **A blocking transition is an interface event, not a new table.** Per-port
 STP state has been polled and stored since 5.x, and per-VLAN detail since
@@ -4489,7 +4518,7 @@ once it does — proving the dedup key is not left stuck against a row the
 first fix failed to close — and a blocking/unblocking/blocking burst
 inside the flap window raises no `interface_flapping` row.
 
-### Per-port running config: `configrx_stanza.py` and the interface config route (`configrx_stanza.py`, `web/api.py`, `web/server.py`, `nodesdb.py`) — 5.33.0
+### Per-port running config: `configrx_stanza.py` and the interface config route (`configrx_stanza.py`, `web/api/nodes.py`, `web/server.py`, `nodesdb.py`) — 5.33.0
 
 **Extraction (`configrx_stanza.interface_stanza`).** Pure text in, text or
 `None` out — no device access, no SNMP, no database — so it is unit
@@ -4575,7 +4604,7 @@ below it; a matched stanza renders in a `<pre>` under that same "From
 backup ⟨when⟩" line, with the link back to ConfigRX above it in all
 three backup-found cases.
 
-### Indented headers, and naming what the search tried (`configrx_stanza.py`, `web/api.py`, `nodes.js`) — 5.35.0
+### Indented headers, and naming what the search tried (`configrx_stanza.py`, `web/api/nodes.py`, `nodes.js`) — 5.35.0
 
 **A header does not have to start at column 0 to be found.** A second
 regex, `_INTERFACE_HEADER_INDENTED_RE` (`^(\s+)interface\s+(\S.*?)\s*$`),
@@ -4671,7 +4700,7 @@ pre-seeded) is not started a second time, and a plain `poll_now(device_id)`
 call with `walks` left at its default starts none of the three — the
 shape every non-button caller (bulk import, the trap re-read) uses.
 
-### Cisco fan state: `FAN_TABLES` (`nodeoids.py`, `nodepoll.py`, `web/api.py`, `alertrules.py`, `alertsdb.py`) — 5.33.0
+### Cisco fan state: `FAN_TABLES` (`nodeoids.py`, `nodepoll/vendor_sensor_psu_mixin.py`, `web/api/nodes.py`, `alertrules.py`, `alertsdb.py`) — 5.33.0
 
 `nodeoids.FAN_TABLES` is keyed by enterprise arc (9, Cisco only) to a pair
 of `PsuTable`s, reusing the same declarative shape `PSU_TABLES` already
@@ -4711,7 +4740,7 @@ place the PSU/stack-power ones already do. `tests/
 test_alert_sensor_rules.py` covers the 2/1/0 reading → failed/warning/
 silent progression against a live `AlertEngine`.
 
-### A pulled FRU row vanishes from the walk entirely, not just its state: `_vendor_psu_seen`/`_mark_vendor_rows_absent` (`nodepoll.py`) — 5.35.0
+### A pulled FRU row vanishes from the walk entirely, not just its state: `_vendor_psu_seen`/`_mark_vendor_rows_absent` (`nodepoll/vendor_sensor_psu_mixin.py`) — 5.35.0
 
 **The 5.33.0 "seen before, now silent" rule above only covered half the
 case.** It fires when `_vendor_psu_rows` still returns an entry for an
@@ -4784,7 +4813,7 @@ state column still leaves `complete` `False` and the remembered set
 untouched; `tests/test_sensor_snapshot.py` covers a `0` baseline followed
 by a `3` opening the alert exactly as any other changed reading would.
 
-### Sensor Snapshot: `sensor_baselines`, `BASELINE_FAMILIES` and the threshold skip/resolve path (`nodesdb.py`, `alertrules.py`, `alertengine.py`, `web/api.py`, `web/server.py`, `nodes.js`) — 5.33.0
+### Sensor Snapshot: `sensor_baselines`, `BASELINE_FAMILIES` and the threshold skip/resolve path (`nodesdb.py`, `alertrules.py`, `alertengine.py`, `web/api/nodes.py`, `web/server.py`, `nodes.js`) — 5.33.0
 
 **Storage.** `sensor_baselines(device_id, metric_key, value, ts)`,
 primary keyed on `(device_id, metric_key)`, one row per sensor a snapshot
@@ -4856,7 +4885,7 @@ snapshot, the snapshot resolving both with a note, a later tick at the
 same reading staying quiet, a changed (worse) reading re-opening it, and
 the write/read permission split.
 
-### Dashboard's "Most interface events" tile: `nodesdb.count_interface_events_by_device` (`nodesdb.py`, `web/api.py`) — 5.33.0
+### Dashboard's "Most interface events" tile: `nodesdb.count_interface_events_by_device` (`nodesdb.py`, `web/api/dashboard.py`) — 5.33.0
 
 The tile has been wired to `_offender_node_lists` since the modular
 Dashboard shipped (5.21.0), but it read `count_events_by_device(...,
@@ -4881,7 +4910,7 @@ now calls it in place of the old `count_events_by_device` call for the
 untouched. `tests/test_dashboard_offenders.py` covers the query directly
 and the API list builder that feeds the tile.
 
-### History explorer's export route (`web/api.py`) — 5.23.0
+### History explorer's export route (`web/api/nodes_series.py`) — 5.23.0
 
 `get_nodes_series_export` is not a second query path: it calls
 `get_nodes_series_batch` — the same `q=<device_id>:<metric_key>[,...]`
@@ -5564,7 +5593,7 @@ that choice, since it is a decision about the link being read.
 appended a second `<tbody>` and every neighbour appeared twice. It calls
 `App.grid` per redraw now, exactly as `drawVlanTable` always has.
 
-### Nodes' per-port VLAN membership (`nodesdb.py`, `nodeoids.py`, `nodepoll.py`)
+### Nodes' per-port VLAN membership (`nodesdb.py`, `nodeoids.py`, `nodepoll/vlan_mixin.py`)
 
 Three new `nodesdb.py` tables rather than one, because they answer three
 different questions and age independently: **`vlans`** — which VLANs a
@@ -5759,7 +5788,7 @@ Nodes screen but the decision it takes is an Alerts one. `nodes.js` calls
 the gate would sit unapplied on freshly rendered controls until some
 unrelated event happened to trigger it.
 
-### Manual lines: `map_links` (`mapperdb.py`, `mapper.py`, `web/api.py`, `mapper.js`) — 5.23.0
+### Manual lines: `map_links` (`mapperdb.py`, `mapper.py`, `web/api/mapper.py`, `mapper.js`) — 5.23.0
 
 `map_links` is deliberately its own table rather than a variant
 `map_nodes` row: it names two *existing* `map_nodes` rows
@@ -5852,7 +5881,7 @@ by delegation on the `<tbody>` for the same rebuild-on-every-redraw
 reason. `tests/test_frontend_contracts.py` §87 pins this shape for both
 dialogs identically.
 
-### Frames: `map_frames` (`mapperdb.py`, `web/api.py`, `mapper.js`) — 5.31.0
+### Frames: `map_frames` (`mapperdb.py`, `web/api/mapper.py`, `mapper.js`) — 5.31.0
 
 **Storage.** `map_frames` is deliberately its own table, the same
 reasoning `map_links` (5.23.0, above) already established: a frame's
@@ -5881,7 +5910,7 @@ that no longer matches a row — a stale edit from a tab open on a
 since-deleted frame must not explode, matching `add_frame`/every other
 `update_*`/`delete_*` in this module.
 
-**Routes** (`web/api.py`, `web/server.py`, all gated `mapper` write except
+**Routes** (`web/api/mapper.py`, `web/server.py`, all gated `mapper` write except
 the frame list itself, which rides along on the ordinary `GET
 /api/mapper/maps/<id>` read): `POST /api/mapper/maps/<id>/frames` (`x`,
 `y`, `width`, `height` required; `label`/`color` optional, `add_frame`'s
@@ -6089,7 +6118,7 @@ same case "Open in Nodes" already treats as one, since only a real,
 still-present device has a dialog to open. `App.state.tab` is never
 touched, so Mapper stays the active tab underneath the dialog.
 
-### FiberView (`mapper.py`, `nodesdb.py`, `web/api.py`, `mapper.js`, `app.css`, `tokens.css`) — 5.34.0
+### FiberView (`mapper.py`, `nodesdb.py`, `web/api/mapper.py`, `mapper.js`, `app.css`, `tokens.css`) — 5.34.0
 
 **The verdict is a pure function.** `mapper.link_is_fiber(a_media,
 b_media)` takes each end's `interfaces.media` value — `"optic"`,
@@ -6106,7 +6135,7 @@ plain strings.
 device ids through `sqlitebase`'s `id_chunks` helper (the same chunking
 every other multi-device Nodes lookup uses) and returns a
 `{(device_id, if_index): media}` dict for every interface that has a
-non-NULL media, in one pass. `web/api.py`'s `get_mapper_map()` calls it
+non-NULL media, in one pass. `web/api/mapper.py`'s `get_mapper_map()` calls it
 once, after assembling the map's links, then does a plain dict lookup
 per link for `a_media`/`b_media` and calls `link_is_fiber` on the pair;
 a manual line (`map_links`, no discovered port on either end) defaults
@@ -6230,7 +6259,7 @@ sentence noting this third route to the same frozenset shape, since the
 neighbour naming its own port is evidence a resolver can act on, not the
 guess those two functions exist to refuse.
 
-`web/api.py`'s `_mapper_port_index(service, device_ids)` builds the
+`web/api/_shared.py`'s `_mapper_port_index(service, device_ids)` builds the
 resolver `get_mapper_map` passes in: one
 `nodesdb.interface_port_labels_for_devices(device_ids)` read (the same
 prefetch `_neighbor_local_port_labeler` already makes for a different
@@ -6238,7 +6267,7 @@ purpose), reduced per device through `nodepoll._canonical_if_name` on
 both `name` and `descr`, into `{device_id: {canonical_text: if_index}}`.
 The returned closure runs the same canonicalisation on whatever port
 text a neighbour row sent before the dict lookup, so "Te1/1/1" and
-"TenGigabitEthernet1/1/1" resolve to the same port. `api.py` imports
+"TenGigabitEthernet1/1/1" resolve to the same port. `web/api/_shared.py` imports
 `_canonical_if_name` from `nodepoll` for this — the reverse import never
 happens, so no cycle.
 
@@ -6315,7 +6344,7 @@ one), the `fiber-sm`/`fiber-mismatch`/`blocking` CSS presence checks,
 and a check that `mapper.js` defines `fanOffsets()` and reads
 `view.linkFan`.
 
-### The media-code table replaces two hand-written mode regexes (`nodepoll.py`) — 5.38.0
+### The media-code table replaces two hand-written mode regexes (`nodepoll/_decode.py`) — 5.38.0
 
 **Why FX fell through.** `_OPTIC_MM_TEXT` and `_OPTIC_SM_TEXT` (5.36.0)
 were each one hand-written alternation of the PMD suffixes somebody had
@@ -6379,7 +6408,7 @@ fixture actually exercises the fix it was added to demonstrate.
 
 ### Per-VLAN spanning-tree state — 5.37.0
 
-**`_cisco_vlan_stp(device, config, port_map)`** (`nodepoll.py:7621`) is
+**`_cisco_vlan_stp(device, config, port_map)`** (`nodepoll/vendor_sensor_psu_mixin.py`) is
 the STP counterpart of `_cisco_vlan_device_fdb`, walking the same ground
 a second time for a different column. It bails out early — `({}, False,
 True)` — on an SNMPv3 config (`snmp_version_of(config) != 3` gates the
@@ -6387,10 +6416,10 @@ whole feature) or a config with no `community`. Otherwise it reads the
 VTP VLAN table (`_VTP_VLAN_STATE`, the same OID base `_cisco_vlan_device_
 fdb` already uses), keeps only operational VLANs (state 1, dropping the
 1002-1005 legacy range), sorts them, and slices to `_MAX_VLAN_CONTEXTS`
-(48, a class attribute at `nodepoll.py:7314`) — a slice already makes
+(48, a class attribute in the same file) — a slice already makes
 the pass incomplete. For each VLAN in the (possibly sliced) list, inside
-a `deadline = time.time() + _VLAN_WALK_BUDGET_S` (15.0s, `nodepoll.py:
-7315`) budget, it builds a scoped config with `community` rewritten to
+a `deadline = time.time() + _VLAN_WALK_BUDGET_S` (15.0s, also a class
+attribute there) budget, it builds a scoped config with `community` rewritten to
 `f"{community}@{vlan}"`, resolves a bridge-port map (the caller's
 `port_map` when non-empty, else its own `_bridge_port_map` call), and
 walks `nodeoids.DOT1D_STP_PORT_STATE` through `_walk_column_status`
@@ -6402,16 +6431,16 @@ complete)` — `complete` goes `False` the moment the VLAN list was
 sliced, any column walk came back incomplete, or the deadline is hit
 between VLANs.
 
-**`_poll_stp`** (`nodepoll.py:7787`) calls it after its own existing
+**`_poll_stp`** (`nodepoll/environment_mixin.py`) calls it after its own existing
 global, default-context read and before `update_interface_stp`, gated on
-`detected_vendor(device).lower() == "cisco"` (`nodesdb.py:957`) and
+`detected_vendor(device).lower() == "cisco"` (`nodesdb.py`) and
 `snmp_version_of(config) != 3`. Whether a device answers at all is
 probed once and remembered on `devices.stp_vlan_capable`, the same
-probe-once-remember idiom `_mau_read`/`_cage_read` use
-(`nodepoll.py:6431`): a miss re-probes once an hour off `self.
-_stp_vlan_read: dict[int, float]` (`nodepoll.py:1763`, cleared/reset
-alongside `_mau_read`/`_cage_read` at `nodepoll.py:2781`) checked
-against `_SENSOR_REPROBE_S` (3600.0, `nodepoll.py:6200`) — unlike
+probe-once-remember idiom `_mau_read`/`_cage_read` use — both set up in
+`nodepoll/poller.py`'s `__init__`: a miss re-probes once an hour off
+`self._stp_vlan_read: dict[int, float]` (also set up there, cleared/reset
+alongside `_mau_read`/`_cage_read` in the same place) checked
+against `_SENSOR_REPROBE_S` (3600.0, `nodepoll/environment_mixin.py`) — unlike
 `stp_capable`, a `False` latch is not permanent.
 
 **The merge rule**: for a port present in the per-VLAN result, `rows[if_
@@ -6461,7 +6490,7 @@ whatever per-VLAN detail is already stored alone rather than blank it.
 blocking_vlans` to its per-port dict alongside `media`/`optic_mode`/
 `stp_state`, one column added to the one query 5.36.0 already built.
 
-**API**: `get_nodes_device_interfaces` and its CSV export (`web/api.py`)
+**API**: `get_nodes_device_interfaces` and its CSV export (`web/api/nodes.py`)
 add `stp_blocking_vlans`/`stp_vlan_count` right after `stp_state`, on
 both the JSON row and the CSV header. `get_mapper_map` adds `a_stp_
 vlans`/`b_stp_vlans` to a link's JSON, read straight off the same `a_
@@ -6503,7 +6532,7 @@ fragment in `mapper.js`. `tests/test_mapper_api.py` checks the map JSON's
 `a_stp_vlans`/`b_stp_vlans` keys, `None` on a manual link, and the CSV
 row's VLAN suffix.
 
-### Notes: `map_notes` (`mapperdb.py`, `web/api.py`, `mapper.js`, `app.css`) — 5.38.0
+### Notes: `map_notes` (`mapperdb.py`, `web/api/mapper.py`, `mapper.js`, `app.css`) — 5.38.0
 
 **Storage and validation are the Frame idiom (5.31.0, above), copied for
 a note's own fields.** `map_notes` is its own table for the same reason
@@ -6663,7 +6692,7 @@ override — is unchanged; only what the two tokens resolve to moved.
 
 ### Mapper operator round: STP dots above the glow, a wide strand hit
 target, a coloured VLAN list, staggered port labels, and a fixed Remove
-button (`mapperdb.py`, `web/api.py`, `mapper.js`, `nodes.js`, `app.css`)
+button (`mapperdb.py`, `web/api/mapper.py`, `mapper.js`, `nodes.js`, `app.css`)
 — 5.39.0
 
 **Blocked-STP dots merging into the fiber glow was a stroke-cap geometry
@@ -6804,7 +6833,7 @@ Delete/Backspace key were never gated on `view.selection` in the first
 place, so neither one was ever affected by this bug.
 
 **Frame label text size: `map_frames.text_size` (`mapperdb.py`,
-`web/api.py`, `mapper.js`).** `text_size` is `INTEGER NOT NULL DEFAULT
+`web/api/mapper.py`, `mapper.js`).** `text_size` is `INTEGER NOT NULL DEFAULT
 1` (0=Small, 1=Medium, 2=Large), added the same way every other
 `map_frames` column addition has been — `ensure_columns` inside
 `MapperDatabase._migrate()` — so an existing database picks it up
@@ -6845,7 +6874,7 @@ having the live read land does not re-collapse the table back to five —
 `macExpanded` is read fresh by whichever render runs next, live or
 fallback-to-stored-on-failure alike.
 
-### Note text size, a redrawing FiberView toggle, vmVlan access ports, and port-label geometry (`mapperdb.py`, `nodeoids.py`, `nodepoll.py`, `web/api.py`, `mapper.js`, `app.css`) — 5.40.0
+### Note text size, a redrawing FiberView toggle, vmVlan access ports, and port-label geometry (`mapperdb.py`, `nodeoids.py`, `nodepoll/vlan_mixin.py`, `web/api/mapper.py`, `mapper.js`, `app.css`) — 5.40.0
 
 **Note text size: `map_notes.text_size`, added the same way, and
 sharing the frame's own size table.** `ensure_columns` inside
@@ -7185,7 +7214,7 @@ persisted — a restart resets it, an accepted cold-start cost given ticks
 are 5 seconds apart and `for_polls` defaults to 2. The streak has to be
 incremented *before* `evaluate_threshold()` is called, not inside the
 branch that checks whether it reached `for_polls` — the same
-chicken-and-egg shape `nodepoll.py`'s own `consecutive_fail` handling
+chicken-and-egg shape `nodepoll/`'s own `consecutive_fail` handling
 hit independently, and fixed the same way: an earlier version only
 incremented the streak once a breach had already been detected, which
 meant it could never actually reach `for_polls` and the alert could never
@@ -7590,7 +7619,7 @@ keys rather than leaving a box the server refuses — a box an operator can
 type into and not save is exactly the silent ignore this release exists to
 remove.
 
-### Per-sensor temperature and PSU state as an entity kind (`alertrules.py`, `alertengine.py`, `nodeoids.py`, `nodepoll.py`) — 5.16.0
+### Per-sensor temperature and PSU state as an entity kind (`alertrules.py`, `alertengine.py`, `nodeoids.py`, `nodepoll/`) — 5.16.0
 
 Per-sensor temperature reuses `interface_thresholds` rather than a new
 table, exactly as the schema comment on that table's `metric_root`
@@ -7694,7 +7723,7 @@ coverage at all is evaluated exactly as before, per-device override
 included — the fallback is additive, not a replacement for the
 existing rule.
 
-### Cisco Stack Power (`nodeoids.py`, `nodepoll.py`, `web/api.py`, `alertrules.py`, `alertsdb.py`, `trapdecode.py`, `snmptrapd.py`, `demo/personas.py`) — 5.32.0
+### Cisco Stack Power (`nodeoids.py`, `nodepoll/vendor_sensor_psu_mixin.py`, `web/api/nodes.py`, `alertrules.py`, `alertsdb.py`, `trapdecode.py`, `snmptrapd.py`, `demo/personas.py`) — 5.32.0
 
 **OIDs.** `nodeoids.py` resolves thirteen CISCO-STACKWISE-MIB objects
 (`ciscoMgmt.500`, enterprise arc 9 only) across three tables with three
@@ -8421,7 +8450,7 @@ still deliberately off it — their occurrences always carry `source_kind ""`,
 so filtering on it would silently stop matching any custom rule that has one
 set.
 
-### Upstream suggestions (`nodesdb.py`, `web/api.py`) — 4.49.0
+### Upstream suggestions (`nodesdb.py`, `web/api/nodes.py`) — 4.49.0
 
 The means a *different*, cross-device rollup was missing — not the
 same-device metric rollup the previous section documents (a device's own
@@ -8697,7 +8726,7 @@ derivation (see above), so the explicit pair always wins. Only
 included, has no `resolved_ts` and so takes the ordinary
 `severity_tag`/empty-`recover_tag` path. `token_reference()` documents
 both tokens for the template editor's palette. The **Preview** route
-(`api.py`) only fakes `resolved_ts` — and therefore the tags — when the
+(`web/api/alerts.py`) only fakes `resolved_ts` — and therefore the tags — when the
 template being previewed is `device_up`; every other built-in previews as
 the opening alert it actually renders as.
 
@@ -8856,7 +8885,7 @@ builds on — and so, through that, the HTTPS page monitor — so the senders,
 the self-updater and the HTTPS monitor all clear that one flag from one
 place.
 
-### Reports (`report.py`, `web/api.py`) — 4.49.0
+### Reports (`report.py`, `web/api/nodes_reports.py`) — 4.49.0
 
 Sits above `nodesdb.py`/`alertsdb.py` rather than inside either — it reads
 `device_status_segments` and `samples_hourly` (both already public methods)
@@ -8978,7 +9007,7 @@ exist because Syslog's caller never has a `report.py`-shaped row to feed
 `device_label` directly.
 
 `get_nodes_reports_availability`, `get_nodes_reports_top_metrics` and
-`get_nodes_reports_firmware` (`web/api.py`) all now pass `dns_names` from
+`get_nodes_reports_firmware` (`web/api/nodes_reports.py`) all now pass `dns_names` from
 `app_db.hostnames` the way the firmware route already did, and
 `device_availability_report`/`top_metric_ranking`/`firmware_inventory`
 (`report.py`) run every row's name through `device_label` — Firmware
@@ -8990,12 +9019,12 @@ it are the other two callers this same release adds; none of the three
 CSV exports needed a schema change, since they already read the same rows
 their JSON routes build.
 
-### SFP inventory: `interfaces_with_media`, `sfp_inventory`, priority tint, `histDeviceLabel` (`nodesdb.py`, `report.py`, `reportsched.py`, `web/api.py`, `web/static/app.css`, `nodes.js`) — 5.24.0
+### SFP inventory: `interfaces_with_media`, `sfp_inventory`, priority tint, `histDeviceLabel` (`nodesdb.py`, `report.py`, `reportsched.py`, `web/api/nodes_reports.py`, `web/static/app.css`, `nodes.js`) — 5.24.0
 
 **`nodesdb.interfaces_with_media(device_ids=None, include_empty=False)`
 is a plain join, not a new poll.** `interfaces.media` (`'optic'` /
 `'sfp'` / `'copper'` (5.25.0) / `'sfp_empty'` / `NULL`, set by the
-existing entity-sensor and transceiver-presence walk in `nodepoll.py`)
+existing entity-sensor and transceiver-presence walk in `nodepoll/environment_mixin.py`)
 already backs the DOM/SFP/COP badge on the interface list; this method
 is the first caller to select on it directly. It filters `media IN
 ('optic', 'sfp', 'copper')`, adding `'sfp_empty'` to that list only
@@ -9107,7 +9136,7 @@ this one function instead of duplicating the string by hand, so the
 dropdown and the field's own resting value can never disagree on how a
 device is named.
 
-### SINGLE PSU report: `single_psu_report`, per-member grouping and the StackPower coverage rule (`report.py`, `reportsched.py`, `web/api.py`, `web/static/index.html`, `nodes.js`) — 5.35.0
+### SINGLE PSU report: `single_psu_report`, per-member grouping and the StackPower coverage rule (`report.py`, `reportsched.py`, `web/api/nodes_reports.py`, `web/static/index.html`, `nodes.js`) — 5.35.0
 
 **One query, not one per device.** `single_psu_report(nodesdb,
 device_ids=None, dns_names=None, hostnames=None)` calls
@@ -9131,7 +9160,7 @@ present, down, supplies, last_ts}`: `state 0` (ok) or `1` (degraded)
 count as `present`, `state 2` (failed) or `3` (not present) count as
 `down`, and `supplies` collects `"<label> <state word>"` strings
 (`_PSU_STATE_WORDS = {0: "ok", 1: "degraded", 2: "failed", 3: "not
-present"}`, a shorter vocabulary than `api.py`'s own live-sensor
+present"}`, a shorter vocabulary than `web/api/nodes.py`'s own live-sensor
 `_PSU_STATE_WORDS`, since this text sits in a table cell/CSV column,
 not a device dialog). `_metric_idx(key)` (the `<idx>` half of a
 `"<family>.<idx>"` metric key) does the matching job on the StackPower
@@ -9167,14 +9196,14 @@ sort `(name.lower(), member)`. `PsuReport` carries `device_count`
 (distinct devices with at least one PSU member seen — not the group's
 whole membership), `row_count` and `covered_count` alongside the rows.
 
-**Routes and CSV.** `web/api._psu_report(service, params)` parses
+**Routes and CSV.** `web/api/nodes_reports.py`'s `_psu_report(service, params)` parses
 `device_ids` and calls `single_psu_report` with
 `hostnames=service.app_db.hostnames`, the same shape every other report
 helper uses; `get_nodes_reports_psu` returns `.to_dict()`,
 `get_nodes_reports_psu_export` builds the CSV from `PSU_CSV_HEADER =
 ["device_id", "name", "ip", "member", "psu_total", "psu_present",
 "psu_down", "supplies", "stack_power", "covered", "last_ts",
-"device"]` — the same header both `api.py`'s export route and
+"device"]` — the same header both `web/api/nodes_reports.py`'s export route and
 `reportsched._render_psu`'s attachment build from, and the one
 `nodes.js`'s own client-side CSV mirrors, pinned equal by `tests/
 test_frontend_contracts.py`. Routes: `GET /api/nodes/reports/psu`,
@@ -9205,7 +9234,7 @@ ${r.member}` `` rather than `device_id` alone, since one device can
 contribute two rows (two stack members) that must sort and select
 independently.
 
-### Scheduled reports: `report_schedules`, `reportsched.py` (`nodesdb.py`, `alertmail.py`, `web/service.py`, `web/api.py`) — 5.23.0
+### Scheduled reports: `report_schedules`, `reportsched.py` (`nodesdb.py`, `alertmail.py`, `web/service.py`, `web/api/nodes_reports.py`) — 5.23.0
 
 `reportsched.py` sits above `report.py` the way `report.py` sits above
 `nodesdb.py`/`alertsdb.py`: it owns everything that is not storage —
@@ -9253,7 +9282,8 @@ since no built-in alert has ever needed an HTML body alongside an
 attachment and complicating `add_attachment`'s placement for a case
 nothing uses was not worth it. The CSV attachment itself is built with
 `csvout.csv_text` (see the Layout file list) — the same formula-safe,
-BOM-prefixed CSV every `export.csv` route in `web/api.py` writes, without
+BOM-prefixed CSV every `export.csv` route in `web/api/` writes (through
+`web/api/_shared.py`'s `_csv_response`), without
 `reportsched.py` importing the web package's route handlers just to reach
 two small functions.
 
@@ -9395,7 +9425,7 @@ running counters (`probes`, `lost`, `rtt_sum`, `rtt_min`, `rtt_max`,
 the existing row, folds in the new `PingResult`, and writes it back via
 `INSERT ... ON CONFLICT DO UPDATE`. A target probed every few seconds for
 weeks still costs one row per hop, not thousands. `_topology_json()` in
-`api.py` joins this table's data into each node's response
+`web/api/paths.py` joins this table's data into each node's response
 (`probe_count`, `probe_loss`, `probe_rtt_min/avg/max`) alongside whatever
 `build_topology()` derived from the traceroute history itself — the two
 are independent measurements of the same path, shown side by side in the
@@ -9691,8 +9721,8 @@ visible "port already in use" at startup instead.
 
 ### Storage and views (`flowdb.py`)
 
-`flows` is one row per decoded record; `exporters` is touched once per
-batch-flush per exporter (`touch_exporter()`) with its most recent
+`flows` is one row per decoded record; `exporters` is updated once per
+batch-flush, via `touch_exporters()`, with each exporter's most recent
 version, packet/flow counts and sampling rate, for the status strip.
 Aggregation for the traffic chart and top-N bars groups by whatever
 `Group by` dimension the frontend asked for (`DIMENSIONS` in `flowdb.py`
@@ -10024,8 +10054,7 @@ data means answering "which target's *most recent successful trace*
 actually ended at this exact IP" rather than a literal string match — the
 same question `db.destination_ip(target_id)` already answers in the other
 direction (given a target, what did it last reach). `db.py`'s
-`target_by_destination_ip(ip)` and its bulk form
-`targets_by_destination_ips(ips)` answer it: for each target, compute its
+`targets_by_destination_ips(ips)` answers it: for each target, compute its
 `destination_ip()` (already indexed via `ix_hops_ip`, since it reads the
 final hop of the most recent `reached=1` trace) and check whether that
 equals the address being asked about — a scan over targets (typically a
@@ -10065,7 +10094,7 @@ time, but the route graph needs a span to draw traces from.
 
 `Collector.start()` builds a brand-new `Decoder` on every call, and
 every NetFlow settings save calls `stop()` then `start()` (`post_collector`
-in `web/api.py`, via `service.collector.start(service.flow_settings)`) —
+in `web/api/netflow.py`, via `service.collector.start(service.flow_settings)`) —
 so a settings save that changes nothing about template handling still
 rebuilt the decoder from scratch, and `Decoder.__init__` used to always
 build a fresh, empty `_TemplateCache`. Templates are v9/IPFIX wire state
@@ -10141,7 +10170,7 @@ response's own `bucket_s` says what was actually used, which is what the
 chart's existing hover-shows-the-bucket-size behaviour already surfaces
 to an operator without a separate flag.
 
-### `coverage()` and the lag warning (`flowdb.py`, `web/api.py`, `netflow.js`, `web/service.py`) — 5.23.0
+### `coverage()` and the lag warning (`flowdb.py`, `web/api/netflow.py`, `netflow.js`, `web/service.py`) — 5.23.0
 
 `FlowDatabase.coverage()` is one query (`MIN(ts_end)`/`MAX(ts_end)` off
 the `ix_flows_ts` index, not `stats()`'s full scan) plus both tiers'
@@ -10463,7 +10492,7 @@ stored table SQL for `trigram` and `source`) gets the index dropped and
 rebuilt once in the background, in chunks, without blocking search in the
 meantime — it just scans until the backfill catches up.
 
-### Host cross-referencing (`namelookup.py`, `api.py get_syslog_search`)
+### Host cross-referencing (`namelookup.py`, `web/api/syslog.py`'s `get_syslog_search`)
 
 The `host` column stored in `logs` is exactly what `syslogparse.parse()`
 found in the message — often empty, or just the sending device's own IP
@@ -10518,7 +10547,7 @@ what makes the hop count as *looked up* — which is correct, and a hop that is
 neither resolved nor managed still reads "resolving…".
 
 **From 5.17.0, the free-text search box resolves a device-name fragment
-too**, not only the dedicated Host filter. `_syslog_filters` (`api.py`)
+too**, not only the dedicated Host filter. `_syslog_filters` (`web/api/syslog.py`)
 widens `_syslog_host_ips`'s single-entry memo into a small dict keyed by
 fragment (same 5 s TTL, capped at 8 entries) and, for each whitespace term
 of the free-text query that is three or more characters, resolves it with
@@ -10704,7 +10733,7 @@ calls land. Rather than trust field names on the raw PowerShell snapshot
 committed (`db.dhcp_scopes()`/`db.dhcp_leases()`) and counts leased vs.
 reserved the same way `api.get_ipam_dhcp_scopes()` does — both now share
 one `scope_size(start_ip, end_ip)` function in `ipamdb.py` (moved there
-from a private duplicate in `web/api.py`) so a scope's "total" figure can
+from a private duplicate in `web/api/ipam.py`) so a scope's "total" figure can
 never quietly diverge between the live donut and the history chart.
 
 `GET /api/ipam/dhcp/scope-history` (`api.get_ipam_dhcp_scope_history`)
@@ -10935,7 +10964,7 @@ no per-lease page of its own to route to.
 
 ## Self-update (`selfupdate.py`)
 
-`POST /api/update` (`web/api.py`'s `post_update`) starts a **job** and
+`POST /api/update` (`web/api/settings.py`'s `post_update`) starts a **job** and
 answers `202` with its status straight away; `GET /api/update/status`
 (administrator read) is what the Settings dialog polls once a second for
 what actually happened. It used to be one synchronous call, and all three
@@ -11161,7 +11190,7 @@ once past the threshold (`2 ** (failures - threshold)`, capped at 30s) —
 5 failures adds a one-second delay, 10 adds thirty.
 
 ### TACACS+ AAA sign-in (`tacacsclient.py`, `web/service.py`,
-`web/api.py`) — 5.22.0
+`web/api/auth.py`) — 5.22.0
 
 **`tacacsclient.py`** is a minimal RFC 8907 client, stdlib-only, modelled
 on `ldapclient.py`'s own shape: an error hierarchy
@@ -11194,7 +11223,7 @@ raised as an error, so `post_login` treats it exactly like a wrong local
 password), or `TacacsUnavailable` for anything that means the AAA server
 itself could not be used — no servers configured, no secret saved, a
 secret this host cannot decrypt, a connect/read timeout, or a protocol
-error. That three-way split is what lets `post_login` (`web/api.py`)
+error. That three-way split is what lets `post_login` (`web/api/auth.py`)
 answer "Wrong username or password" for a real reject and "Could not
 reach the AAA server..." (audited as `signin.tacacs_unreachable`) for an
 outage, rather than one message doing for both — see Auth above for why
@@ -11231,8 +11260,8 @@ flatten.
 
 **The shared secret** is `tacacs_secret_enc` in `appdb.py`'s
 `GLOBAL_DEFAULTS`, `dpapi.protect()`-encrypted the same way the SNMPv3
-and SMTP credentials are (`api._encrypt_secret`) and stored as base64
-text, since the settings table's value column is `TEXT`. `api.py`'s
+and SMTP credentials are (`web/api/_shared.py`'s `_encrypt_secret`) and stored as base64
+text, since the settings table's value column is `TEXT`. `web/api/_shared.py`'s
 `_visible_settings` strips it from every read, substituting a plain
 `tacacs_secret_set: bool` the same "has\_credential" idiom every other
 stored credential in this application uses — see
@@ -11295,14 +11324,14 @@ can't read, after building the full response — a filter on the way out,
 not a gate on the way in.
 
 The two routes are the same payload split by *what changes it* (4.43.0).
-`/api/config` — `api.get_config()` — is everything only an operator
+`/api/config` — `web/api/_shared.py`'s `get_config()` — is everything only an operator
 changes: every `*_settings` block, `permissions`, `update`, `version`, the
 constant vocabularies (`severities`, `facilities`, `trap_kinds`,
 `dimensions`, `categories`). It carries `config_version`, an integer
 `Service.bump_config()` moves from `apply_settings`, `apply_global_settings`,
 `apply_netpath_settings`, `save_listener_settings`, and the account and
-grant writers in `api.py`.
-`/api/state` — `api.get_state()` — is what changes on its own: each
+grant writers in `web/api/auth.py`.
+`/api/state` — `web/api/_shared.py`'s `get_state()` — is what changes on its own: each
 worker's `running`/`status`/`counters`, the counts behind the tab badges,
 the session clocks, `storage`, `dns`; it repeats `config_version`. The
 browser (`App.loadState`) fetches config once at start and again only when
@@ -11324,7 +11353,7 @@ because "self change" and "reset someone else's password" need
 different rules from the same route — changing your own password is
 `None` (no permission needed at all, by explicit product requirement),
 while resetting a different account's requires `("settings", WRITE)`.
-Before this shipped, `api.py`'s `post_password` had no authorization
+Before this shipped, `web/api/auth.py`'s `post_password` had no authorization
 check on the reset path at all — `resetting = target.lower() !=
 me.lower()` only decided whether to skip the *current-password*
 check, not whether the caller was allowed to act on someone else's
@@ -11405,7 +11434,7 @@ retry), `nodepoll.EngineCache` (v3 engine discovery caching, keyed here
 by controller id instead of device id), `nodepoll.credential_for()`
 (decrypt-just-before-use, discard after) — rather than reimplementing
 any of it. Table walking is repeated GETNEXT (`_walk_column`), not
-GETBULK: the same choice `nodepoll.py`'s own table walker already made
+GETBULK: the same choice `nodepoll/identify_mixin.py`'s own table walker already made
 ("avoiding a separate GETBULK code path"), matched here rather than
 introducing a second table-walking idiom for one small poller. v1/v2c
 community or v3 noAuthNoPriv/authNoPriv only, at any of the six auth
@@ -11602,7 +11631,7 @@ seed every controller's due time from one `now` taken once per pass — see
 longer stay phase-locked for the life of the process the way the node
 poller stopped doing in 5.9.0.
 
-### AP and radio history: `ap_samples`/`radio_samples`, the wireless size cap (`wirelessdb.py`, `fortipoll.py`, `web/api.py`, `wireless.js`) — 5.23.0
+### AP and radio history: `ap_samples`/`radio_samples`, the wireless size cap (`wirelessdb.py`, `fortipoll.py`, `web/api/wireless.py`, `wireless.js`) — 5.23.0
 
 **No new SNMP is read for this.** `_append_history` (`fortipoll.py`,
 called once per AP from `_poll_controller` after `replace_radios`) writes
@@ -11642,7 +11671,7 @@ range by id span, which neither sample table has, so `wirelessdb`
 overrides `trim_to_size` to delete oldest-by-`ts` directly from both
 tables in 5,000-row batches until under `max_bytes` or the budget runs
 out. `max_wireless_db_mb` (`appdb.DEFAULTS`, 256, minimum 16 —
-`web/api.py`'s settings-bounds table) is now wired into `STORES` (a
+`web/api/settings.py`'s settings-bounds table) is now wired into `STORES` (a
 `cap_key` where it was `None` before) and into
 `Service._prune_wireless`'s call to `self._trim_db(...)`, so Wireless
 joins the nine databases with a live size cap — see the Data layer
@@ -11661,7 +11690,7 @@ shape is what lets `wireless.js` draw both charts with the exact same
 `App.drawSeriesChart`/`App.attachChartZoom` every other history chart in
 the application uses, rather than a bespoke renderer for this one pane.
 
-### AP web tunnel: `WebRelayRegistry.open_target`, `ap_id`/`subject` (`webrelay.py`, `wirelessdb.py`, `web/api.py`, `web/server.py`, `wireless.js`) — 5.38.0
+### AP web tunnel: `WebRelayRegistry.open_target`, `ap_id`/`subject` (`webrelay.py`, `wirelessdb.py`, `web/api/relays.py`, `web/server.py`, `wireless.js`) — 5.38.0
 
 **The relay itself gained one new entry point, not a second relay.**
 `WebRelayRegistry.open_device_relay` (a Nodes device) resolved its
@@ -11708,7 +11737,7 @@ existing settings; unlike a Nodes device's per-device `web_scheme`/
 `web_port` override, a FortiAP has no such field of its own to read, so
 one setting covers every AP a controller reports. **Review fix:**
 `ap_web_port` was accepted with no server-side bound, matching only the
-browser's own `min="1" max="65535"` on the number input; `web/api.py`'s
+browser's own `min="1" max="65535"` on the number input; `web/api/settings.py`'s
 `_SCOPE_SETTINGS_RANGES["wireless"]` now carries `"ap_web_port": (1,
 65535)` alongside `history_days`/`history_sample_s`, so a settings save
 made past the browser (a direct API call, say) is clamped the same way
@@ -11761,7 +11790,7 @@ text, but it only ever selects *which* vendor's fixed commands to use
 (`configrx.resolve()` does a dict lookup); an unrecognized value
 simply fails to resolve and the backup is skipped with a clear error,
 never used as literal command text. There is no exec-command endpoint, no
-command parameter anywhere in `api.py`'s ConfigRX handlers, and no
+command parameter anywhere in `web/api/configrx.py`'s ConfigRX handlers, and no
 free-form input field anywhere in `configrx.js` — grep for `channel.send`
 in `configrx.py` to confirm this hasn't grown a call site beyond
 `_pull_config` and `_do_enable`. `VENDORS` currently holds eleven keys:
@@ -12005,7 +12034,7 @@ optional field.
 **Scheduling** (`ConfigRxWorker`) mirrors `fortipoll.WirelessPoller`'s
 shape (a small `ThreadPoolExecutor`, a scanning loop, a `_queued` set
 for de-duplicating concurrent triggers of the same device) rather than
-`nodepoll.py`'s larger multi-candidate-credential machinery, since a
+`nodepoll/`'s larger multi-candidate-credential machinery, since a
 device here has exactly one fixed SSH credential rather than a
 group/profile fallback chain.
 
@@ -12211,7 +12240,27 @@ to fall to zero between `shutdown()` and `server_close()` — `daemon_threads`
 means no handler is joined, so without it `service.shutdown()` could close a
 store under a handler mid-query.
 
-### `web/api.py`
+### `web/api/` — package layout — 5.44.0
+
+`netpath/web/api.py` (12,267 lines, one file) is now the package
+`netpath/web/api/`:
+
+- `_shared.py` — CSV export, request validation, audit logging, the
+  per-request cache, and helpers used across more than one screen
+  (`_page`, `_require`, `_pick`, `_encrypt_secret`, `_store_v3_credential`,
+  `_clear_credential`, `_neighbor_local_port_labeler`, `_device_index`,
+  and others named where they come up below).
+- One module per screen: `paths.py`, `netflow.py`, `relays.py`,
+  `debug.py`, `settings.py`, `syslog.py`, `snmp.py`, `ipam.py`,
+  `nodes.py`, `nodes_series.py`, `nodes_reports.py`,
+  `nodes_credentials.py`, `alerts.py`, `wireless.py`, `configrx.py`,
+  `mapper.py`, `auth.py`, `dashboard.py`.
+
+`api/__init__.py` re-exports every handler, so `api.<handler>` and
+`server.py`'s route table are unchanged — nothing that calls a handler by
+name needed to change. As with `nodepoll/`, a test patching a
+module-level name must patch the submodule that actually defines it, not
+`api` itself.
 
 One function per route, `(service, params, body, *path_args) -> dict`
 (JSON-serializable). `server.py` catches `PermissionError` -> 401,
@@ -12299,9 +12348,9 @@ the same state. It is now `dict[int, float]` plus a `_started` map and a
 `worker_state()` returning the same `{id: {queued, started}}` shape
 `NodePoller.worker_state()` does — which is what lets
 `_configrx_device_json` join it per device exactly the way the Nodes list
-already joins its own (`api.py:1649`).
+already joins its own, in `web/api/configrx.py`.
 
-### Effective vendor in the ConfigRX list (`api.py`)
+### Effective vendor in the ConfigRX list (`web/api/configrx.py`)
 
 `_configrx_device_json` used to return Nodes' `devices.vendor` verbatim while
 `vendor_override` came back as a separate field the UI only used to fill an
@@ -12311,7 +12360,7 @@ carries `effective_vendor` resolved the same way the worker resolves it, plus
 `vendor_is_override` so the column can mark it, and the vendor filter matches
 on that field. One resolution rule, in two places that agree.
 
-### Bulk settings and bulk backups (`api.py`, `configrx.js`)
+### Bulk settings and bulk backups (`web/api/configrx.py`, `configrx.js`)
 
 `post_configrx_devices_bulk_config`'s allow-list omitted `ssh_username`,
 which the database layer had always permitted (`DEVICE_CONFIG_EDITABLE`).
@@ -12522,7 +12571,7 @@ three behaviours, and the Debug page showed one event stream in three zones.
 `tests/test_time_contracts.py` fails on a private `ago()`, a `toLocale*`
 call on a `Date`, or `App.clock` in a module.
 
-`_device_json` (`api.py`) derives **`status_since_ts`** — `last_up_ts` is the
+`_device_json` (`web/api/nodes.py`) derives **`status_since_ts`** — `last_up_ts` is the
 last poll that saw the device up and is rewritten on every up poll, so a
 device that is up has been up since `last_down_ts` (else `created_ts`), and
 the reverse — and **`sys_uptime_s`** from `last_uptime_ticks` aged forward
@@ -12639,7 +12688,7 @@ is synchronous and returns the finished markup:
 
 Two things are in the helper rather than at the eleven call sites because
 each one would otherwise restate them. The first is that permission check:
-`App.canRead('nodes')`, the browser-side twin of `api.py`'s `_dash_can`,
+`App.canRead('nodes')`, the browser-side twin of `web/api/dashboard.py`'s `_dash_can`,
 so an account that cannot open Nodes is never handed a link into it. The
 second is escaping — the helper is the one place the product builds an
 anchor out of a name somebody else chose, and both the label and the query
@@ -12852,7 +12901,7 @@ artificially, the tiles still appeared at roughly 200 ms — bounded by
 `/api/dashboard` alone, no longer chained behind the two boot fetches.
 65 of 65 walk checks passed.
 
-### A modular Dashboard: per-account layout, the tile catalogue, and the chart renderer lifted to App (`appdb.py`, `web/api.py`, `web/static/dashboard.js`, `web/static/app.js`, `web/static/debug.js`) — 5.21.0
+### A modular Dashboard: per-account layout, the tile catalogue, and the chart renderer lifted to App (`appdb.py`, `web/api/dashboard.py`, `web/static/dashboard.js`, `web/static/app.js`, `web/static/debug.js`) — 5.21.0
 
 **Storage.** `AppDatabase._migrate()` adds `users.dashboard_layout` the
 same way it added `theme` two lines above it (`ensure_columns("users",
@@ -12861,7 +12910,7 @@ saved," not "saved as nothing," so an account that has never opened
 **Edit layout** gets the shipped default rather than an empty grid.
 `user_dashboard_layout(username)` / `set_user_dashboard_layout(username,
 text)` read and write the raw JSON string; `appdb.py` never parses it —
-that is `web/api.py`'s job, at both the read and the write end, so a row
+that is `web/api/dashboard.py`'s job, at both the read and the write end, so a row
 the server itself could not produce (a future version's layout, hand-
 edited JSON) cannot reach the front end unvalidated either.
 
@@ -12891,7 +12940,7 @@ with no schema entry accepts no config keys at all, and an unknown key
 for a type that does have one is refused rather than stored and handed
 back later to whatever reads it. `_dash_int`/`_dash_str`/`_dash_bool`/
 `_dash_enum` are the same shape of small typed validator the rest of
-`api.py` already uses elsewhere; `_dash_int` guards the same bool trap a
+`web/api/dashboard.py` already uses elsewhere; `_dash_int` guards the same bool trap a
 second time for numeric config values. Anything that fails raises
 `ValueError`, which `server.py` already turns into 400 for every route.
 
@@ -13030,7 +13079,7 @@ Dashboard; fix 1 is dashboard-tile-specific, since it lives in
 other caller already either pins its own known ceiling — the loss chart's
 100 — or has no fixed scale to pin at all).
 
-### Multi-interface graph tiles, on-tile drill-down, and the batch series route (`web/api.py`, `web/static/dashboard.js`, `web/static/app.js`) — 5.22.0
+### Multi-interface graph tiles, on-tile drill-down, and the batch series route (`web/api/dashboard.py`, `web/static/dashboard.js`, `web/static/app.js`) — 5.22.0
 
 **The `iface_traffic` config schema widens without breaking a saved
 layout.** `_DASHBOARD_CONFIG_SCHEMA["iface_traffic"]` keeps its legacy

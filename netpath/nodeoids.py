@@ -158,10 +158,9 @@ GENERIC_HEALTH = (
 # "disk", hrStorageRam is "memory". Both readers exclude every other row on
 # purpose — hrStorageVirtualMemory (swap) counted as either would make an
 # ordinary machine read as critically low on memory. Both are a used/size
-# RATIO, so HR_STORAGE_UNITS never multiplies in: size and used share one
-# allocation-unit factor per row (RFC 2790) and it cancels out.
+# RATIO, so the allocation-unit factor is never multiplied in: size and used
+# share one factor per row (RFC 2790) and it cancels out.
 HR_STORAGE_TYPE = "1.3.6.1.2.1.25.2.3.1.2"
-HR_STORAGE_UNITS = "1.3.6.1.2.1.25.2.3.1.4"
 HR_STORAGE_SIZE = "1.3.6.1.2.1.25.2.3.1.5"
 HR_STORAGE_USED = "1.3.6.1.2.1.25.2.3.1.6"
 HR_STORAGE_RAM = "1.3.6.1.2.1.25.2.1.2"
@@ -256,11 +255,6 @@ LLDP_REM_MAN_ADDR_IF_SUBTYPE = "1.0.8802.1.1.2.1.4.2.1.3"
 LLDP_LOC_PORT_ID_SUBTYPE = "1.0.8802.1.1.2.1.3.7.1.2"
 LLDP_LOC_PORT_ID         = "1.0.8802.1.1.2.1.3.7.1.3"
 LLDP_LOC_PORT_DESC       = "1.0.8802.1.1.2.1.3.7.1.4"
-
-# lldpRemChassisIdSubtype's enumeration — needed to tell "this chassis id is
-# a MAC address" (4, the common case, joinable against an interface's
-# phys_addr) from a locally-assigned string or a network address.
-LLDP_CHASSIS_SUBTYPE_MAC_ADDRESS = 4
 
 # CDP (CISCO-CDP-MIB) cdpCacheTable, read as a fallback/supplement on Cisco
 # gear: plenty of older Cisco switches speak CDP only, or speak both and
@@ -386,8 +380,6 @@ VTP_TRUNK_VLANS_ENABLED_3K  = "1.3.6.1.4.1.9.9.46.1.6.1.1.18"  # base 2048
 VTP_TRUNK_VLANS_ENABLED_4K  = "1.3.6.1.4.1.9.9.46.1.6.1.1.19"  # base 3072
 VTP_TRUNK_NATIVE_VLAN   = "1.3.6.1.4.1.9.9.46.1.6.1.1.5"    # vlanTrunkPortNativeVlan
 VTP_TRUNK_DYNAMIC_STATUS = "1.3.6.1.4.1.9.9.46.1.6.1.1.14"  # vlanTrunkPortDynamicStatus
-
-VTP_TRUNK_DYNAMIC_STATUS_ENUM = {1: "trunking", 2: "notTrunking"}
 
 # CISCO-VLAN-MEMBERSHIP-MIB vmVlan: an access port's VLAN, indexed by
 # ifIndex directly (not a bridge port) -- some Catalysts answer this where

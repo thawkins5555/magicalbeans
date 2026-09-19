@@ -228,13 +228,5 @@
   "object_count": 20,
   "resolved_count": 20,
   "unresolved": []
- },
- "if-mib-core.mib": {
-  "digest": "b56eb73a53d9c9e208eacfdaa19543faeb2cc308a97140849c80d393466973de",
-  "import_count": 0,
-  "module": "IF-MIB-CORE",
-  "object_count": 24,
-  "resolved_count": 24,
-  "unresolved": []
  }
 }

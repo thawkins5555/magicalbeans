@@ -363,11 +363,6 @@ class FlowDatabase(SqliteStore):
             self._conn.commit()
         return len(rows)
 
-    def touch_exporter(self, address: str, version: int, packets: int,
-                       flows: int, sampling: int) -> None:
-        """One exporter's counters. A one-row wrapper around touch_exporters."""
-        self.touch_exporters([(address, version, packets, flows, sampling)])
-
     def touch_exporters(self, entries) -> int:
         """Fold a flush's worth of exporter counters in with one commit,
         rather than taking the flow writer's lock once per exporter."""

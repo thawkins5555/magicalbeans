@@ -22,8 +22,9 @@ import time
 from .namelookup import is_ip_literal
 from .nodesmibdb import NodesMibDatabase
 from .nodesseriesdb import NodesSeriesDatabase
+from .snmpformat import format_chassis_address
 from .sqlitebase import (LIKE_ESCAPE, SqliteStore, id_chunks as _id_chunks,
-                         like_contains, reclaim)
+                         like_contains, marks_for, reclaim)
 
 log = logging.getLogger(__name__)
 
@@ -1599,7 +1600,7 @@ class NodesDatabase(SqliteStore):
             if key in fields and key != "name":
                 cols.append(key)
                 vals.append(fields[key])
-        marks = ",".join("?" * len(vals))
+        marks = marks_for(vals)
         with self._lock:
             cur = self._conn.execute(
                 f"INSERT INTO groups({','.join(cols)}) VALUES ({marks})", vals)
@@ -2087,7 +2088,7 @@ class NodesDatabase(SqliteStore):
         rows: list[sqlite3.Row] = []
         with self._lock:
             for chunk in _id_chunks(ids, self._IDS_PER_QUERY):
-                marks = ",".join("?" * len(chunk))
+                marks = marks_for(chunk)
                 rows += self._conn.execute(
                     f"SELECT * FROM devices WHERE id IN ({marks})", chunk).fetchall()
         return rows
@@ -2104,7 +2105,7 @@ class NodesDatabase(SqliteStore):
         aliases: dict = {}
         with self._lock:
             for chunk in _id_chunks(wanted, self._IDS_PER_QUERY):
-                marks = ",".join("?" * len(chunk))
+                marks = marks_for(chunk)
                 for row in self._conn.execute(
                         f"SELECT * FROM devices WHERE ip IN ({marks})", chunk):
                     found.setdefault(row["ip"], row)
@@ -2173,7 +2174,7 @@ class NodesDatabase(SqliteStore):
                 # Chunked: SQLite's bound-variable limit is generous but not
                 # infinite, and a wide level can be thousands of ids.
                 for batch in _id_chunks(frontier):
-                    marks = ",".join("?" * len(batch))
+                    marks = marks_for(batch)
                     for row in self._conn.execute(
                             f"SELECT id FROM devices WHERE upstream_id IN ({marks})"
                             " ORDER BY id", batch).fetchall():
@@ -2247,7 +2248,7 @@ class NodesDatabase(SqliteStore):
         counts: dict = {}
         with self._lock:
             for chunk in _id_chunks(ids, self._IDS_PER_QUERY):
-                marks = ",".join("?" * len(chunk))
+                marks = marks_for(chunk)
                 for row in self._conn.execute(
                         "SELECT device_id, COUNT(*) AS n FROM interfaces"
                         f" WHERE device_id IN ({marks}) GROUP BY device_id",
@@ -2265,7 +2266,7 @@ class NodesDatabase(SqliteStore):
         rows: list[sqlite3.Row] = []
         with self._lock:
             for chunk in _id_chunks(ids, self._IDS_PER_QUERY):
-                marks = ",".join("?" * len(chunk))
+                marks = marks_for(chunk)
                 rows += self._conn.execute(
                     "SELECT device_id, if_index, name, descr, alias FROM interfaces"
                     f" WHERE device_id IN ({marks}) ORDER BY device_id, if_index",
@@ -2286,7 +2287,7 @@ class NodesDatabase(SqliteStore):
         facts: dict[tuple[int, int], dict] = {}
         with self._lock:
             for chunk in _id_chunks(ids, self._IDS_PER_QUERY):
-                marks = ",".join("?" * len(chunk))
+                marks = marks_for(chunk)
                 for row in self._conn.execute(
                         "SELECT device_id, if_index, media, optic_mode,"
                         " stp_state, stp_blocking_vlans"
@@ -2335,7 +2336,7 @@ class NodesDatabase(SqliteStore):
                 cols.append(key)
                 vals.append(clean_community(overrides[key])
                             if key == "community" else overrides[key])
-        marks = ",".join("?" * len(vals))
+        marks = marks_for(vals)
         with self._lock:
             cur = self._conn.execute(
                 f"INSERT INTO devices({','.join(cols)}) VALUES ({marks})", vals)
@@ -2411,7 +2412,7 @@ class NodesDatabase(SqliteStore):
         clauses = ", ".join(f"{key} = ?" for key in allowed)
         with self._lock:
             for chunk in _id_chunks(device_ids):
-                marks = ",".join("?" * len(chunk))
+                marks = marks_for(chunk)
                 self._conn.execute(
                     f"UPDATE devices SET {clauses} WHERE id IN ({marks})",
                     (*allowed.values(), *chunk))
@@ -2447,7 +2448,7 @@ class NodesDatabase(SqliteStore):
                             value = row["overrides"][key]
                             vals.append(clean_community(value)
                                         if key == "community" else value)
-                    marks = ",".join("?" * len(vals))
+                    marks = marks_for(vals)
                     cur = self._conn.execute(
                         f"INSERT INTO devices({','.join(cols)}) VALUES ({marks})", vals)
                     ids.append(cur.lastrowid)
@@ -2494,7 +2495,7 @@ class NodesDatabase(SqliteStore):
         queued = 0
         with self._lock:
             for chunk in _id_chunks(ids):
-                marks = ",".join("?" * len(chunk))
+                marks = marks_for(chunk)
                 rows = self._conn.execute(
                     f"SELECT id, ip, name FROM devices WHERE id IN ({marks})",
                     chunk).fetchall()
@@ -3051,7 +3052,7 @@ class NodesDatabase(SqliteStore):
         found: dict[int, list[sqlite3.Row]] = {}
         with self._lock:
             for chunk in _id_chunks(ids, self._IDS_PER_QUERY):
-                marks = ",".join("?" * len(chunk))
+                marks = marks_for(chunk)
                 rows = self._conn.execute(
                     f"SELECT * FROM device_addresses WHERE device_id IN ({marks})"
                     " ORDER BY ip", chunk).fetchall()
@@ -3445,7 +3446,7 @@ class NodesDatabase(SqliteStore):
         rows: list[sqlite3.Row] = []
         with self._lock:
             for chunk in _id_chunks(normalised):
-                marks = ",".join("?" * len(chunk))
+                marks = marks_for(chunk)
                 rows += self._conn.execute(
                     "SELECT m.*, i.descr AS if_descr,"
                     " EXISTS (SELECT 1 FROM neighbors nb WHERE nb.device_id = m.device_id"
@@ -3945,9 +3946,7 @@ class NodesDatabase(SqliteStore):
                 ).fetchall()
 
     def neighbour_addresses(self, limit: int = 500) -> list[str]:
-        """Addresses present neighbour rows identify by (CDP's cdpCacheAddress and an LLDP subtype-5 chassis id), for the background resolver to name. nodepoll is imported here to avoid a circular import."""
-        from .nodepoll import format_chassis_address
-
+        """Addresses present neighbour rows identify by (CDP's cdpCacheAddress and an LLDP subtype-5 chassis id), for the background resolver to name."""
         with self._lock:
             rows = self._conn.execute(
                 "SELECT DISTINCT remote_address AS value, 0 AS chassis"
@@ -3998,7 +3997,7 @@ class NodesDatabase(SqliteStore):
         rows: list[sqlite3.Row] = []
         with self._lock:
             for chunk in _id_chunks(ids, self._IDS_PER_QUERY):
-                marks = ",".join("?" * len(chunk))
+                marks = marks_for(chunk)
                 rows += self._conn.execute(
                     self._NEIGHBOR_MATCH_SQL + f" WHERE n.device_id IN ({marks})"
                     " ORDER BY n.device_id, n.if_index, n.protocol, n.rem_index",
@@ -4233,7 +4232,7 @@ class NodesDatabase(SqliteStore):
         rows: list[sqlite3.Row] = []
         with self._lock:
             for chunk in _id_chunks(ids, self._IDS_PER_QUERY):
-                marks = ",".join("?" * len(chunk))
+                marks = marks_for(chunk)
                 rows += self._conn.execute(
                     f"SELECT * FROM vlans WHERE device_id IN ({marks})"
                     " ORDER BY device_id, vlan", chunk).fetchall()
@@ -4271,7 +4270,7 @@ class NodesDatabase(SqliteStore):
         rows: list[sqlite3.Row] = []
         with self._lock:
             for chunk in _id_chunks(ids, self._IDS_PER_QUERY):
-                marks = ",".join("?" * len(chunk))
+                marks = marks_for(chunk)
                 rows += self._conn.execute(
                     f"SELECT * FROM vlan_ports WHERE device_id IN ({marks})"
                     " ORDER BY device_id, if_index", chunk).fetchall()
@@ -4296,7 +4295,7 @@ class NodesDatabase(SqliteStore):
         rows: list[sqlite3.Row] = []
         with self._lock:
             for chunk in _id_chunks(ids, self._IDS_PER_QUERY):
-                marks = ",".join("?" * len(chunk))
+                marks = marks_for(chunk)
                 rows += self._conn.execute(
                     f"SELECT * FROM port_vlans WHERE device_id IN ({marks})"
                     " ORDER BY device_id, if_index, vlan", chunk).fetchall()
@@ -4538,7 +4537,7 @@ class NodesDatabase(SqliteStore):
         roots = sorted({str(root) for root in roots if root})
         if not roots:
             return {}
-        marks = ",".join("?" * len(roots))
+        marks = marks_for(roots)
         with self._lock:
             rows = self._conn.execute(
                 "SELECT * FROM interface_thresholds"
@@ -4638,7 +4637,7 @@ class NodesDatabase(SqliteStore):
         out: dict = {}
         with self._lock:
             for chunk in _id_chunks(if_indexes):
-                marks = ",".join("?" * len(chunk))
+                marks = marks_for(chunk)
                 for row in self._conn.execute(
                         "SELECT if_index, stp_state, id, descr FROM interfaces"
                         f" WHERE device_id = ? AND if_index IN ({marks})",
@@ -4707,7 +4706,7 @@ class NodesDatabase(SqliteStore):
                     if if_index not in seen_indexes:
                         removed.append(if_index)
             if removed:
-                marks = ",".join("?" * len(removed))
+                marks = marks_for(removed)
                 self._conn.execute(
                     f"DELETE FROM interfaces WHERE device_id=? AND if_index IN ({marks})",
                     (device_id, *removed))
@@ -4794,11 +4793,11 @@ class NodesDatabase(SqliteStore):
             clauses.append("ts >= ?")
             params.append(time.time() - since_s)
         if kinds:
-            marks = ",".join("?" * len(kinds))
+            marks = marks_for(kinds)
             clauses.append(f"kind IN ({marks})")
             params.extend(kinds)
         if exclude_kinds:
-            marks = ",".join("?" * len(exclude_kinds))
+            marks = marks_for(exclude_kinds)
             clauses.append(f"kind NOT IN ({marks})")
             params.extend(exclude_kinds)
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
@@ -4857,7 +4856,7 @@ class NodesDatabase(SqliteStore):
         first snmp_*/ping_* events from the state it already knows, rather
         than waiting for the next flap to populate one lane and leaving the
         other reading "no history" for a device pinged for months."""
-        marks = ",".join("?" * len(TIMELINE_ONLY_EVENT_KINDS))
+        marks = marks_for(TIMELINE_ONLY_EVENT_KINDS)
         with self._lock:
             row = self._conn.execute(
                 f"SELECT 1 FROM device_events WHERE device_id = ? AND kind IN ({marks}) LIMIT 1",
@@ -4888,7 +4887,7 @@ class NodesDatabase(SqliteStore):
                 ("snmp", self._SNMP_SEGMENT_STATUS, "snmp_ok"),
                 ("ping", self._PING_SEGMENT_STATUS, "ping_ok")):
             kinds = tuple(status_map)
-            marks = ",".join("?" * len(kinds))
+            marks = marks_for(kinds)
             with self._lock:
                 seen = self._conn.execute(
                     f"SELECT 1 FROM device_events WHERE device_id = ? AND ts <= ?"
@@ -4913,7 +4912,7 @@ class NodesDatabase(SqliteStore):
         whatever the last event in the window said. None (no device row to
         read a current state from) keeps whatever the last event said."""
         kinds = tuple(status_map)
-        marks = ",".join("?" * len(kinds))
+        marks = marks_for(kinds)
         with self._lock:
             prior = self._conn.execute(
                 f"SELECT kind FROM device_events WHERE device_id = ? AND ts < ?"
@@ -4947,7 +4946,7 @@ class NodesDatabase(SqliteStore):
         every source.
 
         `limit=None` means "no cap": a drain that loops until it reaches
-        max_event_id() sets its own per-tick budget and does not want a
+        max_device_event_id() sets its own per-tick budget and does not want a
         second, invisible one here."""
         sql = "SELECT * FROM device_events WHERE id > ? ORDER BY id ASC"
         args: list = [int(last_id)]
@@ -4962,12 +4961,6 @@ class NodesDatabase(SqliteStore):
             row = self._conn.execute(
                 "SELECT MAX(id) AS m FROM device_events").fetchone()
         return int(row["m"] or 0)
-
-    # The name every other source the alert engine drains uses for this
-    # (SnmpTrapDatabase.max_id, SyslogDatabase.max_id), so a drain loop can
-    # ask each source the same question instead of special-casing this one.
-    def max_event_id(self) -> int:
-        return self.max_device_event_id()
 
     def count_events_by_device(self, since: float,
                                limit: int | None = None) -> list[sqlite3.Row]:
@@ -5345,7 +5338,7 @@ class NodesDatabase(SqliteStore):
     def add_discovery_result(self, job_id: int, **fields) -> int:
         cols = ["job_id"] + list(fields.keys())
         vals = [job_id] + list(fields.values())
-        marks = ",".join("?" * len(vals))
+        marks = marks_for(vals)
         with self._lock:
             cur = self._conn.execute(
                 f"INSERT INTO discovery_results({','.join(cols)}) VALUES ({marks})", vals)

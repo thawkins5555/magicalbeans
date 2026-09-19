@@ -70,7 +70,7 @@ import time
 # secret store, which needs a passphrase from the environment.
 os.environ.setdefault("NETPATH_SECRET_PASSPHRASE", "snmpv3-diagnostics-suite")
 
-import _paths  # noqa: F401  (puts the repo root on sys.path)
+import _paths
 from _paths import free_udp_port, spawn_stub, tmpdir
 
 import netpath.nodepoll as nodepoll_mod
@@ -211,7 +211,7 @@ print("\n-- PAN-OS: authPriv user, authNoPriv request, errorStatus 16")
 stats = os.path.join(TMP, "denied.json")
 stub, port = spawn_stub("stub_agent_iftable.py", "v3", "--auth-pass", PASSWORD,
                         "--require-priv", "--stats", stats)
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db, did = new_v3_db("denied", PASSWORD)
     poller = NodePoller(db)
@@ -311,7 +311,7 @@ print("\n-- wrongDigests: the real authentication failure still is one")
 stats = os.path.join(TMP, "wrong.json")
 stub, port = spawn_stub("stub_agent_iftable.py", "v3", "--auth-pass", PASSWORD,
                         "--stats", stats)
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db, did = new_v3_db("wrong", WRONG)
     poller = NodePoller(db)
@@ -402,7 +402,7 @@ print("\n-- notInTimeWindows twice is transient, not a failed password")
 # resynced retry draws a Report: the clock case, twice.
 stub, port = spawn_stub("stub_agent_iftable.py", "v3", "--auth-pass", PASSWORD,
                         "--window", "-1")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db, did = new_v3_db("clock", PASSWORD)
     result = api.post_nodes_device_test(FakeService(db), {}, {}, did)
@@ -423,7 +423,7 @@ finally:
 # ===================================== § 5 discovery is a phase
 
 print("\n-- a discovery timeout says discovery was the phase")
-nodepoll_mod.DEFAULT_SNMP_PORT = free_udp_port()      # nothing listens there
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", free_udp_port())      # nothing listens there
 db, did = new_v3_db("dark", PASSWORD, timeout_s=0.3)
 result = api.post_nodes_device_test(FakeService(db), {}, {}, did)
 snmp = result["snmp"]
@@ -751,7 +751,7 @@ finally:
 print("\n-- a fixed password refused by VACM still closes the auth alert")
 stub, port = spawn_stub("stub_agent_iftable.py", "v3", "--auth-pass", PASSWORD,
                         "--require-priv")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db, did = new_v3_db("authok", WRONG)
     poller = NodePoller(db)
@@ -778,7 +778,7 @@ finally:
 print("\n-- unsigned replies, polled past the outage threshold, ping off")
 stub, port = spawn_stub("stub_agent_iftable.py", "v3", "--auth-pass", PASSWORD,
                         "--unsigned-replies")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db, did = new_v3_db("downgrade", PASSWORD)
     poller = NodePoller(db)
@@ -805,14 +805,14 @@ try:
           did not in poller._credential_probe_failed)
     # Ping on, answering: the device is up by ping alone, and the question
     # is the snmp_error event that reads "SNMP is not answering".
-    real_ping = nodepoll_mod.ping_many
-    nodepoll_mod.ping_many = lambda ip, count=3, timeout_ms=1000: (count, count, 0.2)
+    restore = _paths.patch_nodepoll(
+        "ping_many", lambda ip, count=3, timeout_ms=1000: (count, count, 0.2))
     try:
         db.update_group(db.ensure_default_group(), ping_enabled=1)
         for _ in range(4):                 # snmp_fail_alert_after ships as 3
             poll_once(poller, db, did)
     finally:
-        nodepoll_mod.ping_many = real_ping
+        restore()
     check("with ping on, no snmp_error event either: 'SNMP is not answering' is "
           "untrue of an agent that answered every request",
           "snmp_error" not in kinds(db, did), kinds(db, did))
@@ -901,7 +901,7 @@ check("snmp_version_of: None and absent are v2c (1); 0 stays v1; 3 stays v3",
       and snmp_version_of({"snmp_version": 0}) == 0 and snmp_version_of({"snmp_version": 3}) == 3)
 check("credential_for survives the None overlay",
       credential_for({"snmp_version": None, "community": "public"}).identity == "public")
-nodepoll_mod.DEFAULT_SNMP_PORT = free_udp_port()      # nothing listens there
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", free_udp_port())      # nothing listens there
 db, did = new_v3_db("none-version", PASSWORD, timeout_s=0.2)
 poller = NodePoller(db)
 poller.log = CaptureLog()
@@ -948,7 +948,7 @@ stats = os.path.join(TMP, "silent.json")
 stub, port = spawn_stub("stub_agent_iftable.py", "v3", "--auth-pass", PASSWORD,
                         "--bump-boots-at", "0.5", "--silent-out-of-window",
                         "--window", "5", "--stats", stats)
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 
 
 def stub_counts() -> dict:
@@ -1023,7 +1023,7 @@ def discovery_only(data):
 
 
 agent = FakeAgent(discovery_only)
-nodepoll_mod.DEFAULT_SNMP_PORT = agent.port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", agent.port)
 try:
     db, did = new_v3_db("fresh", PASSWORD, timeout_s=0.4)
     poller = NodePoller(db)
@@ -1061,7 +1061,7 @@ check("...and has dropped the device's cached engine (red before 5.8.1)",
 # construction — a regression guard on the arm the fix sits beside.
 print("\n-- _AuthFailure still invalidates")
 stub, port = spawn_stub("stub_agent_iftable.py", "v3", "--auth-pass", PASSWORD)
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db, did = new_v3_db("stillauth", WRONG)
     poller = NodePoller(db)

@@ -4,9 +4,8 @@ The operator asked how mainstream network monitoring products retrieve,
 display, filter, and export historical data — for devices, interfaces,
 environmental sensors, CPU, and similar metrics — and wanted a set of
 options for how this platform could do the same. This document is that
-research and that menu. **Nothing described under "Options" below has been
-built.** No history explorer, export endpoint, or retention change ships
-in this release; this is groundwork for a future decision.
+research and that menu, kept as the record of that decision — see
+"Status" below for which options were chosen and shipped.
 
 ## How the mainstream products do it
 

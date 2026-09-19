@@ -29,7 +29,7 @@ from concurrent.futures import ThreadPoolExecutor
 from . import nodeoids as oids
 from .eventlog import ERROR, NullLog, WIRELESS
 from .nodeoids import oid_key
-from .nodepoll import EngineCache, _Session, credential_for, snmp_version_of
+from .nodepoll import EngineCache, _AuthFailure, _Session, credential_for, snmp_version_of
 from .snmppoll import (
     PDU_GETNEXT, PDU_REPORT, SnmpError,
     build_request, build_v3_request, discovery_probe,
@@ -53,10 +53,6 @@ SNMP_PORT = 161
 
 # Like nodepoll's _STARTUP_SPREAD_S: breaks the phase lock of controllers seeded due at 0 together.
 POLL_SPREAD_S = 30.0
-
-
-class _AuthFailure(SnmpError):
-    pass
 
 
 class WirelessPoller(Worker):
@@ -134,11 +130,7 @@ class WirelessPoller(Worker):
         if self._executor:
             self._executor.shutdown(wait=False, cancel_futures=True)
 
-    def finish_stop(self, deadline: float) -> None:
-        # min, not shutdown()'s max — see Monitor.finish_stop.
-        self._join(timeout=max(0.0, deadline - time.monotonic()))
-        self.drain(min(max(0.0, deadline - time.monotonic()),
-                       self._inflight_budget_s()))
+    finish_stop = Worker._finish_stop_draining
 
     def poll_now(self, controller_id: int) -> None:
         with self._lock:

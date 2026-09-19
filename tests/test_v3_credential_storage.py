@@ -32,7 +32,7 @@ import sys
 
 os.environ.setdefault("NETPATH_SECRET_PASSPHRASE", "v3-credential-storage-suite")
 
-import _paths  # noqa: F401  (puts the repo root on sys.path)
+import _paths
 from _paths import tmpdir
 
 import netpath.nodepoll as nodepoll_mod  # noqa: E402
@@ -100,7 +100,7 @@ def authpriv_profile_db(name):
 
 # nodeoids/nodepoll aim the Test route's datagram here; nothing answers,
 # and the level is in the payload before the first send.
-nodepoll_mod.DEFAULT_SNMP_PORT = 1
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", 1)
 
 # ======================================= § 1 the Test button's level
 

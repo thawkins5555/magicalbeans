@@ -16,7 +16,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-import _paths  # noqa: F401  (repo root + tests dir on sys.path)
+import _paths
 from _paths import tmpdir
 
 from netpath import nodepoll
@@ -346,8 +346,8 @@ def backoff_never_touches_a_device_answering_ping():
 
     # Now ping starts answering while SNMP stays dead: the reachable-but-
     # broken case. Every cycle must still attempt SNMP.
-    original = nodepoll.ping_many
-    nodepoll.ping_many = lambda ip, count=3, timeout_ms=1000: (count, count, 1.0)
+    restore = _paths.patch_nodepoll(
+        "ping_many", lambda ip, count=3, timeout_ms=1000: (count, count, 1.0))
     try:
         config = db.effective_config(db.device(device_id))
         config["snmp_enabled"] = True
@@ -357,7 +357,7 @@ def backoff_never_touches_a_device_answering_ping():
             poller._poll_device(db.device(device_id), config)
         skipped = poller.counters["snmp_backoff"] - before
     finally:
-        nodepoll.ping_many = original
+        restore()
 
     # Only the first cycle tests the status half: once ping answers, the
     # device is reachable and record_poll moves it to "up", so the remaining
@@ -426,8 +426,7 @@ def backoff_records_no_phantom_snmp_failure():
         pings.append(ip)
         return count, 0, None
 
-    original = nodepoll.ping_many
-    nodepoll.ping_many = fake_ping
+    restore = _paths.patch_nodepoll("ping_many", fake_ping)
     try:
         config = db.effective_config(db.device(device_id))
         config["snmp_enabled"] = True
@@ -439,7 +438,7 @@ def backoff_records_no_phantom_snmp_failure():
         skipped_count = poller.counters["snmp_backoff"]
         poller._poll_device(db.device(device_id), config)
     finally:
-        nodepoll.ping_many = original
+        restore()
 
     check(len(pings) == poller._SNMP_BACKOFF_SKIPS + 1,
           "ping runs on every cycle, backed-off ones included (got %d)" % len(pings))

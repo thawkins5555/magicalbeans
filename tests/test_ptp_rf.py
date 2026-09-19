@@ -5,6 +5,7 @@ work for free; a non-radio vendor arc never sends a single packet for it;
 wired end to end through _poll_snmp_scalars."""
 import time
 
+import _paths
 from _paths import spawn_stub, tmpdir
 
 TMP = tmpdir("ptp_rf_")
@@ -36,7 +37,7 @@ def device_against(db: NodesDatabase, port: int, name: str) -> int:
 
 # ------------------------------------------------------------- airFiber
 stub, port = spawn_stub("stub_agent_l2.py", "airfiber")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("airfiber")
     did = device_against(db, port, "af-radio")
@@ -71,7 +72,7 @@ finally:
 
 # -------------------------------------------------------------- Cambium
 stub, port = spawn_stub("stub_agent_l2.py", "cambium")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("cambium")
     did = device_against(db, port, "cambium-radio")

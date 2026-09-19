@@ -21,9 +21,6 @@ GRID = QColor("#222933")
 
 TEXT = QColor("#DCE3EA")
 TEXT_MUTED = QColor("#8F9AA7")
-# The dimmest tone text may be set in: 4.6:1 on PANEL_RAISED. There is no
-# TEXT_FAINT any more — it was 2.5:1 and was being used for prose.
-TEXT_DIM = QColor("#848F9C")
 # Not text: dividers, grips, the dot of a stopped collector. 3.1:1 on RAISED.
 LINE = QColor("#646E7C")
 # The fill for "none of this yet" in a chart. 3.05:1 on PANEL.
@@ -32,29 +29,10 @@ DATA_NEUTRAL = QColor("#606A78")
 ACCENT = QColor("#7AA2F7")
 ACCENT_HOVER = QColor("#97B6FF")   # a primary button under the pointer
 
-# The route canvas is light while the rest of the app stays dark, so it needs
-# its own palette: the dark one's greys and accents have far too little
-# contrast against white to be legible.
-CANVAS = QColor("#FFFFFF")
-CANVAS_PANEL = QColor("#F4F6F9")
-CANVAS_HAIRLINE = QColor("#C9D2DD")
-CANVAS_GRID = QColor("#E4E9F0")
-CANVAS_TEXT = QColor("#161C24")
-CANVAS_TEXT_MUTED = QColor("#55606E")
-CANVAS_TEXT_FAINT = QColor("#66707E")
-CANVAS_ACCENT = QColor("#2F5FC4")
-CANVAS_OK = QColor("#1B7F3B")
-CANVAS_WARN = QColor("#9A6510")
-CANVAS_FAIL = QColor("#B3261E")
-CANVAS_BLOCKED = QColor("#A63D10")
-
 OK = QColor("#3FB950")
 WARN = QColor("#E3B341")
 FAIL = QColor("#F8544C")
 ERROR = QColor("#A371F7")
-BLOCKED = QColor("#FF8A65")
-OVERRUN = QColor("#4DB6AC")
-NODATA = QColor("#1E242D")
 
 # Categorical palette for stacked flow charts: the same eight hues the web
 # NetFlow chart uses (--cat-1 .. --cat-8), chosen for separation under
@@ -65,7 +43,6 @@ SERIES = [
     QColor("#5B8DEB"), QColor("#CF7638"), QColor("#2FA886"), QColor("#B0881A"),
     QColor("#D1609A"), QColor("#4F9A3A"), QColor("#8F76E8"), QColor("#DC5A5A"),
 ]
-SERIES_OTHER = DATA_NEUTRAL
 
 
 MONO_FAMILIES = [

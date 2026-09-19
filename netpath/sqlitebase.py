@@ -297,6 +297,11 @@ def id_chunks(ids, size: int = _ID_CHUNK):
         yield ids[start:start + size]
 
 
+def marks_for(chunk) -> str:
+    """The "?,?,?" placeholder list for one chunk's WHERE ... IN (...)."""
+    return ",".join("?" * len(chunk))
+
+
 # A LIKE needle that matches the operator's text literally. Every search box
 # in the product feeds LIKE, where a typed `_` or `%` is a wildcard unless
 # escaped; pair each of these with `LIKE ? ESCAPE '\\'`.

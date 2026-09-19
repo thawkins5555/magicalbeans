@@ -90,7 +90,7 @@ def v3_engine_time():
     proc, port = spawn_stub("stub_agent_iftable.py", "v3",
                             "--window", "1", "--stats", stats)
     try:
-        nodepoll_mod.DEFAULT_SNMP_PORT = port
+        _paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
         db = NodesDatabase(os.path.join(TMPDIR, "v3.db"))
         group_id = db.ensure_default_group()
         device_id = db.add_device(
@@ -140,7 +140,7 @@ def v3_engine_time():
     proc, port = spawn_stub("stub_agent_iftable.py", "v3", "--window", "1",
                             "--bump-boots-at", "1", "--stats", stats)
     try:
-        nodepoll_mod.DEFAULT_SNMP_PORT = port
+        _paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
         db = NodesDatabase(os.path.join(TMPDIR, "v3boots.db"))
         group_id = db.ensure_default_group()
         device_id = db.add_device(
@@ -176,7 +176,7 @@ def pool_and_walks():
     print("\n-- pool, caches and walks")
     proc, port = spawn_stub("stub_agent_iftable.py", "ok", "--interfaces", "6")
     try:
-        nodepoll_mod.DEFAULT_SNMP_PORT = port
+        _paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
         db = NodesDatabase(os.path.join(TMPDIR, "pool.db"))
         group_id = db.ensure_default_group()
         device_id = db.add_device(
@@ -340,7 +340,7 @@ def software_version_survives_a_lost_vendor_get():
 
     proc, port = spawn_stub("stub_agent_vendor_health.py", "cisco")
     try:
-        nodepoll_mod.DEFAULT_SNMP_PORT = port
+        _paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
         db = NodesDatabase(os.path.join(TMPDIR, "sw_lost_get.db"))
         group_id = db.ensure_default_group()
         device_id = db.add_device(
@@ -500,7 +500,7 @@ def ipv6_polling():
 
     proc, port = spawn_stub("stub_agent_iftable.py", "ok", "--host", "::1")
     try:
-        nodepoll_mod.DEFAULT_SNMP_PORT = port
+        _paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
         db = NodesDatabase(os.path.join(TMPDIR, "ipv6.db"))
         group_id = db.ensure_default_group()
         device_id = db.add_device(
@@ -532,7 +532,7 @@ def vendor_health():
 
     proc, port = spawn_stub("stub_agent_iftable.py", "fortigate")
     try:
-        nodepoll_mod.DEFAULT_SNMP_PORT = port
+        _paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
         db = NodesDatabase(os.path.join(TMPDIR, "fortigate.db"))
         group_id = db.ensure_default_group()
         device_id = db.add_device(
@@ -573,7 +573,7 @@ def vendor_health():
 
     proc, port = spawn_stub("stub_agent_iftable.py", "cisco")
     try:
-        nodepoll_mod.DEFAULT_SNMP_PORT = port
+        _paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
         db = NodesDatabase(os.path.join(TMPDIR, "cisco.db"))
         group_id = db.ensure_default_group()
         device_id = db.add_device(
@@ -610,7 +610,7 @@ def software_version():
 
     proc, port = spawn_stub("stub_agent_vendor_health.py", "cisco")
     try:
-        nodepoll_mod.DEFAULT_SNMP_PORT = port
+        _paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
         db = NodesDatabase(os.path.join(TMPDIR, "sw_cisco.db"))
         group_id = db.ensure_default_group()
         device_id = db.add_device(
@@ -656,7 +656,7 @@ def software_version():
 
     proc, port = spawn_stub("stub_agent_vendor_health.py", "fortinet")
     try:
-        nodepoll_mod.DEFAULT_SNMP_PORT = port
+        _paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
         db = NodesDatabase(os.path.join(TMPDIR, "sw_fortinet.db"))
         group_id = db.ensure_default_group()
         device_id = db.add_device(
@@ -700,7 +700,7 @@ def software_version():
     # poll is still a success.
     proc, port = spawn_stub("stub_agent_iftable.py", "ok", "--interfaces", "2")
     try:
-        nodepoll_mod.DEFAULT_SNMP_PORT = port
+        _paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
         db = NodesDatabase(os.path.join(TMPDIR, "sw_none.db"))
         group_id = db.ensure_default_group()
         device_id = db.add_device(
@@ -733,7 +733,7 @@ def interface_reads():
     proc, port = spawn_stub("stub_agent_iftable.py", "v1_nosuchname",
                             "--interfaces", "3")
     try:
-        nodepoll_mod.DEFAULT_SNMP_PORT = port
+        _paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
         db = NodesDatabase(os.path.join(TMPDIR, "v1.db"))
         group_id = db.ensure_default_group()
         device_id = db.add_device(
@@ -787,7 +787,7 @@ def interface_reads():
     proc, port = spawn_stub("stub_agent_iftable.py", "dark_after_walk",
                             "--interfaces", "40", "--dark-after", "5")
     try:
-        nodepoll_mod.DEFAULT_SNMP_PORT = port
+        _paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
         db = NodesDatabase(os.path.join(TMPDIR, "dark.db"))
         group_id = db.ensure_default_group()
         device_id = db.add_device(
@@ -822,7 +822,7 @@ def interface_reads():
     proc, port = spawn_stub("stub_agent_iftable.py", "nonnumeric",
                             "--interfaces", "3")
     try:
-        nodepoll_mod.DEFAULT_SNMP_PORT = port
+        _paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
         db = NodesDatabase(os.path.join(TMPDIR, "nonnumeric.db"))
         group_id = db.ensure_default_group()
         device_id = db.add_device(
@@ -849,7 +849,7 @@ def request_matching():
     print("\n-- request matching")
     proc, port = spawn_stub("stub_agent_iftable.py", "stale_id")
     try:
-        nodepoll_mod.DEFAULT_SNMP_PORT = port
+        _paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
         db = NodesDatabase(os.path.join(TMPDIR, "stale.db"))
         group_id = db.ensure_default_group()
         device_id = db.add_device(
@@ -919,7 +919,7 @@ def reboot_suppression():
     proc, port = spawn_stub("stub_agent_iftable.py", "reboot",
                             "--interfaces", "2", "--reboot-after", "2")
     try:
-        nodepoll_mod.DEFAULT_SNMP_PORT = port
+        _paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
         db = NodesDatabase(os.path.join(TMPDIR, "reboot.db"))
         group_id = db.ensure_default_group()
         device_id = db.add_device(
@@ -969,7 +969,7 @@ def reboot_suppression():
 def main():
     proc, port = spawn_stub("stub_agent_iftable.py", "ok", "--interfaces", "24")
     try:
-        nodepoll_mod.DEFAULT_SNMP_PORT = port
+        _paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
         db = NodesDatabase(os.path.join(TMPDIR, "nodes.db"))
         group_id = db.ensure_default_group()
         device_id = db.add_device(

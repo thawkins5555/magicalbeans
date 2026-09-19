@@ -3,6 +3,7 @@ import os
 import sys
 import time
 
+import _paths
 from _paths import spawn_stub, tmpdir
 
 TMPDIR = tmpdir("timeout_accuracy_")
@@ -12,7 +13,7 @@ import netpath.nodepoll as nodepoll_mod
 # ifIndex table, so the identity lands and the table walk times out.
 stub, STUB_PORT = spawn_stub("stub_agent_partial_timeout.py")
 atexit.register(stub.kill)
-nodepoll_mod.DEFAULT_SNMP_PORT = STUB_PORT
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", STUB_PORT)
 
 from netpath.nodesdb import NodesDatabase
 from netpath.nodepoll import NodePoller

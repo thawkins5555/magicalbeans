@@ -14,7 +14,8 @@ import time
 from statistics import mean
 
 from .sqlitebase import (  # re-exported: tests adjust netpath.db.TRIM_CHUNK
-    TRIM_BUDGET_S, TRIM_CHUNK, TRIM_CHUNK_MAX, TRIM_CHUNK_MIN, SqliteStore)
+    TRIM_BUDGET_S, TRIM_CHUNK, TRIM_CHUNK_MAX, TRIM_CHUNK_MIN, SqliteStore,
+    marks_for)
 from .tracer import TraceResult
 
 log = logging.getLogger(__name__)
@@ -386,7 +387,7 @@ class Database(SqliteStore):
         A target with no traces yet is simply absent from the result."""
         if not target_ids:
             return {}
-        marks = ",".join("?" * len(target_ids))
+        marks = marks_for(target_ids)
         with self._lock:
             rows = self._conn.execute(
                 f"SELECT t.* FROM traces t"
@@ -460,7 +461,7 @@ class Database(SqliteStore):
         target_ids = list(target_ids)
         if not target_ids:
             return {}
-        marks = ",".join("?" * len(target_ids))
+        marks = marks_for(target_ids)
         with self._lock:
             rows = self._conn.execute(
                 f"SELECT c.* FROM https_checks c"
@@ -512,8 +513,9 @@ class Database(SqliteStore):
             ).fetchone()
         return row["ip"] if row else None
 
-    def target_by_destination_ip(self, ip: str) -> sqlite3.Row | None:
-        """The target whose most recent successful trace ended exactly at this IP.
+    def targets_by_destination_ips(self, ips) -> dict[str, int]:
+        """The targets whose most recent successful trace ended exactly at each
+        IP, for annotating many flow rows without one query per row.
 
         Reuses destination_ip()'s "final hop of the most recent reached trace"
         definition rather than matching any hop along the path, so a shared
@@ -522,23 +524,6 @@ class Database(SqliteStore):
         so a per-target scan of already-indexed queries is simpler and safer
         than trying to encode the same "final hop" logic in one raw join.
         """
-        with self._lock:
-            targets = self._conn.execute("SELECT id FROM targets").fetchall()
-        best_ts, best_id = None, None
-        for row in targets:
-            target_id = row["id"]
-            if self.destination_ip(target_id) != ip:
-                continue
-            last = self.last_trace(target_id)
-            if last is None:
-                continue
-            if best_ts is None or last["started_ts"] > best_ts:
-                best_ts, best_id = last["started_ts"], target_id
-        return self.target(best_id) if best_id is not None else None
-
-    def targets_by_destination_ips(self, ips) -> dict[str, int]:
-        """Bulk form of target_by_destination_ip, for annotating many flow rows
-        without one query per row."""
         wanted = set(ips)
         if not wanted:
             return {}
@@ -633,7 +618,7 @@ class Database(SqliteStore):
                 "SELECT ip FROM hop_stats WHERE target_id=?", (target_id,)).fetchall()
             stale = [row["ip"] for row in rows if row["ip"] not in keep]
             if stale:
-                marks = ",".join("?" * len(stale))
+                marks = marks_for(stale)
                 self._conn.execute(
                     f"DELETE FROM hop_stats WHERE target_id=? AND ip IN ({marks})",
                     (target_id, *stale))

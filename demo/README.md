@@ -1,8 +1,7 @@
 # SappiWhere demo harness
 
 A self-contained rig that stands up a fake network, points a real SappiWhere at
-it, drives nine scripted incidents through it, walks the browser UI with
-Playwright, and writes down what happened.
+it, drives nine scripted incidents through it, and writes down what happened.
 
 Nothing here touches `netpath/` or `tests/`. Everything the app talks to is on
 the loopback interface: simulated SNMP agents on `127.0.0.2` upwards, a
@@ -22,10 +21,10 @@ That is the whole demo. It takes roughly 20 minutes at `--count 250`, and
 leaves everything in `demo/out/`. For a five-minute smoke test:
 
 ```bash
-python3 demo/scenario.py --count 25 --out demo/out --fast --skip-ui
+python3 demo/scenario.py --count 25 --out demo/out --fast
 ```
 
-`--fast` scales every wait down 4x; `--skip-ui` leaves out the browser walk.
+`--fast` scales every wait down 4x.
 
 ---
 
@@ -35,9 +34,7 @@ python3 demo/scenario.py --count 25 --out demo/out --fast --skip-ui
 | --- | --- | --- | --- |
 | **root** (or `CAP_NET_BIND_SERVICE`) | *(nothing — see below)* | the app listens on syslog **514/udp+tcp**, SNMP traps **162/udp** and the simulated agents answer on **161/udp** | those collectors report `running: false` and steps 6 and 7 measure nothing |
 | **`ulimit -n` ≥ 4096** | *(nothing — see below)* | one UDP socket per simulated device, plus the poller's own | `fleet.py` dies part-way through `bind()` |
-| **Python 3.9+** (stdlib only) | **Python 3.9+** (stdlib only), via the **`py` launcher** | everything except the UI walk | — |
-| **Node 22 + Playwright 1.56** installed globally | same | `demo/ui_walk.mjs` | the scenario records `skipped` and carries on |
-| `PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers` | `$env:PLAYWRIGHT_BROWSERS_PATH = "C:\pw-browsers"` | where Chromium lives | Playwright cannot find a browser |
+| **Python 3.9+** (stdlib only) | **Python 3.9+** (stdlib only), via the **`py` launcher** | everything | — |
 | *(optional)* real `ping`/`traceroute` | *(optional)* real `ping`/`tracert` | not needed — `demo/bin`'s POSIX scripts (`ping`, `traceroute`) shadow both on Linux, and their `.cmd` twins (`ping.cmd`, `traceroute.cmd`, `tracert.cmd`) do the same on Windows | — |
 
 Raise the file-descriptor limit before a large fleet:
@@ -103,14 +100,6 @@ being explicit about rather than just omitting the row:
   Stop-Process -Id <ProcessId> -Force   # once you've confirmed it's stale
   ```
 
-Playwright is resolved through `npm root -g`, so it does not have to be
-installed next to the repository:
-
-```bash
-npm root -g            # e.g. /opt/node22/lib/node_modules
-node -e "require(require('child_process').execSync('npm root -g').toString().trim() + '/playwright')"
-```
-
 Ports used: **8443** (app), **8099** (fleet control), **1025** (SMTP sink),
 **161** (simulated agents), **162**, **514**, **2055**. Pass `--port` and
 `--control-port` to `scenario.py` if any of them are already taken.
@@ -126,8 +115,7 @@ Ports used: **8443** (app), **8099** (fleet control), **1025** (SMTP sink),
 | `generators.py` | NetFlow v5/v9, SNMP traps and syslog senders, as functions and as a CLI. |
 | `bin/ping`, `bin/traceroute` | Scripted stand-ins put at the front of `PATH`, so NetPath traces a network that does not exist. Paths come from `routes.json`. |
 | `seed.py` | Fills a running app over its HTTP API: groups, profiles, devices, NetPath targets, IPAM, wireless, ConfigRX, settings, alert rules, users. `--defaults` seeds without tuning anything the application ships — see [Campaign settings vs shipped defaults](#campaign-settings-vs-shipped-defaults). |
-| `ui_walk.mjs` | Drives the browser with Playwright: every tab (by `data-tab`, so a label rename cannot break it), every subtab including Nodes' Topology and the device-detail pane's four nested ones, every dialog it can reach (device groups, the MIB catalog, Upload MIB, ConfigRX's device-settings and bulk-settings dialogs, and the rest), a MAC search and ConfigRX's inline config viewer and diff, a kiosk-mode (`?kiosk=1`) pass, and every top-level tab again under each of the three themes and at three viewport sizes — screenshots, console log, timing metrics. |
-| `scenario.py` | The conductor. Starts everything, runs `seed.py`, runs the nine incident steps, runs `ui_walk.mjs`, writes the report, stops everything. |
+| `scenario.py` | The conductor. Starts everything, runs `seed.py`, runs the nine incident steps, writes the report, stops everything. |
 | `configrx_compliance_fixture.py` | A realistic ConfigRX compliance demonstration, not a unit test: seeds a plant-shaped rule set and capture data against a real `ConfigRxDatabase`. |
 | `fake_ssh.py` | Fake SSH devices (paramiko) for exercising ConfigRX's capture logic — one persona per loopback port, sharing personas with `tests/stubs/stub_ssh_device.py`. |
 | `routes.json` | The scripted traceroute paths `bin/ping`/`bin/traceroute` read: multihop, route change, refused, silent, dead and degraded, keyed by destination IP. |
@@ -269,13 +257,6 @@ python3 demo/generators.py syslog  --count 20 --rate 400 --duration 60
 python3 demo/generators.py syslog  --count 20 --rate 200 --duration 60 --tcp --framing octet
 ```
 
-**5. The UI walk**
-
-```bash
-node demo/ui_walk.mjs --base http://127.0.0.1:8443 \
-     --creds demo/out/creds.txt --out demo/out/ui --tag 250
-```
-
 ---
 
 ## What the scenario does
@@ -316,23 +297,6 @@ app-<count>.log           the app's stdout
 fleet-<count>.log         the fleet's stdout
 scenario-<count>.log      the run's own log
 data-<count>/             the ten SQLite databases for this run
-ui/tab-*.png              one screenshot per top-level tab, admin pass
-ui/sub-*.png              one per subtab, admin pass (includes Nodes'
-                          Topology and the device-detail pane's four
-                          nested subtabs)
-ui/dlg-*.png              one per dialog it could open
-ui/feature-*.png          MAC search, ConfigRX's inline config viewer
-                          and diff (panes, not dialogs)
-ui/theme-<theme>-*.png    every top-level tab under dark/light/contrast
-ui/viewport-<WxH>-*.png   every top-level tab at 1920x1080, 1366x768
-                          and 1280x720
-ui/kiosk-*.png            a kiosk-mode (?kiosk=1) session
-ui/viewer-*.png           the same top-level tabs as the read-only
-                          `viewer` account
-ui/console-<count>.json   console errors/warnings, page errors, failed
-                          requests, every HTTP response >= 400 (every pass)
-ui/metrics-<count>.json   nodes-table fill time, long tasks, payload size
-ui/walk-<count>.json      per-step ok/skipped/failed
 ```
 
 Each run uses a fresh `data-<count>/` directory, so there is no teardown step
@@ -353,11 +317,12 @@ Each run uses a fresh `data-<count>/` directory, so there is no teardown step
 Two quirks worth knowing, both in the app rather than here:
 
 * Changing a password destroys every session for that account
-  (`netpath/web/api.py:4060`), so `seed.py` signs in again straight after.
+  (`netpath/web/api/auth.py:584`), so `seed.py` signs in again straight after.
 * `POST /api/users` always sets `must_change`, and an admin *reset* sets it
   again — only the account changing its **own** password clears it. `seed.py`
-  therefore signs in once as each new account to clear the flag, so the UI walk
-  is not blocked by a forced-change dialog.
+  therefore signs in once as each new account to clear the flag, so opening
+  the app as one of the seeded accounts is not blocked by a forced-change
+  dialog.
 
 ---
 
@@ -384,17 +349,16 @@ Two quirks worth knowing, both in the app rather than here:
 * **ConfigRX backups will not succeed** without something answering SSH, and
   (absent the passphrase above) the credential cannot be stored anyway. The
   seeding proves the configuration path, not a completed backup.
-* **`GET /api/alerts` caps `limit` at 2000** (`netpath/web/api.py:2973`), so a
+* **`GET /api/alerts` caps `limit` at 2000** (`netpath/web/api/alerts.py:154`), so a
   very large outage can truncate the per-rule counts. `results-<count>.json`
   records `alerts_truncated` when it does. **Export CSV** on the Alerts tab is
   not subject to this cap — it goes to 50,000 rows — but the seeding scripts
   do not exercise it.
 * **`GET /api/nodes/devices` still returns the whole fleet in one JSON body
   when called with no parameters**, which is what every script in this
-  harness does — the UI walk measures how big that gets
-  (`ui/metrics-<count>.json`, `devices_payload_bytes`). From 4.47.0 the route
-  also accepts `limit`/`offset` for a paged caller; nothing here uses that
-  path, so this harness's numbers are still the whole-fleet cost.
+  harness does. From 4.47.0 the route also accepts `limit`/`offset` for a
+  paged caller; nothing here uses that path, so this harness's numbers are
+  still the whole-fleet cost.
 * **Seeding a fleet is still one `POST /api/nodes/devices` per device.** A
   bulk-import route (`POST /api/nodes/devices/bulk-import`) exists from
   4.47.0, but `seed.py` does not use it — the per-device rate it prints is

@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import types
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(TESTS_DIR)
@@ -81,3 +82,22 @@ def _drain(proc) -> None:
             pass
     except Exception:  # the pipe closes when the stub is killed
         pass
+
+
+def patch_nodepoll(name, value):
+    """Set `name` on netpath.nodepoll and on every netpath.nodepoll.*
+    submodule holding its own copy (the code resolves it there, not off the
+    package). Returns a restore()."""
+    from netpath import nodepoll
+    targets = [nodepoll] + [mod for mod in vars(nodepoll).values()
+                            if isinstance(mod, types.ModuleType)
+                            and mod.__name__.startswith("netpath.nodepoll.")
+                            and hasattr(mod, name)]
+    saved = [(mod, getattr(mod, name)) for mod in targets]
+    for mod in targets:
+        setattr(mod, name, value)
+
+    def restore():
+        for mod, old in saved:
+            setattr(mod, name, old)
+    return restore

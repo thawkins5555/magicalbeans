@@ -98,14 +98,7 @@ class Monitor(Worker):
         if wait:
             self._join(timeout=5)
 
-    def drain(self, timeout_s: float = 3.0) -> bool:
-        """Wait for in-flight traces to finish. True if they all did."""
-        deadline = time.time() + timeout_s
-        while time.time() < deadline:
-            if not self.inflight():
-                return True
-            time.sleep(0.05)
-        return not self.inflight()
+    # drain() is Worker's: the in-flight set it waits on is exactly inflight().
 
     def shutdown(self, drain_s: float = 3.0) -> None:
         self.stop()
@@ -124,13 +117,7 @@ class Monitor(Worker):
         self.stop()
         self._executor.shutdown(wait=False, cancel_futures=True)
 
-    def finish_stop(self, deadline: float) -> None:
-        # min, not shutdown()'s max: the in-flight budget is a ceiling on what
-        # a trace could still legitimately need, not a promise to wait it out.
-        # Whichever of it and the shared teardown deadline is smaller wins.
-        self._join(timeout=max(0.0, deadline - time.monotonic()))
-        self.drain(min(max(0.0, deadline - time.monotonic()),
-                       self._inflight_budget_s()))
+    finish_stop = Worker._finish_stop_draining
 
     def _inflight_budget_s(self, ceiling_s: float = 30.0) -> float:
         """The longest a currently in-flight trace could still legitimately
@@ -457,14 +444,7 @@ class Resolver(Worker):
         with self._lock:
             return {ip: {"started": self._started.get(ip)} for ip in self._pending}
 
-    def drain(self, timeout_s: float = 3.0) -> bool:
-        """Wait for in-flight lookups to finish. True if they all did."""
-        deadline = time.time() + timeout_s
-        while time.time() < deadline:
-            if not self.inflight():
-                return True
-            time.sleep(0.05)
-        return not self.inflight()
+    # drain() is Worker's: the in-flight set it waits on is exactly inflight().
 
     def shutdown(self) -> None:
         self.stop()
@@ -879,13 +859,7 @@ class HttpsChecker(Worker):
         self.begin_stop()
         self.drain(drain_s)
 
-    def drain(self, timeout_s: float = 3.0) -> bool:
-        deadline = time.time() + timeout_s
-        while time.time() < deadline:
-            if not self.inflight():
-                return True
-            time.sleep(0.05)
-        return not self.inflight()
+    # drain() is Worker's: the in-flight set it waits on is exactly inflight().
 
     def inflight(self) -> set[int]:
         with self._lock:

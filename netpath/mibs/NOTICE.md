@@ -1,6 +1,6 @@
 # Third-party notices — bundled MIB modules
 
-This directory ships twenty-one `.mib` files. Eighteen of them are other
+This directory ships twenty `.mib` files. Eighteen of them are other
 people's work, redistributed here, and this file says whose and under what
 terms. It is the MIB bundle's equivalent of
 `netpath/web/static/vendor/LICENSE-xterm.txt`, which does the same job for the
@@ -93,14 +93,13 @@ notice retained.
 
 ## Written for this application
 
-These three are ours, not third-party, and carry no external licence. They are
+These two are ours, not third-party, and carry no external licence. They are
 listed so the count in this file matches the directory.
 
 | File | Module | What it is |
 | --- | --- | --- |
 | `enterprise-roots.mib` | `SAPPIWHERE-ENTERPRISE-ROOTS` | Private Enterprise Number arcs under `1.3.6.1.4.1`, so a vendor MIB uploaded afterwards resolves its parent arc on the first try. Each arc is a public IANA assignment named as "this number belongs to this vendor" — not an extract of any vendor's MIB text. |
 | `enterprise-roots-2.mib` | `SAPPIWHERE-ENTERPRISE-ROOTS-2` | A continuation of the above, kept as a separate file because bundled MIBs are seeded by filename and an already-seeded file is never re-read. |
-| `if-mib-core.mib` | `IF-MIB-CORE` | A hand-written subset covering only the IF-MIB and ifXTable columns the poller reads, restated in this application's own words so the MIB browser shows description text without shipping a second copy of RFC 2863. |
 
 ---
 

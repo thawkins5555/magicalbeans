@@ -14,7 +14,7 @@ import time
 
 from .ipam_dhcp import stored_mac
 from .sqlitebase import (LIKE_ESCAPE, SqliteStore, id_chunks, like_contains,
-                         like_prefix)
+                         like_prefix, marks_for)
 
 
 _MAC_SEPARATORS = ":-. \t"
@@ -412,7 +412,7 @@ class IpamDatabase(SqliteStore):
         rows: list[sqlite3.Row] = []
         with self._lock:
             for chunk in id_chunks(ids):
-                marks = ",".join("?" * len(chunk))
+                marks = marks_for(chunk)
                 rows += self._conn.execute(
                     f"SELECT * FROM {table} WHERE id IN ({marks})", chunk).fetchall()
         return rows
@@ -609,11 +609,6 @@ class IpamDatabase(SqliteStore):
                 (subnet_id, mac, fresh, seen_ts, fresh, seen_ts,
                  mac_changed, seen_ts, source, detail, ip))
         return previous
-
-    def set_host_switch_port(self, ip: str, device_id: int, if_index: int,
-                             port: str, seen_ts: float) -> None:
-        """The access port a host's MAC was learned on; a newer sighting wins."""
-        self.set_host_switch_ports([(ip, device_id, if_index, port, seen_ts)])
 
     def set_host_switch_ports(self, rows) -> None:
         with self._lock:

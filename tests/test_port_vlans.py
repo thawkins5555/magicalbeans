@@ -5,6 +5,7 @@ ageing (mirroring neighbors/mac_entries), and vlan_interval_s scheduling/
 inheritance (0 = off, mirroring lldp_interval_s)."""
 import time
 
+import _paths
 from _paths import spawn_stub, tmpdir, free_udp_port
 
 TMP = tmpdir("port_vlans_")
@@ -112,7 +113,7 @@ check("base 3072: byte 0 bit 1 -> VLAN 3073, not VLAN 3074",
 
 # ------------------------------------------------------- 3. dot1q standards path
 stub, port = spawn_stub("stub_agent_vlan.py", "dot1q")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("dot1q")
     did = device_against(db, port, vendor="", name="dot1q-sw")
@@ -140,7 +141,7 @@ finally:
 
 # --------------------------------- 4. dot1dBasePortIfIndex absent -> fallback
 stub, port = spawn_stub("stub_agent_vlan.py", "dot1q_no_baseport")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("dot1q_no_baseport")
     did = device_against(db, port, vendor="", name="nomap-sw")
@@ -160,7 +161,7 @@ finally:
 
 # ------------------------------ 5. cisco_vtp: gated off a non-Cisco device
 stub, port = spawn_stub("stub_agent_vlan.py", "cisco_vtp")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("cisco_noncisco")
     did = device_against(db, port, vendor="", name="noncisco-sw")
@@ -175,7 +176,7 @@ finally:
 
 # ---------------------- 5b. the same agent DOES answer once marked Cisco
 stub, port = spawn_stub("stub_agent_vlan.py", "cisco_vtp")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("cisco_yescisco")
     did = device_against(db, port, vendor="cisco", name="cisco-sw")
@@ -202,7 +203,7 @@ finally:
 
 # ------------------------------------------ 6. Cisco supersedes standards
 stub, port = spawn_stub("stub_agent_vlan.py", "both")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("both")
     did = device_against(db, port, vendor="cisco", name="both-sw")
@@ -231,7 +232,7 @@ finally:
 # leaving the standards-path answer (dot1qPvid, the egress/untagged
 # bitmaps) in place.
 stub, port = spawn_stub("stub_agent_vlan.py", "cisco_mixed")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("cisco_mixed")
     did = device_against(db, port, vendor="cisco", name="mixed-sw")
@@ -274,7 +275,7 @@ finally:
 # device, must not appear either. The access port's own VLAN (20) must
 # survive untouched by either trunk's allow-list.
 stub, port = spawn_stub("stub_agent_vlan.py", "cisco_default_trunk")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("cisco_default_trunk")
     did = device_against(db, port, vendor="cisco", name="fleet-sw")
@@ -321,7 +322,7 @@ finally:
 # cover that port at all (common on Cisco gear with no per-VLAN community
 # indexing configured).
 stub, port = spawn_stub("stub_agent_vlan.py", "access_fallback")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("access_fallback")
     did = device_against(db, port, vendor="", name="access-fallback-sw")
@@ -355,7 +356,7 @@ finally:
 # in no Q-BRIDGE bitmap, so it must get no membership at all; ifIndex 3 is
 # an ordinary trunk, untouched by vmVlan.
 stub, port = spawn_stub("stub_agent_vlan.py", "cisco_access")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("cisco_access")
     did = device_against(db, port, vendor="cisco", name="access-vmvlan-sw")
@@ -392,7 +393,7 @@ finally:
 
 # --------------------------------------------------- 7. neither table -> None
 stub, port = spawn_stub("stub_agent_vlan.py", "no_vlan")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("no_vlan")
     did = device_against(db, port, vendor="cisco", name="none-sw")
@@ -418,7 +419,7 @@ finally:
 # still return None, not a genuine-but-empty dict that ages every stored
 # row to present=0 and logs a 0-row walk on every scheduled poll.
 stub, port = spawn_stub("stub_agent_vlan.py", "baseport_only")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("baseport_only")
     did = device_against(db, port, vendor="", name="baseport-only-sw")
@@ -433,7 +434,7 @@ finally:
 
 # --------------------------------------------------- 8. mac_entries fallback
 stub, port = spawn_stub("stub_agent_vlan.py", "dot1q")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("fallback")
     did = device_against(db, port, vendor="", name="fallback-sw")

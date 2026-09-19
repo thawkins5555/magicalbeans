@@ -9,9 +9,9 @@ SAPPIWHERE-ENTERPRISE-ROOTS-2 DEFINITIONS ::= BEGIN
 --
 -- Same rules as the first file: every arc below is a public IANA-assigned
 -- Private Enterprise Number under 1.3.6.1.4.1, named here only as "this
--- number belongs to this vendor", and each one is also in trapoids.WELL_KNOWN
--- -- the two must be kept in step, since vendor identification reads the code
--- table and MIB resolution reads this one.
+-- number belongs to this vendor", and each one is also in
+-- trapdecode.WELL_KNOWN -- the two must be kept in step, since vendor
+-- identification reads the code table and MIB resolution reads this one.
 
 -- Read from MOXA-GENERAL-MIB's own text: moxa ::= { enterprises 8691 }.
 moxa           OBJECT IDENTIFIER ::= { enterprises 8691 }

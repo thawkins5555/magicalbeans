@@ -171,7 +171,7 @@ try:
             self.settings = {"never_scan_cidrs": ""}
             self.log = FakeLog()
 
-    web_api._discovery_communities_for_group = lambda service, group_id: "public"
+    web_api.nodes_credentials._discovery_communities_for_group = lambda service, group_id: "public"
 
     def post(**extra):
         captured.clear()

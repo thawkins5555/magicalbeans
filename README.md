@@ -831,7 +831,7 @@ way DPAPI is.
 ## Layout
 
 The interface lives entirely in the browser now — `web/static/` — talking to
-the backend over the JSON endpoints in `web/api.py`. `console.py` is the only
+the backend over the JSON endpoints in `web/api/`. `console.py` is the only
 thing left with a native window: the small service-status console described
 above, not the application itself.
 
@@ -874,7 +874,7 @@ netpath/
   nodeoids.py      built-in polled-metric OID catalog for the Nodes poller;
                    also OID constants for FortiGate Wireless Controller
                    polling
-  nodepoll.py      NodePoller: the per-device SNMP/ping scheduler
+  nodepoll/        NodePoller: the per-device SNMP/ping scheduler
   nodesdb.py       nodes.db: devices, polling profiles, interfaces, state
                    events, discovery, per-port VLAN membership (`vlans`/
                    `vlan_ports`/`port_vlans`, for MAPPER); also the facade
@@ -948,7 +948,7 @@ netpath/
     __init__.py    exports Service and WebServer
     service.py     headless service: opens the databases, starts the
                    scheduler, resolver and collectors
-    api.py         JSON endpoints — one function per route, grouped by
+    api/           JSON endpoints — one function per route, grouped by
                    NetPath, NetFlow, syslog, IPAM, auth and users, plus
                    nodes, alerts, snmp, wireless, configrx, mapper, ssh,
                    debug, settings, dashboard, audit, maintenance, update,

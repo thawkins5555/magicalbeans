@@ -17,6 +17,7 @@ import subprocess
 import sys
 import time
 
+import _paths
 from _paths import REPO_ROOT, spawn_stub, tmpdir
 
 import netpath.nodepoll as nodepoll_mod
@@ -85,7 +86,7 @@ class FakeService:
 # ======================================================= § 1 read_hardware
 
 stub, port = spawn_stub("stub_agent_ups_env.py", "hardware")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_nodes_db("hardware")
     did = device_against(db, "hw-1")
@@ -182,7 +183,7 @@ finally:
 # ======================================================= § 2 read_dom_all
 
 stub, port = spawn_stub("stub_agent_ups_env.py", "hardware")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_nodes_db("dom_all")
     did = device_against(db, "hw-2")
@@ -257,7 +258,7 @@ finally:
 # ==================================================== § 3 API route shapes
 
 stub, port = spawn_stub("stub_agent_ups_env.py", "hardware")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_nodes_db("api")
     did = device_against(db, "hw-3")
@@ -291,7 +292,7 @@ finally:
 
 # No ENTITY-SENSOR-MIB, no CISCO-ENVMON, no stored metrics at all.
 stub, port = spawn_stub("stub_agent_ups_env.py", "no_ups")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_nodes_db("empty")
     did = device_against(db, "plain-switch")
@@ -317,7 +318,7 @@ finally:
 # ------------------------------------------------- ping-only: no SNMP at all
 
 stub, port = spawn_stub("stub_agent_ups_env.py", "hardware")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_nodes_db("ping_only")
     did = device_against(db, "ping-only-1")
@@ -344,7 +345,7 @@ finally:
 # carrying an optic -- the only signal this app has for the SFP badge,
 # since IF-MIB has no media column.
 stub, port = spawn_stub("stub_agent_ups_env.py", "hardware")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_nodes_db("per_port")
     did = device_against(db, "hw-4")
@@ -404,7 +405,7 @@ finally:
 # instead, and still record sfp_temp_c: copper only changes the badge, not
 # what gets measured.
 stub, port = spawn_stub("stub_agent_ups_env.py", "sfp_media")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_nodes_db("copper_temp")
     did = device_against(db, "hw-copper")
@@ -426,7 +427,7 @@ finally:
 
 # --- a walk that answered nothing must never strip the badge --------------
 stub, port = spawn_stub("stub_agent_ups_env.py", "no_ups")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_nodes_db("media_keep")
     did = device_against(db, "hw-5")
@@ -484,7 +485,7 @@ import netpath.nodepoll as nodepoll_mod
 from netpath.nodesdb import NodesDatabase
 from netpath.nodepoll import NodePoller
 
-nodepoll_mod.DEFAULT_SNMP_PORT = {port}
+nodepoll_mod.vlan_mixin.DEFAULT_SNMP_PORT = {port}
 db = NodesDatabase(os.path.join(tempfile.mkdtemp(prefix="wild_scale_"), "nodes.db"))
 gid = db.ensure_default_group()
 db.update_group(gid, snmp_version=1, community="public", snmp_timeout_s=1.0,

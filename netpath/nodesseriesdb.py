@@ -17,7 +17,7 @@ import logging
 import sqlite3
 import time
 
-from .sqlitebase import SqliteStore, id_chunks, reclaim
+from .sqlitebase import SqliteStore, id_chunks, marks_for, reclaim
 
 log = logging.getLogger(__name__)
 
@@ -218,7 +218,7 @@ class NodesSeriesDatabase(SqliteStore):
                     self._conn.executemany(
                         "INSERT OR IGNORE INTO metrics(device_id, key, label, unit,"
                         " kind, scope) VALUES (?,?,?,?,?,?)", missing)
-                    marks = ",".join("?" * len(missing))
+                    marks = marks_for(missing)
                     for r in self._conn.execute(
                             f"SELECT id, key FROM metrics WHERE device_id = ?"
                             f" AND key IN ({marks})",
@@ -281,7 +281,7 @@ class NodesSeriesDatabase(SqliteStore):
         keys = [str(k) for k in keys if k]
         if not keys:
             return []
-        marks = ",".join("?" * len(keys))
+        marks = marks_for(keys)
         with self._lock:
             return self._conn.execute(
                 "SELECT device_id, key, label, last_value, last_ts"
@@ -320,11 +320,11 @@ class NodesSeriesDatabase(SqliteStore):
         keys = [str(k) for k in keys if k]
         if not ids or not keys:
             return []
-        key_marks = ",".join("?" * len(keys))
+        key_marks = marks_for(keys)
         rows: list[sqlite3.Row] = []
         with self._lock:
             for chunk in id_chunks(ids, self._IDS_PER_QUERY):
-                marks = ",".join("?" * len(chunk))
+                marks = marks_for(chunk)
                 rows += self._conn.execute(
                     "SELECT device_id, key, label, last_value, last_ts"
                     f" FROM metrics WHERE device_id IN ({marks})"
@@ -370,7 +370,7 @@ class NodesSeriesDatabase(SqliteStore):
             device_clause = ""
             params: list = [key]
             if chunk:
-                marks = ",".join("?" * len(chunk))
+                marks = marks_for(chunk)
                 device_clause = f" AND m.device_id IN ({marks})"
                 params.extend(chunk)
             params.extend([h0, h1])
@@ -437,12 +437,6 @@ class NodesSeriesDatabase(SqliteStore):
                 f" ORDER BY hour", (metric_id, t0, t1)).fetchall()
             return [{"ts": row["hour"], "min": row["vmin"], "avg": row["vavg"],
                     "max": row["vmax"], "n": row["n"]} for row in rows]
-
-    def owns_metric(self, device_id: int, metric_id: int) -> bool:
-        with self._lock:
-            return self._conn.execute(
-                "SELECT 1 FROM metrics WHERE id = ? AND device_id = ?",
-                (metric_id, device_id)).fetchone() is not None
 
     def raw_window_s(self, device_id: int, metric_id: int) -> float:
         """The window width below which series() answers this metric from
@@ -537,7 +531,7 @@ class NodesSeriesDatabase(SqliteStore):
         removed = 0
         with self._lock:
             for chunk in id_chunks(ids):
-                marks = ",".join("?" * len(chunk))
+                marks = marks_for(chunk)
                 cursor = self._conn.execute(
                     f"DELETE FROM metrics WHERE device_id IN ({marks})", chunk)
                 removed += cursor.rowcount or 0
@@ -600,7 +594,7 @@ class NodesSeriesDatabase(SqliteStore):
         removed = 0
         for table in self._live_tables("samples"):
             for batch in id_chunks(metric_ids, max(1, chunk)):
-                marks = ",".join("?" * len(batch))
+                marks = marks_for(batch)
                 with self._lock:
                     if not self._still_live("samples", table):
                         break
@@ -1062,11 +1056,6 @@ class NodesSeriesDatabase(SqliteStore):
                  table, after)
         reclaim(self._conn, self._lock, label=self.LABEL)
         return True
-
-    def rewrite_now(self, band: int | None = None) -> bool:
-        """The whole rewrite, synchronously: tests and the demo seeder."""
-        return all(self._rewrite_table(table, band=band)
-                   for table in list(_REWRITE_SPEC) if self._rewriting(table))
 
     # ------------------------------------------------------------- migration
 

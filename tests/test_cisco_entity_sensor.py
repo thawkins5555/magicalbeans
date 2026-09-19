@@ -17,6 +17,7 @@ Nodes event-log lines that say why a read came back empty.
 import socket
 import time
 
+import _paths
 from _paths import spawn_stub, tmpdir
 
 import netpath.nodepoll as nodepoll_mod
@@ -93,7 +94,7 @@ class CaptureLog:
 # ============================================== § 1 the fallback gate
 
 stub, port = spawn_stub("stub_agent_ups_env.py", "cisco_dom")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     # One device per database: devices.ip is unique and every one of these
     # has to be the same 127.0.0.1 the stub is listening on.
@@ -145,7 +146,7 @@ finally:
 # ================================= § 2 read_hardware over the Cisco table
 
 stub, port = spawn_stub("stub_agent_ups_env.py", "cisco_dom")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_nodes_db("hardware")
     did = device_against(db, "cisco-sw")
@@ -208,7 +209,7 @@ finally:
 # ==================================== § 3 read_dom_all and read_dom agree
 
 stub, port = spawn_stub("stub_agent_ups_env.py", "cisco_dom")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_nodes_db("dom")
     did = device_against(db, "cisco-sw-2")
@@ -247,7 +248,7 @@ finally:
 # ============================== § 4 _poll_environment and the hourly latch
 
 stub, port = spawn_stub("stub_agent_ups_env.py", "cisco_dom")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_nodes_db("environment")
     did = device_against(db, "cisco-sw-3")
@@ -338,7 +339,7 @@ finally:
 # --------- a device latched incapable, then identified as Cisco afterwards
 
 stub, port = spawn_stub("stub_agent_ups_env.py", "cisco_dom")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_nodes_db("latch")
     did = device_against(db, "late-identified")
@@ -388,7 +389,7 @@ finally:
 # ===================================================== § 5 diagnostics
 
 stub, port = spawn_stub("stub_agent_ups_env.py", "no_ups")   # neither table
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_nodes_db("diag_nothing")
     did = device_against(db, "answers-nothing")
@@ -414,7 +415,7 @@ finally:
     stub.kill()
 
 stub, port = spawn_stub("stub_agent_ups_env.py", "cisco_dom")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     # --- read something, map nothing --------------------------------------
     db = new_nodes_db("diag_unmapped")

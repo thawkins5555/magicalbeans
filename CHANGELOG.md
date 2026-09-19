@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.44.0 — Backend restructure, dead code removed](#5440--backend-restructure-dead-code-removed)
 - [5.43.0 — Test hardening ahead of the restructure](#5430--test-hardening-ahead-of-the-restructure)
 - [5.42.0 — Mapper placeholder blocks, and a shorter blocked-VLAN row](#5420--mapper-placeholder-blocks-and-a-shorter-blocked-vlan-row)
 - [5.41.0 — Link detail pane's blocked VLANs now name which switch is doing the blocking](#5410--link-detail-panes-blocked-vlans-now-name-which-switch-is-doing-the-blocking)
@@ -176,6 +177,90 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.44.0 — Backend restructure, dead code removed
+
+Nothing changes for the operator: same URLs (298 routes), same responses,
+same polling on the wire, same database schema. This is Phase 2 of the
+five-part restructure 5.43.0 did the test groundwork for — splitting the
+two largest files in the codebase into packages, and clearing out code
+nothing calls any more. Proven a pure move: every function in the two split
+files was compared, old version against new, by an automated check.
+
+**`netpath/web/api.py` (12,267 lines) is now the package `netpath/web/api/`.**
+`_shared.py` holds the CSV, validation, audit-log and per-request-cache
+helpers every route uses; everything else is one module per screen —
+`paths`, `netflow`, `relays`, `debug`, `settings`, `syslog`, `snmp`, `ipam`,
+`nodes`, `nodes_series`, `nodes_reports`, `nodes_credentials`, `alerts`,
+`wireless`, `configrx`, `mapper`, `auth`, `dashboard`. `api/__init__.py`
+re-exports every handler, so nothing that calls into `api.<handler>` or
+`server.py`'s route table needed to change.
+
+**`netpath/nodepoll.py` (9,387 lines) is now the package `netpath/nodepoll/`.**
+`poller.py` keeps the `NodePoller` class — its constructor is now seven
+named setup steps instead of one long one — the scheduling loop, autoscale
+and device bookkeeping; the SNMP work is split across mixins by what it
+polls: discovery, the main poll cycle, vendor/model identification,
+environment (sensors, fans, PSUs), vendor-specific sensors, ARP, LLDP/CDP,
+and VLANs; `_consts`/`_decode`/`_session`/`_jobs` hold shared constants,
+decoders, the SNMPv3 session and background-job plumbing. The built-in
+self-test still runs the same way: `python -m netpath.nodepoll`.
+
+**A new module, `netpath/snmpformat.py`,** holds three small formatting
+helpers (`detect_reboot`, `format_chassis_address`, `format_cdp_address`)
+that used to sit awkwardly wherever they'd fit to dodge an import cycle —
+`nodesdb.py` and `wirelessdb.py` now import them normally. Two real
+two-way dependencies remain — Nodes discovery with the poller, and the
+mapper database with the mapper — and stay as deferred (in-function)
+imports on purpose; they're a genuine loop between two modules, not a
+missing shared home.
+
+**Duplicated code now has one copy.** `sqlitebase.marks_for` replaces 58
+hand-written SQL placeholder expressions across 8 database modules;
+`Worker.drain`/`Worker._finish_stop_draining` replace three identical
+copies each (across the trace monitor, resolver and HTTPS checker; and
+again across the node poller, wireless poller and trace monitor); the
+FortiGate poller now reuses the node poller's `_AuthFailure`. Left alone
+on purpose, because the behaviour actually differs underneath the similar
+shape: each store's prune routine (filters, batching and space-reclaim
+differ enough that only two of the seven are truly identical), each
+worker's begin-stop/shutdown/poll-now variants, and the FortiGate SNMP
+walk versus the node poller's walk (different retry and packet handling).
+
+**Ten long functions were split into named steps, behaviour unchanged**
+— `Service.__init__` (181 to 27 lines), the maintenance sweep (174 to 42,
+every stop checkpoint kept), `NodePoller.__init__` (240 to 11),
+`server.py`'s route dispatch (231 to 170), the device-test handler (309 to
+248), the mapper's map-building function (250 to 195), login (234 to 211
+— the credential-check order and failed-login timing are untouched on
+purpose), alert threshold evaluation (396 to 368), the per-device poll
+(693 to 632), and the environment/sensor poll (398 to 364). The largest
+poller and alert loops were deliberately left mostly as one block each —
+splitting them further would risk changing timing or ordering that alerts
+and polling depend on, for a readability gain not worth that risk.
+
+**Dead code removed.** Unused one-row wrappers (`flowdb.touch_exporter`,
+`ipamdb.set_host_switch_port`, `db.target_by_destination_ip`,
+`nodesseriesdb.owns_metric`/`rewrite_now`, `nodesdb.max_event_id`,
+`api._csv_cell`); about twenty unused constants in `selfupdate`,
+`reportsched`, `vendorid`, `snmpcrypt`, `trapdecode`, `nfdecode`,
+`nodeoids` and the demo scripts; unused colours left over from the
+retired desktop canvas view in `theme.py`; `netpath/mibs/if-mib-core.mib`,
+a hand-written subset superseded by the full IF-MIB already bundled — an
+existing install keeps its own copy on disk, but **a fresh install now
+lists 20 bundled MIBs instead of 21**; and `demo/ui_walk.mjs` plus the
+demo scenario's UI-walk step, since CI's own browser walk
+(`tests/ui/walk.mjs`) already covers that ground. Kept on purpose: every
+module's in-file self-test, and all schema-migration, legacy-import and
+one-time-repair code, none of which is "dead" just because it runs
+rarely.
+
+**Tests.** One helper, `tests/_paths.patch_nodepoll`, replaces roughly 160
+separate patch locations across 30 suites that used to each know exactly
+where inside `nodepoll.py` a name lived; a handful of other patches were
+repointed to the specific submodule that now actually reads the name.
+
+Full test suite: 177 of 184 suites passed, 2 skipped (no PySide6, no openssl on the build machine). The 7 failures are the same build-machine environmental failures 5.42.0 shows (test_ipam_dhcp_temp, test_palo_alto_polling, test_selfupdate_job, test_service_shutdown, test_snmpv3_diagnostics, test_temppath, test_web_gates); 5.42.0 itself scored 176 of 184.
 
 ### 5.43.0 — Test hardening ahead of the restructure
 

@@ -1243,24 +1243,12 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"error": f"No {level} access to {module}"}, 403)
         return False
 
-    def _route(self, method: str) -> None:
-        parsed = urlparse(self.path)
-        path = parsed.path
-        params = {k: v[0] for k, v in parse_qs(parsed.query).items()}
-
-        # Query parameters starting with an underscore are ours, not the
-        # caller's; strip anything that arrives claiming to be one.
-        params = {k: v for k, v in params.items() if not k.startswith("_")}
-
+    def _authenticate_request(self, method: str, path: str, params: dict) -> bool:
+        """Resolve the caller from the session cookie or a bearer token,
+        setting the `_token`/`_username` params in place. Returns whether
+        the caller is authenticated."""
         token = self._cookie(SESSION_COOKIE)
         session = self.service.sessions.get(token) if token else None
-        params["_cache"] = self._request_cache
-        params["_client"] = self.client_address[0]
-        params["_agent"] = self.headers.get("User-Agent", "")
-        # The WEB relay hands back a URL the browser must be able to open --
-        # the only address it's known to reach this server on is the one it
-        # just used. Guessing from the listener could hand back "0.0.0.0".
-        params["_host"] = self.headers.get("Host", "")
         authenticated = False
         if session:
             params["_token"] = token
@@ -1293,41 +1281,87 @@ class Handler(BaseHTTPRequestHandler):
                 if username:
                     params["_username"] = username
                     authenticated = True
+        return authenticated
 
-        if not authenticated and path not in PUBLIC_PATHS and path not in PUBLIC_API:
-            if path.startswith("/api/"):
-                self._json({"error": "Not signed in", "authenticated": False}, 401)
-            else:
-                # The query string survives the bounce so /?kiosk=1 comes
-                # back as a kiosk after sign-in (login.js hands it back).
-                query = urlparse(self.path).query
-                self._send(302, b"", "text/plain",
-                           {"Location": "/login" + ("?" + query if query else "")})
+    def _reject_unauthenticated(self, authenticated: bool, path: str) -> bool:
+        """Answer 401 (API) or bounce to sign-in (page) for an
+        unauthenticated request to a private path. Returns whether the
+        request was refused."""
+        if authenticated or path in PUBLIC_PATHS or path in PUBLIC_API:
+            return False
+        if path.startswith("/api/"):
+            self._json({"error": "Not signed in", "authenticated": False}, 401)
+        else:
+            # The query string survives the bounce so /?kiosk=1 comes
+            # back as a kiosk after sign-in (login.js hands it back).
+            query = urlparse(self.path).query
+            self._send(302, b"", "text/plain",
+                       {"Location": "/login" + ("?" + query if query else "")})
+        return True
+
+    def _reject_must_change(self, authenticated: bool, path: str, params: dict) -> bool:
+        """Answer 403 if the signed-in account owes a password change.
+        Returns whether the request was refused.
+
+        The flag on the account, not on the session: a reset takes effect
+        for a session that is already open, and the check costs one indexed
+        lookup on a table with one row per operator. Applies to a token-
+        authenticated request exactly the same as a browser one — an
+        account that owes a password change is not fully trusted yet,
+        whichever door it came in by.
+        """
+        if not (authenticated and path.startswith("/api/")
+                and path not in MUST_CHANGE_API):
+            return False
+        row = api.request_user(self.service, params)
+        if row is not None and row["must_change"]:
+            self._json({"error": "password change required"}, 403)
+            return True
+        return False
+
+    def _reject_bad_write(self, method: str) -> bool:
+        """Answer 415/403 for a non-JSON or cross-origin write. Returns
+        whether the request was refused.
+
+        A cross-site form can send a POST but cannot set this content type
+        without a preflight the browser will refuse. With SameSite=Strict on
+        the cookie that is belt and braces, but both are cheap.
+        """
+        if method not in ("POST", "PUT", "DELETE"):
+            return False
+        content_type = (self.headers.get("Content-Type") or "").split(";")[0]
+        if content_type.strip() != "application/json":
+            self._json({"error": "Requests must be application/json"}, 415)
+            return True
+        if not self._same_origin():
+            self._json({"error": "Cross-origin request refused"}, 403)
+            return True
+        return False
+
+    def _route(self, method: str) -> None:
+        parsed = urlparse(self.path)
+        path = parsed.path
+        params = {k: v[0] for k, v in parse_qs(parsed.query).items()}
+
+        # Query parameters starting with an underscore are ours, not the
+        # caller's; strip anything that arrives claiming to be one.
+        params = {k: v for k, v in params.items() if not k.startswith("_")}
+
+        authenticated = self._authenticate_request(method, path, params)
+        params["_cache"] = self._request_cache
+        params["_client"] = self.client_address[0]
+        params["_agent"] = self.headers.get("User-Agent", "")
+        # The WEB relay hands back a URL the browser must be able to open --
+        # the only address it's known to reach this server on is the one it
+        # just used. Guessing from the listener could hand back "0.0.0.0".
+        params["_host"] = self.headers.get("Host", "")
+
+        if self._reject_unauthenticated(authenticated, path):
             return
-
-        # The flag on the account, not on the session: a reset takes effect
-        # for a session that is already open, and the check costs one indexed
-        # lookup on a table with one row per operator. Applies to a token-
-        # authenticated request exactly the same as a browser one — an
-        # account that owes a password change is not fully trusted yet,
-        # whichever door it came in by.
-        if authenticated and path.startswith("/api/") and path not in MUST_CHANGE_API:
-            row = api.request_user(self.service, params)
-            if row is not None and row["must_change"]:
-                self._json({"error": "password change required"}, 403)
-                return
-
-        # A cross-site form can send a POST but cannot set this content type
-        # without a preflight the browser will refuse. With SameSite=Strict on
-        # the cookie that is belt and braces, but both are cheap.
-        if method in ("POST", "PUT", "DELETE"):
-            content_type = (self.headers.get("Content-Type") or "").split(";")[0]
-            if content_type.strip() != "application/json":
-                self._json({"error": "Requests must be application/json"}, 415)
-                return
-            if not self._same_origin():
-                self._json({"error": "Cross-origin request refused"}, 403)
-                return
+        if self._reject_must_change(authenticated, path, params):
+            return
+        if self._reject_bad_write(method):
+            return
 
         for route_method, pattern, handler, requirement in COMPILED:
             if route_method != method:

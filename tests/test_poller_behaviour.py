@@ -10,7 +10,7 @@ import threading
 import time
 import types
 
-import _paths  # noqa: F401  (puts the repo root on sys.path)
+import _paths
 from _paths import tmpdir
 
 from netpath import nodeoids
@@ -253,7 +253,7 @@ def test_independent_octet_widths():
     agent.start()
     tmp = tmpdir("poller_review_widths_")
     db = NodesDatabase(os.path.join(tmp, "nodes.db"))
-    nodepoll_mod.DEFAULT_SNMP_PORT = agent.port
+    _paths.patch_nodepoll("DEFAULT_SNMP_PORT", agent.port)
     try:
         group_id = db.ensure_default_group()
         device_id = db.add_device("127.0.0.1", "widths-stub", group_id=group_id,
@@ -300,7 +300,7 @@ def test_utilization_clamped_at_sentinel():
     agent.start()
     tmp = tmpdir("poller_review_util_")
     db = NodesDatabase(os.path.join(tmp, "nodes.db"))
-    nodepoll_mod.DEFAULT_SNMP_PORT = agent.port
+    _paths.patch_nodepoll("DEFAULT_SNMP_PORT", agent.port)
     try:
         group_id = db.ensure_default_group()
         device_id = db.add_device("127.0.0.1", "sentinel-stub", group_id=group_id,
@@ -487,7 +487,7 @@ def _setup_reassignable_device(prefix: str, name: str):
     agent.start()
     tmp = tmpdir(prefix)
     db = NodesDatabase(os.path.join(tmp, "nodes.db"))
-    nodepoll_mod.DEFAULT_SNMP_PORT = agent.port
+    _paths.patch_nodepoll("DEFAULT_SNMP_PORT", agent.port)
     group_id = db.ensure_default_group()
     device_id = db.add_device("127.0.0.1", name, group_id=group_id,
                               snmp_version=1, community="public",
@@ -865,7 +865,7 @@ def _walk_device(prefix: str, port: int, **overrides):
                               snmp_version=1, community="public",
                               ping_enabled=0, poll_interval_s=999,
                               snmp_timeout_s=1.0, snmp_retries=0, **overrides)
-    nodepoll_mod.DEFAULT_SNMP_PORT = port
+    _paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
     poller = NodePoller(db)
     return db, poller, db.device(device_id)
 
@@ -955,8 +955,8 @@ def test_the_interface_read_opens_one_socket_and_decrypts_once():
         credentials["n"] += 1
         return real_credential(config)
 
-    nodepoll_mod._Session = CountingSession
-    nodepoll_mod.credential_for = counting_credential
+    restore_session = _paths.patch_nodepoll("_Session", CountingSession)
+    restore_credential = _paths.patch_nodepoll("credential_for", counting_credential)
     try:
         # The ifIndex walk has its own session either way; this is about the
         # per-interface reads that follow it.
@@ -975,8 +975,8 @@ def test_the_interface_read_opens_one_socket_and_decrypts_once():
               f"...and one credential decrypt, not one each "
               f"({credentials['n']} decrypts)")
     finally:
-        nodepoll_mod._Session = real_session
-        nodepoll_mod.credential_for = real_credential
+        restore_session()
+        restore_credential()
         db.close()
         agent.stop()
 
@@ -1190,12 +1190,12 @@ def _counting_sessions(counts: dict):
         counts["decrypts"] += 1
         return real_credential(config)
 
-    nodepoll_mod._Session = CountingSession
-    nodepoll_mod.credential_for = counting_credential
+    restore_session = _paths.patch_nodepoll("_Session", CountingSession)
+    restore_credential = _paths.patch_nodepoll("credential_for", counting_credential)
 
     def restore():
-        nodepoll_mod._Session = real_session
-        nodepoll_mod.credential_for = real_credential
+        restore_session()
+        restore_credential()
     return restore
 
 

@@ -5,6 +5,7 @@ sample, the capability probe remembered so a non-PoE/non-STP device is
 probed exactly once, and poe_enabled/stp_enabled inheritance."""
 import time
 
+import _paths
 from _paths import spawn_stub, tmpdir
 
 TMP = tmpdir("poe_stp_")
@@ -63,7 +64,7 @@ def two_ports(db: NodesDatabase, device_id: int) -> None:
 # ------------------------------------------------------------------- PoE
 
 stub, port = spawn_stub("stub_agent_l2.py", "poe")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("poe")
     did = device_against(db, port, "poe-sw")
@@ -102,7 +103,7 @@ finally:
 
 # ------------------------------------------------ PoE: probed once, then skipped
 stub, port = spawn_stub("stub_agent_l2.py", "no_poe")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("no_poe")
     did = device_against(db, port, "no-poe-sw")
@@ -132,7 +133,7 @@ finally:
 # ------------------------------------------------------------------- STP
 
 stub, port = spawn_stub("stub_agent_l2.py", "stp")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("stp")
     did = device_against(db, port, "stp-sw")
@@ -188,7 +189,7 @@ finally:
 
 # ------------------------------------------------ STP: probed once, then skipped
 stub, port = spawn_stub("stub_agent_l2.py", "no_stp")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_db("no_stp")
     did = device_against(db, port, "no-stp-sw")

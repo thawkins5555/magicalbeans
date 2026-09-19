@@ -14,6 +14,7 @@ evaluate_threshold closing an alert already open on a port that goes dark.
 import socket
 import time
 
+import _paths
 from _paths import spawn_stub, tmpdir
 
 import netpath.nodepoll as nodepoll_mod
@@ -119,7 +120,7 @@ def rule(source_kind, threshold, clear_threshold, comparison):
 # ================================================ § 1 media from the walk
 
 stub, port = spawn_stub("stub_agent_ups_env.py", "sfp_media")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_nodes_db("media")
     did = device_against(db, "media-sw")
@@ -221,7 +222,7 @@ finally:
 
 # --- ifMauType's own probe-once-remember: noSuchObject is not re-walked --
 stub, port = spawn_stub("stub_agent_ups_env.py", "sfp_media_no_mau")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_nodes_db("mau_reprobe")
     did = device_against(db, "no-mau-sw")
@@ -250,7 +251,7 @@ finally:
 
 # --- a walk that answered nothing must never clear a badge ---------------
 stub, port = spawn_stub("stub_agent_ups_env.py", "no_ups")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_nodes_db("media_keep")
     did = device_against(db, "quiet-sw")
@@ -275,7 +276,7 @@ finally:
 # strength of the alias walk, and everything the cage scan never reached
 # looks exactly like a cage that is gone.
 stub, port = spawn_stub("stub_agent_ups_env.py", "sfp_media_no_class")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_nodes_db("media_partial")
     did = device_against(db, "flaky-sw")
@@ -306,7 +307,7 @@ finally:
 # else (class/alias/containment) answers -- the case an empty walk (the
 # 'media_keep' block above) does not cover.
 stub, port = spawn_stub("stub_agent_ups_env.py", "sfp_media_no_sensor_values")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_nodes_db("media_sensor_timeout")
     did = device_against(db, "sensor-timeout-sw")
@@ -330,7 +331,7 @@ finally:
 # the cage/occupant scan and the optic_ports fallback scan of text on the
 # same cadence, while the DOM sensor itself still proves if 17 'optic'.
 stub, port = spawn_stub("stub_agent_ups_env.py", "sfp_media_no_descr")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_nodes_db("media_mode_timeout")
     did = device_against(db, "mode-timeout-sw")
@@ -357,7 +358,7 @@ finally:
 
 # --- a device with no DOM sensors at all still gets its cages badged -----
 stub, port = spawn_stub("stub_agent_ups_env.py", "sfp_media_no_sensors")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_nodes_db("no_sensors")
     did = device_against(db, "no-sensors-sw")
@@ -380,7 +381,7 @@ finally:
 
 # --- an incomplete entPhysicalName fallback walk keeps stored badges -----
 stub, port = spawn_stub("stub_agent_ups_env.py", "sfp_media_no_names")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_nodes_db("names_cut")
     did = device_against(db, "names-cut-sw")
@@ -403,7 +404,7 @@ finally:
 
 # --- diagnostic: nothing mapped to a port at all --------------------------
 stub, port = spawn_stub("stub_agent_ups_env.py", "sfp_media_no_port_map")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_nodes_db("no_port_map")
     did = device_against(db, "no-port-map-sw")
@@ -462,7 +463,7 @@ db.close()
 # ============================================== § 2 the dark optic's value
 
 stub, port = spawn_stub("stub_agent_ups_env.py", "sfp_media")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db = new_nodes_db("dark")
     did = device_against(db, "dark-sw")

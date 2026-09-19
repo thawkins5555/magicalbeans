@@ -19,9 +19,6 @@ PER_ARC_OBJECTS = 150
 PER_ARC_BUDGET_S = 5.0
 GENERIC_ARCS = frozenset({8072, 2021})   # netSnmp, ucdavis — the agent, not the maker
 
-SOURCES = ("manual", "learned", "sysObjectID", "walk", "sysDescr", "oid", "")
-CONFIDENCES = ("high", "medium", "low", "")
-
 
 # ------------------------------------------------------------- arc hopping
 

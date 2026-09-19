@@ -25,7 +25,7 @@ import socket
 import sqlite3
 import time
 
-import _paths  # noqa: F401  (puts the repo root on sys.path)
+import _paths
 from _paths import spawn_stub, tmpdir
 
 import netpath.nodepoll as nodepoll_mod
@@ -95,7 +95,7 @@ def stub_counts(path: str) -> dict:
 stub, port = spawn_stub("stub_agent_iftable.py", "palo_alto",
                         "--interfaces", "400", "--reply-delay", "0.02",
                         "--dark-after-rows", "40")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db, device_id = new_db("slow_walk")
     # Interfaces this poll will never reach: they must survive it.
@@ -131,7 +131,7 @@ finally:
 
 stub, port = spawn_stub("stub_agent_iftable.py", "palo_alto",
                         "--interfaces", "400", "--gen-err", IF_INDEX)
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     # genErr on the ifIndex column: the agent IS answering, so this is a
     # degrade -- but with a reason, which is § 2 below. The "gone away"
@@ -155,7 +155,7 @@ finally:
 
 stub, port = spawn_stub("stub_agent_iftable.py", "palo_alto",
                         "--interfaces", "8", "--no-such-name", IF_INDEX)
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db, device_id = new_db("no_such_name")
     poller = NodePoller(db)
@@ -172,7 +172,7 @@ finally:
 
 stub, port = spawn_stub("stub_agent_iftable.py", "dark_after_walk",
                         "--interfaces", "2", "--dark-after", "0")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     # dark_after_walk answers the scalars and then stops answering GETs.
     # Its ifIndex walk still answers, so to get the "nothing at all" case
@@ -185,7 +185,7 @@ try:
     dead.bind(("127.0.0.1", 0))
     dead_port = dead.getsockname()[1]
     dead.close()
-    nodepoll_mod.DEFAULT_SNMP_PORT = dead_port
+    _paths.patch_nodepoll("DEFAULT_SNMP_PORT", dead_port)
     raised = ""
     try:
         poller._poll_interfaces(device, config)
@@ -194,7 +194,7 @@ try:
     check("an ifIndex walk that got NOTHING at all still raises -- a "
           "device that has gone away must not read as healthy",
           "SnmpTimeout" in raised, raised or "<nothing raised>")
-    nodepoll_mod.DEFAULT_SNMP_PORT = port
+    _paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
     db.close()
 finally:
     stub.kill()
@@ -205,7 +205,7 @@ stats = os.path.join(TMP, "refuse_bulk.json")
 stub, port = spawn_stub("stub_agent_iftable.py", "palo_alto",
                         "--interfaces", "6", "--refuse-bulk",
                         "--stats", stats)
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db, device_id = new_db("refuse_bulk")
     db.update_group(db.ensure_default_group(), snmp_version=1)
@@ -304,7 +304,7 @@ check("and a legacy trailing space is stripped on the way to the wire",
 stub, port = spawn_stub("stub_agent_iftable.py", "palo_alto",
                         "--interfaces", "40", "--bulk-cap", "3",
                         "--stale-id", "3")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 api_module_port = port
 try:
     db, device_id = new_db("test_button")
@@ -342,7 +342,7 @@ finally:
 
 stub, port = spawn_stub("stub_agent_iftable.py", "palo_alto",
                         "--interfaces", "8", "--gen-err", IF_INDEX)
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db, device_id = new_db("test_button_generr")
     result = api.post_nodes_device_test(FakeService(db), {}, {}, device_id)
@@ -386,7 +386,7 @@ db.close()
 
 stub, port = spawn_stub("stub_agent_iftable.py", "palo_alto",
                         "--interfaces", "300", "--bulk-cap", "5")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
 try:
     db, device_id = new_db("end_to_end")
     poller = NodePoller(db)

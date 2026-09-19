@@ -411,18 +411,18 @@ try:
     check("export: the readable time column parses as a local timestamp",
           _re.match(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$", rows[1][0]) is not None, rows[1])
     check("export: cap is SERIES_EXPORT_CAP (200000)",
-          exported.get("cap") == api_mod.SERIES_EXPORT_CAP, exported.get("cap"))
+          exported.get("cap") == api_mod.nodes_series.SERIES_EXPORT_CAP, exported.get("cap"))
     check("export: not truncated for two points under the cap",
           exported.get("truncated") is False, exported)
 
-    real_cap = api_mod.SERIES_EXPORT_CAP
-    api_mod.SERIES_EXPORT_CAP = 1
+    real_cap = api_mod.nodes_series.SERIES_EXPORT_CAP
+    api_mod.nodes_series.SERIES_EXPORT_CAP = 1
     try:
         status, capped = call(
             "GET", f"/api/nodes/series/export.csv?q={batch_device}:if_in_bps.1,"
                   f"{batch_device}:if_out_bps.1", token=admin)
     finally:
-        api_mod.SERIES_EXPORT_CAP = real_cap
+        api_mod.nodes_series.SERIES_EXPORT_CAP = real_cap
     check("export: a cap of 1 truncates two points to one, and says so",
           status == 200 and capped.get("truncated") is True
           and capped.get("count") == 1, (status, capped))

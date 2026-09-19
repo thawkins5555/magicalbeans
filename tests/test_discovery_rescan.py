@@ -19,7 +19,7 @@ import os
 import threading
 import time
 
-import _paths  # noqa: F401
+import _paths
 
 from netpath import nodepoll as nodepoll_mod
 from netpath.auth import DEFAULT_PASSWORD, DEFAULT_USER, hash_password
@@ -271,8 +271,7 @@ try:
             gate.wait()
         return answer
 
-    real_job_class = nodepoll_mod.DiscoveryJob
-    nodepoll_mod.DiscoveryJob = HeldJob
+    restore = _paths.patch_nodepoll("DiscoveryJob", HeldJob)
     service.node_poller.discovery_running = gated_running
     try:
         race_target = "10.96.0.0/24"
@@ -295,7 +294,7 @@ try:
             thread.join(60)
     finally:
         HeldJob.release.set()
-        nodepoll_mod.DiscoveryJob = real_job_class
+        restore()
         service.node_poller.discovery_running = real_running
 
     statuses = sorted(status for status, _payload in answers.values())

@@ -86,9 +86,6 @@ _COPY_ALONGSIDE = ("requirements.txt", "README.md", "RUNBOOK.md",
 # The before-restart hook alone measures 37-63s against a real fleet, vs.
 # app.js's 30s request timeout — so this runs as a job, not inline.
 
-STEPS = ("idle", "checking", "up_to_date", "downloading", "extracting",
-         "installing", "restarting", "failed")
-
 _TERMINAL = {"up_to_date": "done", "failed": "failed"}
 
 # Long enough for one poll of /api/update/status to see "restarting" before

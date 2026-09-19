@@ -11,7 +11,7 @@ import tempfile
 import threading
 import time
 
-import _paths  # noqa: F401  (puts the repo root on sys.path)
+import _paths
 
 from netpath.nodesdb import NodesDatabase
 from netpath.nodepoll import NodePoller
@@ -209,9 +209,7 @@ def main():
     agent.start()
     time.sleep(0.1)
 
-    from netpath.nodepoll import DEFAULT_SNMP_PORT
-    import netpath.nodepoll as nodepoll_mod
-    nodepoll_mod.DEFAULT_SNMP_PORT = agent.port  # redirect the poller at our stub
+    _paths.patch_nodepoll("DEFAULT_SNMP_PORT", agent.port)  # redirect the poller at our stub
 
     group_id = db.ensure_default_group()
     # ping_enabled=0 on purpose. This device is a stub SNMP agent on the

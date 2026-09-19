@@ -43,7 +43,6 @@ T_END_OF_MIB_VIEW  = 0x82
 PDU_GET      = 0xA0
 PDU_GETNEXT  = 0xA1
 PDU_RESPONSE = 0xA2
-PDU_SET      = 0xA3
 PDU_TRAP_V1  = 0xA4      # SNMPv1 Trap-PDU — a different shape entirely
 PDU_GETBULK  = 0xA5
 PDU_INFORM   = 0xA6      # InformRequest-PDU — same shape as SNMPv2-Trap-PDU
@@ -60,8 +59,6 @@ GENERIC_NAMES = ["coldStart", "warmStart", "linkDown", "linkUp",
 SYS_UPTIME_0 = "1.3.6.1.2.1.1.3.0"
 SNMP_TRAP_OID_0 = "1.3.6.1.6.3.1.1.4.1.0"
 SNMP_TRAP_ENTERPRISE_0 = "1.3.6.1.6.3.1.1.4.3.0"
-
-MAX_DATAGRAM = 65535
 
 # SNMP's wire types bound these fields far tighter than BER does. RFC 2578
 # 7.1: SNMP's "INTEGER" (the v1 generic/specific trap fields, the v2/v3
