@@ -193,6 +193,10 @@ class NodePoller(Worker, DiscoveryMixin, PollMixin, VendorIdentifyMixin, Environ
         # device_id -> when the per-VLAN STP pass was last tried. See
         # _cisco_vlan_stp/devices.stp_vlan_capable.
         self._stp_vlan_read: dict[int, float] = {}
+        # device_id -> when UCD-SNMP was last tried/whether it answered,
+        # probe-once-remember'd like _mau_read/_mau_capable.
+        self._ucd_read: dict[int, float] = {}
+        self._ucd_capable: dict[int, bool] = {}
         # device_id -> when a sensor-diagnostic event was last written for
         # it. See _log_sensor_diag.
         self._sensor_diag_ts: dict[int, float] = {}
@@ -674,6 +678,8 @@ class NodePoller(Worker, DiscoveryMixin, PollMixin, VendorIdentifyMixin, Environ
         self._vendor_sensor_threshold_read.pop(device_id, None)
         self._mau_read.pop(device_id, None)
         self._cage_read.pop(device_id, None)
+        self._ucd_read.pop(device_id, None)
+        self._ucd_capable.pop(device_id, None)
         self._forget_vendor_psu_static(device_id)
         self._stack_power_read.pop(device_id, None)
         # And "start from nothing": an explicit retry is the one place a
@@ -1070,7 +1076,7 @@ class NodePoller(Worker, DiscoveryMixin, PollMixin, VendorIdentifyMixin, Environ
                       self._vendor_sensor_read, self._vendor_sensor_threshold_read,
                       self._mau_read, self._mau_capable,
                       self._cage_read, self._cage_capable,
-                      self._stp_vlan_read,
+                      self._stp_vlan_read, self._ucd_read, self._ucd_capable,
                       self._stack_power_read, self._stack_power_capable,
                       self._sensor_diag_ts, self._snmp_backoff,
                       self._snmp_failing_count, self._get_batch,

@@ -4691,7 +4691,10 @@ class NodesDatabase(SqliteStore):
         The returned dict carries `ids`: {if_index: interfaces.id} for
         every row this device now has, because the caller needs those ids
         to record link events and every row is already read here — one
-        SELECT per interface afterwards was pure duplication.
+        SELECT per interface afterwards was pure duplication. It also
+        carries `prior`: the rows exactly as read at the top, before any of
+        this poll's writes — the caller's own PRE-update read of the same
+        table, for the same reason.
         """
         now = time.time()
         with self._lock:
@@ -4714,21 +4717,34 @@ class NodesDatabase(SqliteStore):
                 else:
                     if prior["descr"] != row.get("descr"):
                         reindexed.append(if_index)
-                    updates.append(
-                        (row.get("descr"), row.get("alias"), row.get("name") or None,
-                         row.get("phys_addr"),
-                         row.get("speed_bps"), row.get("admin_status"),
-                         row.get("oper_status"), now, device_id, if_index))
+                    static = (row.get("descr"), row.get("alias"),
+                             row.get("name") or None, row.get("phys_addr"),
+                             row.get("speed_bps"), row.get("admin_status"),
+                             row.get("oper_status"))
+                    # A steady-state poll changes nothing here; skip the write.
+                    if static != (prior["descr"], prior["alias"], prior["name"],
+                                 prior["phys_addr"], prior["speed_bps"],
+                                 prior["admin_status"], prior["oper_status"]):
+                        updates.append((*static, device_id, if_index))
             if inserts:
                 self._conn.executemany(
                     "INSERT INTO interfaces(device_id, if_index, descr, alias,"
                     " name, phys_addr, speed_bps, admin_status, oper_status,"
                     " last_seen_ts) VALUES (?,?,?,?,?,?,?,?,?,?)", inserts)
             if updates:
+                # last_seen_ts is not set here -- the batch below covers it
+                # for every seen row, changed or not.
                 self._conn.executemany(
                     "UPDATE interfaces SET descr=?, alias=?, name=?, phys_addr=?,"
-                    " speed_bps=?, admin_status=?, oper_status=?, last_seen_ts=?"
+                    " speed_bps=?, admin_status=?, oper_status=?"
                     " WHERE device_id=? AND if_index=?", updates)
+            # last_seen_ts advances for every seen row without rewriting the rest.
+            existing_seen = [i for i in seen_indexes if i in existing]
+            for chunk in _id_chunks(existing_seen):
+                self._conn.execute(
+                    f"UPDATE interfaces SET last_seen_ts=? WHERE device_id=?"
+                    f" AND if_index IN ({marks_for(chunk)})",
+                    (now, device_id, *chunk))
             if allow_delete:
                 for if_index in existing:
                     if if_index not in seen_indexes:
@@ -4743,7 +4759,7 @@ class NodesDatabase(SqliteStore):
                 (device_id,)).fetchall()}
             self._conn.commit()
         return {"added": added, "removed": removed, "reindexed": reindexed,
-                "ids": ids}
+                "ids": ids, "prior": existing}
 
     def update_interface_rate(self, device_id: int, if_index: int, *,
                               in_octets: int | None, out_octets: int | None,

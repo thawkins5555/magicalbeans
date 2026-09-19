@@ -1,6 +1,6 @@
-"""fortipoll's SNMPv3 GETNEXT used to read the engine tuple raw
+"""fortipoll's SNMPv3 walk requests used to read the engine tuple raw
 (engineTime never advanced -- >150s stale fails notInTimeWindows), retried
-never on a Report, and checked no msgID. _snmp_get_next now goes through
+never on a Report, and checked no msgID. _snmp_walk_request now goes through
 nodepoll's shared v3_exchange (nodepoll/_session.py), the same one
 _v3_exchange wraps for NodePoller -- same engine-advance, resync-retry and
 msgID match nodepoll already has, one session per walk kept from 5.46.0.

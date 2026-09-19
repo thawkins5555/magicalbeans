@@ -1999,12 +1999,19 @@ end
             over = socket.create_connection(("127.0.0.1", spare_port), timeout=3)
             held.append(over)
             over.sendall(b"GET /login HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            # Closing a socket with unread bytes queued lands as a FIN or an RST
+            # depending on timing; both mean "not served". A timeout still fails.
+            answer = b"(no answer)"
+            closed = False
             try:
                 answer = over.recv(65536)
+                closed = answer == b""
+            except (ConnectionResetError, ConnectionAbortedError):
+                closed = True
             except (socket.timeout, TimeoutError, OSError):
-                answer = b"(no answer)"
+                pass
             check("D23 one past the ceiling is closed, not served",
-                  answer == b"", answer[:60])
+                  closed, answer[:60])
 
             # And the slot comes back: close one, and the next is served.
             held[0].close()

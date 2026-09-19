@@ -4104,15 +4104,23 @@ reports on all of them in one SNMP walk.
   like the rest of this list. The list is the fields the
   controller's own SNMP tables report, so adding one costs no extra
   polling; Response and IP are there too.
-- **Polled on a fixed interval** (default 60 s) via repeated SNMP
-  GETNEXT walks of the FortiGate Wireless Controller MIB's
+- **Polled on a fixed interval** (default 60 s) via repeated SNMP walks of
+  the FortiGate Wireless Controller MIB's
   `fgWcWtpConfigTable`/`fgWcWtpSessionTable`/`fgWcWtpSessionRadioTable`,
   and, from 5.10.0, its profile-radio table for each radio's configured
-  channel width — the exact same table-walking approach Nodes' own SNMP
-  poller uses, rather than a second, separate GETBULK code path. A
-  controller that's briefly unreachable does not wipe its AP list; only a
-  poll that genuinely succeeded but no longer sees that AP counts against
-  it.
+  channel width. **From 5.49.0**, a controller on SNMP v2c or v3 walks
+  these tables with GETBULK instead of GETNEXT — a 100-AP column that
+  needed 101 round trips now needs about 3 — while v1 still walks with
+  GETNEXT, which has no bulk form. A reply that's too big for the
+  controller to send halves the batch size and tries again, down to a
+  floor below which the controller is walked with GETNEXT instead; a
+  controller whose GETBULK support fails outright is remembered and
+  walked with GETNEXT from then on, with a fresh attempt at GETBULK once
+  an hour, on a manual poll, or after the controller is deleted and
+  re-added. Every AP/radio row stored is identical either way — the
+  change is round trips, not data. A controller that's briefly
+  unreachable does not wipe its AP list; only a poll that genuinely
+  succeeded but no longer sees that AP counts against it.
 - **Controllers no longer all poll in the same second, from 5.10.0.** A
   never-polled controller is due at once; every other controller's next
   due time is spread across a small window the same way Nodes' own poller

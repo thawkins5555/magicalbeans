@@ -242,6 +242,8 @@ def delete_wireless_controller_credential(service, params, body, controller_id) 
 
 def post_wireless_controller_poll(service, params, body, controller_id) -> dict:
     _require(service.wireless_db.controller(controller_id), "controller")
+    # An operator's own Poll Now re-probes GETBULK at once, not on the hourly retry.
+    service.wireless.forget_bulk_verdict(controller_id)
     service.wireless.poll_now(controller_id)
     return {"ok": True}
 

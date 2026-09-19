@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.49.0 — Low-risk poll and API performance](#5490--low-risk-poll-and-api-performance)
 - [5.48.0 — First-run administrator password; low-severity fixes](#5480--first-run-administrator-password-low-severity-fixes)
 - [5.47.0 — Review fixes: security, correctness, history maintenance](#5470--review-fixes-security-correctness-history-maintenance)
 - [5.46.0 — Performance](#5460--performance)
@@ -181,6 +182,94 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.49.0 — Low-risk poll and API performance
+
+Third release out of the phase-5 review's follow-up plan (see 5.47.0
+below): the low-risk poll and API performance items the review surfaced.
+Nothing changes on screen. Two changes are on the wire; stated plainly:
+
+**Operator-visible**
+
+1. **FortiGate / wireless controllers on SNMP v2c or v3 are now walked
+   with GETBULK instead of GETNEXT** (v1 is unchanged — it has no GETBULK
+   form). A 100-AP column walk measures at 3 requests instead of 101; at
+   roughly 500 APs the old GETNEXT walk needed on the order of 12,000
+   round trips per poll, enough to overrun the poll interval across a slow
+   WAN link. Safety net: a reply that comes back too big for the
+   controller to send halves the batch size (40 rows, then 20, 10, 5, and
+   so on) and retries; at the floor it falls back to GETNEXT for that
+   walk. A controller that answers GETBULK with an error status, or whose
+   very first GETBULK attempt times out before anything has been learned
+   about it, is walked with GETNEXT instead from then on — remembered, not
+   re-tried every poll — with that verdict cleared and re-probed the
+   moment the controller is deleted or polled manually, and otherwise
+   re-probed once an hour regardless. The AP, radio and client rows stored
+   are identical whichever protocol did the walk (checked by test).
+2. **A Net-SNMP (UCD-SNMP) device that has never answered its CPU/memory
+   scalar request is no longer asked for it on every poll.** It's probed
+   once, remembered, and re-probed once an hour, with that memory reset
+   immediately by a manual poll, a detected reboot, or a change of which
+   credential answered the device. Operator consequence: if you widen a
+   device's SNMP view so those objects become readable, CPU/memory
+   metrics can take up to an hour to appear unless one of those resets
+   happens first. A request that simply times out is never treated as
+   "this device doesn't support it" — only a definite no-such-object reply
+   is; a flaky link will keep being asked.
+
+**Correctness / robustness / performance** (no operator action needed)
+
+3. Interface write path: the store now hands the poller back the interface
+   rows it already read while writing them, so the poller no longer issues
+   a second read of the same table every poll. Within that write, a
+   device's static interface fields (name, alias, type, speed, MAC
+   address, admin/oper status) are only written when one of them actually
+   changed; "last seen" still advances for every interface seen that poll,
+   in one batched statement covering all of them. Measured: an unchanged
+   poll now issues 5 statements to the interfaces table whether the device
+   has 10 interfaces or 200 — previously the statement count rose with
+   interface count. The separate commit for the interface-rate update is
+   unchanged (two commits total for the interface work; kept apart on
+   purpose — see below). Across a whole poll cycle the total statement
+   count barely moves, since sample writes dominate it; the saving is
+   less I/O per unchanged interface, not a headline number.
+4. The device-identity read and the UCD-SNMP scalar read now share one UDP
+   socket instead of opening one each (two sockets down to one per scalar
+   phase), and it's closed on every code path, including error paths.
+5. Nodes list API: the per-row schema check the row-to-JSON conversion
+   does is now computed once per page of devices instead of once per row.
+   Measured on a full-row list request: 3.8 ms down to about 3.1 ms. A new
+   `fields=list` projection, used only by the Nodes table on screen, sends
+   28 fields (about 700 bytes per device) instead of the full 86-field,
+   ~2,050-byte row — 66% smaller. Same permission gate and secret
+   redaction as the full row; it filters output that's already redacted,
+   it doesn't skip redaction. Any other API caller, and every device
+   dialog on screen, still gets the full row unchanged.
+
+**Left alone on purpose.** Spanning-tree's own follow-up walks keep their
+own SNMP sockets rather than sharing the one above — sharing would touch
+more than two dozen call sites for a saving that doesn't matter at
+spanning-tree's polling cadence. The interface-rate update stays its own
+commit, separate from the rest of the interface write, so the store's
+lock isn't held any longer per poll than before.
+
+**Tests.** One new suite, `test_fortipoll_getbulk.py`: the stored AP/radio
+rows are identical under GETBULK and GETNEXT, a large AP count needs far
+fewer round trips under GETBULK, a too-big reply halves the batch and the
+walk still completes, and a controller that refuses GETBULK outright falls
+back to GETNEXT once and is never asked with GETBULK again for the life of
+the poller. Benchmarks are flat except the device-list figure above.
+Browser walk: 94/94, no console errors, page errors or failed requests for
+either an admin or a viewer account. Full suite: 205 of 207 suites passed,
+2 skipped — both failures are known timing-sensitive suites:
+`test_ipam_dhcp_search` passes when run on its own, and one
+connection-ceiling check in `test_web_security` is under separate
+investigation.
+The code review's findings were fixed after that run and the affected suites re-run individually, all passing: test_web_security (twice), test_fortipoll_getbulk, test_poll_write_path, test_poller_behaviour, test_nodes_api_fixes, test_frontend_contracts, test_wireless_poller. The connection-ceiling check in test_web_security was the test's own: a socket closed with the client's bytes still queued arrives as a reset on some timings and as a clean close on others, and only the second was accepted; both mean the connection was not served, and a real timeout still fails the check.
+
+**Not in this release.** GETBULK for Nodes' own interface polling,
+spanning-tree walk cadence, and down-port sample storage remain planned
+follow-up releases.
 
 ### 5.48.0 — First-run administrator password; low-severity fixes
 

@@ -5069,6 +5069,98 @@ hold unbatched. Rejected as a worse trade for this workload — `tests/
 bench_prune.py --large` prints the unbatched number on every run so a
 future change here is measured against it rather than assumed better.
 
+### The interface write path hands back what it already read: `replace_interfaces`'s `prior` (`nodesdb.py`, `nodepoll/poll_mixin.py`) — 5.49.0
+
+`replace_interfaces(device_id, rows, allow_delete)` already read every one
+of a device's interface rows at the top, to match the walk against them by
+`if_index`. The poller then read the same table again itself, immediately
+after, purely to get rate-calculation baselines (`last_in_octets` and
+friends) for its own next step — a second SELECT of exactly what the
+first one already had in memory. `replace_interfaces` now returns that
+pre-write read as `prior` in its result dict, alongside the existing
+`ids` mapping, and `poll_mixin.py`'s poll step reads `result["prior"]`
+instead of issuing its own query. The contract: `prior` is the table
+**before** this call's own inserts/updates/deletes, keyed by `if_index`,
+covering every row that existed when the poll started (including ones
+this same call is about to delete) — never the post-write state.
+
+Two write changes ride along in the same function, both changed-only:
+
+- **Static columns** (`descr`, `alias`, `name`, `phys_addr`, `speed_bps`,
+  `admin_status`, `oper_status`) are compared against `prior` before
+  writing; a steady-state interface — nothing about it changed since the
+  last poll — is skipped, added to neither `inserts` nor `updates`.
+- **`last_seen_ts` still advances for every interface the walk actually
+  saw**, changed or not, but as one batched `UPDATE ... WHERE if_index IN
+  (...)` over all of them (chunked through `_id_chunks`) rather than
+  folded into the per-row static UPDATE — an interface with nothing else
+  to write still needs this column touched, and batching it keeps that
+  cheap instead of forcing a per-row statement just to bump one column.
+
+Measured: a poll where nothing changed now issues 5 statements against
+`interfaces` regardless of whether the device has 10 ports or 200 — the
+initial SELECT, the batched `last_seen_ts` UPDATE, the closing SELECT for
+`ids`, and the transaction's own begin/commit; before this, the static
+UPDATE ran once per interface. `update_interface_rates` (the rate/counter
+half of the interface write) is untouched and keeps its own commit,
+deliberately — see "Left alone on purpose" in `CHANGELOG.md`'s 5.49.0
+entry for why holding the store's lock no longer than before mattered
+more here than merging one more commit away.
+
+### The UCD-SNMP latch: `_ucd_read`/`_ucd_capable` (`nodepoll/poll_mixin.py`, `nodepoll/poller.py`) — 5.49.0
+
+`read_ucd_snmp` (inside `_poll_snmp_scalars`) used to send the UCD-SNMP
+CPU/memory GET on every poll of every device, including the large
+majority that have never answered it — most non-Linux/BSD SNMP agents
+have no `UCD-SNMP-MIB` at all. It now follows the same probe-once-latch
+shape as `_mau_capable`/`_cage_capable` elsewhere in this file:
+`_ucd_capable[device_id]` is `True`/`False`/absent (never probed), and
+`_ucd_read[device_id]` is when it was last asked. The GET is sent when
+`_ucd_capable` is not `False`, or when it is `False` but
+`_SENSOR_REPROBE_S` (3600 s, the same hourly constant every other
+probe-once latch in this file uses, defined once on the mixin in
+`environment_mixin.py`) has elapsed since the last read.
+
+`_ucd_capable` is set `False` only when the GET returns and every varbind
+in it is `noSuchObject`/`noSuchInstance` — a definite "this agent doesn't
+have these objects" answer. A timeout or any other `SnmpError` raised by
+the GET itself propagates out of `read_ucd_snmp` to `_best_effort`, which
+swallows it without touching `_ucd_capable` at all — a lost packet never
+teaches the latch "doesn't support it", only a real negative reply does.
+`_ucd_capable` is set `True` the moment any of the UCD-SNMP objects come
+back readable, from whatever verdict it held before (including `False`) —
+an operator widening a device's SNMP view takes effect on the next poll
+that reaches the hourly re-probe window, not sooner, which is the
+operator-visible "up to an hour" note in `CHANGELOG.md`.
+
+Three places clear both dicts for a device, each a reason the old verdict
+might no longer hold:
+
+- `detect_reboot` firing in the poll step (new firmware can add or drop
+  MIB support).
+- A credential index change in `_poll_snmp_scalars`'s multi-credential
+  probe (a different credential can expose a different object set) — not
+  on the first-ever resolution, since that would erase the verdict
+  `_poll_snmp_scalars` had just set on the very same poll.
+- `NodePoller.poll_now`'s explicit retry path (the operator's Test/Poll
+  Now button), which discards every per-device probe cache the same way,
+  UCD-SNMP included.
+
+`_forget_devices` sweeps both dicts for any device id no longer live,
+alongside every other per-device poll cache it already swept.
+
+### One socket for identity and UCD-SNMP, closed on every path (`nodepoll/poll_mixin.py`)
+
+The scalar-read phase used to open one SNMP session for the identity GET
+(`sysDescr`/`sysObjectID`/and so on) and a second one for the UCD-SNMP GET
+immediately after — two sockets, two v3 engine-discovery round trips where
+applicable, for two GETs on the same device in the same poll. `_session_for`
+is now called once at the top of that phase and the same session is
+threaded through both `_snmp_get_on` calls; the `try`/`finally` that closes
+it wraps the whole span, not just the identity GET, so an exception
+anywhere in between — a v1 identity extra, a credential verdict out of
+`_poll_software_version` — still closes the socket rather than leaking it.
+
 ## MAPPER
 
 MAPPER (`mapper.py`, `mapperdb.py`, `web/static/mapper.js`) is a manually-
@@ -12024,6 +12116,65 @@ rather than risking being read as the answer to the next one. The packets
 on the wire — PDU shape, OIDs, credentials — are otherwise identical to
 before.
 
+### GETBULK table walks, with a GETNEXT fallback and an hourly re-probe: `_bulk_settings`/`_remember_repetitions`/`forget_bulk_verdict`, `_snmp_walk_request` (`fortipoll.py`) — 5.49.0
+
+`_walk_column` walked every controller with GETNEXT, one row per request,
+whatever the SNMP version — the same request-count problem nodepoll's own
+walk had already solved for Nodes. A controller on v2c or v3 now walks
+with GETBULK; v1 is untouched (`_bulk_settings` returns `(False, 0)`
+outright for it — v1 has no GETBULK PDU).
+
+**Per-controller state**, mirroring nodepoll's own `_bulk_repetitions`
+pattern: `_bulk_repetitions[controller_id]` is the learned
+`max_repetitions` to ask for, or `0` meaning "GETNEXT only, don't ask with
+GETBULK again yet"; `_bulk_last_probe[controller_id]` is when that `0`
+verdict was recorded. `_bulk_settings` reads both: a `0` verdict younger
+than `BULK_RETRY_S` (3600 s, one hour) keeps the walk on GETNEXT; once
+that ages out, GETBULK is tried again from `BULK_MAX_REPETITIONS` (40 —
+nodepoll's own shipped default, `snmp_bulk_max_repetitions`; there is no
+per-controller setting here).
+
+**Three ways a walk downgrades itself, all inside `_walk_column`'s loop,
+all recorded through `_remember_repetitions`:**
+
+1. **tooBig** (`error_status == 1`) halves `max_repetitions` (40 → 20 →
+   10 → 5 → 2 → 1) and retries the same GETBULK request; at the floor
+   (`max_repetitions <= 1`) it gives up on GETBULK for this controller and
+   switches to GETNEXT.
+2. **Any other error status with no rows yet returned** (genErr and
+   similar) — GETBULK is refused outright by this agent — switches to
+   GETNEXT immediately, no halving.
+3. **The very first GETBULK request of a walk timing out** (tracked by
+   `untried_first_request`, true only until one request on this walk has
+   succeeded or failed with a real reply) is read as "this controller
+   doesn't answer GETBULK at all" rather than a plain lost packet — a
+   large first reply can exceed a tunnelled link's path MTU. The walk
+   retries the same OID once with GETNEXT before continuing. A timeout on
+   any later request in the same walk is a normal `SnmpTimeout`, raised as
+   before.
+
+Each of the three sets `_bulk_repetitions[controller_id] = 0` and stamps
+`_bulk_last_probe`, so the next poll starts that controller on GETNEXT and
+the hourly window above governs when GETBULK is tried again.
+`forget_bulk_verdict(controller_id)`, called from
+`post_wireless_controller_poll` (the operator's own **Poll Now**), clears
+both dicts immediately rather than waiting on the hour — an operator who
+just fixed a path filter or MTU issue sees the fix take effect on the poll
+they asked for. `_schedule_pass` drops both dicts' entries for any
+controller id no longer live, the same sweep `_next_run` and the v3
+`EngineCache` already get, so a reused id never inherits a stale verdict.
+
+`_snmp_walk_request` is unchanged in shape — one request/response on a
+session the caller owns — except that it now takes `pdu_tag` and
+`max_repetitions` rather than assuming GETNEXT; `max_repetitions` is
+ignored by `build_request`/`v3_exchange` for a GETNEXT PDU, so a v1 or
+downgraded caller passes it unused. The 4096-row cap (`_WALK_MAX_ROWS`)
+and the non-advancing-OID guard in `_walk_column`'s per-row loop are
+unchanged and apply to both PDU types, since a GETBULK response is walked
+one row at a time the same way a GETNEXT response is — a single response
+just carries more of them. Stored AP/radio/client rows are identical
+whichever PDU walked them (`tests/test_fortipoll_getbulk.py`).
+
 ### Per-AP response time (`fortipoll.py`, `nodeoids.py`)
 
 The module's stated design is that it talks to the controller and never to an
@@ -12818,6 +12969,45 @@ outlive the service or bring a collector back up after shutdown stopped it.
 The UI needed no change: `/api/state` already reports each worker's `running`
 flag and `status_text()`, so the poll every page makes shows the collector
 going down and coming back.
+
+### `_device_json(row, reveal, keys=None)`, `_DEVICE_LIST_FIELDS` and `fields=list` (`web/api/nodes.py`) — 5.49.0
+
+`_device_json` builds one device's ~86-field JSON row. Its `keys`
+parameter lets a caller looping over many rows from the same
+`nodes_db.devices()` query — all sharing the same column set — compute
+`frozenset(row.keys())` once and pass it in, instead of every one of the
+86-odd field lookups that need to check "does this row have this column"
+(the migration-defensive ones like `mib_file_auto`, `lldp_interval_s`,
+`vlan_interval_s`, `arp_table_interval_s`) recomputing `row.keys()` for
+itself. `_device_rows_json` computes `keys` once from `rows[0]` and passes
+it to every `_device_json` call in the batch. Measured on a full-row list
+request: 3.8 ms down to about 3.1 ms.
+
+`_DEVICE_LIST_FIELDS` is the frozenset of the 28 fields nodes.js's
+`COLUMNS` array can ever read for the Nodes table — every column it ships
+with plus every optional one an operator can switch on without a page
+reload, which is why the optional ones' data has to be in the response
+already rather than fetched on demand. `_device_list_rows_json` builds the
+normal full `_device_rows_json` list — same permission gate, same secret
+redaction, since nothing about how a row is built changes — and then
+filters each device dict down to just those 28 keys before it goes on the
+wire: about 700 bytes per device against the full row's ~2,050 (66%
+smaller).
+
+`get_nodes_devices` picks the projection by `fields`: `"index"` for
+`_device_index_rows_json` (unchanged, 5.44.0), `"list"` for the new
+`_device_list_rows_json`, anything else (including no `fields` param at
+all) for the unchanged full `_device_rows_json`. `fields=list` is sent
+only by nodes.js's own Nodes table; an API-token caller that never passes
+`fields` keeps getting the full row, unchanged, same as before this
+existed — every device dialog on screen also asks for the full row by id,
+not the list projection. **Rule for future work:** a new Nodes-table
+column must add its field name to `_DEVICE_LIST_FIELDS`, or the column
+will read blank/undefined once `fields=list` is in use — nothing else
+enforces that the projection stays in sync with `COLUMNS`, other than
+`tests/test_frontend_contracts.py`, which pins the literal request shape
+nodes.js sends and would need updating alongside a `COLUMNS` change
+anyway.
 
 ### `Service.cached_poll`: a cache stampede computes once, not once per caller (`web/service.py`) — 5.46.0
 

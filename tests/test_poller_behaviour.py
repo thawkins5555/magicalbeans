@@ -643,39 +643,90 @@ def test_link_down_recorded_without_reboot():
 # --------------------------------------------------------------- Fix 4 (pure)
 
 def test_fortipoll_walk_terminates_on_stuck_oid():
-    """A GETNEXT peer that advances once and then keeps re-answering the
-    same OID forever must not be walked to fortipoll's 4096-iteration
-    cap: _walk_column has to notice the OID stopped advancing and stop
-    itself, the same guard nodepoll.py's own _walk_column_status already
-    applies via _oid_key. Driven directly against _walk_column with
-    _snmp_get_next monkeypatched -- no real socket needed, since the walk
-    loop itself is what is under test, not the wire format."""
-    db = WirelessDatabase(os.path.join(tmpdir("poller_review_fortiwalk_"), "wireless.db"))
-    poller = WirelessPoller(db)
-    base_oid = "1.3.6.1.4.1.12356.101.14.1.1.2"
-    calls = {"n": 0}
+    """A peer that advances once and then keeps re-answering the same OID
+    forever must not be walked to fortipoll's 4096-row cap: _walk_column has
+    to notice the OID stopped advancing and stop itself, the same guard
+    nodepoll.py's own _walk_column_status already applies via _oid_key.
+    Driven directly against _walk_column with _snmp_walk_request
+    monkeypatched -- no real socket needed, since the walk loop itself is
+    what is under test, not the wire format. Run against both PDU tags
+    _walk_column can choose (GETBULK for v2c/v3, GETNEXT for v1) -- the
+    guard lives in the per-varbind loop shared by both, but a monkeypatch
+    keyed to the wrong seam would silently test nothing."""
+    from netpath.snmppoll import PDU_GETBULK, PDU_GETNEXT
 
-    def fake_get_next(controller, config, oid, session, verify_replies=True):
-        calls["n"] += 1
-        # First call advances into the table (one real row); every call
-        # after that echoes the same row back, exactly the misbehaviour
-        # that was left unguarded.
-        row_oid = f"{base_oid}.1"
-        return types.SimpleNamespace(varbinds=[
-            {"oid": row_oid, "type": "OctetString", "value": "AP0001"}])
+    for snmp_version, expect_tag in ((1, PDU_GETBULK), (0, PDU_GETNEXT)):
+        db = WirelessDatabase(os.path.join(
+            tmpdir("poller_review_fortiwalk_"), "wireless.db"))
+        poller = WirelessPoller(db)
+        base_oid = "1.3.6.1.4.1.12356.101.14.1.1.2"
+        calls = {"n": 0}
+        tags_seen = set()
 
-    poller._snmp_get_next = fake_get_next
-    controller = {"ip": "127.0.0.1", "id": 1}
-    config = {"snmp_version": 1, "community": "public"}
+        def fake_walk_request(controller, config, oid, session, pdu_tag,
+                              max_repetitions, verify_replies=True):
+            calls["n"] += 1
+            tags_seen.add(pdu_tag)
+            # First call advances into the table (one real row); every call
+            # after that echoes the same row back, exactly the misbehaviour
+            # that was left unguarded.
+            row_oid = f"{base_oid}.1"
+            return types.SimpleNamespace(error_status=0, varbinds=[
+                {"oid": row_oid, "type": "OctetString", "value": "AP0001"}])
 
-    values = poller._walk_column(controller, config, base_oid)
+        poller._snmp_walk_request = fake_walk_request
+        controller = {"ip": "127.0.0.1", "id": 1}
+        config = {"snmp_version": snmp_version, "community": "public"}
 
-    check(calls["n"] < 4096,
-          f"walk against a stuck-OID peer stopped promptly, not at the "
-          f"4096-row cap ({calls['n']} GETNEXT call(s))")
-    check(values == {"1": "AP0001"},
-          f"the one real row before the agent got stuck is still kept ({values})")
-    db.close()
+        values = poller._walk_column(controller, config, base_oid)
+
+        check(tags_seen == {expect_tag},
+              f"snmp_version={snmp_version} walks with pdu_tag {expect_tag}, "
+              f"the seam this test actually drives (saw {tags_seen})")
+        check(calls["n"] < 4096,
+              f"walk against a stuck-OID peer (snmp_version={snmp_version}) "
+              f"stopped promptly, not at the 4096-row cap ({calls['n']} call(s))")
+        check(values == {"1": "AP0001"},
+              f"the one real row before the agent got stuck is still kept "
+              f"(snmp_version={snmp_version}, {values})")
+        db.close()
+
+
+def test_fortipoll_walk_hits_row_cap():
+    """A peer that keeps genuinely advancing forever (not stuck, just an
+    enormous or hostile table) has to be stopped at fortipoll's 4096-row
+    cap -- now a row count, not a request count, since one GETBULK response
+    can carry many rows. Run against both PDU tags for the same reason as
+    the stuck-OID test above."""
+    from netpath.snmppoll import PDU_GETBULK, PDU_GETNEXT
+
+    for snmp_version, rows_per_call in ((1, 40), (0, 1)):
+        db = WirelessDatabase(os.path.join(
+            tmpdir("poller_review_fortiwalk_cap_"), "wireless.db"))
+        poller = WirelessPoller(db)
+        base_oid = "1.3.6.1.4.1.12356.101.14.1.1.2"
+        state = {"next": 1}
+
+        def fake_walk_request(controller, config, oid, session, pdu_tag,
+                              max_repetitions, verify_replies=True,
+                              rows_per_call=rows_per_call):
+            varbinds = []
+            for _ in range(rows_per_call):
+                varbinds.append({"oid": f"{base_oid}.{state['next']}",
+                                 "type": "OctetString", "value": "AP"})
+                state["next"] += 1
+            return types.SimpleNamespace(error_status=0, varbinds=varbinds)
+
+        poller._snmp_walk_request = fake_walk_request
+        controller = {"ip": "127.0.0.1", "id": 1}
+        config = {"snmp_version": snmp_version, "community": "public"}
+
+        values = poller._walk_column(controller, config, base_oid)
+
+        check(len(values) == 4096,
+              f"an ever-advancing peer (snmp_version={snmp_version}) is cut "
+              f"off at exactly the 4096-row cap (got {len(values)})")
+        db.close()
 
 
 def test_format_ticks_divides_by_a_hundred():
@@ -1812,6 +1863,7 @@ def main():
     test_link_down_suppressed_after_reboot_when_identity_changed()
     test_link_down_recorded_without_reboot()
     test_fortipoll_walk_terminates_on_stuck_oid()
+    test_fortipoll_walk_hits_row_cap()
     test_interface_cap_is_a_note_not_an_error()
     test_a_column_walk_is_bounded_by_bytes_not_only_rows()
     test_a_column_walk_has_a_deadline_even_when_the_caller_gives_none()

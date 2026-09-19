@@ -4,9 +4,9 @@ one batch of device rows rather than an unclamped list and two queries per
 pair; applying a batch of upstream suggestions is one read, not three per
 assignment; the three device sub-routes that skipped their existence check
 answer 400 for an unknown id like every sibling; a MIB object's OID must be
-dotted ASCII decimal before it is stored; and the two projections the
-browser asks for (`?if_index=` on a port table, `?fields=index` on the
-device list) return the same shape with less of it.
+dotted ASCII decimal before it is stored; and the projections the browser
+asks for (`?if_index=` on a port table, `?fields=index`/`?fields=list` on
+the device list) return the same shape with less of it.
 
 Real `Service` and `WebServer` over loopback HTTP, because the route table
 and the permission gate sit between the socket and the handler.
@@ -21,6 +21,7 @@ import _paths  # noqa: F401  (repo root + tests dir on sys.path)
 
 from netpath.auth import DEFAULT_PASSWORD, DEFAULT_USER, hash_password
 from netpath.web import Service, WebServer
+from netpath.web.api.nodes import _DEVICE_LIST_FIELDS, _device_json
 
 TMPDIR = _paths.tmpdir("nodes_api_fixes_")
 
@@ -330,6 +331,69 @@ try:
           [d["id"] for d in full["devices"]] == [d["id"] for d in paged["devices"]],
           ([d["id"] for d in full["devices"]][:4],
            [d["id"] for d in paged["devices"]][:4]))
+
+    # ------------------------- 6b. row.keys() batching, and ?fields=list
+    class CountingKeysRow:
+        """Wraps a real sqlite3.Row so .keys() calls can be counted without
+        changing what indexing returns."""
+        def __init__(self, row):
+            self._row = row
+            self.keys_calls = 0
+
+        def keys(self):
+            self.keys_calls += 1
+            return self._row.keys()
+
+        def __getitem__(self, key):
+            return self._row[key]
+
+    # A few fields _device_json builds through other helpers (override_fields,
+    # _v3_level_fields, device_web_target) each read row.keys() once on their
+    # own account -- not the ~25-calls-per-row bug this pins, so the proof is
+    # the DELTA between the two calls below, not an absolute count: handing
+    # in a precomputed key set must save _device_json's own one call, and
+    # nothing here should still scale with the number of defensively-keyed
+    # fields in its dict literal.
+    raw_row = service.nodes_db.device(dup_ids[0])
+    wrapped = CountingKeysRow(raw_row)
+    _device_json(wrapped, reveal=False)
+    without_keys = wrapped.keys_calls
+
+    wrapped2 = CountingKeysRow(raw_row)
+    _device_json(wrapped2, reveal=False, keys=frozenset(raw_row.keys()))
+    with_keys = wrapped2.keys_calls
+
+    check("_device_json's own ~25 defensively-keyed fields cost it exactly "
+          "one row.keys() call, not one per field",
+          without_keys == with_keys + 1,
+          (without_keys, with_keys))
+    check("...a handful of calls total, not one that scales with the "
+          "number of columns in the dict literal",
+          without_keys <= 5, without_keys)
+
+    LIST_KEYS = set(_DEVICE_LIST_FIELDS)
+    status, list_payload = call("GET", "/api/nodes/devices?fields=list", token=admin)
+    list_rows = list_payload.get("devices", []) if status == 200 else []
+    check("?fields=list returns every device", status == 200
+          and len(list_rows) == list_payload.get("total"),
+          (status, len(list_rows), list_payload.get("total")))
+    check("...with exactly the columns the Nodes table draws",
+          bool(list_rows) and all(set(r) == LIST_KEYS for r in list_rows),
+          sorted(list_rows[0]) if list_rows else list_rows)
+
+    status, full_unpaged = call("GET", "/api/nodes/devices", token=admin)
+    full_by_id = {d["id"]: d for d in full_unpaged["devices"]}
+    check("...and every value in the projection is identical to the full row's",
+          all(full_by_id[r["id"]][k] == r[k] for r in list_rows for k in LIST_KEYS),
+          "value mismatch between fields=list and the full projection")
+
+    status, list_paged = call(
+        "GET", "/api/nodes/devices?fields=list&limit=10&offset=5", token=admin)
+    check("...and paging means what it means on the full route",
+          status == 200 and len(list_paged["devices"]) == 10
+          and list_paged["limit"] == 10 and list_paged["offset"] == 5
+          and list_paged["total"] == full_unpaged["total"],
+          (status, list_paged.get("limit"), list_paged.get("offset")))
 
     # ------------------------- 7. poll_overrun is out of the dialog's log
     #

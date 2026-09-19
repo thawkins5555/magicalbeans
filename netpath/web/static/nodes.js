@@ -6670,7 +6670,9 @@
     const query = readDeviceFilters();
     const generation = ++view.refreshGen;
     const [devices] = await Promise.all([
-      App.get('/api/nodes/devices', query),
+      // 'list' is the projection the table itself draws from -- the detail
+      // pane fetches the full row separately (loadDetail/deviceDialog).
+      App.get('/api/nodes/devices', { ...query, fields: 'list' }),
       loadNodesConfig(),
       loadDiscJobsIfNeeded(),
     ]);

@@ -966,6 +966,257 @@ def reboot_suppression():
         proc.kill()
 
 
+def interface_write_path_batching():
+    """replace_interfaces: an unchanged poll writes far less than a changed
+    one, last_seen_ts still advances for every interface either way, and
+    `prior` is exactly the pre-update row poll_mixin.py used to read with a
+    SELECT of its own. Also the scripted sequence a poll's link-event
+    detection depends on: new port, removed port, alias change, status
+    flap, speed change, unchanged -- byte-identical results throughout.
+    """
+    print("\n-- interface write-path batching")
+    db = NodesDatabase(os.path.join(TMPDIR, "iface_batch.db"))
+    try:
+        group_id = db.ensure_default_group()
+        device_id = db.add_device("127.0.0.1", "batch-test", group_id=group_id,
+                                  poll_interval_s=999, ping_enabled=0)
+
+        base_rows = [{"if_index": i, "descr": f"Gi0/{i}", "alias": "",
+                     "admin_status": "up", "oper_status": "up",
+                     "speed_bps": 1_000_000_000} for i in range(1, 11)]
+        # Production hands interface_speed_bps a float (1e9); the column is
+        # INTEGER. And a blank name, normalised to NULL on both sides.
+        base_rows.append({"if_index": 11, "descr": "Gi0/11", "alias": "",
+                          "name": "", "admin_status": "up", "oper_status": "up",
+                          "speed_bps": 1e9})
+        db.replace_interfaces(device_id, base_rows)
+        time.sleep(0.01)
+        baseline = {r["if_index"]: dict(r) for r in db.interfaces(device_id)}
+
+        texts = []
+        db._conn.set_trace_callback(lambda sql: texts.append(sql))
+        try:
+            result = db.replace_interfaces(device_id, base_rows)
+        finally:
+            db._conn.set_trace_callback(None)
+        unchanged_statements = len(texts)
+        check(not any("UPDATE interfaces SET descr" in t for t in texts),
+              f"a float speed_bps (1e9) and a blank name still compare equal "
+              f"to the stored row, so the second poll issues no per-row "
+              f"UPDATE ({[t for t in texts if 'descr' in t]})")
+        check(bool(result["prior"]) and all(
+            result["prior"][i]["descr"] == baseline[i]["descr"] for i in baseline),
+              "replace_interfaces returns the pre-update row for every interface")
+        after_unchanged = {r["if_index"]: dict(r) for r in db.interfaces(device_id)}
+        check(all(after_unchanged[i]["last_seen_ts"] > baseline[i]["last_seen_ts"]
+                  for i in baseline),
+              "last_seen_ts still advances on a poll that changed nothing else")
+        check(all(after_unchanged[i][k] == baseline[i][k] for i in baseline
+                  for k in ("descr", "alias", "admin_status", "oper_status", "speed_bps")),
+              "…and every other column is untouched, byte-identical")
+
+        changed_rows = [dict(row, alias="changed") for row in base_rows]
+        with CommitCounter(db._conn) as counter:
+            db.replace_interfaces(device_id, changed_rows)
+        check(counter.statements > unchanged_statements,
+              f"an unchanged poll costs fewer statements than one that "
+              f"actually writes something ({unchanged_statements} vs "
+              f"{counter.statements})")
+
+        wide_rows = [{"if_index": i, "descr": f"Gi0/{i}", "alias": "changed",
+                     "admin_status": "up", "oper_status": "up",
+                     "speed_bps": 1_000_000_000} for i in range(1, 201)]
+        db.replace_interfaces(device_id, wide_rows)
+        with CommitCounter(db._conn) as counter:
+            db.replace_interfaces(device_id, wide_rows)
+        check(counter.statements <= unchanged_statements + 2,
+              f"200 unchanged interfaces cost about the same as 11 "
+              f"({unchanged_statements} vs {counter.statements})")
+    finally:
+        db.close()
+
+    db2 = NodesDatabase(os.path.join(TMPDIR, "iface_seq.db"))
+    try:
+        g2 = db2.ensure_default_group()
+        d2 = db2.add_device("127.0.0.2", "seq-test", group_id=g2,
+                            poll_interval_s=999, ping_enabled=0)
+        seq_rows = [{"if_index": 1, "descr": "Gi0/1", "alias": "a",
+                    "admin_status": "up", "oper_status": "up",
+                    "speed_bps": 1_000_000_000},
+                   {"if_index": 2, "descr": "Gi0/2", "alias": "b",
+                    "admin_status": "up", "oper_status": "down",
+                    "speed_bps": 1_000_000_000}]
+        db2.replace_interfaces(d2, seq_rows)
+
+        new_port = seq_rows + [{"if_index": 3, "descr": "Gi0/3", "alias": "",
+                               "admin_status": "up", "oper_status": "up",
+                               "speed_bps": 1_000_000_000}]
+        db2.replace_interfaces(d2, new_port)
+        check({r["if_index"] for r in db2.interfaces(d2)} == {1, 2, 3},
+              "a new port is added")
+
+        alias_changed = [dict(new_port[0], alias="renamed")] + new_port[1:]
+        db2.replace_interfaces(d2, alias_changed)
+        check({r["if_index"]: r["alias"] for r in db2.interfaces(d2)}[1] == "renamed",
+              "an alias change is stored")
+
+        flapped = [dict(alias_changed[0]),
+                  dict(alias_changed[1], oper_status="up"),
+                  dict(alias_changed[2])]
+        db2.replace_interfaces(d2, flapped)
+        check({r["if_index"]: r["oper_status"] for r in db2.interfaces(d2)}[2] == "up",
+              "a status flap is stored")
+
+        sped_up = [dict(flapped[0], speed_bps=10_000_000_000)] + flapped[1:]
+        db2.replace_interfaces(d2, sped_up)
+        check({r["if_index"]: r["speed_bps"] for r in db2.interfaces(d2)}[1]
+              == 10_000_000_000, "a speed change is stored")
+
+        before_unchanged = {r["if_index"]: dict(r) for r in db2.interfaces(d2)}
+        db2.replace_interfaces(d2, sped_up)
+        after = {r["if_index"]: dict(r) for r in db2.interfaces(d2)}
+        check(all(after[i][k] == before_unchanged[i][k] for i in after
+                  for k in ("descr", "alias", "admin_status", "oper_status", "speed_bps"))
+              and all(after[i]["id"] == before_unchanged[i]["id"] for i in after),
+              "an unchanged poll after all that leaves every value byte-identical")
+
+        result = db2.replace_interfaces(
+            d2, [row for row in sped_up if row["if_index"] != 2], allow_delete=True)
+        check(2 in result["removed"]
+              and 2 not in {r["if_index"] for r in db2.interfaces(d2)},
+              "a removed port is deleted when the walk was complete")
+    finally:
+        db2.close()
+
+
+def ucd_snmp_probe_once_and_shared_session():
+    """UCD-SNMP: a device that answers noSuchObject (real vendor gear, per
+    the stub's own comment) is asked once, then not again until the hourly
+    re-probe -- and the identity GET and the UCD-SNMP GET share one socket,
+    the same session _poll_interfaces already shares across its own GETs.
+    """
+    print("\n-- UCD-SNMP probe-once and shared session")
+    import socket as _socket
+    from netpath import nodeoids
+
+    proc, port = spawn_stub("stub_agent_iftable.py", "cisco")
+    try:
+        _paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
+        db = NodesDatabase(os.path.join(TMPDIR, "ucd_latch.db"))
+        group_id = db.ensure_default_group()
+        device_id = db.add_device(
+            "127.0.0.1", "ucd-test", group_id=group_id,
+            snmp_version=1, community="public", ping_enabled=0,
+            poll_interval_s=999, snmp_timeout_s=1.0, snmp_retries=1)
+        poller = NodePoller(db)
+
+        ucd_calls = []
+        real_get_on = poller._snmp_get_on
+        ucd_oids = list(nodeoids.UCD_SNMP.values())
+
+        def counting(session, dev, cfg, oids, *a, **kw):
+            if oids == ucd_oids:
+                ucd_calls.append(1)
+            return real_get_on(session, dev, cfg, oids, *a, **kw)
+
+        poller._snmp_get_on = counting
+        try:
+            _poll_once(poller, db, device_id)
+            _poll_once(poller, db, device_id)
+        finally:
+            poller._snmp_get_on = real_get_on
+        check(len(ucd_calls) == 1,
+              f"a device answering noSuchObject is asked once, not once a "
+              f"poll ({len(ucd_calls)})")
+
+        # Ageing the latch past the hourly window proves this is a re-probe,
+        # not a permanent verdict.
+        poller._ucd_read[device_id] = time.time() - poller._SENSOR_REPROBE_S - 1
+        poller._snmp_get_on = counting
+        try:
+            _poll_once(poller, db, device_id)
+        finally:
+            poller._snmp_get_on = real_get_on
+        check(len(ucd_calls) == 2,
+              "…but does ask again once the hourly re-probe window passes")
+        poller.shutdown()
+        db.close()
+    finally:
+        proc.kill()
+
+    proc, port = spawn_stub("stub_agent_iftable.py", "ok")
+    try:
+        _paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
+        db = NodesDatabase(os.path.join(TMPDIR, "ucd_session.db"))
+        group_id = db.ensure_default_group()
+        device_id = db.add_device(
+            "127.0.0.1", "session-test", group_id=group_id,
+            snmp_version=1, community="public", ping_enabled=0,
+            poll_interval_s=999, snmp_timeout_s=1.0, snmp_retries=1)
+        poller = NodePoller(db)
+        device = db.device(device_id)
+        config = db.effective_config(device)
+        # Isolated to the identity + UCD-SNMP pair this change touches --
+        # the other scalar reads a full poll makes are out of its scope
+        # and open sockets of their own.
+        poller._poll_software_version = lambda *a, **kw: {}
+        poller._poll_vendor_health = lambda *a, **kw: []
+        poller._poll_ups_health = lambda *a, **kw: []
+        poller._poll_rf_metrics = lambda *a, **kw: []
+
+        opened = []
+        real_socket = _socket.socket
+
+        def recording_socket(family, kind, *rest):
+            if kind == _socket.SOCK_DGRAM:
+                opened.append(1)
+            return real_socket(family, kind, *rest)
+
+        nodepoll_mod.socket.socket = recording_socket
+        try:
+            poller._poll_snmp_scalars(device, config)
+        finally:
+            nodepoll_mod.socket.socket = real_socket
+        check(len(opened) == 1,
+              f"the identity GET and the UCD-SNMP GET share one socket "
+              f"({len(opened)} opened)")
+
+        # F4: an exception between the identity GET and the UCD read (a
+        # credential verdict out of _poll_software_version, say) must still
+        # close the shared session.
+        from netpath.nodepoll._session import _Session
+        closes = []
+        real_close = _Session.close
+
+        def counting_close(self_):
+            closes.append(1)
+            return real_close(self_)
+
+        _Session.close = counting_close
+
+        def boom(*a, **kw):
+            raise RuntimeError("injected")
+
+        poller._poll_software_version = boom
+        try:
+            raised = False
+            try:
+                poller._poll_snmp_scalars(device, config)
+            except RuntimeError:
+                raised = True
+            check(raised, "the injected exception actually propagated")
+            check(len(closes) == 1,
+                  f"...and the shared session was still closed, not leaked "
+                  f"({len(closes)} close(s))")
+        finally:
+            _Session.close = real_close
+
+        poller.shutdown()
+        db.close()
+    finally:
+        proc.kill()
+
+
 def main():
     proc, port = spawn_stub("stub_agent_iftable.py", "ok", "--interfaces", "24")
     try:
@@ -1058,6 +1309,8 @@ def main():
     finally:
         proc.kill()
 
+    interface_write_path_batching()
+    ucd_snmp_probe_once_and_shared_session()
     reboot_suppression()
     interface_reads()
     vendor_health()

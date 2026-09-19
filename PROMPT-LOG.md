@@ -1852,3 +1852,30 @@ takes or how much else is running at the time.
 (version), `CHANGELOG.md`, `FEATURES.md`, `INTERNALS.md`,
 `tests/README.md`, and this file. `README.md`, `RUNBOOK.md` and
 `demo/README.md` were updated separately for the same release.
+
+## 5.49.0 — Low-risk poll and API performance
+
+Release C of the approved five-release plan (see 5.47.0 above: A =
+5.47.0, B = 5.48.0, C = this one, D and E still to come as 5.50.0 and
+5.51.0). The low-risk poll and API performance items the phase-5 review
+surfaced: FortiGate/wireless controllers walk with GETBULK instead of
+GETNEXT on v2c/v3, a device known not to answer the Net-SNMP CPU/memory
+read is no longer asked for it every poll, the interface write path
+reuses a read it had already done instead of repeating it, the identity
+and Net-SNMP scalar reads now share one socket, and the Nodes table's own
+API request now asks for a smaller, dedicated set of fields. Nothing
+changes on screen. Two work lanes, Thing1 and Thing2, split the items
+between them; both lanes' changes went through the same review-and-walk
+pass together rather than separately, per standing policy of reviewing
+only once per set of related changes.
+
+**Walk and full suite both run detached**, the same way the walk was
+moved to a detached process in 5.48.0 for this same low-memory box — this
+time the full 207-suite run was launched the same way, to a log file
+outside the harness's own background-task tracking, so a long run
+surviving to completion does not depend on the harness's background-task
+limiter leaving it alone.
+
+**Files changed for 5.49.0's documentation:** `netpath/__init__.py`
+(version), `CHANGELOG.md`, `FEATURES.md`, `INTERNALS.md`,
+`tests/README.md`, and this file.

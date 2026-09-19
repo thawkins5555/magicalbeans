@@ -509,6 +509,10 @@ class PollMixin:
                 previous["last_uptime_ts"] or now)
             if rebooted:
                 self.db.record_device_event(device_id, "rebooted", note)
+                # A reboot can be onto different firmware; re-probe UCD-SNMP
+                # support from nothing rather than trust the old verdict.
+                self._ucd_read.pop(device_id, None)
+                self._ucd_capable.pop(device_id, None)
 
         walk_pending = bool(
             snmp_ok and identity and settings.get("vendor_walk_enabled", True)
@@ -521,15 +525,14 @@ class PollMixin:
         # ----------------------------------------------------- interfaces
 
         if interfaces:
-            # Captured before replace_interfaces() overwrites descr/alias/
-            # admin_status/oper_status — comparing against a post-replace
-            # read would always compare the new value to itself and never
-            # detect a link_up/link_down transition.
-            existing = {row["if_index"]: row for row in self.db.interfaces(device_id)}
-            # T2 — the interface table. Its `ids` map replaces one
-            # interface_id_for() SELECT per port below.
+            # T2 — the interface table. `prior` is the pre-update read
+            # replace_interfaces() already did for its own comparison, so
+            # the link-event loop below reuses it instead of reading the
+            # table a second time; `ids` replaces one interface_id_for()
+            # SELECT per port.
             result = self.db.replace_interfaces(
                 device_id, interfaces, allow_delete=interfaces_complete)
+            existing = result["prior"]
             interface_ids = result["ids"]
             rate_rows: list[dict] = []
             # The device-level worst case of each per-interface rate. The
@@ -991,6 +994,10 @@ class PollMixin:
                         _error_specificity(exc) >= _error_specificity(last_error):
                     last_error = exc
                 continue
+            if cached_index is not None and index != cached_index:
+                # A genuine credential change may answer UCD-SNMP differently.
+                self._ucd_read.pop(device_id, None)
+                self._ucd_capable.pop(device_id, None)
             self._credentials[device_id] = index
             self._credential_probe_failed.pop(device_id, None)
             return trial_config, identity, uptime_ticks, metrics
@@ -1133,6 +1140,7 @@ class PollMixin:
                 "sw_source": info.source or None, "fw_source": info.fw_source or None}
 
     def _poll_snmp_scalars(self, device, config: dict):
+        device_id = device["id"]
         oids = list(nodeoids.SYSTEM_SCALARS.values())
         # An operator-chosen OID for vendor and/or location. Both the bare and
         # the .0 instance form are asked for, because "1.3.6.1.4.1.x.y" and
@@ -1155,65 +1163,85 @@ class PollMixin:
         custom = nodeoids.identity_oid_variants(config)
         if custom["all"] and not is_v1:
             oids += [oid for oid in custom["all"] if oid not in oids]
-        response = self._snmp_get(device, config, oids)
-        values = {vb["oid"]: vb["value"] for vb in response.varbinds
-                  if vb["type"] not in ("noSuchObject", "noSuchInstance",
-                                        "endOfMibView")}
-        if custom["all"] and is_v1:
-            values.update(self._identity_extras(device, config, custom["all"]))
-        identity = {
-            "sys_descr": values.get(nodeoids.SYSTEM_SCALARS["sys_descr"]) or "",
-            "sys_object_id": values.get(nodeoids.SYSTEM_SCALARS["sys_object_id"]) or "",
-            "sys_name": values.get(nodeoids.SYSTEM_SCALARS["sys_name"]) or "",
-            "sys_contact": values.get(nodeoids.SYSTEM_SCALARS["sys_contact"]) or "",
-            "sys_location": values.get(nodeoids.SYSTEM_SCALARS["sys_location"]) or "",
-        }
-        # The zero-SNMP half of vendor identification, every poll: a manual
-        # or learned vendor, a real vendor arc in sysObjectID, the walk this
-        # device already had for this sysObjectID, then the sysDescr guess.
-        # See vendorid.poll_decision for the order and why.
-        detected, source, confidence, vendor_arc = vendorid.poll_decision(
-            identity["sys_object_id"], identity["sys_descr"], device,
-            self.db.learned_vendor(identity["sys_object_id"]))
-        # Always stored, always what the behavioural readers use — a custom
-        # vendor name replaces the display value only (see
-        # nodesdb.detected_vendor).
-        identity["vendor_detected"] = detected
-        identity["vendor"], identity["vendor_source"] = detected, source
-        identity["vendor_confidence"] = confidence
-        identity["vendor_arc"] = vendor_arc
+        # One socket from here through the UCD-SNMP read below -- the whole
+        # span is in the try, not just the first GET, since an exception
+        # from anything in between (a v1 identity extra, a credential
+        # verdict out of _poll_software_version) leaked this socket too.
+        session = self._session_for(device, config)
+        try:
+            response = self._snmp_get_on(session, device, config, oids)
+            values = {vb["oid"]: vb["value"] for vb in response.varbinds
+                      if vb["type"] not in ("noSuchObject", "noSuchInstance",
+                                            "endOfMibView")}
+            if custom["all"] and is_v1:
+                values.update(self._identity_extras(device, config, custom["all"]))
+            identity = {
+                "sys_descr": values.get(nodeoids.SYSTEM_SCALARS["sys_descr"]) or "",
+                "sys_object_id": values.get(nodeoids.SYSTEM_SCALARS["sys_object_id"]) or "",
+                "sys_name": values.get(nodeoids.SYSTEM_SCALARS["sys_name"]) or "",
+                "sys_contact": values.get(nodeoids.SYSTEM_SCALARS["sys_contact"]) or "",
+                "sys_location": values.get(nodeoids.SYSTEM_SCALARS["sys_location"]) or "",
+            }
+            # The zero-SNMP half of vendor identification, every poll: a manual
+            # or learned vendor, a real vendor arc in sysObjectID, the walk this
+            # device already had for this sysObjectID, then the sysDescr guess.
+            # See vendorid.poll_decision for the order and why.
+            detected, source, confidence, vendor_arc = vendorid.poll_decision(
+                identity["sys_object_id"], identity["sys_descr"], device,
+                self.db.learned_vendor(identity["sys_object_id"]))
+            # Always stored, always what the behavioural readers use — a custom
+            # vendor name replaces the display value only (see
+            # nodesdb.detected_vendor).
+            identity["vendor_detected"] = detected
+            identity["vendor"], identity["vendor_source"] = detected, source
+            identity["vendor_confidence"] = confidence
+            identity["vendor_arc"] = vendor_arc
 
-        custom_vendor = nodeoids.first_text(values, custom["vendor"])
-        if custom_vendor:
-            identity["vendor"] = custom_vendor
-            identity["vendor_source"] = "oid"
-        custom_location = nodeoids.first_text(values, custom["location"])
-        if custom_location:
-            identity["sys_location"] = custom_location
+            custom_vendor = nodeoids.first_text(values, custom["vendor"])
+            if custom_vendor:
+                identity["vendor"] = custom_vendor
+                identity["vendor_source"] = "oid"
+            custom_location = nodeoids.first_text(values, custom["location"])
+            if custom_location:
+                identity["sys_location"] = custom_location
 
-        uptime = values.get(nodeoids.SYSTEM_SCALARS["sys_uptime"])
-        uptime_ticks = int(uptime) if isinstance(uptime, (int, float)) else None
-        # _sw_walk_due tells a reboot from a re-poll with this.
-        identity["sys_uptime_ticks"] = uptime_ticks
+            uptime = values.get(nodeoids.SYSTEM_SCALARS["sys_uptime"])
+            uptime_ticks = int(uptime) if isinstance(uptime, (int, float)) else None
+            # _sw_walk_due tells a reboot from a re-poll with this.
+            identity["sys_uptime_ticks"] = uptime_ticks
 
-        identity.update(self._poll_software_version(device, config, identity))
+            identity.update(self._poll_software_version(device, config, identity))
 
-        metrics = []
+            metrics = []
 
-        def read_ucd_snmp():        # best-effort: often not present at all
-            extra_response = self._snmp_get(device, config, list(nodeoids.UCD_SNMP.values()))
-            extra = {vb["oid"]: vb["value"] for vb in extra_response.varbinds
-                     if vb["type"] not in ("noSuchObject", "noSuchInstance")}
-            idle = extra.get(nodeoids.UCD_SNMP["cpu_raw_idle"])
-            if isinstance(idle, (int, float)):
-                metrics.append(("cpu_pct", "CPU", "%", "gauge", max(0.0, 100.0 - float(idle))))
-            avail = extra.get(nodeoids.UCD_SNMP["mem_avail_kb"])
-            total = extra.get(nodeoids.UCD_SNMP["mem_total_kb"])
-            if isinstance(avail, (int, float)) and isinstance(total, (int, float)) and total:
-                metrics.append(("mem_pct", "Memory", "%", "gauge",
-                               max(0.0, 100.0 * (1 - float(avail) / float(total)))))
+            def read_ucd_snmp():        # best-effort: often not present at all
+                # Probe-once-remember'd like _mau_capable.
+                capable = self._ucd_capable.get(device_id)
+                due = (time.time() - self._ucd_read.get(device_id, 0.0)
+                      >= self._SENSOR_REPROBE_S)
+                if capable is False and not due:
+                    return
+                self._ucd_read[device_id] = time.time()
+                extra_response = self._snmp_get_on(session, device, config,
+                                                   list(nodeoids.UCD_SNMP.values()))
+                extra = {vb["oid"]: vb["value"] for vb in extra_response.varbinds
+                         if vb["type"] not in ("noSuchObject", "noSuchInstance")}
+                if extra:
+                    self._ucd_capable[device_id] = True
+                elif capable is None:
+                    self._ucd_capable[device_id] = False
+                idle = extra.get(nodeoids.UCD_SNMP["cpu_raw_idle"])
+                if isinstance(idle, (int, float)):
+                    metrics.append(("cpu_pct", "CPU", "%", "gauge", max(0.0, 100.0 - float(idle))))
+                avail = extra.get(nodeoids.UCD_SNMP["mem_avail_kb"])
+                total = extra.get(nodeoids.UCD_SNMP["mem_total_kb"])
+                if isinstance(avail, (int, float)) and isinstance(total, (int, float)) and total:
+                    metrics.append(("mem_pct", "Memory", "%", "gauge",
+                                   max(0.0, 100.0 * (1 - float(avail) / float(total)))))
 
-        self._best_effort(f"UCD-SNMP read for {device['ip']}", read_ucd_snmp)
+            self._best_effort(f"UCD-SNMP read for {device['ip']}", read_ucd_snmp)
+        finally:
+            session.close()
 
         metrics.extend(self._poll_vendor_health(device, config, identity,
                                                 already={m[0] for m in metrics}))

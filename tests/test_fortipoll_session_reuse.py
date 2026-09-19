@@ -1,9 +1,10 @@
-"""_snmp_get_next used to open a new _Session (a UDP socket) for every
-GETNEXT inside _walk_column's loop. _walk_column now opens one session for
-the whole walk and reuses it. Same PDUs/request ids/timeouts/retries/error
-mapping -- this pins only that the socket count drops to one per walk (not
-one per row), that _poll_controller opens exactly one per column walked, and
-that the walked values are unchanged, against the real stub agent."""
+"""_snmp_walk_request (formerly _snmp_get_next) used to open a new _Session
+(a UDP socket) for every request inside _walk_column's loop. _walk_column
+now opens one session for the whole walk and reuses it. Same PDUs/request
+ids/timeouts/retries/error mapping -- this pins only that the socket count
+drops to one per walk (not one per row), that _poll_controller opens exactly
+one per column walked, and that the walked values are unchanged, against the
+real stub agent."""
 import os
 import sys
 
@@ -93,16 +94,19 @@ def main():
 
         counts = {"opened": 0, "closed": 0}
         fortipoll_mod._Session = counting_session(counts)
-        real_get_next = poller._snmp_get_next
+        real_walk_request = poller._snmp_walk_request
         calls = {"n": 0}
 
-        def failing_get_next(*args, **kwargs):
+        # Raised on the very first request, not the second: with GETBULK a
+        # two-row column can finish in one round trip, so only the first
+        # call is guaranteed to happen whichever protocol the walk used.
+        def failing_walk_request(*args, **kwargs):
             calls["n"] += 1
-            if calls["n"] == 2:
+            if calls["n"] == 1:
                 raise fortipoll_mod.SnmpError("stub-injected failure")
-            return real_get_next(*args, **kwargs)
+            return real_walk_request(*args, **kwargs)
 
-        poller._snmp_get_next = failing_get_next
+        poller._snmp_walk_request = failing_walk_request
         try:
             try:
                 poller._walk_column(controller, config, oids.WTP_SESSION_MAC)
@@ -110,7 +114,7 @@ def main():
             except fortipoll_mod.SnmpError:
                 raised = True
         finally:
-            poller._snmp_get_next = real_get_next
+            poller._snmp_walk_request = real_walk_request
             fortipoll_mod._Session = real_session
 
         check(raised, "the injected failure reaches _walk_column's caller")

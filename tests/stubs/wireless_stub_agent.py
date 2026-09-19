@@ -1,8 +1,8 @@
 """A minimal UDP SNMP stub agent serving a synthetic fgWc AP table
 (fgWcWtpConfigTable / fgWcWtpSessionTable / fgWcWtpSessionRadioTable /
-fgWcWtpProfileRadioTable) for testing WirelessPoller's GETNEXT table-walking
-end to end, without a real FortiGate Wireless Controller. Only implements what
-the poller actually uses: v2c GETNEXT over exactly the fgWc OIDs in
+fgWcWtpProfileRadioTable) for testing WirelessPoller's table-walking end to
+end, without a real FortiGate Wireless Controller. Only implements what the
+poller actually uses: v2c GETNEXT/GETBULK over exactly the fgWc OIDs in
 nodeoids.py.
 
 An optional second argument names a mutation file, re-read before every reply,
@@ -12,6 +12,11 @@ which lets a suite change what the controller reports between two polls:
     AP0001.session_uptime=900    session column 10
     AP0001.2.channel=149         radio 2's operating channel
     AP0001.1.mode=4              radio 1's FgWcWtpRadioMode
+
+An optional third argument is the AP count -- the first two are always the
+original, hand-specified pair every fixture-driven test keys on; anything
+beyond that is a templated online AP with one radio, for tests that only
+care about scale.
 """
 import os
 import socket
@@ -20,7 +25,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))))  # the repo root, from tests/stubs/
 from netpath import nodeoids as oids  # noqa: E402
-from netpath.snmppoll import decode_response  # noqa: E402
+from netpath.snmppoll import PDU_GETBULK, decode_response  # noqa: E402
 from netpath.trapdecode import (  # noqa: E402
     PDU_RESPONSE, T_END_OF_MIB_VIEW, T_SEQUENCE, V2C, _tlv, enc_int,
     enc_octets, enc_oid, enc_varbind,
@@ -34,9 +39,12 @@ def wtp_suffix(vdom: str, wtp_id: str) -> str:
     return f"{vdom}.{len(wtp_id)}.{chars}"
 
 
-def aps():
-    """Two synthetic APs, one online with two radios, one offline."""
-    return [
+def aps(count: int = 2):
+    """The first two are the original, hand-specified pair (one online with
+    two radios, one offline) every fixture-driven test keys on; `count`
+    beyond that appends templated online single-radio APs, for a test that
+    only cares about scale (request counts at N APs)."""
+    base = [
         {"vdom": "1", "wtp_id": "AP0001", "name": "Lobby-AP", "mac": bytes.fromhex("00119300aabb"),
          "state": 2, "model": "FAP231F", "clients": 14,
          # 127.0.0.1 rather than a routable-looking address so the poller's
@@ -57,6 +65,20 @@ def aps():
                      "bssid": bytes.fromhex("00119300ccf0"), "width": 2}],
         },
     ]
+    if count <= len(base):
+        return base[:max(count, 0)]
+    for i in range(len(base) + 1, count + 1):
+        hi, lo = (i >> 8) & 0xFF, i & 0xFF
+        base.append({
+            "vdom": "1", "wtp_id": f"AP{i:04d}", "name": f"AP-{i}",
+            "mac": bytes([0x00, 0x11, 0x93, 0x02, hi, lo]),
+            "state": 2, "model": "FAP231F", "clients": 1,
+            "ip": bytes([10, 40, hi, lo]),
+            "uptime": 100_000, "session_uptime": 90_000, "profile": "FAP231F-default",
+            "radios": [{"id": 1, "channel": 6, "power": 17, "clients": 1, "mode": 3,
+                        "bssid": bytes([0x00, 0x11, 0x93, 0x03, hi, lo]), "width": 1}],
+        })
+    return base
 
 
 def apply_overrides(table, overrides: dict) -> None:
@@ -88,8 +110,8 @@ def read_overrides(path: str | None) -> dict:
     return values
 
 
-def build_table(overrides: dict | None = None):
-    table_aps = aps()
+def build_table(overrides: dict | None = None, count: int = 2):
+    table_aps = aps(count)
     apply_overrides(table_aps, overrides or {})
 
     table: dict[str, bytes] = {}
@@ -140,9 +162,15 @@ def next_oid(table, requested):
     return None
 
 
-def build_reply(request_id, oid, value_bytes):
-    body = enc_varbind(oid, value_bytes) if value_bytes is not None else \
-        enc_varbind(oid, _tlv(T_END_OF_MIB_VIEW, b""))
+def build_reply(request_id, replies: list):
+    """`replies` is [(oid, value_bytes_or_None), ...] -- one entry for a
+    GETNEXT answer, up to max-repetitions for a GETBULK one. None encodes
+    endOfMibView, RFC 3416's padding once a GETBULK repetition runs off
+    the end of the table."""
+    body = b"".join(
+        enc_varbind(oid, value_bytes) if value_bytes is not None
+        else enc_varbind(oid, _tlv(T_END_OF_MIB_VIEW, b""))
+        for oid, value_bytes in replies)
     pdu = _tlv(PDU_RESPONSE, enc_int(request_id) + enc_int(0) + enc_int(0) +
               _tlv(T_SEQUENCE, body))
     return _tlv(T_SEQUENCE, enc_int(V2C) + enc_octets(COMMUNITY) + pdu)
@@ -151,8 +179,9 @@ def build_reply(request_id, oid, value_bytes):
 def main():
     port = int(sys.argv[1])
     state_path = sys.argv[2] if len(sys.argv) > 2 else None
+    ap_count = int(sys.argv[3]) if len(sys.argv) > 3 else 2
     overrides = read_overrides(state_path)
-    table = build_table(overrides)
+    table = build_table(overrides, ap_count)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(("127.0.0.1", port))
     print(f"wireless stub agent listening on 127.0.0.1:{port} "
@@ -162,7 +191,7 @@ def main():
         fresh = read_overrides(state_path)
         if fresh != overrides:
             overrides = fresh
-            table = build_table(overrides)
+            table = build_table(overrides, ap_count)
         try:
             request = decode_response(data)
         except Exception as exc:
@@ -171,10 +200,20 @@ def main():
         if not request.varbinds:
             continue
         requested = request.varbinds[0]["oid"]
-        nxt = next_oid(table, requested)
-        reply_oid = nxt or requested
-        value = table.get(nxt) if nxt else None
-        sock.sendto(build_reply(request.request_id, reply_oid, value), addr)
+        # error_index doubles as max-repetitions for a GETBULK request (same
+        # wire position, see snmppoll.build_request); a GETNEXT answers one.
+        repetitions = (max(1, request.error_index)
+                      if request.pdu_tag == PDU_GETBULK else 1)
+        replies = []
+        current = requested
+        for _ in range(repetitions):
+            nxt = next_oid(table, current)
+            if nxt is None:
+                replies.append((current, None))
+                continue
+            replies.append((nxt, table[nxt]))
+            current = nxt
+        sock.sendto(build_reply(request.request_id, replies), addr)
 
 
 if __name__ == "__main__":

@@ -11,9 +11,10 @@ FortiGate deployment has asked for it and a half-wired level is worse
 than an absent one. A signed reply's digest IS verified here since 5.8.0,
 the same way Nodes verifies it.
 
-Table walking here is repeated GETNEXT, not GETBULK: a handful of
-controllers is not an estate of switches, so the request-count problem
-GETBULK solves for nodepoll's `_walk_column` does not arise.
+Table walking uses GETBULK on v2c/v3 (5.49.0) and GETNEXT on v1, the same
+split nodepoll's own walk makes, over the same wire-format functions --
+a large FortiGate's per-AP/per-radio columns made this the same
+request-count problem nodepoll's walk already solved.
 """
 
 from __future__ import annotations
@@ -30,7 +31,7 @@ from . import nodeoids as oids
 from .eventlog import ERROR, NullLog, WIRELESS
 from .nodeoids import oid_key
 from .nodepoll import EngineCache, _AuthFailure, _Session, credential_for, snmp_version_of, v3_exchange
-from .snmppoll import PDU_GETNEXT, SnmpError, build_request
+from .snmppoll import PDU_GETBULK, PDU_GETNEXT, SnmpError, SnmpTimeout, build_request
 from .wirelessdb import WirelessDatabase
 from .worker import Worker
 
@@ -50,6 +51,19 @@ SNMP_PORT = 161
 # Like nodepoll's _STARTUP_SPREAD_S: breaks the phase lock of controllers seeded due at 0 together.
 POLL_SPREAD_S = 30.0
 
+# nodepoll's own shipped default (snmp_bulk_max_repetitions) -- there is no
+# per-controller equivalent setting here, so one constant serves every walk.
+BULK_MAX_REPETITIONS = 40
+
+# Same interval identify_mixin.py's _IDENTIFY_RETRY_S uses for its own
+# bounded re-probe: a controller latched to GETNEXT-only is tried with
+# GETBULK again this often, in case whatever refused or dropped it changed.
+BULK_RETRY_S = 3600.0
+
+# Same cap _walk_column has always enforced, now on rows rather than
+# requests: one GETBULK response can carry many rows.
+_WALK_MAX_ROWS = 4096
+
 
 class WirelessPoller(Worker):
     STOPPED_TEXT = "Poller stopped"
@@ -59,6 +73,13 @@ class WirelessPoller(Worker):
         self.db = db
         self.log = log or NullLog()
         self._engines = EngineCache()
+        # controller id -> learned GETBULK max_repetitions, 0 = GETNEXT only
+        # (a controller that ever answers tooBig at repetitions=1). Mirrors
+        # nodepoll's own _bulk_repetitions.
+        self._bulk_repetitions: dict[int, int] = {}
+        # controller id -> when a 0 verdict above was last recorded, for the
+        # hourly re-probe in _bulk_settings.
+        self._bulk_last_probe: dict[int, float] = {}
         self._executor: ThreadPoolExecutor | None = None
         self._stop = threading.Event()
         self._queued: set[int] = set()
@@ -215,6 +236,10 @@ class WirelessPoller(Worker):
         for gone in [cid for cid in self._next_run if cid not in live]:
             self._next_run.pop(gone, None)
         self._engines.forget(live)
+        # A reused controller id must not inherit a stale GETBULK verdict.
+        for gone in [cid for cid in self._bulk_repetitions if cid not in live]:
+            self._bulk_repetitions.pop(gone, None)
+            self._bulk_last_probe.pop(gone, None)
 
     def _run_one(self, controller_id: int) -> None:
         try:
@@ -420,60 +445,126 @@ class WirelessPoller(Worker):
 
     # ------------------------------------------------------------ SNMP layer
 
+    def _bulk_settings(self, controller, config: dict) -> tuple[bool, int]:
+        """(use GETBULK, repetitions) for a walk of this controller -- the
+        same per-controller memory nodepoll's own _bulk_settings keeps, so
+        a controller that answered tooBig (or refused GETBULK outright) is
+        not re-asked with it on every column of every poll; a GETNEXT-only
+        verdict is retried with GETBULK again after BULK_RETRY_S."""
+        if int(config.get("snmp_version") or 0) == 0:
+            return False, 0
+        controller_id = controller["id"]
+        learned = self._bulk_repetitions.get(controller_id)
+        if learned == 0:
+            last_probe = self._bulk_last_probe.get(controller_id)
+            if last_probe is None or time.time() - last_probe < BULK_RETRY_S:
+                return False, 0
+        return True, (learned or BULK_MAX_REPETITIONS)
+
+    def _remember_repetitions(self, controller, repetitions: int, *,
+                              use_bulk: bool = True) -> None:
+        controller_id = controller["id"]
+        self._bulk_repetitions[controller_id] = (
+            max(1, int(repetitions)) if use_bulk else 0)
+        if not use_bulk:
+            self._bulk_last_probe[controller_id] = time.time()
+
+    def forget_bulk_verdict(self, controller_id: int) -> None:
+        """Clears a controller's learned GETBULK verdict, so an operator's
+        Poll Now after fixing a path re-probes at once rather than waiting
+        for the hourly retry."""
+        self._bulk_repetitions.pop(controller_id, None)
+        self._bulk_last_probe.pop(controller_id, None)
+
     def _walk_column(self, controller, config: dict, base_oid: str,
                      verify_replies: bool = True) -> dict[str, object]:
         values: dict[str, object] = {}
         current = base_oid
+        controller_id = controller["id"]
+        use_bulk, max_repetitions = self._bulk_settings(controller, config)
+        # Only this walk's very first, never-tried request gets the timeout downgrade below.
+        untried_first_request = use_bulk and controller_id not in self._bulk_repetitions
         # One socket for the whole walk, not one per row.
         session = _Session(controller["ip"], SNMP_PORT, 3.0, 2)
+        hit_cap = False
         try:
-            for _ in range(4096):
-                response = self._snmp_get_next(
-                    controller, config, current, session, verify_replies)
+            while True:
+                pdu_tag = PDU_GETBULK if use_bulk else PDU_GETNEXT
+                try:
+                    response = self._snmp_walk_request(
+                        controller, config, current, session, pdu_tag,
+                        max_repetitions, verify_replies)
+                except SnmpTimeout:
+                    if not untried_first_request:
+                        raise
+                    # A large GETBULK reply can exceed path MTU on a tunnelled link.
+                    use_bulk = False
+                    response = self._snmp_walk_request(
+                        controller, config, current, session, PDU_GETNEXT,
+                        0, verify_replies)
+                    self._remember_repetitions(controller, 0, use_bulk=False)
+                untried_first_request = False
+                if use_bulk and response.error_status == 1:   # tooBig
+                    if max_repetitions <= 1:
+                        use_bulk = False
+                        self._remember_repetitions(controller, 0, use_bulk=False)
+                    else:
+                        max_repetitions = max(1, max_repetitions // 2)
+                        self._remember_repetitions(controller, max_repetitions)
+                    continue
+                if use_bulk and response.error_status and not values:
+                    # Any other error status (genErr etc.) before any row came back -- GETBULK is refused outright.
+                    use_bulk = False
+                    self._remember_repetitions(controller, 0, use_bulk=False)
+                    continue
                 if not response.varbinds:
                     break
-                vb = response.varbinds[0]
-                oid = vb["oid"]
-                if not oid or not (oid == base_oid or oid.startswith(base_oid + ".")):
+                stop = False
+                # GETBULK answers many rows per response, GETNEXT one -- both walk this same loop.
+                for vb in response.varbinds:
+                    oid = vb["oid"]
+                    if not oid or not (oid == base_oid or oid.startswith(base_oid + ".")):
+                        stop = True
+                        break
+                    if vb["type"] in ("noSuchObject", "noSuchInstance", "endOfMibView"):
+                        stop = True
+                        break
+                    if oid_key(oid) <= oid_key(current):
+                        # A stuck or malicious agent that never answers a later OID would spin forever otherwise.
+                        stop = True
+                        break
+                    values[oid[len(base_oid) + 1:]] = vb["value"]
+                    current = oid
+                    if len(values) >= _WALK_MAX_ROWS:
+                        hit_cap = True
+                        stop = True
+                        break
+                if stop:
                     break
-                if vb["type"] in ("noSuchObject", "noSuchInstance", "endOfMibView"):
-                    break
-                if oid_key(oid) <= oid_key(current):
-                    # A broken or malicious agent that keeps answering GETNEXT
-                    # with the same OID (or one that sorts no later) would
-                    # otherwise spin through every iteration below, writing
-                    # the same dict key each time and ending with a silently
-                    # one-entry table. nodepoll.py's own walk
-                    # (_walk_column_status) guards against exactly this by
-                    # requiring the returned OID to have lexicographically
-                    # advanced; mirrored here.
-                    break
-                values[oid[len(base_oid) + 1:]] = vb["value"]
-                current = oid
-            else:
-                # The loop ran all 4096 iterations without ever breaking out
-                # -- unlike nodepoll.py's walk, which logs when it hits its
-                # row cap, this used to end with a truncated table and no
-                # sign anything was cut short.
-                self.log.add(WIRELESS, f"Table walk of {base_oid} on {controller['ip']} "
-                                       f"stopped at the 4096-row cap",
-                             target=controller["ip"])
         finally:
             session.close()
+        if hit_cap:
+            self.log.add(WIRELESS, f"Table walk of {base_oid} on {controller['ip']} "
+                                   f"stopped at the {_WALK_MAX_ROWS}-row cap",
+                         target=controller["ip"])
         return values
 
-    def _snmp_get_next(self, controller, config: dict, oid: str, session: "_Session",
-                       verify_replies: bool = True):
-        """One GETNEXT on a session the caller owns (opened and closed once
-        for the whole walk in _walk_column, not once per row)."""
+    def _snmp_walk_request(self, controller, config: dict, oid: str,
+                           session: "_Session", pdu_tag: int, max_repetitions: int,
+                           verify_replies: bool = True):
+        """One GETNEXT/GETBULK round trip on a session the caller owns
+        (opened and closed once for the whole walk in _walk_column, not once
+        per row). non_repeaters is always 0: every walk here is over a
+        single column. `max_repetitions` is ignored by build_request/
+        v3_exchange for a GETNEXT pdu_tag, so a v1 caller passes it unused."""
         version = snmp_version_of(config)
         if version in (0, 1):
             identity = credential_for(config).identity
             request_id = session.next_request_id()
-            packet = build_request(version, identity or "public", PDU_GETNEXT,
-                                   request_id, [oid])
+            packet = build_request(version, identity or "public", pdu_tag,
+                                   request_id, [oid], max_repetitions=max_repetitions)
             # The id filter is what makes a late reply to the previous
-            # GETNEXT a dropped datagram rather than this one's answer.
+            # request a dropped datagram rather than this one's answer.
             return session.request(packet, expect_request_id=request_id)
         # Shared with NodePoller (engineTime, Report retry, msgID). The
         # priv args below are always None: controllers has no priv columns.
@@ -485,9 +576,10 @@ class WirelessPoller(Worker):
 
         try:
             return v3_exchange(
-                session, PDU_GETNEXT, [oid], identity=credential.identity,
+                session, pdu_tag, [oid], identity=credential.identity,
                 auth_proto=credential.auth_proto, password=credential.auth_password,
                 engine=self._engines.current(controller_id),
+                max_repetitions=max_repetitions,
                 ip=controller["ip"], learned=learned,
                 priv_proto=credential.priv_proto, priv_password=credential.priv_password,
                 verify_replies=verify_replies)

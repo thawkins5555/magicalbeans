@@ -4922,6 +4922,14 @@ else:
           "moment check() resolves, before its visible budget is spent "
           "(got: %s)" % _stoppedEarly)
 
+# ---------------------------------------------------------------------------
+# 102. Release C performance (5.49.0): the Nodes table's own list fetch asks
+#      for the table's projection, not the whole 25-column row per device.
+NODES102 = read("nodes.js")
+_REFRESH102 = js_function(NODES102, "refresh")
+check("App.get('/api/nodes/devices', { ...query, fields: 'list' })" in _REFRESH102,
+      "nodes.js's device list refresh asks for the 'list' projection")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

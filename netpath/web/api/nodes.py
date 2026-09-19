@@ -49,7 +49,12 @@ SECRET_COLUMNS = frozenset({
 })
 
 
-def _device_json(row, reveal: bool = False) -> dict:
+def _device_json(row, reveal: bool = False, keys: frozenset | None = None) -> dict:
+    # `keys` lets a caller looping over many rows from the same query (all
+    # sharing the same columns) compute row.keys() once instead of ~25
+    # times per row -- see _device_rows_json.
+    if keys is None:
+        keys = frozenset(row.keys())
     overrides = nodesdb.override_fields(row)
     return {
         "id": row["id"], "ip": row["ip"], "name": row["name"],
@@ -68,24 +73,24 @@ def _device_json(row, reveal: bool = False) -> dict:
         "ping_enabled": _tri(row["ping_enabled"]),
         "snmp_enabled": _tri(row["snmp_enabled"]),
         "oid_set": row["oid_set"], "mib_file_id": row["mib_file_id"],
-        "mib_file_auto": bool(row["mib_file_auto"]) if "mib_file_auto" in row.keys() else False,
+        "mib_file_auto": bool(row["mib_file_auto"]) if "mib_file_auto" in keys else False,
         "ping_count": row["ping_count"], "ping_timeout_ms": row["ping_timeout_ms"],
         "unreachable_ping_only": row["unreachable_ping_only"],
         "mac_table_interval_s": row["mac_table_interval_s"],
         # The same inherit-via-NULL override columns mac_table_interval_s
         # models, read defensively for a row fetched before the migration
         # that added them has run.
-        "lldp_interval_s": (row["lldp_interval_s"] if "lldp_interval_s" in row.keys() else None),
+        "lldp_interval_s": (row["lldp_interval_s"] if "lldp_interval_s" in keys else None),
         # Per-port VLAN membership walk interval, inheritable and defensively
         # keyed the same way lldp_interval_s immediately above is -- added in
         # the same migration, read the same way for a row from before it ran.
-        "vlan_interval_s": (row["vlan_interval_s"] if "vlan_interval_s" in row.keys() else None),
+        "vlan_interval_s": (row["vlan_interval_s"] if "vlan_interval_s" in keys else None),
         # ARP-cache walk interval: the same inherit-via-NULL override as the
         # three above, defensively keyed for the same reason, and the one
         # whose _merge_config fallback is 0 rather than an hour (see there).
-        "arp_table_interval_s": (row["arp_table_interval_s"] if "arp_table_interval_s" in row.keys() else None),
-        "poe_enabled": (_tri(row["poe_enabled"]) if "poe_enabled" in row.keys() else None),
-        "stp_enabled": (_tri(row["stp_enabled"]) if "stp_enabled" in row.keys() else None),
+        "arp_table_interval_s": (row["arp_table_interval_s"] if "arp_table_interval_s" in keys else None),
+        "poe_enabled": (_tri(row["poe_enabled"]) if "poe_enabled" in keys else None),
+        "stp_enabled": (_tri(row["stp_enabled"]) if "stp_enabled" in keys else None),
         # The capability probe's verdict — True/False once probed, None
         # until the first poll gets to it — and, once stp_capable is true,
         # the bridge-wide state the device pane's BRIDGE & RF subtab reads.
@@ -93,24 +98,24 @@ def _device_json(row, reveal: bool = False) -> dict:
         # instead (see get_nodes_device_interfaces); the topology-change
         # COUNT is a metric with history (see get_nodes_device_metrics), not a column
         # here — this is the device's current bridge identity, not a series.
-        "poe_capable": (bool(row["poe_capable"]) if "poe_capable" in row.keys()
+        "poe_capable": (bool(row["poe_capable"]) if "poe_capable" in keys
                         and row["poe_capable"] is not None else None),
-        "stp_capable": (bool(row["stp_capable"]) if "stp_capable" in row.keys()
+        "stp_capable": (bool(row["stp_capable"]) if "stp_capable" in keys
                         and row["stp_capable"] is not None else None),
-        "stp_protocol_spec": (row["stp_protocol_spec"] if "stp_protocol_spec" in row.keys() else None),
-        "stp_priority": (row["stp_priority"] if "stp_priority" in row.keys() else None),
-        "stp_root_id": (row["stp_root_id"] if "stp_root_id" in row.keys() else None),
-        "stp_root_cost": (row["stp_root_cost"] if "stp_root_cost" in row.keys() else None),
-        "stp_root_port": (row["stp_root_port"] if "stp_root_port" in row.keys() else None),
+        "stp_protocol_spec": (row["stp_protocol_spec"] if "stp_protocol_spec" in keys else None),
+        "stp_priority": (row["stp_priority"] if "stp_priority" in keys else None),
+        "stp_root_id": (row["stp_root_id"] if "stp_root_id" in keys else None),
+        "stp_root_cost": (row["stp_root_cost"] if "stp_root_cost" in keys else None),
+        "stp_root_port": (row["stp_root_port"] if "stp_root_port" in keys else None),
         "stp_time_since_change_s": (row["stp_time_since_change_s"]
-                                    if "stp_time_since_change_s" in row.keys() else None),
-        "upstream_id": (row["upstream_id"] if "upstream_id" in row.keys() else None),
+                                    if "stp_time_since_change_s" in keys else None),
+        "upstream_id": (row["upstream_id"] if "upstream_id" in keys else None),
         # Vendor identification (4.32): keyed defensively for a row handed
         # in from an older-shaped source.
         "vendor_confidence": (row["vendor_confidence"] or ""
-                              if "vendor_confidence" in row.keys() else ""),
+                              if "vendor_confidence" in keys else ""),
         "vendor_override": (row["vendor_override"]
-                            if "vendor_override" in row.keys() else None),
+                            if "vendor_override" in keys else None),
         "sys_descr": row["sys_descr"], "sys_name": row["sys_name"],
         "sys_object_id": row["sys_object_id"], "sys_contact": row["sys_contact"],
         "sys_location": row["sys_location"], "vendor": row["vendor"],
@@ -131,14 +136,14 @@ def _device_json(row, reveal: bool = False) -> dict:
         # _refresh_default_gateway — comma-joined when more than one, "" when
         # unset or the last read found none.
         "default_gateway": ((row["default_gateway"] or "")
-                            if "default_gateway" in row.keys() else ""),
+                            if "default_gateway" in keys else ""),
         # sw_image_file is Cisco's boot image path, not a version.
-        "sw_version": (row["sw_version"] if "sw_version" in row.keys() else None),
-        "fw_version": (row["fw_version"] if "fw_version" in row.keys() else None),
-        "sw_image": (row["sw_image"] if "sw_image" in row.keys() else None),
-        "sw_image_file": (row["sw_image_file"] if "sw_image_file" in row.keys() else None),
-        "sw_source": (row["sw_source"] if "sw_source" in row.keys() else None),
-        "fw_source": (row["fw_source"] if "fw_source" in row.keys() else None),
+        "sw_version": (row["sw_version"] if "sw_version" in keys else None),
+        "fw_version": (row["fw_version"] if "fw_version" in keys else None),
+        "sw_image": (row["sw_image"] if "sw_image" in keys else None),
+        "sw_image_file": (row["sw_image_file"] if "sw_image_file" in keys else None),
+        "sw_source": (row["sw_source"] if "sw_source" in keys else None),
+        "fw_source": (row["fw_source"] if "fw_source" in keys else None),
         "status": row["status"], "ping_ok": _tri(row["ping_ok"]),
         "ping_rtt_ms": row["ping_rtt_ms"], "snmp_ok": _tri(row["snmp_ok"]),
         "snmp_error": row["snmp_error"], "consecutive_fail": row["consecutive_fail"],
@@ -151,8 +156,8 @@ def _device_json(row, reveal: bool = False) -> dict:
         # Web-interface fields for the WEB relay, keyed defensively for a
         # pre-migration row. `web_port_effective` is resolved here so the
         # form can show a placeholder without repeating the 80/443 rule.
-        "web_scheme": (row["web_scheme"] if "web_scheme" in row.keys() else None),
-        "web_port": (row["web_port"] if "web_port" in row.keys() else None),
+        "web_scheme": (row["web_scheme"] if "web_scheme" in keys else None),
+        "web_port": (row["web_port"] if "web_port" in keys else None),
         "web_port_effective": _web_port_effective(row),
     }
 
@@ -379,9 +384,12 @@ def _device_rows_json(service, params, rows) -> list[dict]:
     # per row.
     aliases = service.nodes_db.addresses_for_devices(row["id"] for row in rows)
     reveal = _may_read_secrets(service, params, "nodes")
+    # Every row here comes from the one `devices()` query, so they share one
+    # column set -- computed once rather than by every _device_json call.
+    keys = frozenset(rows[0].keys()) if rows else frozenset()
     devices = []
     for row in rows:
-        device = _device_json(row, reveal)
+        device = _device_json(row, reveal, keys)
         device["polling"] = row["id"] in worker_state
         device["muted_until"] = muted.get(str(row["id"]))
         device["rule_muted_count"] = rule_muted_counts.get(row["id"], 0)
@@ -404,6 +412,26 @@ def _device_index_rows_json(service, params, rows) -> list[dict]:
     return [{field: row[field] for field in _DEVICE_INDEX_FIELDS} for row in rows]
 
 
+# Every field any nodes.js COLUMNS entry reads, on or off by default -- everything else there is unused.
+_DEVICE_LIST_FIELDS = frozenset({
+    "id", "status", "name", "sys_name", "ip", "display_name_source",
+    "addresses", "maintenance", "muted_until", "rule_muted_count",
+    "override_count", "override_fields", "group_id", "device_group_id",
+    "vendor", "vendor_source", "vendor_confidence",
+    "ping_rtt_ms", "snmp_ok", "ping_ok", "last_poll_ts", "sys_uptime_s",
+    "sys_location", "sys_contact", "sys_object_id",
+    "sw_version", "sw_image", "fw_version",
+})
+
+
+def _device_list_rows_json(service, params, rows) -> list[dict]:
+    """The Nodes table's own projection of _device_rows_json -- same
+    permission gate and secret redaction, since it is that same output
+    filtered down."""
+    return [{k: v for k, v in device.items() if k in _DEVICE_LIST_FIELDS}
+            for device in _device_rows_json(service, params, rows)]
+
+
 # Paging here is opt-in, not the default: a caller that sends neither
 # `limit` nor `offset` still gets the whole fleet back, because nothing here
 # can be sure it is the only caller (test_frontend_contracts.py and tests/ui/
@@ -423,11 +451,10 @@ def get_nodes_devices(service, params, body) -> dict:
             return {"devices": [], "total": 0}
         filters["only_ids"] = only_ids
     total = service.nodes_db.devices_count(**filters)
-    # `fields=index` is app.js's shared ip->device / id->device cache, which
-    # reads seven columns and was being handed the whole 25-column row for
-    # every device in the fleet, every thirty seconds, per open tab. Paging
-    # is unchanged; only the projection differs.
-    to_json = (_device_index_rows_json if params.get("fields") == "index"
+    # fields=index/list trim the row for app.js's cache / nodes.js's table; no `fields` keeps the full row.
+    field_mode = params.get("fields")
+    to_json = (_device_index_rows_json if field_mode == "index"
+               else _device_list_rows_json if field_mode == "list"
                else _device_rows_json)
     if params.get("limit") is None and params.get("offset") is None:
         rows = service.nodes_db.devices(**filters)

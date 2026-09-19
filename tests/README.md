@@ -110,6 +110,14 @@ deadline math would hang rather than silently pass), and
 rather than trusting `ping.exe`'s exit code alone, and decodes localised
 Windows ping output with `errors="replace"` instead of raising).
 
+5.49.0 added one suite: `test_fortipoll_getbulk.py` (the FortiGate/wireless
+poller's table walk under its new GETBULK path: the stored AP/radio rows
+come out identical whether a controller was walked with GETBULK or
+GETNEXT, a large AP count needs far fewer round trips under GETBULK, a
+too-big reply halves the batch size and the walk still completes, and a
+controller that refuses GETBULK outright falls back to GETNEXT once and
+is never asked with GETBULK again for the life of the poller).
+
 One family is worth calling out by name: `test_frontend_contracts.py`,
 `test_time_contracts.py`, `test_layout_contracts.py`, `test_design_tokens.py`
 and `test_static_headers.py` read the shipped JS/HTML/CSS as text rather than
