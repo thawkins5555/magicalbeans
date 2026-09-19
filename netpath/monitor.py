@@ -185,6 +185,9 @@ class Monitor(Worker):
                         last = self.db.last_trace(target["id"])
                         due = (last["started_ts"] + target["interval_s"]) if last else now
                         self._next_run[target["id"]] = due
+                    elif due - now > target["interval_s"]:
+                        due = now + target["interval_s"]   # backward clock step
+                        self._next_run[target["id"]] = due
                     if now >= due:
                         self._next_run[target["id"]] = now + target["interval_s"]
                         if target["id"] in self.inflight():
@@ -890,6 +893,9 @@ class HttpsChecker(Worker):
                     if due is None:
                         row = last.get(target_id)
                         due = (row["ts"] + target["interval_s"]) if row else now
+                        self._next_run[target_id] = due
+                    elif due - now > target["interval_s"]:
+                        due = now + target["interval_s"]   # backward clock step
                         self._next_run[target_id] = due
                     if now >= due:
                         self._next_run[target_id] = now + target["interval_s"]

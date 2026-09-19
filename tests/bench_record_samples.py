@@ -76,27 +76,29 @@ def main(argv):
     db, device_id = build(os.path.join(folder, "per_row.db"), preload)
     batch = [(f"per_row.{i}", f"metric {i}", "u", "gauge", 0.0, float(i))
              for i in range(rows)]
-    started = time.monotonic()
+    started = time.perf_counter()
     for key, label, unit, kind, _ts, value in batch:
         record_one_at_a_time(db, device_id, key, label, unit, kind,
                              time.time(), value)
-    per_row_s = time.monotonic() - started
+    per_row_s = time.perf_counter() - started
     db.close()
 
     db, device_id = build(os.path.join(folder, "batched.db"), preload)
     now = time.time()
     batch = [(f"batched.{i}", f"metric {i}", "u", "gauge", now, float(i))
              for i in range(rows)]
-    started = time.monotonic()
+    started = time.perf_counter()
     db.record_metric_samples(device_id, batch)
-    batched_s = time.monotonic() - started
+    batched_s = time.perf_counter() - started
     db.close()
 
+    # perf_counter is high-resolution, but a handful of rows can still land
+    # at 0.000s; floor the divisor rather than let that raise.
     print(f"one commit per sample : {per_row_s:8.3f} s  "
-          f"{rows / per_row_s:12,.0f} samples/s")
+          f"{rows / max(per_row_s, 1e-9):12,.0f} samples/s")
     print(f"one commit per poll   : {batched_s:8.3f} s  "
-          f"{rows / batched_s:12,.0f} samples/s")
-    print(f"\nbatched is {per_row_s / batched_s:.0f}x faster for this poll")
+          f"{rows / max(batched_s, 1e-9):12,.0f} samples/s")
+    print(f"\nbatched is {per_row_s / max(batched_s, 1e-9):.0f}x faster for this poll")
     return 0
 
 

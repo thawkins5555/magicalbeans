@@ -18,7 +18,9 @@ Bob leads the team and is the interactive session. Bob is a Fable 5 genius devel
 - **Dingus2** (Haiku) — non-reasoning task
 - **Javariius** (Fable) — code review before any push to main
 
-Do not spawn any agent or teammate other than those listed.
+Do not spawn any agent or teammate other than those listed, with one exception: when a phase has more than two independent lanes with disjoint file ownership, Bob may add extra Sonnet general-task teammates (Thing3, Thing4, …), each with an exclusive file list.
+
+Only one Javariius runs at a time; a multi-part review is run as sequential passes.
 
 No one spawns agents or teammates but Bob.
 
@@ -48,7 +50,7 @@ Ask as many questions as necessary during planning. During deployment use all re
 
 Test entry points: standalone scripts run as `python3 tests/test_<name>.py`; the full suite is `python3 tests/run_all.py`. The headless browser walk is `PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers node tests/ui/walk.mjs`, after starting `demo/fleet.py`, `python3 -m netpath --headless`, and `demo/seed.py`.
 
-Tests currently failing in the web container for environmental reasons: `test_alert_sms` (no secret passphrase), `test_collectors_hardening` (no traceroute), `test_web_gates`, `test_prune_lock_hold` (timing). Confirm a failure is environmental (same failure on `main`) before skipping it.
+As of 5.47.0 the full suite passes with no failures on the Windows build machine (203 suites; `test_console_shutdown` and `test_https_check` skip without PySide6 / openssl). In the web container `test_alert_sms` (no secret passphrase) and `test_collectors_hardening` (no traceroute) fail for environmental reasons. `test_web_gates` is not environmental: it takes about three minutes, so give it the wall-clock time. Timing-sensitive under load — rerun alone before judging: `test_prune_lock_hold`, `test_ipam_dhcp_search`, `test_web_security` (D7, D22, D23, D30b). Confirm any other failure against `main` before skipping it.
 
 ## Stephen_King
 

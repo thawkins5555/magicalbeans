@@ -83,13 +83,17 @@ def get_syslog_overview(service, params, body) -> dict:
     buckets = service.syslog_db.histogram(t0, t1, bucket, filters)
     stats = service.cached_poll("syslog_stats", 10.0,
                                 service.syslog_db.stats)
+    # A full-table scan; shared by every open tab. Same 10s TTL as `stats`
+    # above (syslog_refresh_s's own default).
+    sources = service.cached_poll("syslog_recent_sources", 10.0,
+                                  service.syslog_db.sources)
     return {
         "t0": t0, "t1": t1, "bucket_s": bucket,
         "buckets": buckets,
         "stats": stats,
         "sources": [{"source": row["source"], "count": row["n"],
                      "last_seen": row["last_seen"]}
-                    for row in service.syslog_db.sources()],
+                    for row in sources],
     }
 
 

@@ -148,9 +148,12 @@ try:
           rec.calls and rec.calls[0]["path"].endswith(".ps1")
           and "-File" in rec.calls[0]["argv"]
           and rec.calls[0]["argv"][0] == "/opt/fake/pwsh")
+    # Text-mode write, so Windows translates \n to \r\n on disk; PowerShell
+    # reads either, and the content is what matters here, not the line ending.
     check("1f. ...written as UTF-8 with a BOM, the whole script, unchanged",
           rec.calls and rec.calls[0]["bytes"].startswith(BOM)
-          and rec.calls[0]["bytes"][len(BOM):].decode("utf-8") == ipam_dhcp._TEST_SCRIPT)
+          and rec.calls[0]["bytes"][len(BOM):].decode("utf-8").replace("\r\n", "\n")
+          == ipam_dhcp._TEST_SCRIPT.replace("\r\n", "\n"))
     check("1g. the server and credential reached the script as environment "
           "variables, the password intact at the moment of the run",
           rec.calls and rec.calls[0]["env"]["SAPPI_DHCP_SERVER"] == SERVER

@@ -581,12 +581,28 @@ mechanism built for this.
    console window is even still open, if it is not running as a service at
    all. If the browser shows a connection error rather than a sign-in page,
    this is the answer.
-2. **Locked out after failed attempts?** From 4.39.0 an account is locked for a
-   period after twenty failures in fifteen minutes and returns 429. It clears
-   itself; wait, or restart the service.
-3. **Stuck on "you must change your password"?** That is the server refusing
+2. **Locked out after failed attempts?** From 4.39.0, and per client address
+   from 5.47.0, twenty failures in fifteen minutes from one address locks
+   that address out and returns 429. The bare account name never locks on
+   its own — only a growing delay applies to it, counted across every
+   address it was tried from — so failures spread across many addresses
+   cannot lock a named account out everywhere at once. The lock clears
+   itself as the failures age out of the fifteen-minute window; wait, or
+   restart the service.
+3. **Signed in fine yesterday, bounced straight back to the sign-in page
+   today with no error?** From 5.47.0 a session is only honoured from the
+   address it was created from — a new Wi-Fi association, a VPN reconnect, a
+   DHCP lease renewal, or an egress path that changed which of several
+   public addresses a request leaves from will all do this. Check the
+   event log (Settings → Debug, or the Nodes-independent system log) for a
+   line naming the account and both addresses if you want to confirm that's
+   what happened. Sign in again; for a wall display or kiosk on DHCP, give
+   it a reservation so this stops recurring. This also applies to an open
+   SSH terminal or WEB relay tunnel, which will close under the same
+   conditions.
+4. **Stuck on "you must change your password"?** That is the server refusing
    every other route until the change is done, which is correct. Change it.
-4. **The last admin password is genuinely lost.** Stop the service, delete the
+5. **The last admin password is genuinely lost.** Stop the service, delete the
    `users` table from `app.db`, start it: the default `admin`/`admin` account
    is recreated with full access and must change its password immediately.
    On Linux:
@@ -612,7 +628,7 @@ mechanism built for this.
    This is a real recovery path and it is also why file permissions — or,
    on Windows, the account owning `%APPDATA%\netpath-monitor\` — on the data
    directory matter: anyone who can write `app.db` can do this.
-5. **After it is back**, check the audit log (Settings → Audit, `admin`
+6. **After it is back**, check the audit log (Settings → Audit, `admin`
    capability) for what happened before the lockout.
 
 **Automation should not be holding a human's password.** A script that

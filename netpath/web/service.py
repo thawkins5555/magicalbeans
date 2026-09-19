@@ -534,7 +534,8 @@ class Service:
     def _open_sessions(self) -> None:
         self.sessions = SessionStore(
             idle_minutes=int(self.settings.get("session_idle_minutes", 10)),
-            max_hours=int(self.settings.get("session_max_hours", 12)))
+            max_hours=int(self.settings.get("session_max_hours", 12)),
+            log=self.log)
         self.throttle = LoginThrottle()
         # After sessions (a terminal belongs to a signed-in user) and after
         # configrx_db (it is where the device's SSH credential and host key
@@ -1650,6 +1651,9 @@ class Service:
 
     def run_maintenance(self, force: bool = False) -> None:
         now = time.time()
+        # A backward clock step must not postpone the next sweep by more
+        # than one interval.
+        self._last_maintenance = min(self._last_maintenance, now)
         if not force and now - self._last_maintenance < MAINTENANCE_INTERVAL_S:
             return
 

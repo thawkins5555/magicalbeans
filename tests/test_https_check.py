@@ -120,6 +120,18 @@ try:
     check("a latency is measured", (result.latency_ms or 0) > 0, result)
     check("no error text on a healthy page", result.error == "", result)
 
+    # latency used time.monotonic(), which ticks at 15.6 ms on Windows;
+    # frozen here to prove the measurement no longer depends on it.
+    real_monotonic = time.monotonic
+    time.monotonic = lambda: 1.0
+    try:
+        result = httpcheck.check(f"{BASE}/", timeout_s=5.0, insecure=True)
+    finally:
+        time.monotonic = real_monotonic
+    check("latency is still measured with time.monotonic() frozen "
+          "(elapsed now comes from perf_counter)",
+          result.ok and (result.latency_ms or 0) > 0, result)
+
     print("httpcheck.check: a page that answers badly")
     result = httpcheck.check(f"{BASE}/broken", timeout_s=5.0, insecure=True)
     check("503 is unavailable, with the code in the reason",

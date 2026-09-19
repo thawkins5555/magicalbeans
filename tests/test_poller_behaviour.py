@@ -26,6 +26,8 @@ from netpath.trapdecode import (
 )
 from netpath.wirelessdb import WirelessDatabase
 from netpath.fortipoll import WirelessPoller
+from netpath.configrxdb import ConfigRxDatabase
+from netpath.configrx import ConfigRxWorker
 
 FAILURES = []
 
@@ -1304,6 +1306,252 @@ def test_stopping_the_poller_drops_the_cached_walk_limits():
         db.close()
 
 
+def test_stop_then_start_leaves_no_device_permanently_queued():
+    """begin_stop cancels queued futures, but _run_one only clears
+    _queued/_mac_running/etc. from inside itself -- a cancelled future never
+    runs, so a device stuck behind a busy pool at stop time used to stay
+    "queued" forever and _submit refused it on every later attempt."""
+    from concurrent.futures import ThreadPoolExecutor
+    db = NodesDatabase(os.path.join(tmpdir("poller_review_stopstart_"), "nodes.db"))
+    try:
+        poller = NodePoller(db)
+        poller.log = types.SimpleNamespace(
+            add=lambda category, message, target="", detail="": None)
+        blocker = threading.Event()
+        poller._executor = ThreadPoolExecutor(max_workers=1)
+        poller._executor.submit(blocker.wait)   # occupies the one worker
+        for device_id in (1, 2, 3):
+            check(poller._submit(device_id),
+                  f"device #{device_id} queues behind the busy worker")
+        for device_id in (1, 2, 3):
+            poller._mac_running.add(device_id)
+            poller._vlan_running.add(device_id)
+            poller._arp_running.add(device_id)
+            poller._lldp_running.add(device_id)
+        poller._mac_executor = ThreadPoolExecutor(max_workers=1)
+
+        poller.begin_stop()
+        blocker.set()   # let the blocked worker finish so shutdown() can join it
+
+        check(not poller._queued,
+              f"begin_stop clears every device cancelled before it ever "
+              f"ran, not left stuck in _queued ({poller._queued})")
+        for name in ("_mac_running", "_vlan_running", "_arp_running", "_lldp_running"):
+            running = getattr(poller, name)
+            check(not running, f"...and {name} too ({running})")
+
+        # start() makes a fresh pool the way reconfigure()/service.py do.
+        poller._executor = ThreadPoolExecutor(max_workers=4)
+        for device_id in (1, 2, 3):
+            check(poller._submit(device_id),
+                  f"device #{device_id} is resubmittable after start(), "
+                  f"not refused forever")
+        poller._executor.shutdown(wait=True, cancel_futures=True)
+    finally:
+        db.close()
+
+
+def test_wireless_stop_then_start_leaves_no_controller_permanently_queued():
+    """Same defect in the FortiGate poller: poll_now's _queued only got
+    discarded from inside _run_one, so a future cancelled before it ever
+    ran left the controller queued forever."""
+    from concurrent.futures import ThreadPoolExecutor
+    db = WirelessDatabase(os.path.join(tmpdir("wireless_review_stopstart_"), "wireless.db"))
+    try:
+        poller = WirelessPoller(db)
+        blocker = threading.Event()
+        poller._executor = ThreadPoolExecutor(max_workers=1)
+        poller._executor.submit(blocker.wait)
+        for controller_id in (1, 2, 3):
+            poller.poll_now(controller_id)
+        check(poller._queued == {1, 2, 3},
+              f"three controllers queue behind the busy worker ({poller._queued})")
+
+        poller.begin_stop()   # shuts down + clears cancelled ids synchronously
+        blocker.set()
+
+        check(not poller._queued,
+              f"begin_stop clears every controller cancelled before it ever "
+              f"ran, not left stuck in _queued ({poller._queued})")
+
+        # A second busy pool, so 1/2/3 are still queued (not already run and
+        # self-discarded) at the moment this checks _queued.
+        blocker2 = threading.Event()
+        poller._executor = ThreadPoolExecutor(max_workers=1)
+        poller._executor.submit(blocker2.wait)
+        for controller_id in (1, 2, 3):
+            poller.poll_now(controller_id)
+        check(poller._queued == {1, 2, 3},
+              f"every controller is pollable again after start(), not "
+              f"refused forever ({poller._queued})")
+        blocker2.set()
+        poller._executor.shutdown(wait=True, cancel_futures=True)
+    finally:
+        db.close()
+
+
+def test_configrx_stop_then_start_leaves_no_device_permanently_queued():
+    """Same defect in ConfigRX: backup_now's "already waiting" check
+    (device_id in self._queued) never clears for a future cancelled
+    before _run_one starts."""
+    from concurrent.futures import ThreadPoolExecutor
+    folder = tmpdir("configrx_review_stopstart_")
+    cdb = ConfigRxDatabase(os.path.join(folder, "configrx.db"))
+    ndb = NodesDatabase(os.path.join(folder, "nodes.db"))
+    try:
+        worker = ConfigRxWorker(cdb, ndb)
+        real_running = ConfigRxWorker.running
+        ConfigRxWorker.running = property(lambda self: True)
+        try:
+            blocker = threading.Event()
+            worker._executor = ThreadPoolExecutor(max_workers=1)
+            worker._executor.submit(blocker.wait)
+            for device_id in (1, 2, 3):
+                check(worker.backup_now(device_id),
+                      f"device #{device_id} queues behind the busy worker")
+
+            worker.begin_stop()
+            blocker.set()
+
+            check(not worker._queued,
+                  f"begin_stop clears every device cancelled before it "
+                  f"ever ran, not left stuck in _queued ({worker._queued})")
+
+            blocker2 = threading.Event()
+            worker._executor = ThreadPoolExecutor(max_workers=1)
+            worker._executor.submit(blocker2.wait)
+            for device_id in (1, 2, 3):
+                check(worker.backup_now(device_id),
+                      f"device #{device_id} is queueable again after "
+                      f"start(), not \"already waiting\" forever")
+            blocker2.set()
+            worker._executor.shutdown(wait=True, cancel_futures=True)
+        finally:
+            ConfigRxWorker.running = real_running
+    finally:
+        cdb.close()
+        ndb.close()
+
+
+def test_wireless_ap_ping_uses_perf_counter():
+    """_ping_ap's round trip used time.time(), which ticks at 15.6 ms on
+    Windows -- a loopback ping rounds to 0.0 ms."""
+    db = WirelessDatabase(os.path.join(tmpdir("wireless_review_pingclock_"), "wireless.db"))
+    try:
+        poller = WirelessPoller(db)
+        poller._ping_deadline = float("inf")   # so a frozen clock never "expires" it
+        real_time = time.time
+        time.time = lambda: 1000.0             # a true constant, not just offset
+        try:
+            rtt = poller._ping_ap("127.0.0.1", "online")
+        finally:
+            time.time = real_time
+        check(rtt is not None and rtt > 0,
+              f"a nonzero round trip is still measured with time.time() "
+              f"frozen to a constant (rtt={rtt}, elapsed now comes from "
+              f"perf_counter, which time.time() being frozen cannot zero out)")
+    finally:
+        db.close()
+
+
+def test_wireless_loop_survives_a_database_error():
+    """fortipoll's _loop had no guard around _schedule_pass, unlike
+    NodePoller's -- one sqlite3.OperationalError killed the thread with
+    no sign why (status/error stayed blank)."""
+    db = WirelessDatabase(os.path.join(tmpdir("wireless_review_loopguard_"), "wireless.db"))
+    try:
+        poller = WirelessPoller(db)
+        poller.error = None
+        real_settings = db.settings
+        calls = {"n": 0}
+
+        def exploding_settings():
+            calls["n"] += 1
+            raise RuntimeError("database is locked")
+
+        db.settings = exploding_settings
+        thread = threading.Thread(target=poller._loop, daemon=True)
+        poller._stop.clear()
+        thread.start()
+        deadline = time.time() + 5
+        while time.time() < deadline and not poller.error:
+            time.sleep(0.05)
+        check(bool(poller.error) and "database is locked" in poller.error,
+              f"a failing pass is reported instead of killing the thread "
+              f"(error={poller.error!r})")
+        check(thread.is_alive(), "…and the scheduling thread is still running")
+
+        attempts = calls["n"]
+        time.sleep(1.3)
+        check(calls["n"] > attempts,
+              f"…and it tries again on the next tick "
+              f"({attempts} -> {calls['n']} attempts)")
+
+        db.settings = real_settings
+        deadline = time.time() + 5
+        while time.time() < deadline and poller.error:
+            time.sleep(0.05)
+        check(poller.error is None,
+              f"the error clears once passes succeed again (error={poller.error!r})")
+
+        poller._stop.set()
+        thread.join(timeout=3)
+    finally:
+        db.close()
+
+
+def test_configrx_loop_survives_a_database_error():
+    """configrx's _loop guarded the compliance sweep but not the
+    settings/devices_due read ahead of it -- same defect as fortipoll's."""
+    folder = tmpdir("configrx_review_loopguard_")
+    cdb = ConfigRxDatabase(os.path.join(folder, "configrx.db"))
+    ndb = NodesDatabase(os.path.join(folder, "nodes.db"))
+    try:
+        worker = ConfigRxWorker(cdb, ndb)
+        worker.error = None
+        real_settings = cdb.settings
+        calls = {"n": 0}
+
+        def exploding_settings():
+            calls["n"] += 1
+            raise RuntimeError("database is locked")
+
+        cdb.settings = exploding_settings
+        # The loop's own cadence is 30s (backups, not per-second polling);
+        # sped up here so the test does not wait that long for a retry.
+        real_wait = worker._stop.wait
+        worker._stop.wait = lambda timeout=None: real_wait(0.05)
+        thread = threading.Thread(target=worker._loop, daemon=True)
+        worker._stop.clear()
+        thread.start()
+        deadline = time.time() + 5
+        while time.time() < deadline and not worker.error:
+            time.sleep(0.05)
+        check(bool(worker.error) and "database is locked" in worker.error,
+              f"a failing pass is reported instead of killing the thread "
+              f"(error={worker.error!r})")
+        check(thread.is_alive(), "…and the scheduling thread is still running")
+
+        attempts = calls["n"]
+        time.sleep(0.5)
+        check(calls["n"] > attempts,
+              f"…and it tries again on the next tick "
+              f"({attempts} -> {calls['n']} attempts)")
+
+        cdb.settings = real_settings
+        deadline = time.time() + 5
+        while time.time() < deadline and worker.error:
+            time.sleep(0.05)
+        check(worker.error is None,
+              f"the error clears once passes succeed again (error={worker.error!r})")
+
+        worker._stop.set()
+        thread.join(timeout=3)
+    finally:
+        cdb.close()
+        ndb.close()
+
+
 def test_only_an_unencodable_oid_is_reported_as_an_oid_fault():
     """Only an unencodable OID (SnmpBadOid) is reported as an OID fault; other ValueErrors still record the poll."""
     agent, db, poller, device_id = _setup_reassignable_device(
@@ -1462,6 +1710,12 @@ def main():
     test_the_custom_mib_read_opens_one_socket_and_decrypts_once()
     test_a_refused_credential_does_not_leak_the_interface_socket()
     test_stopping_the_poller_drops_the_cached_walk_limits()
+    test_stop_then_start_leaves_no_device_permanently_queued()
+    test_wireless_stop_then_start_leaves_no_controller_permanently_queued()
+    test_configrx_stop_then_start_leaves_no_device_permanently_queued()
+    test_wireless_ap_ping_uses_perf_counter()
+    test_wireless_loop_survives_a_database_error()
+    test_configrx_loop_survives_a_database_error()
     test_only_an_unencodable_oid_is_reported_as_an_oid_fault()
     test_deleting_a_device_drops_every_cache_keyed_on_it()
     test_a_refused_community_is_not_printed()

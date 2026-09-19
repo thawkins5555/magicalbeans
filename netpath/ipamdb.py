@@ -748,11 +748,15 @@ class IpamDatabase(SqliteStore):
             self._conn.commit()
 
     def prune_conflicts(self, older_than_days: float) -> int:
+        # Kept below so an age sweep can't reuse an id past AlertEngine's
+        # cursor -- not for older_than_days=0, which the cursor rewind covers.
         cutoff = time.time() - older_than_days * 86400
+        where = "resolved_ts IS NOT NULL AND resolved_ts < ?"
+        if older_than_days > 0:
+            where += " AND id < (SELECT MAX(id) FROM conflicts)"
         with self._lock:
             cur = self._conn.execute(
-                "DELETE FROM conflicts WHERE resolved_ts IS NOT NULL"
-                " AND resolved_ts < ?", (cutoff,))
+                f"DELETE FROM conflicts WHERE {where}", (cutoff,))
             self._conn.commit()
         return cur.rowcount or 0
 

@@ -4654,15 +4654,14 @@ check("node.tagName === 'TABLE' ? [node] : node.getElementsByTagName('table')" i
       "the plain-table observer finds nested tables by tag name, not a CSS "
       "selector, for every added node")
 
-for _fn in ("fillGroupFilter", "fillDevGroupFilter", "fillReportDevGroupSelects"):
+for _fn in ("fillGroupFilter", "fillDevGroupFilter", "fillReportDevGroupSelects",
+           "fillDiscGroups"):
     check("App.setHtml(select," in js_function(NODES100, _fn),
           "%s skips the write when its option list is unchanged" % _fn)
-# fillDiscGroups' own groupOptionsHtml bakes `selected` into the option
-# string, which the browser normalises away on read-back, so this call
-# rarely (never, in practice) actually short-circuits -- still correct and
-# consistent, just not a skip, so it gets its own, more modest check.
-check("App.setHtml(select," in js_function(NODES100, "fillDiscGroups"),
-      "fillDiscGroups still goes through App.setHtml for consistency")
+# A baked-in selectedId changed the string with the selection, defeating
+# any skip; groupOptionsHtml() now takes none, and .value is restored below.
+check("App.setHtml(select, groupOptionsHtml());" in js_function(NODES100, "fillDiscGroups"),
+      "...and no longer bakes a selectedId into that string")
 
 check("App.setHtml(App.el('nd-d-summary')" in NODES100,
       "the device detail header's summary line skips an unchanged rewrite")
@@ -4702,8 +4701,9 @@ check("lastDrawHtml = null;" in _LOADING101,
 check("JSON.stringify(view.dashboard)" not in DASHBOARD101,
       "refresh() no longer signatures the whole payload to decide whether to draw")
 
-# A real run, not another literal pin: fillGroupFilter (and its App.setHtml)
-# evaluated by node, proving a second identical call writes innerHTML once.
+# A real run, not another literal pin: fillGroupFilter (and the real
+# App.setHtml/lastHtml) evaluated by node, proving a second identical call
+# writes innerHTML once.
 _FGF_HARNESS = """
 'use strict';
 let writes = 0;
@@ -4712,6 +4712,7 @@ const selectEl = {
   get innerHTML() { return this._html || ''; },
   set innerHTML(v) { this._html = v; writes += 1; },
 };
+%(lastHtml)s
 %(setHtml)s
 const App = {
   el: () => selectEl,
@@ -4730,11 +4731,9 @@ console.log(JSON.stringify({ writes, value: selectEl.value }));
 if NODE is None:
     print("SKIP  fillGroupFilter's second-draw-is-free proof (node not on this machine)")
 else:
-    # js_function's block-matcher is written for multi-line bodies; setHtml
-    # is one line, so it is pulled out directly instead.
-    _SETHTML_LINE = next(l for l in APP.splitlines() if "function setHtml(" in l).strip()
     _script = _FGF_HARNESS % {
-        "setHtml": _SETHTML_LINE,
+        "lastHtml": js_const(APP, "lastHtml"),
+        "setHtml": js_function(APP, "setHtml"),
         "fillGroupFilter": js_function(NODES100, "fillGroupFilter"),
     }
     _folder = tempfile.mkdtemp(prefix="fill_group_filter_")
@@ -4751,6 +4750,56 @@ else:
     check(_result.get("writes") == 1,
           "fillGroupFilter writes innerHTML once across two calls with an "
           "unchanged group list (got: %s)" % _result)
+
+# setHtml/setText evaluated for real: an entity-bearing string still skips
+# its second write, and a foreign textContent write forces the next one.
+_SETHTML_HARNESS = """
+'use strict';
+let writes = 0;
+const el = {
+  get innerHTML() { return this._html || ''; },
+  set innerHTML(v) { this._html = v; writes += 1; },
+  get textContent() { return this._text || ''; },
+  set textContent(v) { this._text = v; },
+};
+%(lastHtml)s
+%(setHtml)s
+%(setText)s
+const html = "<span>O&#39;Brien &quot;Router&quot;</span>";
+setHtml(el, html);
+setHtml(el, html);
+const afterTwo = writes;
+setText(el, 'something else');
+setHtml(el, html);
+console.log(JSON.stringify({ afterTwo, afterForeignWrite: writes }));
+"""
+
+if NODE is None:
+    print("SKIP  setHtml/setText's WeakMap proof (node not on this machine)")
+else:
+    _script = _SETHTML_HARNESS % {
+        "lastHtml": js_const(APP, "lastHtml"),
+        "setHtml": js_function(APP, "setHtml"),
+        "setText": js_function(APP, "setText"),
+    }
+    _folder = tempfile.mkdtemp(prefix="set_html_")
+    try:
+        _path = os.path.join(_folder, "run.js")
+        with open(_path, "w", encoding="utf-8") as _handle:
+            _handle.write(_script)
+        _out = subprocess.run([NODE, _path], capture_output=True, text=True,
+                              encoding="utf-8", timeout=30)
+        _result = ({"error": _out.stderr.strip()[:400]} if _out.returncode != 0
+                   else json.loads(_out.stdout))
+    finally:
+        shutil.rmtree(_folder, ignore_errors=True)
+    check(_result.get("afterTwo") == 1,
+          "two identical setHtml calls with an entity-bearing string write "
+          "once (got: %s)" % _result)
+    check(_result.get("afterForeignWrite") == 2,
+          "...but a foreign textContent write in between forces the next "
+          "setHtml to write again, not trust a now-stale cache (got: %s)"
+          % _result)
 
 # dashboard.js's draw(): an explicit call (no options) always writes, even
 # with identical HTML; only refresh()'s ifChanged call may skip.

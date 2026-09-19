@@ -352,6 +352,18 @@ def iphlpapi_path():
          f"a real iphlpapi probe of a loopback address succeeds: "
          f"sent={sent} received={received} rtt={rtt}")
 
+    # The RTT used to come from time.monotonic(), which ticks at 15.6 ms
+    # on Windows; frozen here to prove it no longer depends on it.
+    real_monotonic = time.monotonic
+    time.monotonic = lambda: 1.0
+    try:
+        _, _, rtt_frozen = ipam_scan._ping_many_iphlpapi("127.0.0.4", 3, 500)
+    finally:
+        time.monotonic = real_monotonic
+    check(rtt_frozen is not None,
+         f"...and still measures an RTT with time.monotonic() frozen "
+         f"(rtt={rtt_frozen}, elapsed now comes from perf_counter)")
+
     # A device that is down is the case this has to get right: no reply must
     # read as loss, not as an exception and not as a false success.
     started = time.monotonic()

@@ -962,14 +962,14 @@ try:
     real_get = service.sessions.get
     raised = []
 
-    def flaky_get(looked_up):
+    def flaky_get(looked_up, client=None):
         """Raise for this one session's token, and only three times: every
         other caller — including the request that signs it out — sees the
         real store."""
         if looked_up == flaky_token and len(raised) < 3:
             raised.append(looked_up)
             raise RuntimeError("the session store is busy")
-        return real_get(looked_up)
+        return real_get(looked_up, client)
 
     service.sessions.get = flaky_get
     try:

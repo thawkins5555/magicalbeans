@@ -745,9 +745,12 @@ engine._tick()
 assert engine._breach_streaks, "the streaks were never built"
 for device_id in victims:
     nodes.remove_device(device_id)
+# A deleted device's streak entries are dropped by the periodic FULL pass,
+# not by every tick any more -- force the next one to be one.
+engine._threshold_full_pass_ts = 0.0
 engine._tick()
 assert engine._breach_streaks == {}, engine._breach_streaks
-ok("streak state for a deleted device is dropped rather than leaked")
+ok("streak state for a deleted device is dropped by the next full pass")
 
 nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
 

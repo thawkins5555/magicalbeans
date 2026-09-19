@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.47.0 — Review fixes: security, correctness, history maintenance](#5470--review-fixes-security-correctness-history-maintenance)
 - [5.46.0 — Performance](#5460--performance)
 - [5.45.0 — Front-end tidy-up](#5450--front-end-tidy-up)
 - [5.44.0 — Backend restructure, dead code removed](#5440--backend-restructure-dead-code-removed)
@@ -179,6 +180,152 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.47.0 — Review fixes: security, correctness, history maintenance
+
+Follows a whole-codebase review of 5.46.0 covering security, correctness and
+performance. The review's full findings were exported to a local file at the
+operator's request and are kept out of this public repository; the operator
+approved the recommended fix set below. Nothing here changes what a device is
+asked for — the SNMPv3 retry (below) is the one exception, adding one extra
+packet on the wire for FortiGate/wireless controllers polled with v3.
+
+**Operator-visible**
+
+1. **A web session is honoured only from the client address it created it
+   from.** If an operator's own address changes mid-session — new Wi-Fi, a
+   VPN reconnect, a DHCP lease renewal on a wall display, or multi-address
+   NAT egress — the session is ended and the browser is returned to the
+   sign-in page; one event-log line records the account and both addresses.
+   The same check covers an open SSH terminal and an open WEB relay tunnel,
+   not just the browser tab, so either closes under the same conditions.
+   Put a DHCP reservation on any wall display running a kiosk
+   session. API tokens are unaffected — they were never bound to an address.
+2. **Sign-in lock-out is now per client address.** Repeated failures from one
+   address lock that address out; a named account can no longer be locked
+   for everyone from every other address. A growing delay still applies to
+   repeated failures against one user name on its own. One audit entry is
+   written per lock-out episode rather than one per refused attempt while
+   it's locked. Changing your own password now shares the same hashing
+   capacity sign-in uses (busy → "try again" instead of piling up), and
+   repeated wrong "current password" entries are delayed and locked the same
+   way sign-in failures are.
+3. **Trap communities are hidden from read-only SNMP accounts.** An account
+   with SNMP read but not write no longer sees the accepted trap community
+   strings on the SNMP Trap settings panel — a "configured" indicator takes
+   their place — and can no longer filter or free-text search traps by
+   community. Accounts with SNMP write are unchanged.
+4. **FortiGate/wireless SNMPv3 polling is more reliable.** The poller now
+   keeps a controller's SNMP engine time current and retries once when the
+   controller asks for a time resync, the same handling the Nodes poller
+   already used. Previously, roughly one poll in three or four of an SNMPv3
+   FortiGate/wireless controller could fail with "unreachable" purely from
+   clock drift between polls. This adds one retry packet on the wire, for
+   SNMPv3 controllers only — v1/v2c and plain SNMPv3 polls that don't hit a
+   resync are unchanged.
+5. **Weekly maintenance windows keep their wall-clock time across a
+   daylight-saving change.** A window created in summer no longer starts an
+   hour early (or late) once the clocks change.
+6. **An idle HTTPS connection that never completes its TLS handshake no
+   longer delays other clients.** The handshake now runs on the
+   connection's own thread with a 30-second limit, instead of on the single
+   thread that accepts every connection. Plain-HTTP deployments are
+   unaffected.
+7. **The WEB relay never forwards the application's own session cookie to a
+   device**, and discards a device cookie of that same name on the way
+   back. A relayed connection that stops parsing as HTTP is closed rather
+   than passed through untouched (a WebSocket upgrade is still allowed
+   through). Oversized request headers are refused (431) rather than read
+   indefinitely.
+
+**Correctness** (no operator action needed)
+
+8. **The alert engine no longer misses events after a device delete or a
+   history prune.** Device events, interface events, traps, syslog and IPAM
+   conflicts are all read by row number; deleting a device or pruning old
+   rows could lower a table's highest row number below where the engine's
+   read cursor was sitting, and every event after that point was silently
+   skipped until as many new rows arrived as the table used to hold. The
+   engine now notices when a source's highest row number has dropped and
+   rewinds its cursor to match. A periodic age-prune now always keeps each
+   event table's newest row, so a prune can never itself cause this; an
+   explicit "delete everything" action still empties the table completely,
+   as it should.
+9. **Stopping and starting a worker no longer strands queued devices.**
+   Stop then Start of the Nodes poller, the wireless poller, or ConfigRX
+   used to leave devices that were queued at the moment of Stop unpollable
+   until the whole service restarted.
+10. **The wireless and ConfigRX scheduler loops survive a database error.**
+    Either used to die silently on one bad database read; both now log the
+    reason on the worker strip and keep running.
+11. **Windows SNMP reads handle two more failure modes correctly.** An ICMP
+    port-unreachable answer during an SNMP read now reads as "no reply"
+    instead of a generic error that could leave a half-dead agent reading as
+    healthy; a failure to create the UDP socket itself is now recorded as a
+    failed poll instead of leaving the device's status frozen. Latencies now
+    use the high-resolution clock, so a fast LAN round trip no longer reads
+    as 0.0 ms.
+12. **Schedulers, and the Syslog rate limiter, recover within one interval
+    of a backward clock step** (an NTP correction, or a VM resuming from
+    suspend) instead of waiting out however far the clock jumped; the
+    maintenance sweep does the same.
+13. **Drop-downs whose entries contain quotes or back-ticks no longer rebuild
+    (and snap shut) on every 2-second refresh**, and the device summary line
+    no longer clears a text selection on every refresh.
+
+**Performance**
+
+14. **Alert thresholds are evaluated only for devices with something new to
+    check** — a device that received new samples, or had an alert resolve —
+    with a full pass every 60 seconds, at start-up, and immediately after a
+    rule or per-device override changes. On an idle tick this now runs no
+    metric query at all; measured on a 500-device test fleet with 2% of
+    devices touched between ticks, that's 210 rows read instead of 10,500.
+    Alert open/clear timing for devices that are receiving samples is
+    unchanged; deleted-device cleanup and stale-sample handling now run on
+    the 60-second pass rather than every tick.
+15. **Syslog and Trap overview panels are faster to open.** The oldest/newest
+    timestamps shown are now index look-ups instead of a table scan, and the
+    Sources/Kinds panels are cached for 10 seconds — the page's own refresh
+    period. Row counts stay exact.
+16. **Metric history maintenance is faster at scale**, measured at 10,000
+    metrics: the hourly roll-up dropped from 1,404 ms to 765 ms (its longest
+    single lock hold from 101 ms to 67 ms); the age prune's longest lock
+    hold dropped from 277 ms to 93 ms. The per-metric row cap is now skipped
+    when the fleet's own retention setting is already the tighter limit for
+    its fastest poll interval — never when that interval isn't known. One
+    change was deliberately **not** made: batching the over-cap hourly trim
+    would have bounded each lock hold to about 0.12 s, but at the cost of
+    roughly 110 seconds of near-continuous work in place of one 3.4-second
+    hold — rejected as a worse trade; `tests/bench_prune.py --large` keeps
+    reporting the unbatched number so this isn't revisited by accident.
+
+**Tests.** Five long-failing suites turned out to be test defects rather than
+product bugs, and are fixed: a coarse Windows clock tripped up
+`test_service_shutdown` and `bench_record_samples`; a Windows temp-folder
+fallback tripped up `test_temppath` and `test_selfupdate_job`; and newline
+translation tripped up `test_ipam_dhcp_temp`. `test_web_gates`'s self-service
+allow-list was updated for the per-user dashboard layout routes added since it
+was last touched. `test_palo_alto_polling` and `test_snmpv3_diagnostics` now
+pass as a side effect of the Windows SNMP fix above. Twelve new suites:
+`test_alert_cursor_rewind.py`, `test_alert_window_dst.py`,
+`test_backward_clock_step.py`, `test_fortipoll_v3_exchange.py`,
+`test_maintenance_clock_step.py`, `test_overview_stats_perf.py`,
+`test_prune_fastest_interval.py`, `test_series_maintenance_equivalence.py`,
+`test_session_connection_reset.py`, `test_session_socket_creation_error.py`,
+`test_threshold_change_driven.py` and `test_tls_handshake_thread.py`, plus a
+frozen reference copy of the pre-5.47.0 metric-maintenance routines
+(`tests/_old_series_maintenance.py`, not itself a suite) that the equivalence
+suite checks the new code against. Full suite: 203 of 203 suites passed, 2
+skipped (no PySide6, no openssl on the build machine) — the first run with no
+failing suites. Browser walk: 94/94, no console errors, page errors or failed
+requests for either an admin or a viewer account.
+
+**Not in this release.** First-run administrator password handling is next
+release. Self-update package verification was deferred by the operator.
+GETBULK interface polling, spanning-tree walk cadence and down-port sample
+storage are planned follow-up releases. A handful of lower-severity review
+items are carried to next release as well.
 
 ### 5.46.0 — Performance
 

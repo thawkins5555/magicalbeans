@@ -18,6 +18,8 @@ import threading
 import time
 from collections import OrderedDict
 
+from .eventlog import SYSTEM
+
 # OWASP Password Storage Cheat Sheet, 2024 figures.
 SCRYPT_N = 1 << 17
 SCRYPT_R = 8
@@ -198,11 +200,12 @@ def check_username(username: str) -> str:
 class SessionStore:
     """In-memory sessions, with an idle timeout and an absolute lifetime."""
 
-    def __init__(self, idle_minutes: int = 240, max_hours: int = 12):
+    def __init__(self, idle_minutes: int = 240, max_hours: int = 12, log=None):
         self._lock = threading.Lock()
         self._sessions: dict[str, dict] = {}
         self.idle_seconds = idle_minutes * 60
         self.max_seconds = max_hours * 3600
+        self.log = log
 
     def configure(self, idle_minutes: int, max_hours: int) -> None:
         with self._lock:
@@ -218,11 +221,15 @@ class SessionStore:
                                      "agent": agent[:120]}
         return token
 
-    def get(self, token: str) -> dict | None:
+    def get(self, token: str, client: str | None = None) -> dict | None:
         """Validate without extending. Background polling — the periodic
         state fetch every open tab makes, whether or not anyone is at the
         keyboard — reads through here, so merely having the app open does not
-        by itself keep a session alive. An explicit action does; see touch()."""
+        by itself keep a session alive. An explicit action does; see touch().
+
+        A session is honoured only from the address it was created from,
+        when `client` is given; presented from anywhere else, it is
+        destroyed and treated as absent."""
         if not token:
             return None
         now = time.time()
@@ -230,17 +237,24 @@ class SessionStore:
             session = self._sessions.get(token)
             if session is None:
                 return None
-            if (now - session["last_seen"] > self.idle_seconds
-                    or now - session["created"] > self.max_seconds):
+            expired = (now - session["last_seen"] > self.idle_seconds
+                      or now - session["created"] > self.max_seconds)
+            mismatched = client is not None and session["client"] != client
+            if expired or mismatched:
                 self._sessions.pop(token, None)
+                if mismatched and not expired and self.log:
+                    self.log.add(SYSTEM,
+                                 f"Session for {session['username']} refused: "
+                                 f"created from {session['client']}, "
+                                 f"presented from {client}")
                 return None
             return dict(session, token=token)
 
-    def touch(self, token: str) -> dict | None:
+    def touch(self, token: str, client: str | None = None) -> dict | None:
         """Validate and mark the session as used just now — called only for
         a deliberate action (POST/PUT/DELETE or an activity heartbeat), so
         the idle clock tracks presence rather than an open tab."""
-        session = self.get(token)
+        session = self.get(token, client)
         if session is None:
             return None
         with self._lock:
@@ -299,9 +313,10 @@ MAX_TRACKED_KEYS = 10_000
 class LoginThrottle:
     """Slow down guessing, then stop it.
 
-    Counted per username and per source address, so one noisy address cannot
-    lock an account for everyone else, and one account cannot be used to lock
-    out an address.
+    Counted per username and per source address. Only the address can
+    hard-lock — the bare user name only ever grows its own back-off delay —
+    so no remote host can lock a named account out for every other address,
+    and one account cannot be used to lock out an address.
     """
 
     def __init__(self, threshold: int = 5, window_s: float = 900,
@@ -311,6 +326,10 @@ class LoginThrottle:
         self._lock = threading.Lock()
         # Ordered so the least recently touched key is the one evicted.
         self._failures: "OrderedDict[str, list[float]]" = OrderedDict()
+        # Addresses whose lock-out has already been reported (see
+        # announce_lockout()) — always a subset of _failures' keys, kept
+        # that way below, so it shares that same bound.
+        self._lockout_announced: set[str] = set()
         self.threshold = threshold
         self.window_s = window_s
         self.max_delay_s = max_delay_s
@@ -330,6 +349,7 @@ class LoginThrottle:
             self._failures.move_to_end(key)
         else:
             self._failures.pop(key, None)
+            self._lockout_announced.discard(key)
         return stamps
 
     def delay_for(self, username: str, client: str) -> float:
@@ -343,21 +363,31 @@ class LoginThrottle:
         # Doubling, capped: 5 failures is a second, 10 is half a minute.
         return min(self.max_delay_s, 2 ** (worst - self.threshold))
 
-    def lockout_remaining(self, username: str, client: str) -> float:
-        """Seconds this username or this address is refused for, 0 when
-        neither is. Either being over the threshold is enough — they are
-        counted independently on purpose."""
+    def lockout_remaining(self, client: str) -> float:
+        """Seconds this address is refused for, 0 otherwise."""
         now = time.time()
         with self._lock:
-            worst = 0.0
-            for key in self._keys(username, client):
-                stamps = self._recent(key, now)
-                if len(stamps) >= self.lockout_threshold:
-                    # The lock lifts when the oldest failure that still
-                    # counts towards the threshold ages out of the window.
-                    oldest_counted = sorted(stamps)[-self.lockout_threshold]
-                    worst = max(worst, oldest_counted + self.window_s - now)
-        return max(0.0, worst)
+            key = f"c:{client}"
+            stamps = self._recent(key, now)
+            if len(stamps) < self.lockout_threshold:
+                return 0.0
+            # The lock lifts when the oldest failure that still counts
+            # towards the threshold ages out of the window.
+            oldest_counted = sorted(stamps)[-self.lockout_threshold]
+        return max(0.0, oldest_counted + self.window_s - now)
+
+    def announce_lockout(self, client: str) -> bool:
+        """True the first time an address is found locked since its last
+        fresh failure — a flood against an already-locked address must
+        write one audit row per lock episode, not one per request."""
+        now = time.time()
+        with self._lock:
+            key = f"c:{client}"
+            if (len(self._recent(key, now)) < self.lockout_threshold
+                    or key in self._lockout_announced):
+                return False
+            self._lockout_announced.add(key)
+            return True
 
     def record_failure(self, username: str, client: str) -> None:
         now = time.time()
@@ -365,8 +395,10 @@ class LoginThrottle:
             for key in self._keys(username, client):
                 self._failures.setdefault(key, []).append(now)
                 self._failures.move_to_end(key)
+                self._lockout_announced.discard(key)
             while len(self._failures) > self.max_keys:
-                self._failures.popitem(last=False)
+                evicted, _ = self._failures.popitem(last=False)
+                self._lockout_announced.discard(evicted)
 
     def clear(self, username: str) -> None:
         """Forget this account's failures. The address's are NOT forgotten:

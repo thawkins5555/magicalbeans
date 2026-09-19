@@ -454,9 +454,11 @@ try:
     #     "stopped unexpectedly" escaping to _run_job's catch-all
     # =================================================================
     # Point every location the staging helper can try at a path under a
-    # regular file, so none can be created — install root, system temp, and
-    # temppath's own last-resort root. The failure must come back through
-    # step("failed") with the explanatory message, never the generic one.
+    # regular file, so none can be created — install root, system temp,
+    # temppath's own last-resort root, and its two Windows fallbacks (real
+    # and writable on this machine otherwise). The failure must come back
+    # through step("failed") with the explanatory message, never the
+    # generic one.
     _blocker = os.path.join(TMPDIR, "blocker-file")
     with open(_blocker, "w", encoding="utf-8") as _h:
         _h.write("not a directory\n")
@@ -467,9 +469,13 @@ try:
     _saved_app_root = selfupdate._APP_ROOT
     _saved_tp_root = selfupdate.temppath._APP_ROOT
     _saved_tempdir = tempfile.tempdir
+    _saved_localappdata = os.environ.get("LOCALAPPDATA")
+    _saved_systemroot = os.environ.get("SystemRoot")
     selfupdate._APP_ROOT = os.path.join(_blocker, "sub")            # uncreatable
     selfupdate.temppath._APP_ROOT = os.path.join(_blocker, "root")  # uncreatable
     tempfile.tempdir = os.path.join(_blocker, "systemp")            # uncreatable
+    os.environ["LOCALAPPDATA"] = os.path.join(_blocker, "local")    # uncreatable
+    os.environ["SystemRoot"] = os.path.join(_blocker, "sysroot")    # uncreatable
     try:
         selfupdate._run_job(db12, None, None)
         st12 = selfupdate.status()
@@ -477,6 +483,12 @@ try:
         selfupdate._APP_ROOT = _saved_app_root
         selfupdate.temppath._APP_ROOT = _saved_tp_root
         tempfile.tempdir = _saved_tempdir
+        for _name, _value in (("LOCALAPPDATA", _saved_localappdata),
+                              ("SystemRoot", _saved_systemroot)):
+            if _value is None:
+                os.environ.pop(_name, None)
+            else:
+                os.environ[_name] = _value
     db12.close()
     check("12. every location failing ends on the failed step, not a raise",
           st12["state"] == "failed" and st12["step"] == "failed", str(st12))

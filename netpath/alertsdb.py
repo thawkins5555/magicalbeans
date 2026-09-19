@@ -7,6 +7,7 @@ a repeat increments that alert's `count` rather than opening a duplicate.
 
 from __future__ import annotations
 
+import calendar
 import ipaddress
 import json
 import logging
@@ -467,6 +468,13 @@ MAX_WINDOW_DAYS = 14.0
 _WEEK_S = 7 * 86400.0
 
 
+def _local_wall_seconds(ts: float) -> float:
+    """`ts` restated as local wall-clock seconds (epoch plus that moment's
+    UTC offset), so a weekly modulo on this tracks "Sunday 02:00" across a
+    clock change instead of drifting an hour."""
+    return calendar.timegm(time.localtime(ts))
+
+
 def is_window_active(row, now: float | None = None) -> bool:
     """Whether `row` (a maintenance_windows row) covers anything right now.
 
@@ -485,7 +493,9 @@ def is_window_active(row, now: float | None = None) -> bool:
     if row["recurrence"] == "weekly":
         if now < row["start_ts"]:
             return False
-        return (now - row["start_ts"]) % _WEEK_S < duration
+        elapsed = (_local_wall_seconds(now)
+                  - _local_wall_seconds(row["start_ts"])) % _WEEK_S
+        return elapsed < duration
     return row["start_ts"] <= now < row["end_ts"]
 
 
@@ -496,7 +506,8 @@ def _window_occurrence_end(row, now: float) -> float:
     a recurring window is only the first occurrence's)."""
     duration = row["end_ts"] - row["start_ts"]
     if row["recurrence"] == "weekly":
-        elapsed = (now - row["start_ts"]) % _WEEK_S
+        elapsed = (_local_wall_seconds(now)
+                  - _local_wall_seconds(row["start_ts"])) % _WEEK_S
         return now - elapsed + duration
     return row["end_ts"]
 
@@ -1214,6 +1225,10 @@ class AlertsDatabase(SqliteStore):
     _TEMPLATE_SUBJECTS_RESET_5_30 = "template_subjects_reset_5_30"
 
     def _after_open(self) -> None:
+        # AlertEngine's per-tick change signals: see take_dirty_devices and
+        # threshold_generation below. Reset per process, like its own state.
+        self._dirty_devices: set[int] = set()
+        self._threshold_generation = 0
         self._seed_templates()
         self._seed_rules()
         self._run_named_migrations()
@@ -1925,6 +1940,7 @@ class AlertsDatabase(SqliteStore):
             cur = self._conn.execute(
                 f"INSERT INTO rules({','.join(cols)}) VALUES ({marks})", vals)
             self._conn.commit()
+            self._bump_threshold_generation()
             return cur.lastrowid
 
     def update_rule(self, rule_id: int, **fields) -> None:
@@ -1950,6 +1966,7 @@ class AlertsDatabase(SqliteStore):
                 f"UPDATE rules SET {clauses} WHERE id = ?",
                 (*allowed.values(), rule_id))
             self._conn.commit()
+            self._bump_threshold_generation()
 
     def alert_count_for_rule(self, rule_id: int) -> int:
         """Every alert this rule ever raised, in any state — not just the
@@ -1979,6 +1996,8 @@ class AlertsDatabase(SqliteStore):
                 " AND id NOT IN (SELECT DISTINCT rule_id FROM alerts)",
                 (rule_id,))
             self._conn.commit()
+            if cursor.rowcount:
+                self._bump_threshold_generation()
             return (cursor.rowcount or 0) > 0
 
     # ------------------------------------------------------- device thresholds
@@ -2055,6 +2074,7 @@ class AlertsDatabase(SqliteStore):
                 (device_id, rule_key, threshold, clear_threshold,
                  1 if enabled else 0, now))
             self._conn.commit()
+            self._bump_threshold_generation()
 
     def clear_device_threshold(self, device_id: int, rule_key: str) -> bool:
         """False when there was no override to remove, so a caller can tell
@@ -2064,6 +2084,8 @@ class AlertsDatabase(SqliteStore):
                 "DELETE FROM device_thresholds WHERE device_id = ? AND rule_key = ?",
                 (device_id, rule_key))
             self._conn.commit()
+            if cursor.rowcount:
+                self._bump_threshold_generation()
             return (cursor.rowcount or 0) > 0
 
     # -------------------------------------------------------------- templates
@@ -2369,11 +2391,16 @@ class AlertsDatabase(SqliteStore):
 
     def resolve(self, alert_id: int, by: str = "") -> None:
         with self._lock:
-            self._conn.execute(
+            row = self._conn.execute(
+                "SELECT entity_kind, entity_id FROM alerts WHERE id=?",
+                (alert_id,)).fetchone()
+            cursor = self._conn.execute(
                 "UPDATE alerts SET state='resolved', resolved_ts=?, resolved_by=?"
                 " WHERE id=? AND state IN ('open','acked')",
                 (time.time(), by, alert_id))
             self._conn.commit()
+            if cursor.rowcount and row is not None:
+                self._mark_dirty(row["entity_kind"], row["entity_id"])
 
     def resolve_many(self, alert_ids: list[int], by: str = "") -> int:
         if not alert_ids:
@@ -2383,12 +2410,20 @@ class AlertsDatabase(SqliteStore):
         with self._lock:
             for chunk in id_chunks(alert_ids):
                 marks = marks_for(chunk)
+                # Read before the update: only ids actually resolved here
+                # (not merely asked for) mark their device dirty.
+                open_rows = {row["id"]: row for row in self._conn.execute(
+                    f"SELECT id, entity_kind, entity_id FROM alerts"
+                    f" WHERE id IN ({marks}) AND state IN ('open','acked')",
+                    chunk).fetchall()}
                 cursor = self._conn.execute(
                     f"UPDATE alerts SET state='resolved', resolved_ts=?,"
                     f" resolved_by=? WHERE id IN ({marks})"
                     f" AND state IN ('open','acked')",
                     (now, by, *chunk))
                 changed += cursor.rowcount or 0
+                for row in open_rows.values():
+                    self._mark_dirty(row["entity_kind"], row["entity_id"])
             self._conn.commit()
             return changed
 
@@ -3135,8 +3170,11 @@ class AlertsDatabase(SqliteStore):
                 " rolled_up_into=? WHERE id=?",
                 (time.time(), by, rolled_up_into, row["id"]))
             self._conn.commit()
-            return self._conn.execute(
+            resolved = self._conn.execute(
                 "SELECT * FROM alerts WHERE id = ?", (row["id"],)).fetchone()
+            if resolved is not None:
+                self._mark_dirty(resolved["entity_kind"], resolved["entity_id"])
+            return resolved
 
     def resolve_by_dedup_prefix(self, prefix: str, by: str = "",
                                 rolled_up_into: int | None = None
@@ -3173,6 +3211,8 @@ class AlertsDatabase(SqliteStore):
                 resolved.extend(self._conn.execute(
                     f"SELECT * FROM alerts WHERE id IN ({marks})", chunk
                 ).fetchall())
+            for row in resolved:
+                self._mark_dirty(row["entity_kind"], row["entity_id"])
             resolved.sort(key=lambda row: row["opened_ts"])
             return resolved
 
@@ -3388,6 +3428,35 @@ class AlertsDatabase(SqliteStore):
                 " ON CONFLICT(source) DO UPDATE SET cursor_id=excluded.cursor_id",
                 (source, value))
             self._conn.commit()
+
+    # --------------------------------------------- change-driven thresholds
+
+    def _mark_dirty(self, entity_kind: str, entity_id) -> None:
+        """Called wherever an alert is resolved, so its device re-derives
+        promptly rather than waiting for the next full pass. Entities
+        outside Nodes (device_id_for returns None) are ignored."""
+        device_id = alertrules.device_id_for(entity_kind, entity_id)
+        if device_id is None:
+            return
+        with self._lock:
+            self._dirty_devices.add(device_id)
+
+    def take_dirty_devices(self) -> set[int]:
+        """Device ids an alert resolve has touched since the last call,
+        cleared as they are taken."""
+        with self._lock:
+            dirty, self._dirty_devices = self._dirty_devices, set()
+        return dirty
+
+    def _bump_threshold_generation(self) -> None:
+        """A rule or override changed what breaches -- forces a full
+        threshold pass on AlertEngine's next tick."""
+        with self._lock:
+            self._threshold_generation += 1
+
+    def threshold_generation(self) -> int:
+        with self._lock:
+            return self._threshold_generation
 
     # ------------------------------------------------------------------ storage
 

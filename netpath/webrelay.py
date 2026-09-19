@@ -213,6 +213,13 @@ def map_refresh(value: str, names, origin: str) -> str:
         + map_url(m.group(3), names, origin) + m.group(2), rest)
 
 
+def strip_named_cookie(value: str, name: str) -> str:
+    """A `Cookie:` header with one named crumb removed."""
+    kept = [crumb.strip() for crumb in value.split(";")
+            if crumb.split("=", 1)[0].strip() != name]
+    return "; ".join(kept)
+
+
 def map_cookie(value: str, names) -> str:
     """A cookie the device scoped to its own name, or to this server's, is
     scoped to nothing instead. Host-only is the one scope a browser will
@@ -270,22 +277,28 @@ def _body_plan(fields, *, is_response: bool, code: int = 0, method: str = ""):
     return ("eof", 0) if is_response else ("none", 0)
 
 
-def _rebuild(start: bytes, lines, replaced: dict) -> bytes:
+def _rebuild(start: bytes, lines, replaced: dict, dropped=frozenset()) -> bytes:
     out = [start]
     for index, line in enumerate(lines):
+        if index in dropped:
+            continue
         value = replaced.get(index)
         out.append(line if value is None
                    else line.split(b":", 1)[0] + b": " + value)
     return b"\r\n".join(out) + b"\r\n\r\n"
 
 
-def frame_request(head: bytes, authority: bytes, names, origin: str):
+def frame_request(head: bytes, authority: bytes, names, origin: str,
+                  session_cookie: str = ""):
     """(head, body kind, body length, method) for one request, with every
     place its head names the relay — `Host:`, `Origin:`, `Referer:`, and a
     request target written out in full — pointed at the device instead, so
     the device builds its URLs against its own address and the three it may
     compare still agree there, as they did when nothing was read at all.
-    None sends the connection to the byte pump."""
+    None sends the connection to the byte pump.
+
+    `session_cookie`, if given, is stripped out of `Cookie:` (the header is
+    dropped entirely if nothing else was in it)."""
     parts = _split_head(head)
     if parts is None:
         return None
@@ -303,9 +316,17 @@ def frame_request(head: bytes, authority: bytes, names, origin: str):
             map_url(target.decode("latin-1"), names, origin).encode("latin-1"),
             match.group(3)))
     replaced = {}
+    dropped = set()
     for index, (name, value) in enumerate(fields):
         if name == b"host":
             replaced[index] = authority
+            continue
+        if name == b"cookie" and session_cookie:
+            mapped = strip_named_cookie(value.decode("latin-1"), session_cookie)
+            if not mapped:
+                dropped.add(index)
+            elif mapped != value.decode("latin-1"):
+                replaced[index] = mapped.encode("latin-1")
             continue
         if name not in REQUEST_HEADERS:
             continue
@@ -314,17 +335,20 @@ def frame_request(head: bytes, authority: bytes, names, origin: str):
             text, names, origin)
         if mapped != text:
             replaced[index] = mapped.encode("latin-1")
-    return (_rebuild(start, lines, replaced), plan[0], plan[1],
+    return (_rebuild(start, lines, replaced, dropped), plan[0], plan[1],
             match.group(1).upper().decode("ascii"))
 
 
-def frame_response(head: bytes, take_method, names, origin: str):
+def frame_response(head: bytes, take_method, names, origin: str,
+                   session_cookie: str = ""):
     """(head, body kind, body length, "") for one response, with every
     address it names mapped back onto the relay's origin.
 
     `take_method` is called — once, and only for a final response — for the
     method of the request being answered, since a `HEAD` answer carries no
     body however its head is framed.
+
+    `session_cookie`, if given: a `Set-Cookie` naming it is dropped outright.
     """
     parts = _split_head(head)
     if parts is None:
@@ -341,11 +365,15 @@ def frame_response(head: bytes, take_method, names, origin: str):
     if plan is None:
         return None
     replaced = {}
+    dropped = set()
     for index, (name, value) in enumerate(fields):
         if name not in REWRITTEN_HEADERS:
             continue
         text = value.decode("latin-1")
         if name == b"set-cookie":
+            if session_cookie and text.split("=", 1)[0].strip() == session_cookie:
+                dropped.add(index)
+                continue
             mapped = map_cookie(text, names)
         elif name == b"refresh":
             mapped = map_refresh(text, names, origin)
@@ -353,7 +381,7 @@ def frame_response(head: bytes, take_method, names, origin: str):
             mapped = map_url(text, names, origin)
         if mapped != text:
             replaced[index] = mapped.encode("latin-1")
-    return _rebuild(start, lines, replaced), plan[0], plan[1], ""
+    return _rebuild(start, lines, replaced, dropped), plan[0], plan[1], ""
 
 
 class _HttpConnection:
@@ -363,6 +391,9 @@ class _HttpConnection:
 
     def __init__(self):
         self.blind = threading.Event()
+        # Set only for a genuine 101: the one reason both directions should
+        # go on pumping raw bytes once blind.
+        self.upgraded = threading.Event()
         self._lock = threading.Lock()
         self._methods: list[str] = []
 
@@ -376,8 +407,10 @@ class _HttpConnection:
 
 
 # Returned by _read_head for "there is no head here": distinct from None,
-# which is the connection ending cleanly.
+# which is the connection ending cleanly. _TOO_LARGE is this direction's own
+# head past MAX_HEAD_BYTES; _BLIND is the other direction having given up.
 _BLIND = object()
+_TOO_LARGE = object()
 
 
 def _close_quietly(sock: socket.socket) -> None:
@@ -617,6 +650,10 @@ class WebRelaySession:
         # authority the device is told to build its own URLs against.
         self.origin = f"{scheme}://{host}:{port}"
         self.url = self.origin + "/"
+        # Deferred: server.py imports webrelay (via web.api), so importing
+        # this at module load time would cycle back into a half-built module.
+        from .web.server import SESSION_COOKIE
+        self.session_cookie = SESSION_COOKIE
         self.relay_names = frozenset(
             name for name in (str(host).strip("[]").lower(),
                               str(target_ip).strip("[]").lower()) if name)
@@ -801,11 +838,28 @@ class WebRelaySession:
                 break
             self._forward(dst, data, to_device)
 
-    def _blindly(self, src, dst, to_device: bool, state, buf) -> None:
-        """Back to the pump, for this connection and for good: the other
-        direction checks the switch before it frames anything else."""
+    def _go_blind(self, src, dst, to_device: bool, state, buf) -> None:
+        """Flip the shared switch. A genuine upgrade keeps pumping both
+        ways; anything else must not carry the browser's next request --
+        cookie included -- to the device unexamined, so that leg just
+        drains via _pump's half-close instead."""
         state.blind.set()
+        if to_device and not state.upgraded.is_set():
+            return
         self._copy(src, dst, to_device, bytes(buf))
+
+    def _refuse_oversized(self, src, state) -> None:
+        """The browser's own request head grew past MAX_HEAD_BYTES -- e.g.
+        a device that stuffed enough cookies into its answers. Refused
+        outright rather than left to drain, since a device that can do
+        that once can keep doing it forever."""
+        state.blind.set()
+        try:
+            src.sendall(b"HTTP/1.1 431 Request Header Fields Too Large\r\n"
+                       b"Connection: close\r\nContent-Length: 0\r\n\r\n")
+            src.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
 
     def _frame(self, src: socket.socket, dst: socket.socket, to_device: bool,
                state: "_HttpConnection") -> None:
@@ -814,22 +868,36 @@ class WebRelaySession:
         buf = bytearray()
         while not self._stopped.is_set():
             if state.blind.is_set():
+                if to_device and not state.upgraded.is_set():
+                    return
                 return self._copy(src, dst, to_device, bytes(buf))
             head = self._read_head(src, buf, state)
             if head is None:                    # the connection ended
                 if buf:
                     self._forward(dst, bytes(buf), to_device)
                 return
+            if head is _TOO_LARGE:
+                if to_device:
+                    return self._refuse_oversized(src, state)
+                return self._go_blind(src, dst, to_device, state, buf)
             if head is _BLIND:
-                return self._blindly(src, dst, to_device, state, buf)
+                return self._go_blind(src, dst, to_device, state, buf)
+            if not to_device:
+                # Peeked ahead of frame_response, which already treats a
+                # 101 as "stop framing" -- upgraded must be set first.
+                first_line = head.split(b"\r\n", 1)[0]
+                match = _STATUS_LINE.match(first_line)
+                if match and match.group(1) == b"101":
+                    state.upgraded.set()
             framed = (frame_request(head, self.device_authority,
-                                    self.relay_names, self.device_origin)
+                                    self.relay_names, self.device_origin,
+                                    self.session_cookie)
                       if to_device
                       else frame_response(head, state.take, self.relay_names,
-                                          self.origin))
+                                          self.origin, self.session_cookie))
             if framed is None:
                 buf[:0] = head       # not a byte of it has moved either way
-                return self._blindly(src, dst, to_device, state, buf)
+                return self._go_blind(src, dst, to_device, state, buf)
             rewritten, kind, length, method = framed
             if to_device:
                 # Before the forward, so the answer cannot arrive first.
@@ -842,19 +910,22 @@ class WebRelaySession:
                 return
             if kind == "chunked" and not self._stream_chunked(src, dst,
                                                               to_device, buf):
-                return self._blindly(src, dst, to_device, state, buf)
+                return self._go_blind(src, dst, to_device, state, buf)
 
     def _read_head(self, src: socket.socket, buf: bytearray, state):
         """The next head, taken off `buf`. None when the connection ended
-        first, `_BLIND` when there is no head here to be had."""
+        first, `_TOO_LARGE`/`_BLIND` when there is no head here to be had."""
         while True:
+            # Checked before looking for the terminator: a head that only
+            # grew past the limit once the terminator itself arrived must
+            # still be refused, not accepted because it happens to be whole.
+            if len(buf) > MAX_HEAD_BYTES:
+                return _TOO_LARGE
             cut = buf.find(b"\r\n\r\n")
             if cut != -1:
                 head = bytes(buf[:cut + 4])
                 del buf[:cut + 4]
                 return head
-            if len(buf) > MAX_HEAD_BYTES:
-                return _BLIND
             data = src.recv(CHUNK_BYTES)
             if not data:
                 return None
@@ -935,7 +1006,7 @@ class WebRelaySession:
         if self.token and now - self._last_touch >= TOUCH_INTERVAL_S:
             self._last_touch = now
             try:
-                self.service.sessions.touch(self.token)
+                self.service.sessions.touch(self.token, self.client_ip)
             except Exception:
                 pass
 
@@ -980,7 +1051,7 @@ class WebRelaySession:
             if now - self._last_traffic >= idle:
                 self.stop(f"idle for {max(1, round(idle / 60))} minute(s)")
                 return True
-        if self.token and self.service.sessions.get(self.token) is None:
+        if self.token and self.service.sessions.get(self.token, self.client_ip) is None:
             self.stop(f"{self.app_user} is no longer signed in")
             return True
         if ticks % PERMISSION_EVERY_TICKS == 0 and not self._has_web_write():

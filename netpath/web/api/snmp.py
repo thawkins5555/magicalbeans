@@ -13,8 +13,8 @@ from ._shared import EXPORT_ROW_CAP, SEARCH_ROW_CAP, _csv_response, _csv_time, _
 
 # --------------------------------------------------------------------- snmp
 
-def _snmp_filters(params) -> dict:
-    return {
+def _snmp_filters(service, params) -> dict:
+    filters = {
         "text": params.get("q", ""),
         "severity": params.get("severity") or None,
         "version": params.get("version") or None,
@@ -23,25 +23,36 @@ def _snmp_filters(params) -> dict:
         "oid": params.get("oid", ""),
         "community": params.get("community", ""),
     }
+    if not _may_read_secrets(service, params, "snmp"):
+        # A caller who may not see the value can't filter on it either --
+        # ignored the same as if it were never given.
+        filters["community"] = ""
+    return filters
 
 
 def get_snmp_overview(service, params, body) -> dict:
     """Histogram plus the context the page needs; deliberately cheap."""
     t0, t1, bucket = _hist_window(params)
-    filters = _snmp_filters(params)
+    filters = _snmp_filters(service, params)
 
-    buckets = service.snmp_db.histogram(t0, t1, bucket, filters)
+    buckets = service.snmp_db.histogram(
+        t0, t1, bucket, filters, reveal=_may_read_secrets(service, params, "snmp"))
     stats = service.cached_poll("trap_stats", 10.0,
                                 service.snmp_db.stats)
+    # Each a full-table scan; shared by every open tab rather than run per
+    # request. Same 10s TTL as `stats` above (snmp_refresh_s's own default).
+    sources = service.cached_poll("trap_recent_sources", 10.0,
+                                  service.snmp_db.recent_sources)
+    kinds = service.cached_poll("trap_kind_counts", 10.0, service.snmp_db.kinds)
     return {
         "t0": t0, "t1": t1, "bucket_s": bucket,
         "buckets": buckets,
         "stats": stats,
         "sources": [{"source": row["source"], "count": row["n"],
                      "last_seen": row["last_seen"]}
-                    for row in service.snmp_db.recent_sources()],
+                    for row in sources],
         "kinds": [{"kind": row["trap_kind"], "count": row["n"]}
-                  for row in service.snmp_db.kinds()],
+                  for row in kinds],
     }
 
 
@@ -52,7 +63,8 @@ def _snmp_trap_rows(service, params, cap: int, *,
                     ) -> tuple[list[dict], bool, float]:
     t1 = _num(params, "t1", time.time())
     t0 = _num(params, "t0", t1 - 86400)
-    filters = _snmp_filters(params)
+    reveal = _may_read_secrets(service, params, "snmp")
+    filters = _snmp_filters(service, params)
 
     started = time.time()
     # Same use_request_limit reasoning as _syslog_search_rows above: the
@@ -63,7 +75,7 @@ def _snmp_trap_rows(service, params, cap: int, *,
         effective = _page(params, 300, cap)[0]
     else:
         effective = cap
-    rows = service.snmp_db.search(t0, t1, filters, limit=effective + 1)
+    rows = service.snmp_db.search(t0, t1, filters, limit=effective + 1, reveal=reveal)
     # One row past the limit says whether anything was left out; `len(rows)
     # >= effective` reported a cut-off for a window with exactly `effective`
     # matches, which was a lie the count label repeated.
@@ -77,7 +89,6 @@ def _snmp_trap_rows(service, params, cap: int, *,
                  service.app_db.hostnames({row["source"] for row in rows}).items()
                  if name}
 
-    reveal = _may_read_secrets(service, params, "snmp")
     traps = []
     for row in rows:
         try:

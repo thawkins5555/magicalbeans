@@ -1292,7 +1292,9 @@ class Handler(BaseHTTPRequestHandler):
         setting the `_token`/`_username` params in place. Returns whether
         the caller is authenticated."""
         token = self._cookie(SESSION_COOKIE)
-        session = self.service.sessions.get(token) if token else None
+        # A session is honoured only from the address that created it.
+        session = (self.service.sessions.get(token, self.client_address[0])
+                  if token else None)
         authenticated = False
         if session:
             params["_token"] = token
@@ -1308,7 +1310,7 @@ class Handler(BaseHTTPRequestHandler):
             # session (api.post_heartbeat), which this blanket touch would
             # have made impossible.
             if method in ("POST", "PUT", "DELETE") and path != "/api/heartbeat":
-                self.service.sessions.touch(token)
+                self.service.sessions.touch(token, self.client_address[0])
         else:
             # No cookie session: an API token may still authenticate this
             # request, checked against `Authorization` rather than `Cookie`.
@@ -1628,6 +1630,8 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
     """ThreadingHTTPServer with a ceiling on concurrent connections, and
     without a traceback for every client that walks away mid-response."""
 
+    is_tls = False   # WebServer.start() sets this True per-instance for TLS
+
     def __init__(self, *args, **kwargs):
         # BoundedSemaphore, not Semaphore: a release that is not matched by
         # an acquire is a leak in the other direction, and a leaked slot
@@ -1648,6 +1652,13 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
 
     def process_request_thread(self, request, client_address):
         try:
+            if self.is_tls:
+                request.settimeout(self.RequestHandlerClass.timeout)
+                try:
+                    request.do_handshake()
+                except Exception:
+                    self.shutdown_request(request)   # quiet: no handshake, no request
+                    return
             super().process_request_thread(request, client_address)
         finally:
             self._slots.release()
@@ -1713,8 +1724,11 @@ class WebServer:
                 context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
                 context.load_cert_chain(self.certfile, self.keyfile or self.certfile)
                 context.minimum_version = ssl.TLSVersion.TLSv1_2
-                self.httpd.socket = context.wrap_socket(self.httpd.socket,
-                                                        server_side=True)
+                # Deferred to process_request_thread (one thread per
+                # connection) instead of running inside accept() itself.
+                self.httpd.socket = context.wrap_socket(
+                    self.httpd.socket, server_side=True,
+                    do_handshake_on_connect=False)
         except (OSError, ssl.SSLError) as exc:
             hint = ""
             if getattr(exc, "errno", None) in (48, 98, 10048):

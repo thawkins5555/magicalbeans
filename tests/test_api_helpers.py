@@ -473,6 +473,37 @@ try:
               (payload["bucket_s"], len(payload["buckets"])))
 
     # ---------------------------------------------------------------------
+    # 5b. The overview's Sources/Kinds panels are single-flighted
+    #
+    # recent_sources()/kinds()/sources() are each a full-table GROUP BY;
+    # get_snmp_overview/get_syslog_overview now read them through
+    # service.cached_poll (10s, matching the sibling `stats` cache already
+    # there) instead of running one per request.
+
+    for name, store, method, handler_fn in [
+            ("snmp", "snmp_db", "recent_sources", get_snmp_overview),
+            ("snmp", "snmp_db", "kinds", get_snmp_overview),
+            ("syslog", "syslog_db", "sources", get_syslog_overview)]:
+        service._poll_cache.clear()   # force a miss on the first of the two calls below
+        database = getattr(service, store)
+        real_method = getattr(database, method)
+        calls = []
+
+        def spy(*a, _calls=calls, _real=real_method, **kw):
+            _calls.append(1)
+            return _real(*a, **kw)
+
+        setattr(database, method, spy)
+        try:
+            handler_fn(service, {}, {})
+            handler_fn(service, {}, {})
+        finally:
+            setattr(database, method, real_method)
+        check(f"/api/{name}/overview calls {method}() once, not once per "
+              f"request, inside the cache window",
+              len(calls) == 1, len(calls))
+
+    # ---------------------------------------------------------------------
     # 6. A CSV cell is data, not a formula
     #
     # A syslog message is written by anything that can reach UDP/514 — no

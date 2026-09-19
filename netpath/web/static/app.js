@@ -3536,16 +3536,19 @@ const App = (() => {
 
   function el(id) { return document.getElementById(id); }
 
-  /* Write-only-if-changed. drawStatus-style redraws run on every fastTick —
-     ten times a second whether or not anything actually changed — and an
-     unconditional write to textContent/innerHTML/style still queues a real
-     DOM mutation (and, for style, can cancel a CSS transition already in
-     flight) even when the new value equals the old one. Seven modules each
-     grew an identical copy of these three guards; this is the one copy.
-     `el` may be null (the caller's own element lookup, not looked up
-     again here) — all three are no-ops in that case. */
-  function setText(el, text) { if (el && el.textContent !== text) el.textContent = text; }
-  function setHtml(el, html) { if (el && el.innerHTML !== html) el.innerHTML = html; }
+  /* Write-only-if-changed, against the last string WRITTEN (the DOM
+     re-serialises an escaped quote or `selected`); setText invalidates it. */
+  const lastHtml = new WeakMap();
+  function setText(el, text) {
+    if (!el || el.textContent === text) return;
+    el.textContent = text;
+    lastHtml.delete(el);
+  }
+  function setHtml(el, html) {
+    if (!el || lastHtml.get(el) === html) return;
+    el.innerHTML = html;
+    lastHtml.set(el, html);
+  }
   function setBg(el, color) { if (el && el.style.background !== color) el.style.background = color; }
   function setHidden(el, hidden) { if (el && el.hidden !== hidden) el.hidden = hidden; }
 

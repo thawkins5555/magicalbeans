@@ -40,15 +40,18 @@ import time
 import _paths
 from _paths import tmpdir
 
+from _old_series_maintenance import old_compact_rollup, old_prune_by_band
 from netpath.alertsdb import AlertsDatabase
 from netpath.ipamdb import IpamDatabase
 from netpath.nodesdb import NodesDatabase
-from netpath.nodesseriesdb import NodesSeriesDatabase
+from netpath.nodesseriesdb import (NodesSeriesDatabase, SCOPE_DEVICE,
+                                   SCOPE_INTERFACE)
 from netpath.snmptrapdb import SnmpTrapDatabase
 from netpath.syslogdb import SyslogDatabase
 from netpath.syslogparse import LogEntry
 
 DAY = 86400.0
+HOUR = 3600.0
 WRITE_BATCH = 50_000
 
 # The shipped caps, read out of each module's DEFAULTS so this bench keeps
@@ -573,9 +576,188 @@ def run(folder: str, rows: int, insert_batch: int) -> None:
               f"{after / max(before, 1e-9):>8.2f}x {size / 1e6:>6.0f}")
 
 
+# ---------------------------------------------- history maintenance, at scale
+#
+# The STORES cases above seed nodes_series.db's `samples` to METRICS=200,
+# spread over whatever `rows` is asked for -- fine for the other six stores,
+# but 200 metrics never reproduces the cost maintenance bands by metric id
+# are meant to fix: a range scan across a band of 200 metrics is cheap
+# regardless of whether it can seek. This mode seeds a fleet-scale metric
+# count instead and times each maintenance stage on its own, printing the
+# hold-time distribution per stage -- what a poller or a reader queued
+# behind this store actually feels, not the stage's total wall time.
+#
+# _trim_hourly is unbatched by design: at 10,000 metrics, one 3.4 s hold
+# beat a batched ~110 s of near-continuous lock duty for the same rows, so
+# the number below is a single-hold baseline, not a regression to chase.
+
+LARGE_METRICS = 10_000
+# 10,000 metrics x 1,440 raw samples is a realistic fleet-scale scenario (a
+# day at a 60 s poll); the hourly depth is a round 30 days.
+LARGE_RAW_PER_METRIC = 1_440
+LARGE_HOURLY_PER_METRIC = 24 * 30
+LARGE_POLL_INTERVAL_S = 60.0
+
+
+class HoldSpy:
+    """test_prune_lock_hold.py's SpyLock, minus the reader-thread plumbing
+    this single-threaded bench doesn't need: every uninterrupted hold on the
+    wrapped lock, timed. The maximum is not a property of a batching scheme
+    -- an automatic WAL checkpoint can land inside any one commit -- so the
+    median and 90th percentile are what a tuning change actually moves.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+        self._local = threading.local()
+        self.holds: list[float] = []
+
+    def acquire(self, *args, **kwargs):
+        got = self._inner.acquire(*args, **kwargs)
+        if got:
+            depth = getattr(self._local, "depth", 0)
+            if depth == 0:
+                self._local.since = time.perf_counter()
+            self._local.depth = depth + 1
+        return got
+
+    def release(self):
+        depth = getattr(self._local, "depth", 0) - 1
+        self._local.depth = depth
+        if depth == 0:
+            self.holds.append(time.perf_counter() - self._local.since)
+        self._inner.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+        return False
+
+
+def large_timed(store, label, call):
+    """Times `call` against a fresh HoldSpy, so every figure printed is this
+    call's own -- not store.lock_stats(), whose counters are cumulative
+    since open and would carry over whatever the seeding phase (or an
+    earlier stage) did.
+    """
+    spy = HoldSpy(store._lock)
+    store._lock = spy
+    started = time.perf_counter()
+    result = call()
+    elapsed = time.perf_counter() - started
+    store._lock = spy._inner
+    holds = sorted(spy.holds) or [0.0]
+    median = holds[len(holds) // 2]
+    p90 = holds[min(len(holds) - 1, int(len(holds) * 0.9))]
+    stats = {"acquisitions": len(holds), "median_s": median, "p90_s": p90,
+             "max_hold_s": holds[-1]}
+    print(f"  {label:<28} {elapsed * 1000:>9.1f} ms   "
+          f"lock: {stats['acquisitions']:>5} acq, "
+          f"median {median * 1000:>7.1f} ms, "
+          f"p90 {p90 * 1000:>7.1f} ms, "
+          f"max {holds[-1] * 1000:>7.1f} ms")
+    return result, stats
+
+
+def large_seed(folder, label, metrics, raw_per_metric, hourly_per_metric,
+              poll_interval_s, now):
+    db = NodesSeriesDatabase(os.path.join(folder, f"{label}.db"))
+    with db._lock:
+        # One metric in 20 is device-level, the rest per-port -- roughly
+        # nodesseriesdb's own real-world proportion the other way round.
+        db._conn.executemany(
+            "INSERT INTO metrics(device_id, key, label, unit, kind, scope)"
+            " VALUES (?,?,?,?,'gauge',?)",
+            [(1 + i % DEVICES, f"bench.{i}", f"metric {i}", "u",
+              SCOPE_DEVICE if i % 20 == 0 else SCOPE_INTERFACE)
+             for i in range(metrics)])
+        db._conn.commit()
+        metric_ids = [row[0] for row in db._conn.execute(
+            "SELECT id FROM metrics ORDER BY id").fetchall()]
+    raw_step = max(1.0, poll_interval_s)
+    fill(db, "INSERT OR REPLACE INTO samples(metric_id, ts, value)"
+             " VALUES (?,?,?)",
+         ((mid, now - s * raw_step, float((s + mid) % 1000))
+          for mid in metric_ids for s in range(raw_per_metric)))
+    fill(db, "INSERT OR REPLACE INTO samples_hourly(metric_id, hour, n, vmin,"
+             " vavg, vmax) VALUES (?,?,60,0.0,?,?)",
+         ((mid, int(now // HOUR) * HOUR - h * HOUR, float(h % 100),
+           float(h % 100) * 2)
+          for mid in metric_ids for h in range(hourly_per_metric)))
+    return db
+
+
+def large_series_bench(folder, metrics: int, raw_per_metric: int,
+                       hourly_per_metric: int, poll_interval_s: float,
+                       oracle: bool = False) -> None:
+    now = time.time()
+    raw_step = max(1.0, poll_interval_s)
+    latest_complete = int(now // HOUR) * HOUR - HOUR
+    cutoff = now - (raw_per_metric * raw_step) / 2
+    trim_floor = max(1, hourly_per_metric * metrics // 4)
+
+    print(f"\nseeding {metrics:,} metrics, {raw_per_metric:,} raw samples "
+          f"and {hourly_per_metric:,} rollups each"
+          f"{' (new + old, for --oracle)' if oracle else ''} ...")
+    started = time.perf_counter()
+    new_db = large_seed(folder, "nodes_series_new", metrics, raw_per_metric,
+                        hourly_per_metric, poll_interval_s, now)
+    old_db = (large_seed(folder, "nodes_series_old", metrics, raw_per_metric,
+                         hourly_per_metric, poll_interval_s, now)
+              if oracle else None)
+    print(f"  seeded in {time.perf_counter() - started:.1f} s, "
+          f"{new_db.size_bytes() / 1e6:,.0f} MB each")
+
+    if oracle:
+        print(f"  {'stage':<24} {'old p90 hold':>13}   {'new p90 hold':>13}")
+
+    def stage(label, old_call, new_call):
+        if oracle:
+            (_, old_stats) = large_timed(old_db, f"{label} (old)", old_call)
+            (_, new_stats) = large_timed(new_db, f"{label} (new)", new_call)
+            print(f"  {label:<24} {old_stats['p90_s']*1000:>10.1f} ms   "
+                  f"{new_stats['p90_s']*1000:>10.1f} ms")
+        else:
+            large_timed(new_db, label, new_call)
+
+    # 1. One hour of roll-up: force the watermark to exactly one pending
+    # hour so max_hours=1 does real work, not "nothing to do".
+    new_db._set_private_setting(new_db._ROLLUP_WATERMARK, latest_complete)
+    if oracle:
+        old_db._set_private_setting(old_db._ROLLUP_WATERMARK, latest_complete)
+    stage("compact_rollup (1 hour)",
+          lambda: old_compact_rollup(old_db, max_hours=1) if oracle else None,
+          lambda: new_db.compact_rollup(max_hours=1))
+
+    # 2. One prune band: the age-based delete alone, not the whole prune()
+    # (which also covers rollups and the cap, timed separately below).
+    stage("prune band (age cutoff)",
+          lambda: old_prune_by_band(old_db, "samples", "ts < ?", (cutoff,))
+                  if oracle else None,
+          lambda: new_db._prune_by_band("samples", "ts < ?", (cutoff,)))
+
+    # 3. The row cap: unchanged code, no "old" to compare against.
+    large_timed(new_db, "cap_samples_per_metric",
+               lambda: new_db.cap_samples_per_metric(max(1, raw_per_metric // 4)))
+
+    # 4. The hourly trim: also unchanged (see the module docstring above),
+    # so likewise a single measurement rather than an old/new split.
+    large_timed(new_db, "_trim_hourly",
+               lambda: new_db._trim_hourly(trim_floor))
+
+    new_db.close()
+    if old_db is not None:
+        old_db.close()
+
+
 def main(argv) -> int:
     sizes = []
     insert_batch = 20_000
+    large = None
+    oracle = False
     index = 0
     while index < len(argv):
         item = argv[index]
@@ -584,11 +766,29 @@ def main(argv) -> int:
         elif item == "--insert-batch":
             index += 1
             insert_batch = int(argv[index].replace("_", ""))
+        elif item == "--large":
+            # An optional metric count may follow; otherwise LARGE_METRICS.
+            if index + 1 < len(argv) and argv[index + 1].lstrip("-").isdigit():
+                index += 1
+                large = int(argv[index].replace("_", ""))
+            else:
+                large = LARGE_METRICS
+        elif item == "--oracle":
+            oracle = True
         else:
             sizes.append(int(item.replace("_", "")))
         index += 1
     folder = tmpdir("bench_prune_")
     print(f"scratch: {folder}")
+    if large is not None:
+        # A dedicated, fleet-scale run -- the STORES loop below stays at its
+        # own METRICS=200 for everyone comparing its existing numbers.
+        # --oracle seeds a second, identical store and runs the pre-rewrite
+        # bodies against it alongside the live code, old vs new.
+        large_series_bench(folder, large, LARGE_RAW_PER_METRIC,
+                           LARGE_HOURLY_PER_METRIC, LARGE_POLL_INTERVAL_S,
+                           oracle=oracle)
+        return 0
     for rows in sizes or [200_000]:
         run(folder, rows, insert_batch)
     return 0

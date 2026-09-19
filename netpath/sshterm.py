@@ -706,7 +706,7 @@ class SshSession:
             return
         self._last_touch = now
         try:
-            self.service.sessions.touch(self.token)
+            self.service.sessions.touch(self.token, self.client_ip)
         except Exception:
             pass
 
@@ -770,7 +770,7 @@ class SshSession:
                 self.ws.close(CLOSE_IDLE, f"Idle timeout ({minutes}m)")
                 self.stop()
                 return True
-        if self.token and self.service.sessions.get(self.token) is None:
+        if self.token and self.service.sessions.get(self.token, self.client_ip) is None:
             self._end_unauthorized(
                 "You were signed out",
                 f"SSH session closed: {self.app_user} is no longer signed in")

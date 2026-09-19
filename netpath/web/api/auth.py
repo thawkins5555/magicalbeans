@@ -59,8 +59,8 @@ def _dummy_hash() -> str:
         return _dummy_hash_value
 
 
-def _login_check_lockout(service, username, client, params, label) -> None:
-    """Raise LockedOut if this username/client pair is still locked out.
+def _login_check_lockout(service, client, params, label) -> None:
+    """Raise LockedOut if this address is still locked out.
 
     Checked before the semaphore and before any hashing: a locked-out
     caller must not be able to hold a verification slot or spend a
@@ -68,13 +68,15 @@ def _login_check_lockout(service, username, client, params, label) -> None:
     """
     from ...auth import LockedOut
 
-    remaining = service.throttle.lockout_remaining(username, client)
+    remaining = service.throttle.lockout_remaining(client)
     if remaining > 0:
-        service.log.add(ERROR_CATEGORY,
-                        f"Refused sign-in for {label} from {client}: too many "
-                        f"failures, locked for another {remaining / 60:.0f} min")
-        _audit(service, dict(params, _username=label), "signin.locked_out",
-               target=label, detail=f"locked for another {remaining:.0f}s")
+        # Logged and audited once per lock episode, not once per request.
+        if service.throttle.announce_lockout(client):
+            service.log.add(ERROR_CATEGORY,
+                            f"Refused sign-in for {label} from {client}: too many "
+                            f"failures, locked for another {remaining / 60:.0f} min")
+            _audit(service, dict(params, _username=label), "signin.locked_out",
+                   target=label, detail=f"locked for another {remaining:.0f}s")
         raise LockedOut(f"Too many failed sign-ins. Try again in "
                         f"{max(1, round(remaining / 60))} minute(s).")
 
@@ -123,7 +125,7 @@ def post_login(service, params, body) -> dict:
         username = ""
     label = username or "(not a username)"
 
-    _login_check_lockout(service, username, client, params, label)
+    _login_check_lockout(service, client, params, label)
     _login_apply_delay(service, username, client)
     _login_acquire_slot(service, client, label)
     # Whether the credential was already verified below (the auto-create
@@ -548,6 +550,7 @@ def post_password(service, params, body) -> dict:
                         verify_password)
 
     me = params.get("_username", "")
+    client = _client(params)
     target = str(body.get("username", "") or me)
     new = str(body.get("new_password", ""))
     resetting = target.lower() != me.lower()
@@ -567,20 +570,40 @@ def post_password(service, params, body) -> dict:
             f"password to change here.")
 
     if not resetting:
-        # Changing your own password needs the current one, so a walk-up at an
-        # unlocked screen cannot lock the real owner out.
-        if not verify_password(str(body.get("current_password", "")), row["password"]):
-            raise PermissionError("That is not the current password")
+        # Same order post_login uses: refused outright if already locked,
+        # else slowed, before a verification slot is ever taken.
+        _login_check_lockout(service, client, params, me)
+        _login_apply_delay(service, me, client)
 
+    # Shares login's own slot semaphore: up to three scrypt calls below
+    # must not let a signed-in account exhaust server memory either.
+    if not _LOGIN_SLOTS.acquire(timeout=_LOGIN_SLOT_WAIT_S):
+        service.log.add(ERROR_CATEGORY,
+                        f"Refused password change for {target} by {me} from "
+                        f"{client}: every password-verification slot busy "
+                        f"for {_LOGIN_SLOT_WAIT_S:.0f}s")
+        raise Busy("The server is busy verifying passwords. Try again in a moment.")
     try:
-        check_password_quality(new, target)
-    except AuthError as exc:
-        raise ValueError(str(exc)) from exc
+        if not resetting:
+            # Changing your own password needs the current one, so a walk-up
+            # at an unlocked screen cannot lock the real owner out.
+            if not verify_password(str(body.get("current_password", "")),
+                                   row["password"]):
+                service.throttle.record_failure(me, client)
+                raise PermissionError("That is not the current password")
 
-    if verify_password(new, row["password"]):
-        raise ValueError("That is already the password")
+        try:
+            check_password_quality(new, target)
+        except AuthError as exc:
+            raise ValueError(str(exc)) from exc
 
-    service.app_db.set_password(target, hash_password(new), must_change=resetting)
+        if verify_password(new, row["password"]):
+            raise ValueError("That is already the password")
+
+        service.app_db.set_password(target, hash_password(new), must_change=resetting)
+    finally:
+        _LOGIN_SLOTS.release()
+    service.throttle.clear(me)
     ended = service.sessions.destroy_user(target)
     service.log.add(SYSTEM_CATEGORY,
                     f"Password for {target} changed by {me}; "

@@ -487,7 +487,9 @@ measure("device_events", nodes_db,
             event_days=EVENT_DAYS, discovery_days=30)),
         "SELECT id FROM device_events", expected)
 
-# And the button: event_days=0 is a cutoff of "now", i.e. every row.
+# And the button: event_days=0 is a cutoff of "now", i.e. every row --
+# the id-keeping guard only applies to the age-based sweep above, not to
+# this explicit "empty the table" call; the cursor rewind covers it instead.
 measure("device_events, delete-everything", nodes_db,
         lambda: without_reclaim(nodesdb_module, lambda: nodes_db.prune(
             event_days=0, discovery_days=0)),

@@ -96,13 +96,13 @@ def check(url: str, timeout_s: float = DEFAULT_TIMEOUT_S,
         urllib.request.HTTPSHandler(context=context), _CountedRedirects())
     request = urllib.request.Request(
         url, headers={"User-Agent": USER_AGENT, "Accept": "*/*"})
-    started = time.monotonic()
+    started = time.perf_counter()   # monotonic ticks at 15.6 ms on Windows, quantising every latency here
     try:
         with opener.open(request, timeout=timeout_s) as response:
             response.read(MAX_BODY_BYTES)
             code = int(response.getcode() or 0)
             final = response.geturl() or url
-        latency = (time.monotonic() - started) * 1000.0
+        latency = (time.perf_counter() - started) * 1000.0
         ok = 200 <= code < 400
         return HttpsResult(ok, code, latency, "" if ok else f"HTTP {code}", final)
     except urllib.error.HTTPError as error:
@@ -111,8 +111,8 @@ def check(url: str, timeout_s: float = DEFAULT_TIMEOUT_S,
         except Exception:
             pass
         code = int(error.code or 0)
-        return HttpsResult(False, code, (time.monotonic() - started) * 1000.0,
+        return HttpsResult(False, code, (time.perf_counter() - started) * 1000.0,
                            f"HTTP {code}"[:ERROR_MAX], error.geturl() or url)
     except Exception as error:                                # noqa: BLE001
-        return HttpsResult(False, None, (time.monotonic() - started) * 1000.0,
+        return HttpsResult(False, None, (time.perf_counter() - started) * 1000.0,
                            _error_text(error)[:ERROR_MAX], url)

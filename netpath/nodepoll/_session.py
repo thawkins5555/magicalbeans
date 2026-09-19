@@ -88,7 +88,12 @@ class _Session:
         # a dotted-quad — and the port is separate, so there is nothing to
         # parse.
         self.family = socket.AF_INET6 if ":" in str(ip) else socket.AF_INET
-        self.sock = socket.socket(self.family, socket.SOCK_DGRAM)
+        try:
+            self.sock = socket.socket(self.family, socket.SOCK_DGRAM)
+        except OSError as exc:
+            # A bare OSError here escapes every SnmpError handler, and
+            # record_poll never runs -- the device's status freezes.
+            raise SnmpError(f"could not open a socket for {ip}: {exc}") from exc
         self.sock.settimeout(self.timeout_s)
         # Request ids for this session's own exchanges. A counter from a
         # random start rather than random.randint per request: two requests
@@ -179,6 +184,11 @@ class _Session:
                     self.sock.settimeout(remaining)
                     data, addr = self.sock.recvfrom(MAX_UDP)
                 except socket.timeout:
+                    last_error = SnmpTimeout(f"no reply from {self.ip}:{self.port}")
+                    break
+                except ConnectionResetError:
+                    # Windows: an ICMP port-unreachable reads as a reset on
+                    # the next recvfrom, same as udpsock.py treats it.
                     last_error = SnmpTimeout(f"no reply from {self.ip}:{self.port}")
                     break
                 except OSError as exc:

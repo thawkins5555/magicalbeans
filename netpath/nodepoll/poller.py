@@ -443,13 +443,20 @@ class NodePoller(Worker, DiscoveryMixin, PollMixin, VendorIdentifyMixin, Environ
             job.cancel()
         if self._executor:
             self._executor.shutdown(wait=False, cancel_futures=True)
+        if self._mac_executor:
+            self._mac_executor.shutdown(wait=False, cancel_futures=True)
+            self._mac_executor = None
         with self._lock:
             for pool in self._draining:
                 pool.shutdown(wait=False, cancel_futures=True)
             self._draining.clear()
-        if self._mac_executor:
-            self._mac_executor.shutdown(wait=False, cancel_futures=True)
-            self._mac_executor = None
+            # A cancelled future never reaches _run_one/_run_*_table's own
+            # clear; _started is untouched since drain() still needs it.
+            self._queued.clear()
+            self._mac_running.clear()
+            self._vlan_running.clear()
+            self._arp_running.clear()
+            self._lldp_running.clear()
 
     finish_stop = Worker._finish_stop_draining
 
@@ -807,6 +814,9 @@ class NodePoller(Worker, DiscoveryMixin, PollMixin, VendorIdentifyMixin, Environ
                 if last and now >= due:
                     due = now + random.uniform(0, min(interval, _STARTUP_SPREAD_S))
                 self._next_run[device_id] = due
+            elif due - now > interval:
+                due = now + interval   # backward clock step
+                self._next_run[device_id] = due
             if now >= due:
                 pending = device_id in self._started or device_id in self._queued
                 # Focus is left exact: it exists to make the selected device
@@ -1123,6 +1133,8 @@ class NodePoller(Worker, DiscoveryMixin, PollMixin, VendorIdentifyMixin, Environ
             # restart does not walk every opted-in switch at once.
             self._next_mac_walk[device_id] = now + random.uniform(0, interval)
             return
+        if due - now > interval:
+            due = self._next_mac_walk[device_id] = now + interval   # backward clock step
         if now < due:
             return
         with self._lock:
@@ -1153,6 +1165,8 @@ class NodePoller(Worker, DiscoveryMixin, PollMixin, VendorIdentifyMixin, Environ
         if due is None:
             self._next_lldp_walk[device_id] = now + random.uniform(0, interval)
             return
+        if due - now > interval:
+            due = self._next_lldp_walk[device_id] = now + interval
         if now < due:
             return
         with self._lock:
@@ -1182,6 +1196,8 @@ class NodePoller(Worker, DiscoveryMixin, PollMixin, VendorIdentifyMixin, Environ
         if due is None:
             self._next_vlan_walk[device_id] = now + random.uniform(0, interval)
             return
+        if due - now > interval:
+            due = self._next_vlan_walk[device_id] = now + interval
         if now < due:
             return
         with self._lock:
@@ -1220,6 +1236,8 @@ class NodePoller(Worker, DiscoveryMixin, PollMixin, VendorIdentifyMixin, Environ
             # restart does not walk every opted-in router at once.
             self._next_arp_walk[device_id] = now + random.uniform(0, interval)
             return
+        if due - now > interval:
+            due = self._next_arp_walk[device_id] = now + interval
         if now < due:
             return
         with self._lock:

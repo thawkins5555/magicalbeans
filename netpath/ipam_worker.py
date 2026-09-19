@@ -153,21 +153,34 @@ class IpamWorker(Worker):
             return
         now = time.time()
 
+        # Clamped below to at most one interval past `now`: a backward clock step must not stall these.
+        scan_interval_s = float(settings.get("scan_interval_minutes", 60)) * 60
+        dhcp_interval_s = float(settings.get("dhcp_poll_interval_minutes", 15)) * 60
+        ingest_interval_s = max(1.0, float(settings.get("device_ingest_minutes", 5))) * 60
+
         subnets = [s for s in self.db.subnets() if s["enabled"]]
         if not self._staggered:
             self._stagger_first_scans(subnets, settings, now)
         for subnet in subnets:
-            if now >= self._next_scan.get(subnet["id"], 0):
+            due = self._next_scan.get(subnet["id"], 0)
+            if due - now > scan_interval_s:
+                due = self._next_scan[subnet["id"]] = now + scan_interval_s
+            if now >= due:
                 self._schedule_scan(subnet["id"], settings)
 
         for server in self.db.dhcp_servers():
             if not server["enabled"]:
                 continue
-            if now >= self._next_dhcp_poll.get(server["id"], 0) and server["id"] not in self._polling:
+            due = self._next_dhcp_poll.get(server["id"], 0)
+            if due - now > dhcp_interval_s:
+                due = self._next_dhcp_poll[server["id"]] = now + dhcp_interval_s
+            if now >= due and server["id"] not in self._polling:
                 self._schedule_dhcp_poll(server["id"], settings)
 
+        if self._next_ingest - now > ingest_interval_s:
+            self._next_ingest = now + ingest_interval_s
         if self.nodes_db is not None and now >= self._next_ingest:
-            self._next_ingest = now + max(1.0, float(settings.get("device_ingest_minutes", 5))) * 60
+            self._next_ingest = now + ingest_interval_s
             self._ingest_device_tables(settings)
 
     # ------------------------------------------------- device-table ingest

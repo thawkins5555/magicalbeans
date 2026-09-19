@@ -852,6 +852,10 @@ class ConfigRxWorker(Worker):
         self._stop.set()
         if self._executor:
             self._executor.shutdown(wait=False, cancel_futures=True)
+            with self._lock:
+                # A cancelled future never reaches _run_one's own pop;
+                # _started is left alone since drain() still needs it.
+                self._queued.clear()
 
     # finish_stop is Worker's: the loop thread only. A backup already running
     # is on a cancelled pool and writes through its own guard.
@@ -904,16 +908,29 @@ class ConfigRxWorker(Worker):
 
     def _loop(self) -> None:
         while not self._stop.is_set():
-            settings = self.db.settings()
-            if settings.get("enabled", True):
-                interval = float(settings.get("backup_interval_hours", 24))
-                for row in self.db.devices_due(interval):
-                    try:
-                        self.backup_now(row["device_id"])
-                    except self.NotRunning:
-                        # Shutting down between the due-list and the submit;
-                        # the next start picks these up again.
-                        break
+            # Guarded like NodePoller._loop: one database error here must
+            # not kill this thread silently.
+            try:
+                settings = self.db.settings()
+                if settings.get("enabled", True):
+                    interval = float(settings.get("backup_interval_hours", 24))
+                    for row in self.db.devices_due(interval):
+                        try:
+                            self.backup_now(row["device_id"])
+                        except self.NotRunning:
+                            # Shutting down between the due-list and the submit;
+                            # the next start picks these up again.
+                            break
+                if self.error:
+                    self.log.add(CONFIGRX, "ConfigRX scheduling recovered")
+                    self.error = None
+            except Exception as exc:
+                message = str(exc) or exc.__class__.__name__
+                new_error = f"ConfigRX scheduling failed: {message}"
+                if new_error != self.error:
+                    self.log.add(ERROR, new_error, detail=traceback.format_exc())
+                self.error = new_error
+                self.counters["errors"] += 1
             now = time.time()
             if now - self._last_compliance_sweep >= COMPLIANCE_SWEEP_INTERVAL_S:
                 self._last_compliance_sweep = now

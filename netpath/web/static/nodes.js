@@ -6316,9 +6316,10 @@
   function fillDiscGroups() {
     const select = App.el('disc-group');
     const previous = select.value;
-    // setHtml rarely short-circuits here (groupOptionsHtml bakes `selected`
-    // into the string, normalised away on read-back) but is still correct.
-    App.setHtml(select, groupOptionsHtml(previous ? Number(previous) : undefined));
+    // No selectedId: that changed the string with the selection, defeating
+    // setHtml's skip. Restored by .value below instead.
+    App.setHtml(select, groupOptionsHtml());
+    select.value = previous;
     if (!select.value && view.groups.length) select.value = String(view.groups[0].id);
   }
 

@@ -209,8 +209,8 @@ class SyslogCollector(udpsock.UdpReceiver):
                     self._buckets.popitem(last=False)
             else:
                 self._buckets.move_to_end(source)
-                bucket[0] = min(self._rate,
-                                bucket[0] + (now - bucket[1]) * self._rate)
+                elapsed = max(0.0, now - bucket[1])   # a backward clock step must not subtract tokens
+                bucket[0] = min(self._rate, bucket[0] + elapsed * self._rate)
                 bucket[1] = now
             if bucket[0] < 1.0:
                 return False

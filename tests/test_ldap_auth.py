@@ -812,5 +812,37 @@ def empty_password_and_session_case_checks():
 
 empty_password_and_session_case_checks()
 
+
+def session_client_binding_checks():
+    """A session is honoured only from the address it was created from."""
+    print("SessionStore: bound to the creating client address")
+    store = SessionStore()
+
+    token = store.create("dana", client="10.0.0.5")
+    check("the same address reads the session back",
+          store.get(token, "10.0.0.5") is not None)
+    check("...and touch() extends it the same way",
+          store.touch(token, "10.0.0.5") is not None)
+
+    check("a different address gets nothing",
+          store.get(token, "10.0.0.6") is None)
+    check("...and the session is gone even for the right address afterwards",
+          store.get(token, "10.0.0.5") is None)
+
+    token2 = store.create("dana", client="10.0.0.5")
+    check("touch() from a different address also refuses and destroys it",
+          store.touch(token2, "10.0.0.7") is None)
+    check("...gone for the right address too", store.get(token2, "10.0.0.5") is None)
+
+    # No client argument (the default) is "don't check" -- every caller that
+    # predates this fix, and anything reading a session for display only.
+    token3 = store.create("dana", client="10.0.0.5")
+    check("omitting client is unchanged: no address check at all",
+          store.get(token3) is not None and store.get(token3, "10.0.0.9") is None)
+    store.destroy(token3)
+
+
+session_client_binding_checks()
+
 sys.exit(1 if failures else 0)
 

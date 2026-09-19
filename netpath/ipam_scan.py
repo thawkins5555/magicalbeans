@@ -349,11 +349,11 @@ def _ping_many_iphlpapi(ip: str, count: int,
     try:
         for _ in range(count):
             sent += 1
-            started = time.monotonic()
+            started = time.perf_counter()   # monotonic ticks at 15.6 ms on Windows, quantising a LAN RTT to 0
             replies = api["send"](ctypes.c_void_p(handle), destination,
                                   payload, len(_IPHLPAPI_PAYLOAD), None,
                                   reply, reply_size, timeout_ms)
-            elapsed = (time.monotonic() - started) * 1000
+            elapsed = (time.perf_counter() - started) * 1000
             if not replies:
                 continue                # timed out, or unreachable
             status = api["reply"].from_buffer(reply).Status
@@ -494,6 +494,7 @@ def _ping_many_socket(ip: str, count: int, timeout_ms: int,
                 continue
             sent += 1
             sent_at = time.monotonic()
+            rtt_started = time.perf_counter()   # RTT only; sent_at/deadline stay monotonic
             deadline = sent_at + timeout_ms / 1000
             while True:
                 remaining = deadline - time.monotonic()
@@ -516,7 +517,7 @@ def _ping_many_socket(ip: str, count: int, timeout_ms: int,
                 if reply_payload[:len(token)] != token:
                     continue
                 received += 1
-                rtts.append((time.monotonic() - sent_at) * 1000)
+                rtts.append((time.perf_counter() - rtt_started) * 1000)
                 break
     finally:
         selector.close()

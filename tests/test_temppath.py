@@ -35,6 +35,8 @@ from netpath import temppath            # noqa: E402
 
 _real_tempdir = tempfile.tempdir
 _real_app_root = temppath._APP_ROOT
+_real_localappdata = os.environ.get("LOCALAPPDATA")
+_real_systemroot = os.environ.get("SystemRoot")
 
 
 def can_really_write(path):
@@ -111,11 +113,15 @@ try:
     #    install directory rather than giving up.
     # =================================================================
     # A regular file where a directory is expected: makedirs(exist_ok=True)
-    # raises against it, so the system temp candidate is refused.
+    # raises against it, so the system temp candidate is refused. The two
+    # Windows fallbacks are routed at the same blocker, real directories
+    # otherwise, so the fallthrough reaches the install directory instead.
     blocker = os.path.join(TMPDIR, "blocker")
     with open(blocker, "w", encoding="utf-8") as _h:
         _h.write("not a directory\n")
     tempfile.tempdir = os.path.join(blocker, "sub")
+    os.environ["LOCALAPPDATA"] = os.path.join(blocker, "local")
+    os.environ["SystemRoot"] = os.path.join(blocker, "sysroot")
     app_root = os.path.join(TMPDIR, "install-root")
     os.makedirs(app_root, exist_ok=True)
     temppath._APP_ROOT = app_root
@@ -173,6 +179,12 @@ try:
 finally:
     tempfile.tempdir = _real_tempdir
     temppath._APP_ROOT = _real_app_root
+    for _name, _value in (("LOCALAPPDATA", _real_localappdata),
+                          ("SystemRoot", _real_systemroot)):
+        if _value is None:
+            os.environ.pop(_name, None)
+        else:
+            os.environ[_name] = _value
     shutil.rmtree(TMPDIR, ignore_errors=True)
 
 print()

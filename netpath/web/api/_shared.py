@@ -608,6 +608,17 @@ def _alerts_settings_json(service, params) -> dict:
     return {**settings, **flags, "webhook_url": "", "webhook_headers": []}
 
 
+def _snmp_settings_json(service, params) -> dict:
+    """The SNMP trap settings block, following _alerts_settings_json's rule:
+    accepted-communities values for a caller who could change them, a has_
+    flag for everyone else."""
+    settings = service.snmp_settings
+    flags = {"has_accepted_communities": bool(settings.get("accepted_communities"))}
+    if _may_read_secrets(service, params, "snmp"):
+        return {**settings, **flags}
+    return {**settings, **flags, "accepted_communities": ""}
+
+
 def get_config(service, params, body) -> dict:
     """Everything the browser needs that only an operator can change.
 
@@ -638,7 +649,7 @@ def get_config(service, params, body) -> dict:
         "severities": SEVERITIES,
         "facilities": FACILITIES,
         "syslog_settings": service.syslog_settings,
-        "snmp_settings": service.snmp_settings,
+        "snmp_settings": _snmp_settings_json(service, params),
         "trap_kinds": list(trapdecode.KINDS),
         "ipam_settings": service.ipam_settings,
         "nodes_settings": service.nodes_settings,

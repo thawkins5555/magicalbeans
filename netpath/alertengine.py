@@ -136,6 +136,9 @@ class AlertEngine(Worker):
         # and _child_first_breach_ts.
         self._breach_streaks: dict[tuple, tuple[float | None, int, float | None,
                                                 float | None, float | None]] = {}
+        # 0/-1 force a full _evaluate_thresholds pass on the first tick.
+        self._threshold_full_pass_ts: float = 0.0
+        self._threshold_generation_seen: int = -1
         # DHCP scopes keep (last polled_ts, streak, first breach ts) rather
         # than a bare count: the engine ticks every few seconds but DHCP is
         # polled every few minutes, so for_polls must count polls, not
@@ -594,11 +597,19 @@ class AlertEngine(Worker):
         An unseeded cursor seeds at the current max id, so a fresh install
         does not alert on imported history; the cursor advances only once the
         caller has finished every row, never if it raises.
+
+        Source tables reuse ids, so a delete/prune dropping the table's own
+        max id below the cursor is rewound here immediately, not through
+        _advance_cursor/_flush_cursors (both forward-only).
         """
         if not self.db.has_cursor(source):
             self.db.set_cursor(source, max_id_fn())
             return
         cursor = self.db.cursor(source)
+        current_max = max_id_fn()
+        if current_max < cursor:
+            cursor = current_max
+            self.db.set_cursor(source, cursor)
         max_id = cursor
         for row in self._read_forward(source, fetch, cursor, max_id_fn):
             if row["id"] > max_id:
@@ -1293,10 +1304,22 @@ class AlertEngine(Worker):
 
         In-memory state, so a restart rebuilds every streak from scratch.
         Deliberately not persisted -- see INTERNALS.md.
+
+        Change-driven: a FULL PASS (every device, as every tick used to run)
+        happens on the first tick, every _THRESHOLD_FULL_PASS_S, and when a
+        rule or override changes; every other tick evaluates only the
+        devices a new sample or an alert resolve touched since the last one.
         """
         occurrences = []
         rules = [r for r in self.db.rules() if r["enabled"] and r["kind"] == "threshold"]
         if not rules:
+            return occurrences
+        now = time.time()
+        generation = self.db.threshold_generation()
+        full_pass = (now - self._threshold_full_pass_ts >= self._THRESHOLD_FULL_PASS_S
+                    or generation != self._threshold_generation_seen)
+        dirty = self.nodes_db.take_dirty_devices() | self.db.take_dirty_devices()
+        if not full_pass and not dirty:
             return occurrences
         # Per-device overrides, read once per TICK for every rule at once
         # rather than once per rule. Keyed by device even for an interface
@@ -1308,8 +1331,11 @@ class AlertEngine(Worker):
         # One query for the families the enabled rules actually name, not a
         # full `SELECT *` per device -- at 2,000 devices with ~90 metrics
         # each that was 400,000 rows every five seconds for four live rules.
+        # Full pass: fleet-wide, as ever. Dirty pass: just this tick's
+        # devices, through UNIQUE(device_id, key) rather than ix_metrics_key.
         wanted = sorted({r["source_kind"] for r in rules if r["source_kind"]})
-        metric_rows = self.nodes_db.metrics_for_families(wanted)
+        metric_rows = (self.nodes_db.metrics_for_families(wanted) if full_pass
+                      else self.nodes_db.metrics_for_families_and_devices(wanted, dirty))
         roots = set(wanted)
         metrics_by_device_key = {}
         # (device_id, root) -> [(if_index, metric row)]
@@ -1333,7 +1359,6 @@ class AlertEngine(Worker):
         # quiet is device_down's or the rollup's fault to report, not a
         # recovery.
         stale_after = float(settings.get("threshold_stale_s", 900) or 0)
-        now = time.time()
         # One indexed fleet-wide read for the whole pass, cached across
         # ticks: the rules in PUBLISHED_THRESHOLD_RULES are judged against
         # the port's own transceiver and nothing else.
@@ -1348,9 +1373,9 @@ class AlertEngine(Worker):
         # since that is the only thing the copy changes.
         rule_dicts: dict[int, dict] = {}
         eval_cache: dict[tuple, dict] = {}
-        # Per (rule, entity) state lived forever otherwise, leaking an entry
-        # per deleted device; only targets this tick actually saw carry over.
-        live_streaks: dict[tuple, tuple] = {}
+        # A full pass starts empty, pruning any deleted device's entries; a
+        # dirty pass mutates _breach_streaks in place so the rest carry over.
+        live_streaks: dict[tuple, tuple] = {} if full_pass else self._breach_streaks
         # Loaded on first use and only when a breach has no new sample behind
         # it, so a tick with nothing breaching costs nothing extra.
         open_keys: set | None = None
@@ -1501,6 +1526,13 @@ class AlertEngine(Worker):
                         # Otherwise breach_seconds would span the silent gap
                         # and fire for_seconds instantly on resume.
                         first_breach_ts = None
+                    elif (previous_ts is not None and stale_after > 0
+                          and sample_ts is not None and sample_ts != previous_ts
+                          and sample_ts - previous_ts > stale_after):
+                        # A dirty pass may have skipped this target while it
+                        # sat quiet, so the branch above never saw it go
+                        # stale -- the gap between samples says so directly.
+                        previous_ts, streak, first_breach_ts = None, 0, None
                     # The same predicate evaluate_threshold itself uses, so a
                     # 'below' rule's streak counts what that rule calls breach.
                     over = breaches(eval_rule, value)
@@ -1628,7 +1660,15 @@ class AlertEngine(Worker):
                             self.counters["resolved"] += 1
                             self._notify_clear(resolved, rule, settings)
         self._breach_streaks = live_streaks
+        if full_pass:
+            self._threshold_full_pass_ts = now
+            self._threshold_generation_seen = generation
         return occurrences
+
+    # How often a full (every-device) pass re-derives thresholds regardless
+    # of which devices are dirty -- bounds how late a missed dirty signal
+    # can be caught.
+    _THRESHOLD_FULL_PASS_S = 60.0
 
     # How long the published-threshold snapshot is reused, against the
     # poller's 3600 s write cadence. Short enough that an optic swapped this

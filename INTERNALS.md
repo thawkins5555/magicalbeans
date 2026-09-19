@@ -1796,6 +1796,35 @@ on a pool that can keep up. `_staggered` is pruned to the live device ids
 alongside the other per-device caches in `_forget_devices`, so a device
 deleted and added again is spread again.
 
+**The backward-clock-step clamp — 5.47.0.** Every due-time scheduler here
+computes a device's (or controller's, or target's) next run as
+`now + interval` at the moment it last ran, and reads `now >= due` on each
+later pass to decide whether it is due again. A large backward step in the
+system clock — an NTP correction, or a VM resuming from suspend — leaves
+`due` sitting arbitrarily far in the future relative to the new, smaller
+`now`, and until this fix nothing ever re-derived it: the scheduler simply
+stalled for however far the clock had jumped, silently, with no error and
+no event. The fix is the same one-line shape wherever a due time is kept
+this way — `elif due - now > interval: due = now + interval` — clamping a
+due time that is now more than one interval ahead of the clock to at most
+one interval away, so the next pass notices it as due again rather than
+waiting out the jump. Applied independently at each scheduler that keeps
+its own due-time dict, since none of them share one: `NodePoller._loop`
+(`nodepoll/poller.py`, device polls and the MAC/VLAN re-walk timer),
+`WirelessPoller._schedule_pass` (`fortipoll.py`), `Monitor`'s trace and web-
+check scheduling (`monitor.py`, both destinations and, separately, the
+maintenance sweep gate — see `Service.run_maintenance`), and
+`IpamWorker`'s scan scheduling (`ipam_worker.py`), which was already
+clamped this way before 5.47.0 and is where the pattern is copied from. The
+Syslog rate limiter (`syslogd.py`) is the one case shaped differently
+because it counts down a token bucket rather than keeping a due time:
+`elapsed = max(0.0, now - bucket[1])` floors the elapsed time at zero, so a
+backward step cannot subtract tokens the bucket never actually spent.
+`tests/test_backward_clock_step.py` and `tests/test_maintenance_clock_step.py`
+step a monkeypatched clock back by more than one interval and check the
+due time comes back clamped in each case, rather than left at its stale,
+far-future value.
+
 **An overrun is not recorded while the device is failing.** `_record_overrun`
 returns early when `device["status"] == "down"` **or**
 `device["consecutive_fail"] > 0`. A poll of a device that stopped answering
@@ -4966,6 +4995,27 @@ indexed. Two changes, together:
   the same Python `set` object it already had rather than touching SQLite
   at all.
 
+### Metric history maintenance: the fastest-interval prune skip, and the rejected trim batch (`nodesdb.py`, `nodesseriesdb.py`, `tests/bench_prune.py`) — 5.47.0
+
+`NodesDatabase.prune()` passes `series_db.prune()` the result of its own
+`_fastest_poll_interval_s()`: the minimum `poll_interval_s` over
+`effective_configs()` (device override, else group/profile, else
+`default_interval_s`) for every **enabled** device — the identical merge
+the scheduler itself polls devices by, so it can never under-state a real
+device's cadence. `series_db.prune`'s per-metric row cap is skipped when
+this interval, together with the configured retention days, already keeps
+fewer rows than the cap would allow — never when no enabled device has a
+sane positive interval, in which case the cap still runs unconditionally,
+same as before this existed.
+
+`_trim_hourly`, the roll-up's over-cap trim, stayed a single unbatched
+DELETE on purpose. A batched rewrite was built and measured: at 10,000
+metrics it bounded each lock hold to about 0.12 s, at the cost of roughly
+110 s of near-continuous lock duty for the same rows, against one 3.4 s
+hold unbatched. Rejected as a worse trade for this workload — `tests/
+bench_prune.py --large` prints the unbatched number on every run so a
+future change here is measured against it rather than assumed better.
+
 ## MAPPER
 
 MAPPER (`mapper.py`, `mapperdb.py`, `web/static/mapper.js`) is a manually-
@@ -7244,9 +7294,10 @@ severity filtering), never before, so a crash mid-batch re-evaluates
 that batch on restart rather than silently skipping part of it.
 
 Threshold rules (`_evaluate_thresholds`) have no cursor at all — a
-threshold is a state (above/below), not an event stream, so it is
-re-evaluated against every threshold-kind rule's device on every 5-second
-tick. Hysteresis is a `threshold`/`clear_threshold` gap plus a
+threshold is a state (above/below), not an event stream. Every device was
+re-evaluated against every threshold-kind rule on every 5-second tick until
+5.47.0; see change-driven threshold evaluation, below, for what runs a
+given tick now. Hysteresis is a `threshold`/`clear_threshold` gap plus a
 `for_polls` consecutive-breach counter, tracked in memory
 (`self._breach_streaks`, keyed by `(rule_id, device_id)`) rather than
 persisted — a restart resets it, an accepted cold-start cost given ticks
@@ -7258,6 +7309,32 @@ hit independently, and fixed the same way: an earlier version only
 incremented the streak once a breach had already been detected, which
 meant it could never actually reach `for_polls` and the alert could never
 fire.
+
+### Cursor rewind, and the age-prune keep-newest-row rule (`alertengine.py`, `nodesdb.py`, `snmptrapdb.py`, `syslogdb.py`, `ipamdb.py`, `wirelessdb.py`) — 5.47.0
+
+Every occurrence table above is `INTEGER PRIMARY KEY` with no
+`AUTOINCREMENT`, so SQLite reuses row ids once a table's rows are gone —
+a device delete removes its `device_events`/`interface_events` rows, and a
+quiet source (traps, syslog, an IPAM conflict) can age-prune down to
+nothing. A cursor left sitting above the new, lower max id then stayed
+stuck forever: every drain method here only ever read `id > cursor`, so it
+saw nothing again until as many new rows arrived as the table used to hold
+— a pruned-empty source, or the source of a just-deleted device, going
+silently blind to genuinely new events. `_drain_from` now checks the
+source's current max id against its cursor on every call and, when the max
+has fallen below the cursor, rewinds the cursor to that max immediately —
+not through `_advance_cursor`/`_flush_cursors`, which are forward-only by
+design.
+
+The prune side closes the other half: each source's own age-based prune
+(`nodesdb.py`, `snmptrapdb.py`, `syslogdb.py`, `ipamdb.py`, `wirelessdb.py`)
+now keeps that table's single newest row regardless of age, so a routine
+retention sweep can never itself be the reason a cursor needs rewinding —
+the rewind exists for a device delete and for a genuine "nothing left"
+state, not as something a nightly prune triggers on its own. This applies
+to the age prune only: the Settings "delete everything now" action still
+empties the table completely, cursor included, which is the point of that
+button.
 
 ### DHCP scope thresholds (`alertengine._evaluate_dhcp_thresholds`)
 
@@ -7411,6 +7488,48 @@ the rest of the tick's evaluation. No behaviour changes — the override
 values read are the same rows, keyed the same way (by device, even for an
 interface target, since an override is about the switch and not one port)
 — only how many times the database is asked for them.
+
+### Change-driven threshold evaluation: dirty-device sets and the threshold generation counter (`alertengine.py`, `nodesdb.py`, `alertsdb.py`) — 5.47.0
+
+`_evaluate_thresholds` used to re-read every metric for every enabled
+device on every 5-second tick, whether or not anything about that device
+had changed since the last one. It now runs a **full pass** — every
+device, as every tick used to — only on the engine's first tick, every
+`_THRESHOLD_FULL_PASS_S` (60 s), and the instant a rule or a per-device
+override changes; every other tick evaluates only the devices something
+actually touched since the previous tick, and a tick with nothing dirty
+and no full pass due runs no metric query at all.
+
+Two independent signals feed this, both drained and cleared on read so
+nothing is double-counted:
+
+- **Dirty-device sets.** `NodesDatabase._dirty_devices` (guarded by its own
+  `_dirty_devices_lock`, since pollers write it from several threads) gains
+  a device id every time `record_metric_samples` is given a non-empty batch
+  for it — a poll landed. `AlertsDatabase._dirty_devices` gains a device id
+  every time `_mark_dirty` runs, which is wherever an alert is resolved, so
+  a rollup child whose parent just cleared re-derives on the very next tick
+  rather than waiting up to 60 s. `AlertEngine._evaluate_thresholds` reads
+  both with `take_dirty_devices()` and unions them into one set for the
+  tick.
+- **The threshold generation counter.** `AlertsDatabase._threshold_generation`
+  is a plain in-memory int, bumped by `_bump_threshold_generation()`
+  wherever a rule or a device's threshold override is created, updated,
+  cleared or deleted. `AlertEngine` compares the live
+  `self.db.threshold_generation()` against `self._threshold_generation_seen`
+  (its own copy, updated after every full pass); a mismatch forces a full
+  pass on that tick regardless of what is or isn't dirty, since a changed
+  rule or override can turn a device that was fine under the old numbers
+  into a breach under the new ones, and dirty-set tracking has no way to
+  know that in advance.
+
+A full pass rebuilds `_breach_streaks` from an empty dict, pruning any
+deleted device's entries; a dirty-only pass mutates the existing dict in
+place so every other device's streak carries over untouched. Idle-tick
+cost, measured on a 500-device fleet with 2% of devices touched between
+ticks: 210 metric rows read instead of 10,500. Deleted-device clean-up and
+stale-sample handling, which need to see every device regardless of
+activity, run on the 60-second full pass rather than on a dirty-only tick.
 
 ### Per-device threshold overrides, and a cross-match bug (`alertsdb.py`, `alertengine.py`, `alertrules.py`) — 4.54.0
 
@@ -11261,12 +11380,59 @@ heartbeat ping when it detects real mouse/keyboard input
 `/api/state` poll every open tab makes on its own — the idle clock
 tracks presence, not whether a tab happens to be open.
 
-**Login throttling** (`LoginThrottle`) counts failures per username *and*
-per source address independently, so one noisy client can't lock out an
-account for everyone else and one account can't be used to lock out a
-shared address (a NAT gateway, for instance). The delay is exponential
-once past the threshold (`2 ** (failures - threshold)`, capped at 30s) —
-5 failures adds a one-second delay, 10 adds thirty.
+**A session is bound to the address it was created on, from 5.47.0.**
+`SessionStore.get(token, client=None)` takes an optional `client`; when
+given, it is compared against the `client` recorded by `create()`. A
+mismatch is treated like an expired session in every way that matters —
+popped from the store and returned as `None` — but is distinguished
+internally so it can be logged: `SessionStore` takes an optional `log` at
+construction (`Service._open_sessions` passes its own `self.log`), and a
+mismatch (as opposed to an ordinary expiry) writes one `SYSTEM` event-log
+line naming the account and both addresses — `"Session for <user> refused:
+created from <a>, presented from <b>"` — so a genuine address change reads
+as itself in the event log rather than as an unremarkable sign-out. Every
+caller that can reach a session from outside the process it was created in
+passes its own address for `client`: the request authenticator
+(`web/server.py`'s `_authenticate_request`, `self.client_address[0]`), the
+SSH terminal watchdog (`sshterm.py`'s per-tick
+`self.service.sessions.get(self.token, self.client_ip)`), and the WEB
+relay watchdog (`webrelay.py`'s identical check). A session is honoured
+only from the address `create()` recorded; from any other address `get()`
+refuses it, destroys it and writes one event-log line naming the user and
+both addresses. A token issued to a script (`authenticate_api_token`)
+is unaffected — it is checked by a separate path that was never keyed to
+an address.
+
+**Login throttling** (`LoginThrottle`) counts failures two ways at once:
+the bare username (`u:<name>`) and the bare source address (`c:<client>`)
+— see `_keys`. Only the address key can hard-lock: `lockout_remaining(client)`
+and `announce_lockout(client)` look at the `c:` key alone, so reaching
+`lockout_threshold` (20) failures from one address inside `window_s` (15
+minutes) refuses further attempts from that address outright until the
+oldest counted failure ages out of the window. The bare username key is
+deliberately never checked for a hard lock — it can never lock an account
+out on its own, so no single remote address can lock a named account out
+for every other address — but it still feeds `delay_for`'s doubling
+back-off (`2 ** (failures - threshold)`, capped at 30 s, once past
+`threshold` (5) failures against that username, counted across every
+address it was tried from), so guessing a password against one account is
+still slowed down even when the guesses are spread across many source
+addresses. `announce_lockout` tracks which addresses have already had a
+lock-out audited (`_lockout_announced`, cleared the moment that address's
+failures age out of the window or a fresh one is recorded), so a flood
+against an already-locked address writes one audit row per lock episode
+rather than one per refused request. `clear(username)` (called on a
+successful sign-in) forgets only that username's own failure history —
+never the address's — so one valid low-privilege account cannot be used to
+reset the throttle counter for its own address and then go on guessing
+other accounts from it. `_failures` and `_lockout_announced` are bounded to
+`max_keys` (10,000) entries, least-recently-touched evicted first, so a
+flood of distinct usernames cannot grow this dict without bound. The same
+throttle instance also gates a signed-in account's own
+password change (`put_account_password` in `web/api/auth.py`): a wrong
+`current_password` calls `record_failure(me, client)`, and the lock-out
+check and back-off delay run before the hashing slot is taken, exactly as
+they do for a sign-in attempt.
 
 ### TACACS+ AAA sign-in (`tacacsclient.py`, `web/service.py`,
 `web/api/auth.py`) — 5.22.0
@@ -12363,6 +12529,22 @@ to fall to zero between `shutdown()` and `server_close()` — `daemon_threads`
 means no handler is joined, so without it `service.shutdown()` could close a
 store under a handler mid-query.
 
+**The TLS handshake runs on the per-connection thread, not the accept
+thread — 5.47.0.** `ssl.wrap_socket`/`SSLContext.wrap_socket` defaults
+`do_handshake_on_connect` to `True`, which used to mean the handshake ran
+inside `accept()` on the single `serve_forever` thread, with no timeout —
+one client that opened a TCP connection and never sent a TLS ClientHello
+held that one thread indefinitely, and nobody else could be accepted while
+it did, no sign-in needed. `BoundedThreadingHTTPServer` now builds the
+listening socket with `do_handshake_on_connect=False`, and
+`process_request_thread` does the handshake itself, after
+`request.settimeout(self.RequestHandlerClass.timeout)` (`Handler.timeout`,
+30 s) — on the thread `MAX_CONNECTIONS` already bounds, inside the same
+`try`/`finally` that releases that thread's semaphore slot. A handshake
+that fails or times out closes the socket quietly (`shutdown_request`, no
+traceback) rather than raising into `serve_forever`. Plain HTTP
+(`self.is_tls` false) skips this entirely and is unaffected.
+
 ### Route lookup: bucketed by method and path segment (`web/server.py`) — 5.46.0
 
 `ROUTES`/`COMPILED` are still the flat, ordered list described above — that
@@ -13284,6 +13466,38 @@ regardless of how often the surrounding tick runs. `tests/test_frontend_contract
 pins both halves of this: an unchanged refresh performs no DOM write, and
 an explicit draw always does.
 
+### `setHtml`'s write-only-if-changed map, and the rule every writer must follow (`app.js`) — 5.47.0
+
+`setHtml(el, html)` and `setText(el, text)` (`app.js`) are the shared
+write-only-if-changed guards most of the frontend's own periodic redraws go
+through: `lastHtml`, a `WeakMap` keyed by element, holds the exact string
+each element was last **written** with through one of these two functions.
+`setHtml` compares the new string against `lastHtml.get(el)` and only
+touches `el.innerHTML` — and only updates the map — on a real difference;
+`setText` compares against `el.textContent` directly (cheaper, and correct
+even though the DOM re-serialises an escaped quote or a `selected`
+attribute differently than it was written) and, on writing, deletes that
+element's `lastHtml` entry, since the two guards must never both believe
+they know what is currently in the element.
+
+**The rule this depends on: nothing else may write `.innerHTML` or
+`.textContent` on an element these guards are used for.** A write that goes
+around `setHtml`/`setText` — assigning `.innerHTML` directly, even with the
+identical content — leaves `lastHtml` holding a stale value (or holding
+nothing, for an element that was never written through the guard at all),
+so the guard has nothing correct to compare the next render against.
+Before 5.47.0, `nodes.js`'s two Nodes-tab filter drop-downs
+(`fillGroupFilter`/`fillDevGroupFilter`, the profile and device-group
+filters) and the device summary line (`nd-d-summary`) rebuilt this way —
+an unconditional `.innerHTML =`/assignment on every periodic refresh tick
+regardless of whether the underlying list or text had actually changed —
+so a dropdown that was open closed itself on the next 2-second tick, and
+the device summary line lost a text selection the same way. All three now
+render through `App.setHtml`, so a tick whose rendered string matches what
+is already on screen touches nothing at all. `nodes.js`'s STP/POE detail
+lines (`stpEl`/`poeEl`) were converted the same way, for the same reason —
+they redraw on every refresh tick too.
+
 ### Multi-interface graph tiles, on-tile drill-down, and the batch series route (`web/api/dashboard.py`, `web/static/dashboard.js`, `web/static/app.js`) — 5.22.0
 
 **The `iface_traffic` config schema widens without breaking a saved
@@ -14184,11 +14398,14 @@ credential.
 **Liveness: a shell is only as live as the sign-in that opened it.** A
 terminal outlives the request that opened it by hours, so being authorised
 at the upgrade is not enough. The session keeps the web session token it was
-opened with, and the 1 Hz watchdog re-reads `service.sessions.get(token)`
-every tick and `permissions_for(app_user)["ssh"]` every fifth (the first is
-a dictionary lookup, the second a database read): a sign-out, an expiry, a
-deleted account or a revoked permission closes the shell with 4401, a
-`status closed` saying which, and an audit line. In the other direction,
+opened with, and the 1 Hz watchdog re-reads
+`service.sessions.get(token, client_ip)` every tick and
+`permissions_for(app_user)["ssh"]` every fifth (the first is a dictionary
+lookup, the second a database read): a sign-out, an expiry, a deleted
+account, a revoked permission, or — **from 5.47.0** — the session now being
+read from a different address than the one it was created on, closes the
+shell with 4401, a `status closed` saying which, and an audit line. In the
+other direction,
 keystrokes are presence for the *web* session too — the same rule server.py
 applies to a POST — so a binary frame calls `sessions.touch(token)`, at most
 once every `TOUCH_INTERVAL_S`, since a shell is a great many keystrokes and
@@ -14457,13 +14674,20 @@ alone would leave the three disagreeing at the device, and an embedded UI
 that compares `Origin` or `Referer` against `Host` answers such a POST 403 —
 a login form that worked before 5.4.0, when all three named the relay and
 agreed, and a fault that presents as the device's since GET is unaffected.
-Inbound, `Location`, `Content-Location`, `Refresh` and `Set-Cookie`'s
-`Domain=` go through `map_url` / `map_refresh` / `map_cookie`: an absolute
-URL naming either `relay_names` member (the host the browser reached this
-server on, and the device's own address) **on the scheme this tunnel
-carries** is moved onto `origin`, and a `Domain=` naming either is dropped so
-the cookie is host-only and the browser keeps it on the relay. Nothing else
-is touched, bodies included.
+**From 5.47.0**, a `Cookie:` header going to the device is also rewritten,
+through `strip_named_cookie(value, self.session_cookie)`: the one crumb
+named after this application's own session cookie (`SESSION_COOKIE` from
+`web/server.py`) is removed, every other crumb the browser sent is passed
+through untouched. Inbound, `Location`, `Content-Location`, `Refresh` and
+`Set-Cookie`'s `Domain=` go through `map_url` / `map_refresh` / `map_cookie`:
+an absolute URL naming either `relay_names` member (the host the browser
+reached this server on, and the device's own address) **on the scheme this
+tunnel carries** is moved onto `origin`, and a `Domain=` naming either is
+dropped so the cookie is host-only and the browser keeps it on the relay.
+**From 5.47.0**, a `Set-Cookie` whose own name matches `session_cookie` is
+dropped outright rather than rewritten and passed on — a device is never
+allowed to set a cookie that could be confused with this application's own,
+whatever domain it names. Nothing else is touched, bodies included.
 
 **The scheme is part of the match** (`_is_ours`). An `http` device answering
 `Location: https://<itself>/` is saying its UI is on TLS, which this tunnel
@@ -14479,17 +14703,35 @@ unparseable request or status line, obsolete line folding, a
 `Transfer-Encoding` that is not plainly `chunked`, a `Content-Length` that
 is not one number, a head carrying both of those (two framings that can
 disagree, and which one the device honours is its own business — the relay
-reads neither rather than forwarding both and picking one), an over-long
-head. `_blindly` then sets
-`_HttpConnection.blind` and copies the rest with `_copy`, the head it could
-not read pushed back on the front of the buffer first, so not a byte is
-dropped or repeated. The switch is one-way and shared: `_read_head` checks
-it after every `recv`, and a direction that gave up sets it *before*
-forwarding the message that made it give up, so the peer direction cannot
-frame anything that arrives afterwards (a browser sends WebSocket frames
-only after it has seen the `101`). The pump is the floor — no device that
-worked before 5.4.0 can be broken by the parser. A response's method comes
-from `_HttpConnection.take()`, pushed by the request direction before the
+reads neither rather than forwarding both and picking one). `_go_blind`
+sets the shared `_HttpConnection.blind` event, the head it could not read
+pushed back on the front of the buffer first so not a byte is dropped or
+repeated. The switch is one-way: `_read_head` checks it after every `recv`,
+and a direction that gave up sets it *before* forwarding the message that
+made it give up, so the peer direction cannot frame anything that arrives
+afterwards (a browser sends WebSocket frames only after it has seen the
+`101`).
+
+**From 5.47.0, the two directions no longer fall back the same way.**
+Before, both legs switched to a plain byte pump once framing gave up, so a
+request the parser could not read was forwarded unfiltered. Now `_go_blind`
+only keeps pumping the browser→device leg when the connection has already
+completed a genuine WebSocket upgrade (`state.upgraded` — set the moment a
+`101` response is seen); any other browser→device message that stops
+parsing as HTTP partway through is not forwarded further, and that leg
+simply drains via the pump's half-close instead of carrying anything more
+to the device. The device→browser leg is unaffected — it still falls back
+to a plain byte pump, so a device response already in flight still reaches
+the browser and a genuinely non-HTTP device (or a WebSocket server frame)
+is not cut off. An over-long request head (`MAX_HEAD_BYTES`) gets its own
+answer rather than silently draining: `_refuse_oversized` sends a plain
+`431 Request Header Fields Too Large` and closes the browser-facing side;
+the same condition on the device→browser leg has no browser-safe status
+line to send back at that point, so it falls back to the blind copy like
+any other unparseable message. The pump is still the floor — no device
+that worked before 5.4.0 can be broken by the parser, only asked to receive
+less of a request the parser gave up on. A response's method comes from
+`_HttpConnection.take()`, pushed by the request direction before the
 request is forwarded and popped only for a final (non-1xx) response, since a
 `HEAD` answer carries no body however its head is framed. An `https`
 session never frames at all.
@@ -14515,7 +14757,9 @@ timeout so closing it is not the only thing that can end the accept loop.
 **What closes one.** `_watch_tick`, once a second: the first-connect window
 (60 s) while nothing has connected, then the idle timeout — `min(900,
 sessions.idle_seconds)`, the same cap `sshterm` applies — then the web
-session going away, then the `web` permission, re-read every five ticks.
+session going away (from 5.47.0, including a session whose address no
+longer matches the one it was created from — see Auth, above), then the
+`web` permission, re-read every five ticks.
 `stop()` closes the listener, then every live connection socket, so a pump
 parked in `recv()` fails at once rather than outliving the tunnel;
 `shutdown()` stops every session concurrently under one 3-second budget and

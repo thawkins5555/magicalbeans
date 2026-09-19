@@ -59,6 +59,42 @@ comes from one query, not one per AP) and `test_disabled_device_cache.py`
 (the disabled-device lookup uses the new partial index and refreshes on
 every device enable/disable/add/remove).
 
+5.47.0 added twelve suites proving the review-fix work, most of them pinning
+a bug that had no other regression guard: `test_alert_cursor_rewind.py`
+(AlertEngine rewinds a source's read cursor the moment its highest row id
+drops below it — a device delete or a history prune can lower that id,
+since every event table is an unguarded `INTEGER PRIMARY KEY` — and each
+source's age-prune now keeps its own newest row so a routine prune can never
+cause the drop itself), `test_alert_window_dst.py` (a weekly maintenance
+window lands on the same local wall-clock time every week across a
+synthetic, fixed-offset daylight-saving change, not the hour of drift a raw
+epoch-seconds modulo would give), `test_backward_clock_step.py` (every
+due-time scheduler clamps to at most one interval past the clock rather than
+stalling after a backward step — NTP correction, VM resume),
+`test_maintenance_clock_step.py` (the same, for `Service.run_maintenance`'s
+15-minute gate), `test_fortipoll_v3_exchange.py` (the FortiGate/wireless
+walk now goes through nodepoll's shared `v3_exchange`, so it gets the same
+engine-time advance, resync retry and msgID check the Nodes poller already
+had), `test_session_connection_reset.py` and
+`test_session_socket_creation_error.py` (an SNMP session on Windows now
+reports a port-unreachable reset as "no reply" and a socket-creation failure
+as a normal `SnmpError`, rather than either escaping as a bare `OSError`
+past every handler that expects one), `test_tls_handshake_thread.py` (the
+TLS handshake runs on the per-connection thread with a timeout, so one idle
+connection can no longer stall every other client), `test_threshold_change_driven.py`
+(the alert engine's threshold pass runs only for devices with a new sample
+or a resolved alert between full passes, with a full pass at start, every
+60 s, and immediately after a rule or override change),
+`test_overview_stats_perf.py` (the Syslog/Trap overview's oldest/newest
+timestamps are index seeks, not a table scan, and the row count stays an
+exact `COUNT(*)`), `test_prune_fastest_interval.py` (the per-metric row cap
+is skipped only when the fleet's own fastest configured poll interval makes
+retention the tighter limit already), and `test_series_maintenance_equivalence.py`
+(the rewritten hourly roll-up and prune delete/summarise exactly what the
+pre-rewrite code did, checked row for row against `tests/_old_series_maintenance.py`,
+a frozen copy of the old code kept only for this comparison and for
+`bench_prune.py --oracle` — never imported from product code).
+
 One family is worth calling out by name: `test_frontend_contracts.py`,
 `test_time_contracts.py`, `test_layout_contracts.py`, `test_design_tokens.py`
 and `test_static_headers.py` read the shipped JS/HTML/CSS as text rather than

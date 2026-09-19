@@ -1240,7 +1240,10 @@ the main window). Five refused logins close the window, and every refusal
 is written to the device's event log with the account that asked and where
 from — never the password. **Remove** now lives in the device's Edit dialog, beside Clear
 credential, so the pane's buttons are the things you do *to* a device
-rather than the one thing you do to get rid of it.
+rather than the one thing you do to get rid of it. **From 5.47.0**, the
+terminal is also watched against the same address the web sign-in behind it
+was created from — if that address changes mid-session it closes the same
+way it does when the sign-in itself ends.
 
 **A WEB button sits beside SSH**, styled to match it, opening the device's
 own web interface in a new window. Until 5.1.0 it pointed the browser
@@ -1257,7 +1260,14 @@ when you sign out, and closes the moment the permission is taken away;
 **Close** beside the button ends it at once. Because it opens a listening
 port on this server it has its own **web** permission, granted to nobody by
 default and to no account on upgrade. The device's event log records how
-many bytes crossed in each direction and never what they were.
+many bytes crossed in each direction and never what they were. **From
+5.47.0**, the tunnel is also watched against the address the web sign-in
+behind it was created from, the same as the SSH terminal above; the
+application's own session cookie is never forwarded to the device, and a
+cookie the device sets under that same name is dropped rather than handed
+back to the browser. A relayed exchange that stops parsing as HTTP partway
+through closes rather than being passed through unexamined — a WebSocket
+upgrade is the one exception, since it is meant to stop being HTTP.
 
 **A tunnel to an `http` device now reads the headers it carries**, which is
 what stops a device rebuilding its own address out of the name and port it
@@ -2358,7 +2368,11 @@ alerts and optionally emailing about them.
   held roll-up notice kept pending until the window lifts — and the device
   list shows the coverage the same way it shows a mute, so a planned
   cutover never looks like an unexplained gap in monitoring. Alerts →
-  **Maintenance** is where they are created and ended.
+  **Maintenance** is where they are created and ended. **From 5.47.0, a
+  weekly window keeps its wall-clock time across a daylight-saving change**
+  — a window created in summer to run Sunday 02:00–04:00 still runs at
+  02:00 local time in winter, rather than drifting an hour once the clocks
+  change.
 - **Maintenance mode takes a device out of service indefinitely.** The
   third silencing mechanism, beside the 7-day mute and the scheduled
   maintenance window, for the box that is off the network until somebody
@@ -3606,7 +3620,11 @@ everyone else's history.
 - **Source and community access control**, the same allow-list-or-
   auto-accept shape Syslog uses for sending addresses, plus a separate
   list for v1/v2c communities (which travel in cleartext in the packet,
-  so this is a filter, not a secret).
+  so this is a filter, not a secret). **From 5.47.0**, seeing the accepted
+  community strings themselves — on the settings panel, or by filtering or
+  free-text searching traps by community — needs SNMP **write**, not just
+  read; a read-only account sees a "configured" indicator instead of the
+  values and its searches simply ignore the community column.
 - **Sending addresses can be resolved to names**, through the same cache
   NetPath and Syslog use.
 - **Send test trap** sends a real coldStart trap to the receiver's own
@@ -3997,7 +4015,12 @@ reports on all of them in one SNMP walk.
   which has no privacy field and refuses a privacy password in words
   rather than dropping it; a signed controller reply IS verified, the way
   Nodes verifies one, and the same **Verify the signature** switch exists
-  in Wireless settings). Managed from
+  in Wireless settings). **From 5.47.0**, an SNMPv3 controller's clock drift
+  no longer costs a poll: the poller keeps the controller's own engine time
+  current and retries once when it asks for a resync, the way Nodes already
+  did — previously roughly one poll in three or four of an SNMPv3
+  controller could read "unreachable" for no reason other than clock skew
+  between polls. Managed from
   **Controllers**, next to the module's Settings button.
 - **Per AP: status, name, client count, model, MAC address, response
   time, and tx power** — the last shown per-radio, since a real AP has more than one
@@ -4932,7 +4955,25 @@ watching which reply comes back, since an existing local account is
 answered locally while an unrecognised username is sent on to the AAA
 server — a direct consequence of two deliberate choices (the distinct
 "AAA unreachable" message and auto-create itself), so turn auto-create
-off where that distinction matters on a given network. **Modules** is
+off where that distinction matters on a given network.
+
+**Sign-in lock-out is per client address, from 5.47.0.** Repeated failed
+sign-ins from one address lock that address out; a named account can no
+longer be locked out for every other address by failures sent from just
+one. A short, doubling delay still applies to repeated failures against one
+user name on its own, so guessing a password is still slowed down even
+spread across many addresses. One audit entry is written per lock-out
+episode, not one per attempt while an address stays locked. A web session
+is honoured only from the address it was created from — see **Nodes → SSH**
+and **the WEB button**, above, for what that means for an open terminal or
+device tunnel — and a genuine address change writes a system event-log
+line naming the account and both addresses, so it reads as itself rather
+than an unremarkable sign-out. Changing your own password now shares the
+same sign-in hashing capacity, so it answers "server busy, try again"
+rather than piling up under load, and repeated wrong "current password"
+entries are delayed and locked the same way sign-in failures are.
+
+**Modules** is
 one list linking to all
 ten per-module Settings dialogs (Nodes, Alerts, Routes/NetPath, NetFlow,
 SNMP Trap, Syslog, IPAM, FORTI-AP, ConfigRX, MAPPER) rather than each

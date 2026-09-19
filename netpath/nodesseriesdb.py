@@ -310,6 +310,28 @@ class NodesSeriesDatabase(SqliteStore):
                 "SELECT device_id, key, label, unit, last_value, last_ts"
                 f" FROM metrics WHERE {' OR '.join(clauses)}", args).fetchall()
 
+    def metrics_for_families_and_devices(self, keys, device_ids) -> list[sqlite3.Row]:
+        """metrics_for_families, narrowed to a device_id set, through
+        UNIQUE(device_id, key) rather than a fleet-wide ix_metrics_key scan."""
+        roots = [str(k) for k in keys if k]
+        ids = list(dict.fromkeys(int(d) for d in device_ids))
+        if not roots or not ids:
+            return []
+        clauses, args = [], []
+        for root in roots:
+            clauses.append("(key = ? OR (key >= ? AND key < ?))")
+            args += [root, root + ".", root + "/"]
+        key_where = " OR ".join(clauses)
+        rows: list[sqlite3.Row] = []
+        with self._lock:
+            for chunk in id_chunks(ids, self._IDS_PER_QUERY):
+                marks = marks_for(chunk)
+                rows += self._conn.execute(
+                    "SELECT device_id, key, label, unit, last_value, last_ts"
+                    f" FROM metrics WHERE device_id IN ({marks}) AND ({key_where})",
+                    [*chunk, *args]).fetchall()
+        return rows
+
     _IDS_PER_QUERY = 500
 
     def metrics_for_devices(self, device_ids, keys) -> list[sqlite3.Row]:
@@ -496,14 +518,18 @@ class NodesSeriesDatabase(SqliteStore):
             for low, high in self._metric_bands():
                 with self._lock:
                     source = self._union_sql("samples")
+                    # CROSS JOIN (as metric_window_aggregates does) makes
+                    # this a per-metric seek rather than a range scan.
                     rows = self._conn.execute(
-                        f"SELECT metric_id, COUNT(*) AS n, MIN(value) AS vmin,"
-                        f" AVG(value) AS vavg, MAX(value) AS vmax"
-                        f" FROM {source}"
-                        f" WHERE metric_id >= ? AND metric_id <= ?"
-                        f" AND ts >= ? AND ts < ? AND value IS NOT NULL"
-                        f" GROUP BY metric_id",
-                        (low, high, hour, hour + 3600)).fetchall()
+                        f"SELECT s.metric_id AS metric_id, COUNT(*) AS n,"
+                        f" MIN(s.value) AS vmin, AVG(s.value) AS vavg,"
+                        f" MAX(s.value) AS vmax"
+                        f" FROM metrics m CROSS JOIN {source} s"
+                        f" ON s.metric_id = m.id AND s.ts >= ? AND s.ts < ?"
+                        f" AND s.value IS NOT NULL"
+                        f" WHERE m.id >= ? AND m.id <= ?"
+                        f" GROUP BY s.metric_id",
+                        (hour, hour + 3600, low, high)).fetchall()
                     if rows:
                         self._conn.executemany(
                             "INSERT INTO samples_hourly(metric_id, hour, n,"
@@ -634,17 +660,14 @@ class NodesSeriesDatabase(SqliteStore):
         """_prune_by_band's body with a deadline: (rows removed, finished).
         Bands come from `metrics` (probing `samples` would be a full scan);
         `bounds_where` narrows them, so a purge starts at its device's ids."""
-        scope_clause = ""
         probe_terms = []
         probe_params = list(bounds_params)
         if interface_only:
-            scope_clause = (f" AND metric_id IN (SELECT id FROM metrics"
-                            f" WHERE scope = {SCOPE_INTERFACE}"
-                            f" AND id >= ? AND id < ?)")
             probe_terms.append(f"scope = {SCOPE_INTERFACE}")
         if bounds_where:
             probe_terms.append(f"({bounds_where})")
         scope_probe = (" WHERE " + " AND ".join(probe_terms)) if probe_terms else ""
+        id_where = (" AND " + " AND ".join(probe_terms)) if probe_terms else ""
         base = table[:-4] if table.endswith("_new") else table
         with self._lock:
             bounds = self._conn.execute(
@@ -658,13 +681,19 @@ class NodesSeriesDatabase(SqliteStore):
         def delete(low_id: int, upper: int) -> int:
             if not self._still_live(base, table):
                 return 0
-            args = [low_id, upper, *params]
-            if interface_only:
-                args += [low_id, upper]
-            cursor = self._conn.execute(
-                f"DELETE FROM {table} WHERE metric_id >= ? AND metric_id < ?"
-                f" AND {where}{scope_clause}", args)
-            return cursor.rowcount or 0
+            # The band's actual ids, chunked into IN lists, not a metric_id
+            # range -- turns each delete into a per-metric seek.
+            ids = [row[0] for row in self._conn.execute(
+                f"SELECT id FROM metrics WHERE id >= ? AND id < ?{id_where}",
+                (low_id, upper, *probe_params)).fetchall()]
+            removed = 0
+            for chunk in id_chunks(ids):
+                marks = marks_for(chunk)
+                cursor = self._conn.execute(
+                    f"DELETE FROM {table} WHERE metric_id IN ({marks})"
+                    f" AND {where}", (*chunk, *params))
+                removed += cursor.rowcount or 0
+            return removed
 
         removed, reached = self._delete_batches(
             low, cut, deadline, delete, chunk=SAMPLE_BAND_METRICS_START,
@@ -675,11 +704,15 @@ class NodesSeriesDatabase(SqliteStore):
     def prune(self, *, sample_days: float = 3, rollup_days: float = 400,
               interface_sample_days: float = 1,
               interface_rollup_days: float = 90,
-              max_samples_per_metric: int = 0) -> int:
+              max_samples_per_metric: int = 0,
+              poll_interval_s: float | None = None) -> int:
         """Age out raw samples and hourly rollups, in two passes per table.
         Per-port metrics are 94% of the rows, so they age out on their own
         pair of cutoffs; the unfiltered pass runs first. Passing 0 (the
-        Settings maintenance button) matches every existing row."""
+        Settings maintenance button) matches every existing row.
+
+        `poll_interval_s`, if known, lets the cap be skipped when retention
+        alone already keeps a metric under it; None runs the cap as before."""
         removed = 0
         now = time.time()
         for table in self._live_tables("samples"):
@@ -696,7 +729,15 @@ class NodesSeriesDatabase(SqliteStore):
             removed += self._prune_by_band(
                 table, "hour < ?",
                 (now - interface_rollup_days * 86400,), interface_only=True)
-        removed += self.cap_samples_per_metric(max_samples_per_metric)
+        # Skip the cap only when a real interval says it can't bind; a guess
+        # risks under-enforcing it, worse than the scan it would save.
+        if max_samples_per_metric > 0:
+            if poll_interval_s is None:
+                removed += self.cap_samples_per_metric(max_samples_per_metric)
+            else:
+                tier_days = max(sample_days, interface_sample_days)
+                if max_samples_per_metric < tier_days * 86400 / poll_interval_s:
+                    removed += self.cap_samples_per_metric(max_samples_per_metric)
         if removed:
             # Freed pages go back in short steps with the lock released
             # between them, not through a whole-file VACUUM.

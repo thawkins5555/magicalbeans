@@ -806,15 +806,19 @@ class SyslogDatabase(SqliteStore):
                 (cutoff, limit)).fetchall()
 
     def stats(self) -> dict:
+        # Split like snmptrapdb.stats(): MIN/MAX alone are index SEARCHes,
+        # combined with COUNT(*) SQLite SCANs instead; log_counts can't
+        # replace the exact row count (a prune's cutoff falls mid-hour).
         with self._lock:
-            row = self._conn.execute(
-                "SELECT COUNT(*) AS rows, MIN(ts) AS lo, MAX(ts) AS hi"
-                " FROM logs").fetchone()
+            lo = self._conn.execute("SELECT MIN(ts) AS v FROM logs").fetchone()["v"]
+            hi = self._conn.execute("SELECT MAX(ts) AS v FROM logs").fetchone()["v"]
+            rows = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM logs").fetchone()["n"]
             last_hour = self._conn.execute(
                 "SELECT SUM(n) AS n FROM log_counts WHERE hour >= ?",
                 (int((time.time() - 3600) // 3600) * 3600,)).fetchone()
         done, total = self.index_progress
-        return {"rows": row["rows"] or 0, "lo": row["lo"], "hi": row["hi"],
+        return {"rows": rows or 0, "lo": lo, "hi": hi,
                 "last_hour": last_hour["n"] or 0, "fts": self.fts,
                 "index_ready": self.index_ready,
                 "index_done": done, "index_total": total,
@@ -935,10 +939,16 @@ class SyslogDatabase(SqliteStore):
                     else time.monotonic() + budget_s)
         incomplete = False
 
-        low, cut = self._id_bounds("ts < ?", (cutoff,))
+        # Kept below so an age sweep can't reuse an id past AlertEngine's
+        # cursor -- not for retention_days=0 ("delete everything now") or
+        # the future-dated cleanup below, which removes the highest id too.
+        age_where = "ts < ?"
+        if retention_days > 0:
+            age_where += " AND id < (SELECT MAX(id) FROM logs)"
+        low, cut = self._id_bounds(age_where, (cutoff,))
         if low is not None:
             gone, reached = self._batched_delete_logs(
-                "ts < ?", (cutoff,), low, cut, deadline)
+                age_where, (cutoff,), low, cut, deadline)
             removed += gone
             incomplete = incomplete or reached < cut
 

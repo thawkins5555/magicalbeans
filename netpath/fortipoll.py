@@ -29,12 +29,8 @@ from concurrent.futures import ThreadPoolExecutor
 from . import nodeoids as oids
 from .eventlog import ERROR, NullLog, WIRELESS
 from .nodeoids import oid_key
-from .nodepoll import EngineCache, _AuthFailure, _Session, credential_for, snmp_version_of
-from .snmppoll import (
-    PDU_GETNEXT, PDU_REPORT, SnmpError,
-    build_request, build_v3_request, discovery_probe,
-)
-from .trapdecode import localized_key
+from .nodepoll import EngineCache, _AuthFailure, _Session, credential_for, snmp_version_of, v3_exchange
+from .snmppoll import PDU_GETNEXT, SnmpError, build_request
 from .wirelessdb import WirelessDatabase
 from .worker import Worker
 
@@ -66,6 +62,8 @@ class WirelessPoller(Worker):
         self._executor: ThreadPoolExecutor | None = None
         self._stop = threading.Event()
         self._queued: set[int] = set()
+        # controller_id -> its Future while queued/running -- see begin_stop.
+        self._queued_futures: dict[int, "Future"] = {}
         self._next_run: dict[int, float] = {}
         self._lock = threading.Lock()
         # Reset per controller in _poll_controller; defined here so the
@@ -147,6 +145,13 @@ class WirelessPoller(Worker):
         self._settings_state = None
         if self._executor:
             self._executor.shutdown(wait=False, cancel_futures=True)
+            with self._lock:
+                # A cancelled future never reaches _run_one's own discard;
+                # a still-running one is left alone for drain().
+                for controller_id, future in list(self._queued_futures.items()):
+                    if future.cancelled():
+                        self._queued.discard(controller_id)
+                        self._queued_futures.pop(controller_id, None)
 
     finish_stop = Worker._finish_stop_draining
 
@@ -156,14 +161,30 @@ class WirelessPoller(Worker):
                 return
             self._queued.add(controller_id)
         try:
-            self._executor.submit(self._run_one, controller_id)
+            future = self._executor.submit(self._run_one, controller_id)
         except RuntimeError:
             with self._lock:
                 self._queued.discard(controller_id)
+            return
+        with self._lock:
+            self._queued_futures[controller_id] = future
 
     def _loop(self) -> None:
+        """Guarded like NodePoller._loop: one database error must not
+        kill this thread silently."""
         while not self._stop.is_set():
-            self._schedule_pass()
+            try:
+                self._schedule_pass()
+                if self.error:
+                    self.log.add(WIRELESS, "Wireless polling scheduling recovered")
+                    self.error = None
+            except Exception as exc:
+                message = str(exc) or exc.__class__.__name__
+                new_error = f"Wireless poller scheduling failed: {message}"
+                if new_error != self.error:
+                    self.log.add(ERROR, new_error, detail=traceback.format_exc())
+                self.error = new_error
+                self._bump("errors")
             self._stop.wait(1.0)
 
     def _first_due(self, last_poll_ts, now: float, interval: float) -> float:
@@ -188,6 +209,8 @@ class WirelessPoller(Worker):
             if due is None:
                 due = self._next_run[controller_id] = self._first_due(
                     controller["last_poll_ts"], now, interval)
+            elif due - now > interval:
+                due = self._next_run[controller_id] = now + interval   # backward clock step
             if now >= due:
                 self._next_run[controller_id] = now + interval
                 self.poll_now(controller_id)
@@ -228,6 +251,7 @@ class WirelessPoller(Worker):
         finally:
             with self._lock:
                 self._queued.discard(controller_id)
+                self._queued_futures.pop(controller_id, None)
 
     # --------------------------------------------------------------- polling
 
@@ -244,13 +268,13 @@ class WirelessPoller(Worker):
             return None
         if time.time() > self._ping_deadline:
             return None
-        started = time.time()
+        started = time.perf_counter()   # time.time() ticks at 15.6 ms on Windows, quantising a LAN round trip
         try:
             from .ipam_scan import ping_once
             ok = ping_once(ip, timeout_ms=PING_TIMEOUT_MS)
         except Exception:
             return None
-        return (time.time() - started) * 1000.0 if ok else None
+        return (time.perf_counter() - started) * 1000.0 if ok else None
 
     def _poll_controller(self, controller) -> None:
         config = dict(controller)
@@ -434,34 +458,25 @@ class WirelessPoller(Worker):
             # The id filter is what makes a late reply to the previous
             # GETNEXT a dropped datagram rather than this one's answer.
             return session.request(packet, expect_request_id=request_id)
+        # Shared with NodePoller (engineTime, Report retry, msgID). The
+        # priv args below are always None: controllers has no priv columns.
         credential = credential_for(config)
-        identity, auth_proto, password = (
-            credential.identity, credential.auth_proto, credential.auth_password)
-        engine = self._engines.get(controller["id"])
-        if engine is None:
-            probe = discovery_probe()
-            response = session.request(probe)
-            if not response.engine_id:
-                raise SnmpError(f"{controller['ip']}: no engine id in discovery reply")
-            self._engines.set(controller["id"], response.engine_id,
-                              response.engine_boots, response.engine_time)
-            engine = self._engines.get(controller["id"])
-        engine_id, boots, engine_time, _learned_at = engine
-        auth_key = localized_key(auth_proto, password, engine_id) \
-            if auth_proto and password else None
-        request_id = session.next_request_id()
-        msg_id = session.next_request_id()
-        packet = build_v3_request(
-            msg_id, request_id, PDU_GETNEXT, [oid],
-            engine_id=engine_id, engine_boots=boots, engine_time=engine_time,
-            user=identity or "", auth_proto=auth_proto, auth_key=auth_key)
-        response = session.request(packet, expect_request_id=request_id,
-                                   auth_proto=auth_proto, auth_key=auth_key,
-                                   verify=self._verify_replies)
-        if response.pdu_tag == PDU_REPORT:
-            self._engines.invalidate(controller["id"])
-            raise _AuthFailure(f"{controller['ip']}: engine resync required")
-        return response
+        controller_id = controller["id"]
+
+        def learned(engine_id: bytes, boots: int, engine_time: int) -> None:
+            self._engines.set(controller_id, engine_id, boots, engine_time)
+
+        try:
+            return v3_exchange(
+                session, PDU_GETNEXT, [oid], identity=credential.identity,
+                auth_proto=credential.auth_proto, password=credential.auth_password,
+                engine=self._engines.current(controller_id),
+                ip=controller["ip"], learned=learned,
+                priv_proto=credential.priv_proto, priv_password=credential.priv_password,
+                verify_replies=self._verify_replies)
+        except _AuthFailure:
+            self._engines.invalidate(controller_id)
+            raise
 
 
 def _split_vdom_name(suffix: str) -> tuple[str, str, str] | None:

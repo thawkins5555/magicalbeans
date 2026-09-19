@@ -486,6 +486,131 @@ try:
           headers(heads[0], "X-Kept"))
     service.web_relays.close(relay["session_id"], "test teardown")
 
+    # ------------------------- the relay never forwards the session cookie
+    print("the operator's session cookie never reaches the device")
+    cookie_seen = []
+
+    def cookie_sink(conn):
+        buf = bytearray()
+        while True:
+            head = read_head(conn, buf)
+            if not head:
+                return
+            cookie_seen.append(head)
+            conn.sendall(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Set-Cookie: sw_session=stolen; Path=/\r\n"
+                b"Set-Cookie: devcookie=keepme; Path=/\r\n"
+                b"Content-Length: 0\r\n\r\n")
+
+    cookie_port = raw_device(cookie_sink)
+    relay = relay_to(cookie_port)
+    sock = socket.create_connection(("127.0.0.1", relay["port"]), timeout=15)
+    buf = bytearray()
+    sock.sendall(
+        f"GET /status.asp HTTP/1.1\r\nHost: {SERVER_NAME}:{relay['port']}\r\n"
+        f"Cookie: sw_session={token}; other=kept\r\n\r\n".encode("ascii"))
+    answer = read_head(sock, buf)
+    sock.close()
+
+    forwarded_cookie = headers(cookie_seen[0], "Cookie")
+    check("the device never sees the operator's session cookie",
+          not forwarded_cookie or "sw_session" not in forwarded_cookie[0],
+          forwarded_cookie)
+    check("...but a device cookie riding alongside it still crosses",
+          forwarded_cookie and "other=kept" in forwarded_cookie[0],
+          forwarded_cookie)
+    returned_cookies = headers(answer, "Set-Cookie")
+    check("a device Set-Cookie naming our session cookie is dropped outright",
+          not any(v.split("=", 1)[0] == "sw_session" for v in returned_cookies),
+          returned_cookies)
+    check("...but the device's own Set-Cookie still reaches the browser",
+          any(v.startswith("devcookie=keepme") for v in returned_cookies),
+          returned_cookies)
+    service.web_relays.close(relay["session_id"], "test teardown")
+
+    # A connection that goes blind for a reason other than a genuine
+    # upgrade must not carry the browser's NEXT request -- cookie included
+    # -- to the device unexamined. Here the device itself forces that by
+    # answering with an oversized head.
+    OVERSIZE_PAD = b"x" * 70_000
+    device_heads = []
+
+    def oversize_once(conn):
+        buf = bytearray()
+        head = read_head(conn, buf)
+        if not head:
+            return
+        device_heads.append(head)
+        conn.sendall(b"HTTP/1.1 200 OK\r\nX-Pad: " + OVERSIZE_PAD
+                     + b"\r\nContent-Length: 0\r\n\r\n")
+        while True:
+            head = read_head(conn, buf)
+            if not head:
+                return
+            device_heads.append(head)
+
+    relay = relay_to(raw_device(oversize_once))
+    sock = socket.create_connection(("127.0.0.1", relay["port"]), timeout=15)
+    sock.sendall(f"GET /one HTTP/1.1\r\nHost: {SERVER_NAME}:"
+                 f"{relay['port']}\r\n\r\n".encode("ascii"))
+    raw_answer = bytearray()
+    deadline = time.time() + 10
+    while len(raw_answer) < len(OVERSIZE_PAD) and time.time() < deadline:
+        chunk = sock.recv(65536)
+        if not chunk:
+            break
+        raw_answer += chunk
+    check("an oversized response head still crosses raw, as a device's own "
+          "malformed traffic always has",
+          OVERSIZE_PAD in raw_answer, len(raw_answer))
+
+    sock.sendall(f"GET /two HTTP/1.1\r\nHost: {SERVER_NAME}:{relay['port']}\r\n"
+                 f"Cookie: sw_session={token}\r\n\r\n".encode("ascii"))
+    sock.settimeout(3)
+    try:
+        second_answer = sock.recv(65536)
+    except (socket.timeout, OSError):
+        second_answer = b""
+    sock.close()
+    deadline = time.time() + 5
+    while len(device_heads) < 1 and time.time() < deadline:
+        time.sleep(0.05)
+    check("the browser's next request on that connection is not delivered",
+          not second_answer, second_answer[:60])
+    check("...and the device never saw it -- the cookie included",
+          len(device_heads) == 1, len(device_heads))
+    service.web_relays.close(relay["session_id"], "test teardown")
+
+    # The browser's OWN request head growing past the limit (cookie
+    # stuffing) is refused outright rather than merely not forwarded.
+    stuffed_heads = []
+
+    def record_only(conn):
+        buf = bytearray()
+        head = read_head(conn, buf)
+        if head:
+            stuffed_heads.append(head)
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+
+    relay = relay_to(raw_device(record_only))
+    sock = socket.create_connection(("127.0.0.1", relay["port"]), timeout=15)
+    sock.sendall(
+        f"GET /stuffed HTTP/1.1\r\nHost: {SERVER_NAME}:{relay['port']}\r\n"
+        f"Cookie: sw_session={token}; stuffing={'z' * 70_000}\r\n\r\n"
+        .encode("ascii"))
+    sock.settimeout(5)
+    try:
+        refusal = sock.recv(65536)
+    except (socket.timeout, OSError):
+        refusal = b""
+    sock.close()
+    check("an oversized request head is refused, never forwarded to the device",
+          not stuffed_heads, stuffed_heads)
+    check("...and the browser is told outright, not left to time out",
+          refusal.startswith(b"HTTP/1.1 431"), refusal[:40])
+    service.web_relays.close(relay["session_id"], "test teardown")
+
     # The whole request head names the device, not the relay. Before 5.4 the
     # browser's Host, Origin and Referer all named the relay and agreed there;
     # moving Host alone left them disagreeing at the device, which is what an

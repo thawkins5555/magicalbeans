@@ -1775,3 +1775,48 @@ Thing4 were added, both on Sonnet, to take the backend performance items.
 account's session limit before finishing their assigned items. Each was
 resumed with a plain "continue" once the limit cleared, picking back up
 from where it stopped rather than restarting.
+
+**Phase 5: the review, and what happened after it.** 5.46.0 (the
+performance pass) shipped. The full security/bug/performance review that
+was always phase 5 of this plan then ran over the shipped 5.46.0 codebase,
+covering security, correctness and performance the same way the earlier
+phases covered structure. The review's full write-up — every finding, its
+severity and where it lives in the code — was exported to a local file at
+the operator's request and is deliberately kept out of this public
+repository; only the fixes below, and their operator-visible effects, are
+recorded here and in `CHANGELOG.md`.
+
+**Operator approved the recommended fix set.** Rather than fix everything
+at once, the highest-value and lowest-risk items went first, and the
+remainder was planned as a sequence of releases so each stays reviewable
+on its own:
+
+- **5.47.0** (this release) — the approved security, correctness and
+  history-maintenance fixes: session address binding, per-address
+  sign-in lock-out, trap-community visibility, the SNMPv3 engine-time
+  retry, the daylight-saving maintenance-window fix, the per-connection
+  TLS handshake, the WEB relay cookie/framing hardening, the alert-cursor
+  rewind and keep-newest-row prune rule, and the metric-history
+  performance work — see `CHANGELOG.md` for the full list.
+- **5.48.0** — first-run administrator password handling, plus the
+  remaining low-severity review items.
+- **5.49.0** — the low-risk poll and API performance items the review
+  also surfaced.
+- **5.50.0** — GETBULK interface polling.
+- **5.51.0** — spanning-tree walk cadence and down-port sample storage.
+- After that, the review's findings are published.
+
+**Operator instructions given alongside this plan, both now standing
+policy in `CLAUDE.md`:** "only run one Javariius at a time" (a single
+review pass in flight, not several running against overlapping diffs),
+and "remove the 10-minute loop" (the periodic Bob-to-teammate check-in
+cadence asked for earlier in this refactor is cancelled — see the "status?"
+note above for when it was added). `CLAUDE.md` was also updated by the
+lead separately, to allow extra Sonnet teammates for disjoint work lanes
+and to add a plain test-status line to the standing rules; noted here for
+the record, no document in this file's own remit changed for that edit
+beyond this note.
+
+**Files changed for 5.47.0's documentation:** `netpath/__init__.py`
+(version), `CHANGELOG.md`, `FEATURES.md`, `INTERNALS.md`, `RUNBOOK.md`,
+`tests/README.md`, and this file.

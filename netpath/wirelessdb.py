@@ -483,10 +483,12 @@ class WirelessDatabase(SqliteStore):
 
     def prune_ap_events(self, retention_days: float = 90) -> int:
         """Lifecycle events are a log, not an archive. Called from the
-        service maintenance loop."""
+        service maintenance loop. Keeps the highest-id row so AlertEngine's
+        cursor (no AUTOINCREMENT here) never sees a reused id go stale."""
         with self._lock:
             cur = self._conn.execute(
-                "DELETE FROM ap_events WHERE ts < ?",
+                "DELETE FROM ap_events WHERE ts < ?"
+                " AND id < (SELECT MAX(id) FROM ap_events)",
                 (time.time() - retention_days * 86400,))
             removed = cur.rowcount or 0
             self._conn.commit()

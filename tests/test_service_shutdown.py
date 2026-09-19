@@ -5,6 +5,7 @@ every minute and, forced, when a settings save asks for one.
 stop/close sequence so a sweep in flight cannot touch a closed database.
 This suite drives both from plain threads, without starting the timer."""
 import io
+import itertools
 import os
 import shutil
 import sqlite3
@@ -557,7 +558,11 @@ from netpath.web.service import SHUTDOWN_DB_GRACE_S, SHUTDOWN_DEADLINE_S  # noqa
 class Wedged:
     """A worker that is asked to stop and then never finishes. Records when
     each half was called, so the test can tell "signalled everything, then
-    waited once" from "signalled and waited, one at a time"."""
+    waited once" from "signalled and waited, one at a time".
+
+    Ordered by a sequence counter, not a timestamp: time.monotonic() is
+    coarse enough on Windows that a tight loop can read back the same tick.
+    """
 
     def __init__(self, name, phases):
         self.name = name
@@ -565,13 +570,16 @@ class Wedged:
         self.running = True
 
     def begin_stop(self):
-        self.phases.append((self.name, "begin", time.monotonic()))
+        self.phases.append((self.name, "begin", next(_seq)))
 
     def finish_stop(self, deadline):
-        self.phases.append((self.name, "finish", time.monotonic()))
+        self.phases.append((self.name, "finish", next(_seq)))
         # Burn the whole budget, the way a poll against unresponsive gear does.
         while time.monotonic() < deadline:
             time.sleep(0.02)
+
+
+_seq = itertools.count()
 
 
 service6 = new_service("t6")
@@ -619,8 +627,8 @@ _begins = [t for _n, phase, t in phases6 if phase == "begin"]
 _finishes = [t for _n, phase, t in phases6 if phase == "finish"]
 check("every worker was asked to stop before any of them was waited for",
      _begins and _finishes and max(_begins) < min(_finishes),
-     f"last begin {max(_begins) - _t0:.2f}s, first finish "
-     f"{min(_finishes) - _t0:.2f}s" if _begins and _finishes else str(phases6))
+     f"last begin seq {max(_begins)}, first finish seq {min(_finishes)}"
+     if _begins and _finishes else str(phases6))
 
 # The ordering the comments in shutdown() call out, as an ordering of waits.
 _order = [n for n, phase, _t in phases6 if phase == "finish"]

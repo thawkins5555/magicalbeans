@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import sqlite3
+import threading
 import time
 
 from .namelookup import is_ip_literal
@@ -1115,6 +1116,10 @@ class NodesDatabase(SqliteStore):
         # disabled_device_ids(), held between calls -- see that method.
         self._disabled_cache: set[int] | None = None
         self._disabled_cache_generation: int = -1
+        # Device ids record_metric_samples has touched, for AlertEngine's
+        # take_dirty_devices. Own lock: pollers write from several threads.
+        self._dirty_devices_lock = threading.Lock()
+        self._dirty_devices: set[int] = set()
         # Opened before super().__init__: _before_schema migrates into them.
         # Derived sibling paths, overridable here for tests, same as mapper.db.
         memory = (not path) or path == ":memory:" or path.startswith("file:")
@@ -2224,6 +2229,17 @@ class NodesDatabase(SqliteStore):
         see NodesSeriesDatabase.metrics_for_families. Same disabled-device
         filter: `enabled` and the metric live in different files."""
         rows = self.series_db.metrics_for_families(keys)
+        if not rows:
+            return rows
+        disabled = self.disabled_device_ids()
+        if not disabled:
+            return rows
+        return [row for row in rows if row["device_id"] not in disabled]
+
+    def metrics_for_families_and_devices(self, keys, device_ids) -> list[sqlite3.Row]:
+        """metrics_for_families, narrowed to device_ids. Same disabled-
+        device filter."""
+        rows = self.series_db.metrics_for_families_and_devices(keys, device_ids)
         if not rows:
             return rows
         disabled = self.disabled_device_ids()
@@ -5481,9 +5497,18 @@ class NodesDatabase(SqliteStore):
         # cutoff of "now" and so matches every existing row -- which is
         # exactly why these three are batched: that button issues them from
         # the HTTP request thread over the whole table.
+        # Kept below so an age sweep can't make a reused id land behind
+        # AlertEngine's cursor -- not for event_days=0 ("empty this table"),
+        # which the cursor rewind in _drain_from already covers.
         event_cutoff = now - event_days * 86400
-        removed += self._prune_by_id("device_events", "ts < ?", (event_cutoff,))
-        removed += self._prune_by_id("interface_events", "ts < ?", (event_cutoff,))
+        device_events_where, interface_events_where = "ts < ?", "ts < ?"
+        if event_days > 0:
+            device_events_where += " AND id < (SELECT MAX(id) FROM device_events)"
+            interface_events_where += " AND id < (SELECT MAX(id) FROM interface_events)"
+        removed += self._prune_by_id(
+            "device_events", device_events_where, (event_cutoff,))
+        removed += self._prune_by_id(
+            "interface_events", interface_events_where, (event_cutoff,))
         removed += self._prune_by_id(
             "discovery_jobs",
             "started_ts < ? AND (state != 'running' OR started_ts < ?)",
@@ -5496,9 +5521,21 @@ class NodesDatabase(SqliteStore):
             sample_days=sample_days, rollup_days=rollup_days,
             interface_sample_days=interface_sample_days,
             interface_rollup_days=interface_rollup_days,
-            max_samples_per_metric=max_samples_per_metric)
+            max_samples_per_metric=max_samples_per_metric,
+            poll_interval_s=self._fastest_poll_interval_s())
         removed += self.series_db.prune_orphan_metrics(self.all_device_ids())
         return removed
+
+    def _fastest_poll_interval_s(self) -> float | None:
+        """The fleet's fastest effective poll interval, for series_db.prune's
+        row-cap skip -- effective_configs() resolves override/group/default
+        the same way the scheduler does, so this is never too slow. None
+        (no enabled devices, or nothing positive) keeps the cap running."""
+        intervals = [float(config["poll_interval_s"])
+                    for config in self.effective_configs().values()
+                    if config.get("poll_interval_s")
+                    and float(config["poll_interval_s"]) > 0]
+        return min(intervals) if intervals else None
 
     def all_device_ids(self) -> list[int]:
         with self._lock:
@@ -5549,13 +5586,28 @@ class NodesDatabase(SqliteStore):
     # enabled flag) is composed here instead of delegated.
 
     def record_metric_samples(self, device_id: int, rows: list) -> dict:
-        return self.series_db.record_metric_samples(device_id, rows)
+        ids = self.series_db.record_metric_samples(device_id, rows)
+        if rows:
+            # A poll touched this device, taken by AlertEngine's next tick.
+            with self._dirty_devices_lock:
+                self._dirty_devices.add(device_id)
+        return ids
 
     def record_metric_sample(self, device_id: int, key: str, label: str,
                              unit: str, kind: str, ts: float,
                              value: float | None) -> int:
-        return self.series_db.record_metric_sample(
-            device_id, key, label, unit, kind, ts, value)
+        """One-row wrapper, through record_metric_samples above so the
+        dirty-set sees it exactly as it would a real poll's batch."""
+        ids = self.record_metric_samples(
+            device_id, [(key, label, unit, kind, ts, value)])
+        return ids[key]
+
+    def take_dirty_devices(self) -> set[int]:
+        """Device ids a new sample has touched since the last call, cleared
+        as they are taken."""
+        with self._dirty_devices_lock:
+            dirty, self._dirty_devices = self._dirty_devices, set()
+        return dirty
 
     def metrics(self, device_id: int) -> list[sqlite3.Row]:
         return self.series_db.metrics(device_id)

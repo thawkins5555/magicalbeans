@@ -842,21 +842,26 @@ def main() -> int:
     check("D7 …and does not put itself into the event log",
           not any(huge[:200] in (e.message or "") for e in SERVICE.log.all()[before:]))
 
-    # Lockout: independent counters per username and per address.
+    # Lockout: hard on the address only; the bare user name only backs off,
+    # never hard-locks -- so no remote host can lock an account out for
+    # every other address.
     throttle = auth_mod.LoginThrottle(threshold=5, window_s=900,
                                       lockout_threshold=3, max_keys=10)
     for _ in range(3):
         throttle.record_failure("victim", "10.0.0.1")
-    check("D7 the username is locked out after the threshold",
-          throttle.lockout_remaining("victim", "10.0.0.9") > 0)
-    check("D7 …and so is the address, independently",
-          throttle.lockout_remaining("someone-else", "10.0.0.1") > 0)
-    check("D7 …while an unrelated pair is not",
-          throttle.lockout_remaining("bystander", "10.0.0.2") == 0)
+    check("D7 the address is locked out after the threshold -- for any "
+          "username, since lockout no longer takes one",
+          throttle.lockout_remaining("10.0.0.1") > 0)
+    check("D7 …but the same username from a different address is not locked "
+          "out — one address cannot lock an account for every other address",
+          throttle.delay_for("victim", "10.0.0.9") == 0
+          and throttle.lockout_remaining("10.0.0.9") == 0)
+    check("D7 …while an unrelated address is not",
+          throttle.lockout_remaining("10.0.0.2") == 0)
     throttle.clear("victim")
-    check("D7 a successful sign-in clears only that account's failures",
-          throttle.lockout_remaining("victim", "10.0.0.9") == 0
-          and throttle.lockout_remaining("someone-else", "10.0.0.1") > 0)
+    check("D7 a successful sign-in clears only that account's own back-off, "
+          "not the address's lock",
+          throttle.lockout_remaining("10.0.0.1") > 0)
     for n in range(200):
         throttle.record_failure(f"guess{n}", f"10.1.0.{n % 250}")
     check("D7 the failure table is bounded",
@@ -864,7 +869,10 @@ def main() -> int:
           str(len(throttle._failures)))
 
     # And end to end: 429 rather than 401 once the real threshold is passed.
+    # last_id is captured before the account locks, so it covers the whole
+    # episode -- the check below needs the row THAT lock itself wrote.
     victim = make_user("lockme", {"nodes": "read"})
+    last_id = SERVICE.app_db.audit_last_id()
     for _ in range(auth_mod.LOCKOUT_THRESHOLD):
         req("POST", "/api/login", {"username": "lockme", "password": "wrong"})
     status, _h, payload = req("POST", "/api/login",
@@ -873,11 +881,49 @@ def main() -> int:
     check("D7 the real threshold locks the account out with 429",
           status == 429 and "Try again" in str(payload.get("error", "")),
           f"{status} {payload}")
+
+    # A flood of requests against an already-locked address writes one
+    # audit row (and one log line) for the whole episode, not one per
+    # refused request.
+    for _ in range(10):
+        status, _h, payload = req("POST", "/api/login",
+                                  {"username": "lockme", "password": "wrong"})
+        check("D7 …every refused request while locked still answers 429",
+              status == 429, status)
+    locked_rows = [row for row in SERVICE.app_db.audit_events(last_id, 500)
+                  if row["action"] == "signin.locked_out"]
+    check("D7 …but only one signin.locked_out audit row was written for "
+          "the whole flood", len(locked_rows) == 1, len(locked_rows))
+
     # Every failure above came from 127.0.0.1, so the ADDRESS is locked out
     # too — which is the point of counting it separately, and would stop
     # the rest of this suite signing in. Stand in for the fifteen minutes
     # passing.
     SERVICE.throttle._failures.clear()
+    SERVICE.throttle._lockout_announced.clear()
+
+    # announce_lockout() is "once per lock episode", not "once ever" -- a
+    # lock that lifts and a fresh run of failures re-locks the same address
+    # must be announced again.
+    once = auth_mod.LoginThrottle(threshold=5, window_s=900,
+                                  lockout_threshold=3, max_keys=10)
+    for _ in range(3):
+        once.record_failure("flooder", "10.2.0.1")
+    check("D7 announce_lockout is true the first time an address is found "
+          "locked", once.announce_lockout("10.2.0.1"))
+    for _ in range(10):
+        check("D7 …and false for every further request against the same "
+              "episode", not once.announce_lockout("10.2.0.1"))
+    # The window ages the old failures out (simulated, not a real 900 s
+    # wait), then a fresh run of failures re-locks the same address.
+    for stamps in once._failures.values():
+        stamps[:] = [ts - once.window_s - 1 for ts in stamps]
+    check("D7 …the lock lifts once its failures age out of the window",
+          once.lockout_remaining("10.2.0.1") == 0)
+    for _ in range(3):
+        once.record_failure("flooder", "10.2.0.1")
+    check("D7 …and the new episode is announced again",
+          once.announce_lockout("10.2.0.1"))
 
     # Concurrency cannot dilute the throttle: the verifications serialise.
     check("D7 password verification is bounded by a semaphore",
@@ -2357,6 +2403,124 @@ end
     check("D30b …so the next sign-in succeeds normally", status == 200,
           str(status))
 
+    # ------------- password change shares login's slot and throttle, so it
+    # cannot exhaust memory or serve as an unthrottled oracle on a
+    # hijacked session's own current password.
+    pw_cookie = make_user("pwtest", {"nodes": "read"})
+
+    held = [api_mod._LOGIN_SLOTS.acquire(timeout=5) for _ in range(4)]
+    real_wait = api_mod.auth._LOGIN_SLOT_WAIT_S
+    api_mod.auth._LOGIN_SLOT_WAIT_S = 0.1
+    try:
+        started = time.time()
+        status, head, payload = req(
+            "POST", "/api/password",
+            {"current_password": "Corr3ct-Horse-Battery",
+             "new_password": "Another-Horse-Battery9"},
+            cookie=pw_cookie)
+        elapsed = time.time() - started
+    finally:
+        api_mod.auth._LOGIN_SLOT_WAIT_S = real_wait
+        for got in held:
+            if got:
+                api_mod._LOGIN_SLOTS.release()
+    check("PW a password change with every slot busy answers 503, not "
+          "blocking", all(held) and status == 503, f"{status} {payload}")
+    check("PW …and it gave up after the bounded wait, not the scrypt's",
+          elapsed < 4.0, f"{elapsed:.2f}s")
+    check("PW …and the slots are free again afterwards",
+          api_mod._LOGIN_SLOTS.acquire(blocking=False)
+          and not api_mod._LOGIN_SLOTS.release(),
+          str(api_mod._LOGIN_SLOTS._value))
+
+    # A wrong current password throttles like a wrong login password would.
+    before_delay = SERVICE.throttle.delay_for("pwtest", "127.0.0.1")
+    for _ in range(6):
+        req("POST", "/api/password",
+            {"current_password": "not-it",
+             "new_password": "Another-Horse-Battery9"},
+            cookie=pw_cookie)
+    after_delay = SERVICE.throttle.delay_for("pwtest", "127.0.0.1")
+    check("PW repeated wrong current passwords grow the account's own "
+          "throttle delay", after_delay > before_delay,
+          (before_delay, after_delay))
+
+    status, _h, payload = req(
+        "POST", "/api/password",
+        {"current_password": "Corr3ct-Horse-Battery",
+         "new_password": "Another-Horse-Battery9"},
+        cookie=pw_cookie)
+    check("PW the real current password still succeeds despite the "
+          "recorded failures", status == 200, (status, payload))
+    # clear() only ever forgets the bare-username key -- the address's is
+    # deliberately kept, the same choice post_login's own success path
+    # already makes.
+    check("PW …and a successful change clears the account's own throttle "
+          "key, like a successful sign-in does",
+          "u:pwtest" not in SERVICE.throttle._failures,
+          list(SERVICE.throttle._failures))
+
+    # Enough wrong current passwords hard-lock the address before
+    # post_password ever hashes anything, exactly like a wrong login
+    # password would -- seeded directly rather than by repeating a slowed
+    # request past the lockout threshold.
+    SERVICE.throttle._failures.clear()
+    SERVICE.throttle._lockout_announced.clear()
+    pw_cookie2 = make_user("pwtest2", {"nodes": "read"})
+    for _ in range(auth_mod.LOCKOUT_THRESHOLD):
+        SERVICE.throttle.record_failure("pwtest2", "127.0.0.1")
+    status, _h, payload = req(
+        "POST", "/api/password",
+        {"current_password": "wrong", "new_password": "Another-Horse-Battery9"},
+        cookie=pw_cookie2)
+    check("PW a password change is refused once the address is locked out",
+          status == 429, (status, payload))
+
+    status, _h, payload = req(
+        "POST", "/api/password",
+        {"username": "pwtest2", "new_password": "Reset-Horse-Battery9"},
+        cookie=admin_cookie)
+    check("PW …but an admin's reset of that (now-locked) account is "
+          "unthrottled", status == 200, (status, payload))
+    SERVICE.throttle._failures.clear()
+    SERVICE.throttle._lockout_announced.clear()
+
+    # ---------- a session presented from a different address is refused,
+    # and destroyed outright, not merely refused once.
+    mismatch_cookie, status, _p = login("admin", ADMIN_PASSWORD)
+    check("setup: a fresh session for the address-mismatch check",
+          status == 200 and bool(mismatch_cookie))
+    raw_token = mismatch_cookie.split("sw_session=")[1].split(";")[0]
+    log_before = len(SERVICE.log.all())
+    try:
+        other_sock = socket.create_connection(
+            ("127.0.0.1", PORT), timeout=5, source_address=("127.0.0.2", 0))
+    except OSError as exc:
+        print(f"SKIP address-mismatch check: cannot bind 127.0.0.2 here ({exc})")
+    else:
+        try:
+            other_sock.sendall(
+                f"GET /api/state HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                f"Cookie: sw_session={raw_token}\r\n"
+                f"Connection: close\r\n\r\n".encode("ascii"))
+            answer = b""
+            while True:
+                chunk = other_sock.recv(65536)
+                if not chunk:
+                    break
+                answer += chunk
+        finally:
+            other_sock.close()
+        check("a session presented from a different address is refused",
+              answer.startswith(b"HTTP/1.1 401"), answer[:40])
+        check("...one event-log line names the mismatch",
+              sum(1 for e in SERVICE.log.all()[log_before:]
+                  if "127.0.0.2" in (e.message or "")) == 1,
+              [e.message for e in SERVICE.log.all()[log_before:]])
+        status, _h, payload = req("GET", "/api/session", cookie=mismatch_cookie)
+        check("...and the session is gone even from its own original address",
+              status == 200 and payload.get("authenticated") is False,
+              (status, payload))
 
     # ---------- D31 what a reader is NOT shown is said, not faked
     # A trap's community came back as "", indistinguishable from a trap that
@@ -2384,6 +2548,53 @@ end
           status == 200 and "community" in csv_text.splitlines()[0]
           and "not shown" in csv_text and "plant-rw" not in csv_text,
           csv_text[:300])
+
+    # ------------- D31 the community filter/search is not an oracle either
+    # The checks above already hide the VALUE from a reader; a reader could
+    # still brute-force it by filtering on a guess and seeing whether the
+    # row comes back, or by putting it in the free-text search.
+    status, _h, payload = req("GET", "/api/snmp/traps?community=plant-rw",
+                              cookie=snmp_reader)
+    check("D31 the community filter is ignored for a reader (would "
+          "otherwise confirm a guessed value)",
+          status == 200 and bool((payload or {}).get("traps")), payload)
+    status, _h, payload = req("GET", "/api/snmp/traps?community=not-the-community",
+                              cookie=snmp_reader)
+    check("D31 …a WRONG guess still returns the row, not zero -- the filter "
+          "is dropped entirely, not merely widened",
+          status == 200 and bool((payload or {}).get("traps")), payload)
+    status, _h, payload = req("GET", "/api/snmp/traps?q=plant-rw", cookie=snmp_reader)
+    check("D31 the free-text search does not match the community column "
+          "for a reader either",
+          status == 200 and not (payload or {}).get("traps"), payload)
+    status, _h, payload = req("GET", "/api/snmp/traps?community=plant-rw",
+                              cookie=snmp_writer)
+    check("D31 …while a write-capable account's filter is unchanged",
+          status == 200 and bool((payload or {}).get("traps")), payload)
+    status, _h, payload = req("GET", "/api/snmp/traps?community=not-the-community",
+                              cookie=snmp_writer)
+    check("D31 …and still excludes a genuinely wrong value for that account",
+          status == 200 and not (payload or {}).get("traps"), payload)
+    status, _h, payload = req("GET", "/api/snmp/traps?q=plant-rw", cookie=snmp_writer)
+    check("D31 …and its free-text search still matches the community column",
+          status == 200 and bool((payload or {}).get("traps")), payload)
+
+    # /api/config: accepted_communities is a stored filter list, not shown
+    # to an account that could not change it either.
+    SERVICE.snmp_db.save_settings({"accepted_communities": "plant-rw"})
+    SERVICE.snmp_settings = SERVICE.snmp_db.settings()
+    status, _h, payload = req("GET", "/api/config", cookie=snmp_reader)
+    snmp_settings = (payload or {}).get("snmp_settings", {})
+    check("D31 accepted_communities is blank for a read-only account",
+          snmp_settings.get("accepted_communities", "MISSING") == "",
+          snmp_settings)
+    check("D31 …but has_accepted_communities still says whether one is set",
+          snmp_settings.get("has_accepted_communities") is True, snmp_settings)
+    status, _h, payload = req("GET", "/api/config", cookie=snmp_writer)
+    snmp_settings = (payload or {}).get("snmp_settings", {})
+    check("D31 …and an account that could change it sees the real value",
+          snmp_settings.get("accepted_communities") not in ("", "MISSING"),
+          snmp_settings)
 
     # debug:read can't see NetPath; None (not False/0) is the honest answer,
     # drawn as an em dash.

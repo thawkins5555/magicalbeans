@@ -459,27 +459,33 @@ class SnmpTrapDatabase(SqliteStore):
     SCAN_COLUMNS = ("source", "community", "trap_oid", "trap_name",
                     "trap_kind", "varbind_text")
 
-    def _scan_clause(self, text: str) -> tuple[str, list]:
+    def _scan_clause(self, text: str, reveal: bool = True) -> tuple[str, list]:
         """A LIKE across every searchable column, one term at a time. Every
-        term must appear somewhere, matching what an indexed search would do."""
+        term must appear somewhere, matching what an indexed search would do.
+
+        `reveal=False` drops the community column: accounts that may not
+        read secrets cannot filter or search on the community either.
+        """
+        columns = self.SCAN_COLUMNS if reveal else tuple(
+            c for c in self.SCAN_COLUMNS if c != "community")
         terms = [term for term in str(text).split() if term] or [text]
         clauses, params = [], []
         for term in terms:
             clauses.append("(" + " OR ".join(
                 f"{column} LIKE ? {LIKE_ESCAPE}"
-                for column in self.SCAN_COLUMNS) + ")")
-            params.extend([like_contains(term)] * len(self.SCAN_COLUMNS))
+                for column in columns) + ")")
+            params.extend([like_contains(term)] * len(columns))
         return " AND ".join(clauses), params
 
     def search(self, t0: float, t1: float, filters: dict, limit: int = 300,
-               newest_first: bool = True) -> list[sqlite3.Row]:
+               newest_first: bool = True, reveal: bool = True) -> list[sqlite3.Row]:
         where, params = self._where(t0, t1, filters)
         order = "DESC" if newest_first else "ASC"
         text = (filters.get("text") or "").strip()
 
         with self._lock:
             if text:
-                scan, scan_params = self._scan_clause(text)
+                scan, scan_params = self._scan_clause(text, reveal)
                 return self._conn.execute(
                     f"SELECT * FROM traps WHERE {where} AND {scan}"
                     f" ORDER BY ts {order} LIMIT ?",
@@ -489,7 +495,7 @@ class SnmpTrapDatabase(SqliteStore):
                 f" ORDER BY ts {order} LIMIT ?", (*params, limit)).fetchall()
 
     def histogram(self, t0: float, t1: float, bucket_s: float = 3600,
-                  filters: dict | None = None) -> list[dict]:
+                  filters: dict | None = None, reveal: bool = True) -> list[dict]:
         """Counts per bucket, from the rollup when nothing else is filtered."""
         filters = filters or {}
         start, bucket_s, slots, buckets = hist_buckets(t0, t1, bucket_s)
@@ -507,7 +513,7 @@ class SnmpTrapDatabase(SqliteStore):
             where, params = self._where(t0, t1, filters)
             text = (filters.get("text") or "").strip()
             if text:
-                scan, scan_params = self._scan_clause(text)
+                scan, scan_params = self._scan_clause(text, reveal)
                 sql = (f"SELECT CAST((ts - ?) / ? AS INTEGER) AS slot,"
                        f" severity AS severity, COUNT(*) AS n FROM traps"
                        f" WHERE {where} AND {scan} GROUP BY slot, severity")
@@ -562,14 +568,18 @@ class SnmpTrapDatabase(SqliteStore):
                 (cutoff, limit)).fetchall()
 
     def stats(self) -> dict:
+        # MIN/MAX alone are index SEARCHes; combined with COUNT(*) in one
+        # SELECT, SQLite SCANs instead. trap_counts can't replace the exact
+        # row count (a prune's cutoff falls mid-hour).
         with self._lock:
-            row = self._conn.execute(
-                "SELECT COUNT(*) AS rows, MIN(ts) AS lo, MAX(ts) AS hi"
-                " FROM traps").fetchone()
+            lo = self._conn.execute("SELECT MIN(ts) AS v FROM traps").fetchone()["v"]
+            hi = self._conn.execute("SELECT MAX(ts) AS v FROM traps").fetchone()["v"]
+            rows = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM traps").fetchone()["n"]
             last_hour = self._conn.execute(
                 "SELECT SUM(n) AS n FROM trap_counts WHERE hour >= ?",
                 (int((time.time() - 3600) // 3600) * 3600,)).fetchone()
-        return {"rows": row["rows"] or 0, "lo": row["lo"], "hi": row["hi"],
+        return {"rows": rows or 0, "lo": lo, "hi": hi,
                 "last_hour": last_hour["n"] or 0, "bytes": self.size_bytes()}
 
     # ------------------------------------------------------------ maintenance
@@ -618,15 +628,20 @@ class SnmpTrapDatabase(SqliteStore):
                     else time.monotonic() + budget_s)
         incomplete = False
 
+        # Kept below so an age sweep can't reuse an id past AlertEngine's
+        # cursor -- not for retention_days=0 ("delete everything now").
+        age_where = "ts < ?"
+        if retention_days > 0:
+            age_where += " AND id < (SELECT MAX(id) FROM traps)"
         with self._lock:
             bounds = self._conn.execute(
-                "SELECT MIN(id) AS lo, MAX(id) AS hi FROM traps WHERE ts < ?",
+                f"SELECT MIN(id) AS lo, MAX(id) AS hi FROM traps WHERE {age_where}",
                 (cutoff,)).fetchone()
         low = bounds["lo"]
         if low is not None:
             cut = bounds["hi"] + 1
             gone, reached = self._batched_delete_traps(
-                "ts < ?", (cutoff,), low, cut, deadline)
+                age_where, (cutoff,), low, cut, deadline)
             removed += gone
             incomplete = incomplete or reached < cut
 
