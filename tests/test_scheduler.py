@@ -176,6 +176,30 @@ def main():
     check(poller._walk_settings["max_rows"] == db.settings()["snmp_walk_max_rows"],
           "…and what it cached is what the settings table says")
 
+    # ------------------------------------ _poll_device reads no settings either
+
+    poller.error = None
+    quiet_id = db.add_device("198.51.100.9", "quiet", group_id=group_id,
+                             ping_enabled=0, snmp_enabled=0)
+    device = db.device(quiet_id)
+    config = db.effective_config(device)
+    poller._poll_device(device, config)          # warm: fills _settings_state
+    with StatementCounter(db._conn) as counter:
+        poller._poll_device(device, config)
+    reads = [statement for statement in counter.statements
+             if "FROM settings" in statement]
+    check(not reads,
+          f"a poll reads the settings table {len(reads)} time(s) "
+          f"(the cached settings are read instead)")
+
+    generation = db.config_generation()
+    db.save_settings({"ping_interval_s": 42})
+    check(db.config_generation() != generation,
+          "saving Nodes settings moves the generation _cached_settings watches")
+    poller._poll_device(device, config)
+    check(poller._settings_state[2]["ping_interval_s"] == 42,
+          "…and the very next poll sees the new value")
+
     db.close()
 
     print()

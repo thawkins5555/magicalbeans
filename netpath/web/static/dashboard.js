@@ -1106,7 +1106,9 @@
     saveLayoutAndRefetch(layoutTile);
   }
 
-  function drawCharts() {
+  // force redraws every chart (fresh placeholders); unforced skips a tile
+  // whose own fetchedAt has not moved since it was last drawn.
+  function drawCharts(force) {
     const root = App.el('dash-grid');
     if (!root) return;
     for (const wrap of root.querySelectorAll('.tile-chart')) {
@@ -1114,6 +1116,8 @@
       const tileId = host && host.dataset.tile;
       const layoutTile = tileId ? activeTiles().find((t) => t.id === tileId) : null;
       const entry = tileId && view.tileData[tileId];
+      if (!force && entry && lastChartFetchedAt[tileId] === entry.fetchedAt) continue;
+      if (tileId) lastChartFetchedAt[tileId] = entry ? entry.fetchedAt : undefined;
       const chart = entry && entry.data && entry.data.chart;
       const svg = wrap.querySelector('svg');
       if (!svg) continue;
@@ -1151,7 +1155,9 @@
     App.el('dash-done').hidden = !view.editing;
   }
 
-  function draw() {
+  // ifChanged: refresh()'s poll tick only, skipping a rewrite the DOM
+  // already matches. Every other caller always repaints, as before.
+  function draw({ ifChanged } = {}) {
     const root = App.el('dash-grid');
     if (!root) return;
     syncEditButtons();
@@ -1160,11 +1166,16 @@
     const d = view.dashboard;
     if (!d) {
       root.innerHTML = errorLine || App.loading();
+      lastDrawHtml = null;
       return;
     }
     const parts = [errorLine];
     parts.push(...activeTiles().map((t) => renderTile(t)));
     root.className = `dash-grid${view.editing ? ' editing' : ''}`;
+    const html = parts.join('')
+      || '<p class="hint">Nothing here is readable with your access.</p>';
+    if (ifChanged && html === lastDrawHtml) { drawCharts(false); return; }
+    lastDrawHtml = html;
     const focused = document.activeElement;
     // Any tile-tools button, matched back by whichever data-* attributes it
     // carries — a plain tool button's data-tile, or the drag handle's
@@ -1172,17 +1183,16 @@
     const keep = focused && focused.tagName === 'BUTTON' && root.contains(focused)
       ? [...focused.attributes].filter((a) => a.name.startsWith('data-'))
           .map((a) => `[${a.name}="${a.value}"]`).join('') : '';
-    root.innerHTML = parts.join('')
-      || '<p class="hint">Nothing here is readable with your access.</p>';
+    root.innerHTML = html;
     if (keep) { const again = root.querySelector(keep); if (again) again.focus(); }
-    drawCharts();
+    drawCharts(true);
   }
 
   let dashResizeTimer = null;
   window.addEventListener('resize', () => {
     if (App.state.tab !== 'dashboard') return;
     clearTimeout(dashResizeTimer);
-    dashResizeTimer = setTimeout(drawCharts, 150);
+    dashResizeTimer = setTimeout(() => drawCharts(true), 150);
   });
 
   /* ------------------------------------------------------- edit mode UI */
@@ -1432,9 +1442,9 @@
       view.error = null;
     } catch (error) {
       // Still draw on supersede, or an overlapping first tick leaves "Loading…" on screen forever.
-      if (error && error.superseded) { draw(); return; }
+      if (error && error.superseded) { draw({ ifChanged: true }); return; }
       view.error = `The dashboard could not be read: ${error.message}`;
-      draw();
+      draw({ ifChanged: true });
       throw error;               // so App.connected() sees a real outcome
     }
     const now = Date.now();
@@ -1470,23 +1480,13 @@
       view.tileData[t.id] = entry;
     }));
     if (dragTileId) return;
-    // Every tick refetches /api/dashboard whether or not the fleet actually
-    // changed, and a rebuild here tears down and redraws every chart SVG
-    // with it. Signature is content, not identity: view.dashboard is a new
-    // object every tick even when nothing in it moved. Edit-mode changes
-    // (add/remove/move/Configure) call draw() directly and are unaffected —
-    // only this refresh()-driven draw is worth skipping.
-    const signature = JSON.stringify(view.dashboard) + '' + view.error + ''
-      + view.offendersFetchedAt + '' + activeTiles().map((t) => {
-          const e = view.tileData[t.id];
-          return `${t.id}:${e ? e.fetchedAt : 0}:${e && e.error ? 1 : 0}`;
-        }).join(',');
-    if (signature === lastDrawSignature) return;
-    lastDrawSignature = signature;
-    draw();
+    // ifChanged: view.dashboard is a new object every tick even when
+    // nothing in it moved, and only THIS poll tick may skip a rewrite.
+    draw({ ifChanged: true });
   }
 
-  let lastDrawSignature = null;
+  let lastDrawHtml = null;
+  const lastChartFetchedAt = {};
   const OFFENDERS_EVERY_MS = 60_000;
 
   function activate() {

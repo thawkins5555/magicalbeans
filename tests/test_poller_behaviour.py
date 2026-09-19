@@ -607,7 +607,7 @@ def test_fortipoll_walk_terminates_on_stuck_oid():
     base_oid = "1.3.6.1.4.1.12356.101.14.1.1.2"
     calls = {"n": 0}
 
-    def fake_get_next(controller, config, oid):
+    def fake_get_next(controller, config, oid, session):
         calls["n"] += 1
         # First call advances into the table (one real row); every call
         # after that echoes the same row back, exactly the misbehaviour

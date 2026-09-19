@@ -692,6 +692,50 @@ ROUTES = [
 COMPILED = [(method, re.compile(pattern), handler, requirement)
             for method, pattern, handler, requirement in ROUTES]
 
+# Buckets COMPILED by (method, literal segment after /api/) so _route looks
+# up a handful of candidates instead of scanning all ~298, ROUTES order
+# preserved per bucket; a non-literal leading segment (none today) falls
+# back to _ROUTE_FALLBACK. Rebuilt on any change to len(COMPILED) rather
+# than once at import, since test_web_security.py's D24/D25 insert/pop a
+# throwaway route at COMPILED[0].
+_ROUTE_SEGMENT_RE = re.compile(r"^\^/api/([A-Za-z0-9_-]+)[/$]")
+_PATH_SEGMENT_RE = re.compile(r"^/api/([A-Za-z0-9_-]+)")
+_ROUTE_INDEX_LEN = -1
+_ROUTE_BUCKETS: dict[tuple[str, str], list[tuple[int, "re.Pattern", object, object]]] = {}
+_ROUTE_FALLBACK: dict[str, list[tuple[int, "re.Pattern", object, object]]] = {}
+
+
+def _rebuild_route_index() -> None:
+    global _ROUTE_INDEX_LEN, _ROUTE_BUCKETS, _ROUTE_FALLBACK
+    buckets: dict[tuple[str, str], list] = {}
+    fallback: dict[str, list] = {}
+    for idx, (method, pattern, handler, requirement) in enumerate(COMPILED):
+        seg_match = _ROUTE_SEGMENT_RE.match(pattern.pattern)
+        entry = (idx, pattern, handler, requirement)
+        if seg_match:
+            buckets.setdefault((method, seg_match.group(1)), []).append(entry)
+        else:
+            fallback.setdefault(method, []).append(entry)
+    _ROUTE_BUCKETS, _ROUTE_FALLBACK = buckets, fallback
+    _ROUTE_INDEX_LEN = len(COMPILED)
+
+
+_rebuild_route_index()
+
+
+def _route_candidates(method: str, path: str):
+    """COMPILED entries that could match `path` under `method`, in the
+    same relative order _route's old linear scan would have tried them."""
+    if len(COMPILED) != _ROUTE_INDEX_LEN:
+        _rebuild_route_index()
+    seg_match = _PATH_SEGMENT_RE.match(path)
+    bucket = _ROUTE_BUCKETS.get((method, seg_match.group(1)), []) if seg_match else []
+    fallback = _ROUTE_FALLBACK.get(method, [])
+    if not fallback:
+        return bucket
+    return sorted(bucket + fallback, key=lambda entry: entry[0])
+
+
 # Reachable without a session: the sign-in page and what it needs to render.
 # tokens.css is the stylesheet app.css reads its colours from; the sign-in
 # page links both, before there is a session to be gated on.
@@ -1363,9 +1407,7 @@ class Handler(BaseHTTPRequestHandler):
         if self._reject_bad_write(method):
             return
 
-        for route_method, pattern, handler, requirement in COMPILED:
-            if route_method != method:
-                continue
+        for _idx, pattern, handler, requirement in _route_candidates(method, path):
             match = pattern.match(path)
             if not match:
                 continue

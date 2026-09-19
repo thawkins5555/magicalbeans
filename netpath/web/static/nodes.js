@@ -921,7 +921,7 @@
 
   function drawDetailHeader() {
     App.el('nd-d-name').textContent = displayName(view.detail);
-    App.el('nd-d-summary').innerHTML = deviceSummaryHtml(view.detail);
+    App.setHtml(App.el('nd-d-summary'), deviceSummaryHtml(view.detail));
     drawWebLink(view.detail);
     drawMaintenanceButton(view.detail);
   }
@@ -3183,9 +3183,11 @@
     const d = view.detail || {};
     const metricByKey = Object.fromEntries((view.metrics || []).map((m) => [m.key, m]));
 
+    // setHtml: this redraws every refresh tick, and the STP/POE line is
+    // usually unchanged from the tick before.
     if (d.stp_capable) {
       const topo = metricByKey.stp_topology_changes;
-      stpEl.innerHTML = '<span class="section">STP</span> ' +
+      App.setHtml(stpEl, '<span class="section">STP</span> ' +
         `root <b>${escape(d.stp_root_id || '—')}</b>` +
         (d.stp_root_cost != null ? `, cost ${escape(String(d.stp_root_cost))}` : '') +
         (d.stp_root_port != null ? `, root port ${escape(String(d.stp_root_port))}` : '') +
@@ -3193,20 +3195,20 @@
         (d.stp_protocol_spec ? `, ${escape(d.stp_protocol_spec)}` : '') +
         (d.stp_time_since_change_s != null
           ? ` — last topology change ${App.duration(d.stp_time_since_change_s)} ago` : '') +
-        (topo ? ` (${topo.last_value} recorded since this device was added)` : '');
+        (topo ? ` (${topo.last_value} recorded since this device was added)` : ''));
     } else {
-      stpEl.innerHTML = '<span class="section">STP</span> ' +
-        '<span class="hint">Not answering BRIDGE-MIB, or not polled yet.</span>';
+      App.setHtml(stpEl, '<span class="section">STP</span> ' +
+        '<span class="hint">Not answering BRIDGE-MIB, or not polled yet.</span>');
     }
 
     if (d.poe_capable) {
       const budget = metricByKey.poe_budget_w, used = metricByKey.poe_consumption_w;
-      poeEl.innerHTML = '<span class="section">POE</span> ' +
+      App.setHtml(poeEl, '<span class="section">POE</span> ' +
         (used ? `${used.last_value.toFixed(1)} W in use` : 'usage not yet polled') +
-        (budget ? ` of ${budget.last_value.toFixed(1)} W budget` : '');
+        (budget ? ` of ${budget.last_value.toFixed(1)} W budget` : ''));
     } else {
-      poeEl.innerHTML = '<span class="section">POE</span> ' +
-        '<span class="hint">Not answering POWER-ETHERNET-MIB, or not polled yet.</span>';
+      App.setHtml(poeEl, '<span class="section">POE</span> ' +
+        '<span class="hint">Not answering POWER-ETHERNET-MIB, or not polled yet.</span>');
     }
 
     const rf = (view.metrics || []).filter((m) => m.key.startsWith('rf_'));
@@ -3964,11 +3966,13 @@
   }
 
   function fillReportDevGroupSelects() {
+    // Built once, not per select: all five share the same option list.
+    const html = reportDevGroupOptionsHtml();
     for (const id of ['nd-rep-avail-devgroup', 'nd-rep-topn-devgroup',
                       'nd-rep-fw-devgroup', 'nd-rep-sfp-devgroup', 'nd-rep-psu-devgroup']) {
       const select = App.el(id);
       const current = select.value;
-      select.innerHTML = reportDevGroupOptionsHtml();
+      App.setHtml(select, html);
       if ([...select.options].some((o) => o.value === current)) select.value = current;
     }
   }
@@ -6312,7 +6316,9 @@
   function fillDiscGroups() {
     const select = App.el('disc-group');
     const previous = select.value;
-    select.innerHTML = groupOptionsHtml(previous ? Number(previous) : undefined);
+    // setHtml rarely short-circuits here (groupOptionsHtml bakes `selected`
+    // into the string, normalised away on read-back) but is still correct.
+    App.setHtml(select, groupOptionsHtml(previous ? Number(previous) : undefined));
     if (!select.value && view.groups.length) select.value = String(view.groups[0].id);
   }
 
@@ -6876,8 +6882,10 @@
   function fillGroupFilter() {
     const select = App.el('nd-filter-group');
     const current = select.value || App.savedControl('nodes', 'nd-filter-group') || '';
-    select.innerHTML = '<option value="">any profile</option>' +
-      view.groups.map((g) => `<option value="${g.id}">${escape(g.name)}</option>`).join('');
+    // setHtml: the source list changes far less than the 2 s poll tick, and
+    // a skipped write leaves an open dropdown open instead of closing it.
+    App.setHtml(select, '<option value="">any profile</option>' +
+      view.groups.map((g) => `<option value="${g.id}">${escape(g.name)}</option>`).join(''));
     select.value = current;
     if (select.selectedIndex < 0) forget(select, 'nd-filter-group');
   }
@@ -6885,8 +6893,8 @@
   function fillDevGroupFilter() {
     const select = App.el('nd-filter-devgroup');
     const current = select.value || App.savedControl('nodes', 'nd-filter-devgroup') || '';
-    select.innerHTML = '<option value="">any group</option>' +
-      view.deviceGroups.map((g) => `<option value="${g.id}">${escape(g.name)}</option>`).join('');
+    App.setHtml(select, '<option value="">any group</option>' +
+      view.deviceGroups.map((g) => `<option value="${g.id}">${escape(g.name)}</option>`).join(''));
     select.value = current;
     if (select.selectedIndex < 0) forget(select, 'nd-filter-devgroup');
   }

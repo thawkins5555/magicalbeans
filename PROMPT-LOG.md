@@ -1756,9 +1756,22 @@ scope.
   being kept so nothing gets accidentally "fixed" or changed along the
   way — that list gets reviewed with the operator at the end (5.47.0).
 
-**Status:** Phases 1 and 2 (test hardening, then dead code/file removal
-plus backend restructure) shipped as 5.43.0 and 5.44.0. Phase 3 (front-end
-tidy-up) is shipping as 5.45.0. No new operator prompt landed in between —
-just periodic "status?" checks, not logged here as separate entries. The
-operator also asked for a check-in every 10 minutes partway through; that
-request was later cancelled.
+**Status:** Phases 1 through 3 (test hardening, then dead code/file removal
+plus backend restructure, then front-end tidy-up) shipped as 5.43.0, 5.44.0
+and 5.45.0. Phase 4 (the performance pass) is shipping as 5.46.0. Phase 5
+(the full security/bug/performance review) is next. No new operator prompt
+landed in between — just periodic "status?" checks, not logged here as
+separate entries. The operator also asked for a check-in every 10 minutes
+partway through; that request was later cancelled.
+
+**"Spawn additional sonnet teammates if needed."** Said partway through the
+performance phase, once it was clear the backend performance lane (route
+lookup, resolver cache, poller/wireless settings caching, the disabled-
+device index, the FortiGate SNMP walk) was more than the two regular
+teammates could carry alongside the front-end redraw-skip work. Thing3 and
+Thing4 were added, both on Sonnet, to take the backend performance items.
+
+**Session limit, mid-phase.** All teammates working this phase hit the
+account's session limit before finishing their assigned items. Each was
+resumed with a plain "continue" once the limit cleared, picking back up
+from where it stopped rather than restarting.

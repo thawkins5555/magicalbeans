@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.46.0 — Performance](#5460--performance)
 - [5.45.0 — Front-end tidy-up](#5450--front-end-tidy-up)
 - [5.44.0 — Backend restructure, dead code removed](#5440--backend-restructure-dead-code-removed)
 - [5.43.0 — Test hardening ahead of the restructure](#5430--test-hardening-ahead-of-the-restructure)
@@ -178,6 +179,120 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.46.0 — Performance
+
+Same screens, same API responses, same alerts, same SNMP packets. This is
+Phase 4 of the restructure (5.43.0–5.45.0 did the test hardening and the
+backend/front-end tidy-up) — nothing here changes what the operator sees or
+what a device is asked for; it changes how much work the server, the poller
+and the browser do to produce the same result.
+
+**Be honest about what moved and what didn't.** The general benchmarks —
+web request latency, a 300-device poll cycle, lock contention — are **flat**
+before and after, within normal run-to-run noise, because none of them
+happens to exercise the paths below at a scale where the difference shows.
+What did move is proven the way it has to be for a change like this: by
+counting the actual operations a new test performs, before and after.
+
+**Server**
+
+1. **Route lookup is bucketed, not scanned.** Every API request used to be
+   tested against all 298 routes in order until one matched. Routes are now
+   grouped by HTTP method and the first path segment (`/api/nodes/...`,
+   `/api/alerts/...`, and so on), so a request is only tested against the
+   handful of routes that could plausibly match — average pattern tests per
+   request down from 51 to 9.6, and an unrecognised API path down from 127
+   tests to 0. Match order and 404 behaviour are unchanged; a new suite,
+   `tests/test_web_routing.py`, checks all 298 routes across all four HTTP
+   methods resolve to exactly the same outcome as the old linear scan.
+2. **The name-resolver address list is cached, not rebuilt every 15
+   seconds.** The list of "other addresses worth naming" — IPAM hosts,
+   Nodes devices, LLDP/CDP neighbours — was rebuilt from full scans of three
+   stores every 15 seconds regardless of whether anything had changed. It is
+   now rebuilt at most once every 60 seconds, and immediately the moment a
+   NetFlow, Syslog, SNMP, IPAM or Nodes resolve setting is saved. **One
+   accepted timing change, stated plainly:** a newly seen address can take
+   up to about 60 seconds to reach the resolver, instead of about 15. Names
+   already learned are cached for days regardless, and a changed resolve
+   setting still takes effect on the very next tick.
+3. **A cache stampede on the Dashboard/state cache is now one computation,
+   not several.** When several browsers asked for the same cached figure at
+   the exact moment it expired, each one used to recompute it independently.
+   Now the first one computes it and the rest wait and share the answer — 20
+   browsers hitting an expired key at once now costs 1 computation instead
+   of 20. A failed computation is still never cached.
+4. **Poller settings are cached, not re-read per device.** The Nodes poller
+   used to read the settings table once for every device on every poll; it
+   now reads a cached copy that refreshes the instant any Nodes setting is
+   saved (with a 60-second backstop regardless). The FortiGate/wireless
+   poller gets the same treatment — three settings reads per controller poll
+   down to none — refreshed the moment a wireless setting is saved,
+   including ahead of the poller's own deferred restart.
+5. **Wireless AP list: one query instead of one per AP.** The per-radio data
+   behind the AP list now comes from a single batched query for the whole
+   list rather than one query per AP. The response is byte-for-byte the
+   same.
+6. **Disabled-device lookups: an index, plus a cache.** Checking which
+   devices are disabled — done several times on every 5-second alert tick,
+   and by Mapper — used to be a full table scan. A new, additive partial
+   database index (`ix_devices_disabled`) lets that query read only the
+   disabled rows, and a cache refreshes the moment a device is added,
+   removed, enabled or disabled. The index is created automatically on
+   upgrade; nothing else about the schema changes.
+7. **FortiGate SNMP walks: one socket per column, not one per row.** Walking
+   a table off a FortiGate controller now opens one UDP socket for the whole
+   column instead of one per row read, and request IDs now come from that
+   session's own sequence rather than being reissued — so a late reply from
+   an earlier request can never be mistaken for the answer to a later one.
+   The packets on the wire are otherwise identical.
+8. **Alert engine: threshold overrides read once per tick.** Per-device
+   threshold overrides used to be read once for every enabled rule on every
+   5-second engine tick; they are now read once per tick, for every rule
+   at once.
+
+**Browser**
+
+9. **Dashboard: redraw only what actually changed.** On the periodic
+   refresh, the tile grid is now rewritten only when its HTML has actually
+   changed, and a chart only redraws when that tile's own data has moved.
+   Previously, background counters ticking over made every 2-second refresh
+   look "changed," so every tile and every chart redrew every time whether
+   or not anything an operator would notice was different. Any operator
+   action — changing the time range, editing the layout, opening Configure,
+   cancelling a dialog — still redraws everything exactly as before; only
+   the unattended background refresh got smarter.
+10. **Nodes: fewer unnecessary rebuilds.** The group/filter dropdowns are no
+    longer rebuilt every 2 seconds when their options haven't changed — the
+    visible effect is small but real: an open dropdown no longer snaps shut
+    on the next refresh. The device summary line and the STP/PoE detail
+    lines now only write to the page when their values change, and the
+    page-wide table enhancer uses a cheaper lookup.
+
+**Left alone on purpose** (listed here for the Phase 5 review): CSV export
+streaming, Mapper's incremental redraw, the two Nodes job-progress polls
+(converting these would change what an operator sees during a slow job),
+and the per-row lookups that exist to guard against a stale element on
+screen.
+
+**Tests.** Seven new suites — `test_web_routing`, `test_cached_poll_singleflight`,
+`test_extra_resolve_targets_cache`, `test_wireless_aps_batch`,
+`test_wireless_settings_cache`, `test_disabled_device_cache`,
+`test_fortipoll_session_reuse` — plus extended `test_scheduler`,
+`test_temp_thresholds` and `test_frontend_contracts` (which now also checks
+that an unchanged Dashboard refresh performs no DOM write, while an explicit
+redraw always does). `tests/ui/walk.mjs` no longer takes screenshots by
+default — it only does when `WALK_SHOTS=1` is set. Browser walk: 94/94, no
+console errors, page errors or failed requests for either an admin or a
+viewer account.
+
+**Code review caught two real problems before this shipped.** The first
+version of the dashboard redraw-skip broke the chart Zoom/Reset control and
+the "Custom…" range dropdown under specific timing; and the first version of
+the poller settings cache could hand back nothing during a poller restart.
+Both fixed before release.
+
+Full test suite: 183 of 191 suites passed, 2 skipped (seven new suites since 5.45.0). The 8 failures are the same build-machine environmental set 5.42.0 shows; test_ipam_dhcp_search passes when run on its own.
 
 ### 5.45.0 — Front-end tidy-up
 

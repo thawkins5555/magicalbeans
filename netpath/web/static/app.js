@@ -4917,10 +4917,10 @@ const App = (() => {
         if (table) tables.add(table);
         for (const node of mutation.addedNodes) {
           if (node.nodeType !== 1) continue;
-          if (node.tagName === 'TABLE') tables.add(node);
-          else if (node.querySelectorAll) {
-            for (const t of node.querySelectorAll('table')) tables.add(t);
-          }
+          // getElementsByTagName, not querySelectorAll: same descendant set,
+          // no selector parsing, and a live collection costs nothing to open.
+          const found = node.tagName === 'TABLE' ? [node] : node.getElementsByTagName('table');
+          for (const t of found) tables.add(t);
         }
       }
       for (const table of tables) {

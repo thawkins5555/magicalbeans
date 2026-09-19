@@ -2747,7 +2747,7 @@ check("const parts = [errorLine];" in _DRAW50,
       "dashboard.js draws a failed read as a line ABOVE the tiles rather than "
       "replacing a whole shift's view with one sentence")
 _DREFRESH50 = js_function(DASH, "refresh")
-check("if (error && error.superseded) { draw(); return; }" in _DREFRESH50,
+check("if (error && error.superseded) { draw({ ifChanged: true }); return; }" in _DREFRESH50,
       "a superseded first fetch still draws — returning left the grid on "
       "'Loading…' whenever the boot and the first poll tick overlapped")
 _OFFENDERS50 = _DREFRESH50[_DREFRESH50.index("OFFENDERS_EVERY_MS) {"):]
@@ -4644,6 +4644,161 @@ for _name in ("download", "bulkToggle", "bulkClear", "extraCounterParts", "niceC
              "localInputValue", "confidenceBadgeHtml", "CONFIDENCE_COLOR"):
     check(_name in _slice59(APP, "const api = {", "\n  };"),
           "%s is exposed on App (the shared api object)" % _name)
+
+# ---------------------------------------------------------------------------
+# 101. Phase 4 performance (5.46.0): do-less-work-for-the-same-result changes
+#      only -- these pin that the guard exists, not the DOM result, which no
+#      static check here can see.
+_WATCH101 = js_function(APP, "watchPlainTables")
+check("node.tagName === 'TABLE' ? [node] : node.getElementsByTagName('table')" in _WATCH101,
+      "the plain-table observer finds nested tables by tag name, not a CSS "
+      "selector, for every added node")
+
+for _fn in ("fillGroupFilter", "fillDevGroupFilter", "fillReportDevGroupSelects"):
+    check("App.setHtml(select," in js_function(NODES100, _fn),
+          "%s skips the write when its option list is unchanged" % _fn)
+# fillDiscGroups' own groupOptionsHtml bakes `selected` into the option
+# string, which the browser normalises away on read-back, so this call
+# rarely (never, in practice) actually short-circuits -- still correct and
+# consistent, just not a skip, so it gets its own, more modest check.
+check("App.setHtml(select," in js_function(NODES100, "fillDiscGroups"),
+      "fillDiscGroups still goes through App.setHtml for consistency")
+
+check("App.setHtml(App.el('nd-d-summary')" in NODES100,
+      "the device detail header's summary line skips an unchanged rewrite")
+_CAPS101 = js_function(NODES100, "drawCapabilitiesTab")
+check("App.setHtml(stpEl," in _CAPS101 and "App.setHtml(poeEl," in _CAPS101,
+      "the capabilities tab's STP/POE lines skip an unchanged rewrite")
+
+DASHBOARD101 = read("dashboard.js")
+_DRAW101 = js_function(DASHBOARD101, "draw")
+_CHARTS101 = js_function(DASHBOARD101, "drawCharts")
+check("let lastDrawHtml = null;" in DASHBOARD101, "dashboard.js keeps the last HTML it wrote")
+check("const lastChartFetchedAt = {};" in DASHBOARD101,
+      "...and the fetchedAt it last drew each tile's chart from")
+check("function draw({ ifChanged } = {}) {" in DASHBOARD101,
+      "draw() only skips a rewrite when its caller opts in")
+check("if (ifChanged && html === lastDrawHtml) { drawCharts(false); return; }" in _DRAW101,
+      "...and only when the produced HTML is unchanged too")
+check(DASHBOARD101.count("draw({ ifChanged: true });") == 3,
+      "only refresh()'s three draw() calls (success, supersede, error) opt "
+      "into skipping -- every other caller (a new tile object, a cancelled "
+      "dropdown pick) always repaints")
+check("drawCharts(true);" in _DRAW101,
+      "a real rewrite still forces every chart to redraw, into its fresh, "
+      "empty placeholder, exactly as before")
+check("if (!force && entry && lastChartFetchedAt[tileId] === entry.fetchedAt) continue;"
+      in _CHARTS101,
+      "an unforced drawCharts skips a tile whose own chart data has not "
+      "moved since it was last drawn -- not the whole payload's volatile "
+      "counters, just this tile's own fetchedAt")
+check("dashResizeTimer = setTimeout(() => drawCharts(true), 150);" in DASHBOARD101,
+      "a resize still forces every chart (fetchedAt does not move on a "
+      "resize, so an unforced call would skip them all)")
+_LOADING101 = _slice59(_DRAW101, "if (!d) {", "\n    }")
+check("lastDrawHtml = null;" in _LOADING101,
+      "leaving the still-loading branch clears the last-written HTML, so a "
+      "later real draw is never compared against a stale 'Loading…' string")
+check("JSON.stringify(view.dashboard)" not in DASHBOARD101,
+      "refresh() no longer signatures the whole payload to decide whether to draw")
+
+# A real run, not another literal pin: fillGroupFilter (and its App.setHtml)
+# evaluated by node, proving a second identical call writes innerHTML once.
+_FGF_HARNESS = """
+'use strict';
+let writes = 0;
+const selectEl = {
+  value: '', selectedIndex: 0,
+  get innerHTML() { return this._html || ''; },
+  set innerHTML(v) { this._html = v; writes += 1; },
+};
+%(setHtml)s
+const App = {
+  el: () => selectEl,
+  savedControl: () => '',
+  setHtml,
+};
+const escape = (s) => String(s);
+const view = { groups: [{ id: 1, name: 'a' }, { id: 2, name: 'b' }] };
+function forget() {}
+%(fillGroupFilter)s
+fillGroupFilter();
+fillGroupFilter();
+console.log(JSON.stringify({ writes, value: selectEl.value }));
+"""
+
+if NODE is None:
+    print("SKIP  fillGroupFilter's second-draw-is-free proof (node not on this machine)")
+else:
+    # js_function's block-matcher is written for multi-line bodies; setHtml
+    # is one line, so it is pulled out directly instead.
+    _SETHTML_LINE = next(l for l in APP.splitlines() if "function setHtml(" in l).strip()
+    _script = _FGF_HARNESS % {
+        "setHtml": _SETHTML_LINE,
+        "fillGroupFilter": js_function(NODES100, "fillGroupFilter"),
+    }
+    _folder = tempfile.mkdtemp(prefix="fill_group_filter_")
+    try:
+        _path = os.path.join(_folder, "run.js")
+        with open(_path, "w", encoding="utf-8") as _handle:
+            _handle.write(_script)
+        _out = subprocess.run([NODE, _path], capture_output=True, text=True,
+                              encoding="utf-8", timeout=30)
+        _result = ({"error": _out.stderr.strip()[:400]} if _out.returncode != 0
+                   else json.loads(_out.stdout))
+    finally:
+        shutil.rmtree(_folder, ignore_errors=True)
+    check(_result.get("writes") == 1,
+          "fillGroupFilter writes innerHTML once across two calls with an "
+          "unchanged group list (got: %s)" % _result)
+
+# dashboard.js's draw(): an explicit call (no options) always writes, even
+# with identical HTML; only refresh()'s ifChanged call may skip.
+_DRAW_HARNESS = """
+'use strict';
+let writes = 0;
+const rootEl = {
+  className: '',
+  get innerHTML() { return this._html || ''; },
+  set innerHTML(v) { this._html = v; writes += 1; },
+};
+const App = { el: () => rootEl, loading: () => 'loading' };
+function syncEditButtons() {}
+function activeTiles() { return []; }
+function renderTile() { return ''; }
+function drawCharts() {}
+const escape = (s) => String(s);
+const document = { activeElement: null };
+const view = { editing: false, error: null, dashboard: { x: 1 } };
+let lastDrawHtml = null;
+%(draw)s
+draw();
+draw();
+const afterTwoExplicit = writes;
+draw({ ifChanged: true });
+console.log(JSON.stringify({ afterTwoExplicit, afterIfChanged: writes }));
+"""
+
+if NODE is None:
+    print("SKIP  dashboard draw()'s explicit-always-writes proof (node not on this machine)")
+else:
+    _script = _DRAW_HARNESS % {"draw": _DRAW101}
+    _folder = tempfile.mkdtemp(prefix="dash_draw_")
+    try:
+        _path = os.path.join(_folder, "run.js")
+        with open(_path, "w", encoding="utf-8") as _handle:
+            _handle.write(_script)
+        _out = subprocess.run([NODE, _path], capture_output=True, text=True,
+                              encoding="utf-8", timeout=30)
+        _result = ({"error": _out.stderr.strip()[:400]} if _out.returncode != 0
+                   else json.loads(_out.stdout))
+    finally:
+        shutil.rmtree(_folder, ignore_errors=True)
+    check(_result.get("afterTwoExplicit") == 2,
+          "two explicit draw() calls with identical HTML both write (got: %s)" % _result)
+    check(_result.get("afterIfChanged") == 2,
+          "...but a draw({ ifChanged: true }) call right after, same HTML, "
+          "does not (got: %s)" % _result)
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))

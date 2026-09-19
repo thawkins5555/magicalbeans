@@ -2245,6 +2245,24 @@ through. `set_default_group()` is a two-statement transaction (clear the
 old default, set the new one) with no in-use check, since making a
 profile default moves no devices.
 
+### Poller settings are cached, not re-read per device (`nodepoll/poller.py`, `nodepoll/poll_mixin.py`) — 5.46.0
+
+`NodePoller._cached_settings()` used to be a thin wrapper that called
+`self.db.settings()` on every device's poll — one settings-table read per
+device per cycle. It now holds `(generation, timestamp, settings)` in
+`_settings_state` and only re-reads when either `self.db.config_generation()`
+has moved (bumped by every settings write; see `disabled_device_ids` below
+for the same trigger used elsewhere) or `_CONFIG_REFRESH_S` (60 s) has
+elapsed since the last read — the generation check makes a save apply on
+the very next poll, and the 60-second backstop is a plain safety net in
+case a generation bump is ever missed. Read into a local (`state =
+self._settings_state`) before checking, not read-modify-write in place,
+because `begin_stop()` clears `_settings_state` to `None` from another
+thread to force a live re-read once stopping starts, and a poll already
+mid-flight must not see that clear turn into a crash. `poll_mixin.py`'s
+per-device poll calls this once per device, same as before, but almost
+every call now hits the cached value instead of the database.
+
 ### The poll pool sizes itself (`nodepoll/poller.py`) — 5.5.0
 
 **Why it is a Little's Law sum and not a feedback loop.** How many workers a
@@ -4927,6 +4945,27 @@ file takes.
 
 ---
 
+### Disabled-device lookup: an index, plus a cache (`nodesdb.py`) — 5.46.0
+
+`disabled_device_ids()` backs a check run several times on every 5-second
+alert tick and by Mapper — is this device one to skip. It used to be a
+plain `SELECT id FROM devices WHERE enabled = 0` run fresh every time,
+which is a full table scan of `devices` on a fleet where "enabled" is not
+indexed. Two changes, together:
+
+- **`ix_devices_disabled`** is a new, additive partial index —
+  `CREATE INDEX ... ON devices(id) WHERE enabled = 0` — so the query above
+  reads only the disabled rows instead of scanning the whole table. It is
+  created automatically on upgrade; no existing column, table or index is
+  touched.
+- **The result is memoised on `config_generation()`**, the same counter
+  `NodePoller._cached_settings` uses (see above): `_disabled_cache` is
+  rebuilt only when `config_generation()` has moved since it was last
+  built, which happens on any device add, remove, enable or disable (and
+  every other write that can flip that flag). A tick between writes reads
+  the same Python `set` object it already had rather than touching SQLite
+  at all.
+
 ## MAPPER
 
 MAPPER (`mapper.py`, `mapperdb.py`, `web/static/mapper.js`) is a manually-
@@ -7361,6 +7400,18 @@ gets the sustained behaviour rather than silently keeping the old one.
 silently at each: `_migrate`, `_RULE_EDITABLE`, `put_alerts_rule`'s
 allow-list, and `_rule_json`.
 
+### Threshold overrides read once per tick, not once per rule (`alertengine._evaluate_thresholds`) — 5.46.0
+
+`_evaluate_thresholds` used to call into the per-device override table once
+for every enabled threshold rule on every 5-second engine tick. It now
+calls `self.db.device_threshold_maps([r["key"] for r in rules])` exactly
+once per tick, for every rule's metric key at once, and builds
+`overrides_by_rule` as a plain in-memory lookup over that one result for
+the rest of the tick's evaluation. No behaviour changes — the override
+values read are the same rows, keyed the same way (by device, even for an
+interface target, since an override is about the switch and not one port)
+— only how many times the database is asked for them.
+
 ### Per-device threshold overrides, and a cross-match bug (`alertsdb.py`, `alertengine.py`, `alertrules.py`) — 4.54.0
 
 `alertsdb.device_thresholds` is one table for every threshold-kind rule
@@ -9568,6 +9619,32 @@ nothing found," distinct from no row at all ("never looked up"), so the
 next resolver pass doesn't retry a genuinely nameless address until the
 TTL (`dns_cache_days`, default 7) expires.
 
+### The resolver's extra-address list is cached, not rebuilt every tick (`web/service.py`) — 5.46.0
+
+`extra_ips()` above is `Service._cached_extra_targets`, not
+`_extra_resolve_targets()` directly. `_extra_resolve_targets()` itself is
+the full-scan version — flow endpoints, syslog sources, SNMP trap sources
+and IPAM/Nodes/neighbour addresses, each gated by its own module's
+`resolve_*` setting — and stays available uncached for any other caller
+(tests included). Before 5.46.0, `Resolver._loop`'s own `poll_s` cadence
+(15 s) meant the full three-store scan ran every 15 seconds regardless of
+whether any of those stores had changed.
+
+`_cached_extra_targets` wraps it in a plain `(timestamp, value)` cache keyed
+on `_EXTRA_TARGETS_TTL_S` (60.0 — four resolver ticks), plus an
+`_extra_targets_generation` counter that `apply_settings` bumps for every
+NetFlow, Syslog, SNMP, IPAM or Nodes settings save. The generation is
+captured *before* calling `_extra_resolve_targets()`: if a settings save
+bumps it while that call is still running, the generation read at the start
+no longer matches the live one when the call returns, and the result is
+returned to this caller but deliberately **not** written into the cache —
+otherwise a scan that started against the old settings could land in the
+cache looking fresh, after a save that should have invalidated it. **One
+accepted timing change:** a newly seen address can now take up to ~60
+seconds to reach the resolver rather than ~15; a changed resolve setting
+still applies on the very next tick, since that path invalidates the cache
+immediately rather than waiting on the TTL.
+
 ### Per-destination timeline windows (`netpath.js`)
 
 `view.t0/t1/follow` are page-global, so switching destination used to
@@ -11590,6 +11667,39 @@ from the same walk). The extra selectable columns (`radio_count`,
 `channels`, `radio_station_count`) are derived in `_ap_json` from radio
 rows the poller already walks, so adding one costs no extra SNMP.
 
+### Controller settings are cached, not re-read per poll (`wirelessdb.py`, `fortipoll.py`) — 5.46.0
+
+The FortiGate/wireless poller used to call `self.db.settings()` up to three
+times per controller poll (`v3_verify_replies`, `history_sample_s`,
+`stale_after_polls`, each read separately). `WirelessDatabase` now keeps a
+plain `_settings_generation` counter, bumped once on every settings write,
+and `FortiPoller._cached_settings()` holds `(generation, settings)` in
+`_settings_state`, re-reading only when `db._settings_generation` has
+moved — no time-based backstop here, unlike the Nodes poller's version,
+since a wireless settings save always goes through the module's own
+deferred restart path (see `_DEFERRED_SCOPES` in the Web layer section),
+which already forces a fresh read on the way back up. `begin_stop()` still
+clears `_settings_state` to `None`, the same reason `NodePoller` does: a
+poll draining after a stop request must read live settings, not a cache
+that could outlive the reason it was built. All three settings reads per
+controller poll are now one cache hit.
+
+### One SNMP socket per column walk, not one per row (`fortipoll.py`) — 5.46.0
+
+`_walk_column` used to open a fresh SNMP session (socket, engine
+discovery for v3) for every row of every table it walked off a
+controller — `fgWcWtpConfigTable`, `fgWcWtpSessionTable`,
+`fgWcWtpSessionRadioTable`, one GETNEXT at a time, each its own socket. It
+now opens one `_Session` for the whole column walk and reuses it across
+every GETNEXT until the walk ends (`endOfMibView`, a non-advancing OID, or
+the 4096-row cap), closing it once in a `finally`. Request IDs come from
+that session's own `next_request_id()` sequence rather than being
+generated per call, which is what makes the reuse safe: a late reply to an
+earlier GETNEXT on the same socket is filtered out by `expect_request_id`
+rather than risking being read as the answer to the next one. The packets
+on the wire — PDU shape, OIDs, credentials — are otherwise identical to
+before.
+
 ### Per-AP response time (`fortipoll.py`, `nodeoids.py`)
 
 The module's stated design is that it talks to the controller and never to an
@@ -11691,6 +11801,17 @@ request) `"radio:<id>:clients"` and `"radio:<id>:power"`. That shared
 shape is what lets `wireless.js` draw both charts with the exact same
 `App.drawSeriesChart`/`App.attachChartZoom` every other history chart in
 the application uses, rather than a bespoke renderer for this one pane.
+
+### One radio query for the whole AP list (`wirelessdb.py`, `web/api/wireless.py`) — 5.46.0
+
+`get_wireless_aps` used to call `radios_for(ap_id)` once per AP to build
+each row's radio list — one query per AP in the list. `radios_for_aps(ap_ids)`
+replaces that with a single `SELECT ... WHERE ap_id IN (...)` (chunked
+through `id_chunks`/`marks_for` like every other dynamic `IN` list in this
+codebase), grouped back into a `{ap_id: [rows]}` dict in the same per-AP
+radio order `radios_for` gave, with an id that has no radios yet getting an
+empty list rather than a missing key. The route's JSON response is
+byte-for-byte the same; only the number of queries behind it changed.
 
 ### AP web tunnel: `WebRelayRegistry.open_target`, `ap_id`/`subject` (`webrelay.py`, `wirelessdb.py`, `web/api/relays.py`, `web/server.py`, `wireless.js`) — 5.38.0
 
@@ -12242,6 +12363,29 @@ to fall to zero between `shutdown()` and `server_close()` — `daemon_threads`
 means no handler is joined, so without it `service.shutdown()` could close a
 store under a handler mid-query.
 
+### Route lookup: bucketed by method and path segment (`web/server.py`) — 5.46.0
+
+`ROUTES`/`COMPILED` are still the flat, ordered list described above — that
+is what a route *is* — but `_route` no longer tests a request against every
+entry in it. `_rebuild_route_index()` groups `COMPILED` by `(method, literal
+segment after /api/)` into `_ROUTE_BUCKETS`, preserving each bucket's
+original `ROUTES` order, and puts anything whose leading segment isn't a
+literal (none today) into `_ROUTE_FALLBACK`. `_route_candidates(method,
+path)` then only tests the handful of entries in that one bucket plus the
+fallback list, merged back into their original relative order — average
+pattern tests per request 51 → 9.6, an unrecognised `/api/...` path 127 → 0.
+Match order and 404 behaviour are unchanged; `tests/test_web_routing.py`
+proves it by resolving all 298 routes across all four HTTP methods through
+both the bucketed lookup and a brute-force linear scan and comparing.
+
+**Rebuilt on `len(COMPILED)` changing, not once at import.**
+`test_web_security.py`'s D24/D25 insert and pop a throwaway route at
+`COMPILED[0]` to test permission handling; a one-time index built at import
+would silently stop matching that route (or anything after it) for the rest
+of the process. `_route_candidates` checks `len(COMPILED) != _ROUTE_INDEX_LEN`
+on every call and rebuilds when it has, which costs nothing on the
+overwhelmingly common case where `COMPILED` never changes after start-up.
+
 ### `web/api/` — package layout — 5.44.0
 
 `netpath/web/api.py` (12,267 lines, one file) is now the package
@@ -12334,6 +12478,34 @@ outlive the service or bring a collector back up after shutdown stopped it.
 The UI needed no change: `/api/state` already reports each worker's `running`
 flag and `status_text()`, so the poll every page makes shows the collector
 going down and coming back.
+
+### `Service.cached_poll`: a cache stampede computes once, not once per caller (`web/service.py`) — 5.46.0
+
+`cached_poll(key, ttl_s, compute)` backs every per-poll figure that's
+expensive to compute and cannot usefully change faster than an operator can
+read it — `/api/state`'s ten database `size_bytes()` calls, the hostname
+cache fill, `/api/debug`'s trap/syslog stats and store sizes. Until 5.46.0 a
+miss (cold key, or an expired one) was an unlocked read-modify-write: every
+tab polling at once past a key's TTL saw the same miss and each ran
+`compute()` itself — for a figure whose entire point is that it's too
+costly to run on every request.
+
+Each key now gets its own `threading.Lock`, created on first use and kept in
+`_poll_locks` for the life of the process (bounded by the fixed set of
+literal keys callers pass, same as `_poll_cache` itself). On a miss, a
+caller takes that key's lock, re-checks the cache (someone may have just
+filled it while the lock was contended), and only then calls `compute()` —
+so of N callers racing a miss, exactly one actually runs `compute()`; the
+rest block on the lock and, once they get it, find the cache already
+filled and return that. The lock is released before returning, and is
+never held across a nested `cached_poll` call on a different key, so
+`compute()` re-entering `cached_poll` cannot deadlock on it. TTL semantics
+are unchanged: a failed `compute()` is never cached, its exception reaches
+only the caller that ran it, and the cache is left empty so the next caller
+to take the lock tries again from a clean slate rather than inheriting the
+failure. `tests/test_cached_poll_singleflight.py` pins this by racing
+twenty threads through a cold key and counting how many times `compute()`
+actually ran.
 
 ### Backup deletion and in-flight state (`configrxdb.py`, `configrx.py`)
 
@@ -13080,6 +13252,37 @@ Dashboard; fix 1 is dashboard-tile-specific, since it lives in
 `dashboard.js`'s own call site rather than in the shared renderer (every
 other caller already either pins its own known ceiling — the loss chart's
 100 — or has no fixed scale to pin at all).
+
+### Dashboard refresh skips a rewrite the DOM already matches (`dashboard.js`) — 5.46.0
+
+Background counters (uptime figures, "last polled Ns ago") change on
+essentially every 2-second refresh even when nothing an operator would call
+a change has happened, and `view.dashboard` is a new object every tick
+regardless. Before 5.46.0 that meant every unattended refresh rebuilt the
+whole tile grid's `innerHTML` and redrew every chart, every tick, forever.
+
+**The rule: only `refresh()`'s own poll tick may skip a rewrite; every
+explicit draw always rewrites.** `draw({ ifChanged })` renders the tile grid
+to an HTML string exactly as before, then — only when the caller passed
+`ifChanged: true` — compares it against `lastDrawHtml`, the string the DOM
+was last actually built from; an identical string calls `drawCharts(false)`
+and returns without touching `innerHTML` at all. Every other caller
+(`draw()` with no argument, or explicitly `{ ifChanged: false }`) always
+replaces `root.innerHTML` and always redraws every chart, whether or not
+anything changed — an operator action (a time-range change, edit-layout,
+Configure, cancelling a dialog, a window resize) is never subject to the
+skip. `refresh()`'s own periodic poll tick is the only caller that passes
+`ifChanged: true`.
+
+`drawCharts(force)` makes the same distinction one level down, per tile:
+`force` (passed as `true` whenever `draw()` did rewrite, and on a resize)
+redraws every chart from a fresh placeholder; unforced (`draw()`'s
+`ifChanged` short-circuit path) skips a tile whose `view.tileData[tileId]`
+`fetchedAt` timestamp hasn't moved since `lastChartFetchedAt[tileId]` was
+last recorded — i.e. that tile's own data has not actually been re-fetched,
+regardless of how often the surrounding tick runs. `tests/test_frontend_contracts.py`
+pins both halves of this: an unchanged refresh performs no DOM write, and
+an explicit draw always does.
 
 ### Multi-interface graph tiles, on-tile drill-down, and the batch series route (`web/api/dashboard.py`, `web/static/dashboard.js`, `web/static/app.js`) — 5.22.0
 

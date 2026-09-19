@@ -210,7 +210,7 @@ CREATE TABLE IF NOT EXISTS sms_credential (
 --
 -- No id/rowid surrogate: (device_id, rule_key) is exactly the fact this
 -- table records — at most one override per rule per device — so it is the
--- natural primary key, and AlertEngine.device_threshold_map's per-tick read
+-- natural primary key, and AlertEngine.device_threshold_maps' per-tick read
 -- (see alertengine._evaluate_thresholds) wants exactly this device_id ->
 -- row shape with no join required to get there.
 CREATE TABLE IF NOT EXISTS device_thresholds (
@@ -2002,17 +2002,27 @@ class AlertsDatabase(SqliteStore):
                 " ORDER BY rule_key", (device_id,)).fetchall()
 
     def device_threshold_map(self, rule_key: str) -> dict[int, sqlite3.Row]:
-        """device_id -> override, for one rule — the shape
-        AlertEngine._evaluate_thresholds wants, read once per rule per tick
-        rather than once per device: this evaluator runs every 5 s over the
-        whole fleet, and a query per device here would be the same
-        regression metrics_for_keys' own batching already exists to avoid.
-        """
+        """device_id -> override, for one rule. A thin wrapper over
+        device_threshold_maps for a caller that only wants one."""
+        return self.device_threshold_maps([rule_key]).get(rule_key, {})
+
+    def device_threshold_maps(self, rule_keys) -> dict[str, dict[int, sqlite3.Row]]:
+        """device_threshold_map's shape for every key at once -- one query
+        (chunked past _ID_CHUNK keys) instead of one per rule."""
+        keys = list(dict.fromkeys(rule_keys))
+        out: dict[str, dict[int, sqlite3.Row]] = {key: {} for key in keys}
+        if not keys:
+            return out
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM device_thresholds WHERE rule_key = ?",
-                (rule_key,)).fetchall()
-        return {row["device_id"]: row for row in rows}
+            rows = []
+            for chunk in id_chunks(keys):
+                marks = marks_for(chunk)
+                rows.extend(self._conn.execute(
+                    f"SELECT * FROM device_thresholds WHERE rule_key IN ({marks})",
+                    chunk).fetchall())
+        for row in rows:
+            out[row["rule_key"]][row["device_id"]] = row
+        return out
 
     def set_device_threshold(self, device_id: int, rule_key: str, *,
                              threshold: float | None, clear_threshold: float | None,

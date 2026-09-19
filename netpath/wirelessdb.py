@@ -11,7 +11,7 @@ import sqlite3
 import time
 
 from .snmpformat import detect_reboot
-from .sqlitebase import SqliteStore, marks_for, reclaim
+from .sqlitebase import SqliteStore, id_chunks, marks_for, reclaim
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS controllers (
@@ -161,6 +161,13 @@ class WirelessDatabase(SqliteStore):
     DEFAULTS = DEFAULTS
     LABEL = "wireless.db"
     OLDEST_TS_SQL = "SELECT MIN(ts) FROM ap_events"
+    # Bumped by save_settings at save time, ahead of _apply_wireless's
+    # deferred restart -- see WirelessPoller._cached_settings.
+    _settings_generation = 0
+
+    def save_settings(self, values: dict) -> None:
+        super().save_settings(values)
+        self._settings_generation += 1
 
     def _migrate(self) -> None:
         self.ensure_columns("access_points", {
@@ -381,6 +388,22 @@ class WirelessDatabase(SqliteStore):
             return self._conn.execute(
                 "SELECT * FROM radios WHERE ap_id = ? ORDER BY radio_id",
                 (ap_id,)).fetchall()
+
+    def radios_for_aps(self, ap_ids) -> dict:
+        """radios_for for many APs at once, grouped by ap_id and in its
+        same per-AP order; an id with no radios gets an empty list."""
+        ids = list(dict.fromkeys(ap_ids))
+        out = {ap_id: [] for ap_id in ids}
+        if not ids:
+            return out
+        with self._lock:
+            for chunk in id_chunks(ids):
+                marks = marks_for(chunk)
+                for row in self._conn.execute(
+                        f"SELECT * FROM radios WHERE ap_id IN ({marks}) "
+                        f"ORDER BY ap_id, radio_id", chunk):
+                    out[row["ap_id"]].append(row)
+        return out
 
     def access_point(self, ap_id: int) -> sqlite3.Row | None:
         with self._lock:

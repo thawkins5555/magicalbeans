@@ -35,7 +35,7 @@ class PollMixin:
         ip = device["ip"]
         now = time.time()
 
-        settings = self.db.settings()
+        settings = self._cached_settings()
         self._verify_replies = bool(settings.get("v3_verify_replies", True))
         ping_ok = None
         ping_rtt_ms = None

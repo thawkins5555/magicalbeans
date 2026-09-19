@@ -74,14 +74,30 @@ class WirelessPoller(Worker):
         # v3_verify_replies, read once per controller poll and carried for
         # every GETNEXT of that poll — nodepoll keeps it the same way.
         self._verify_replies = True
+        # db.settings(), rebuilt when db._settings_generation moves (see
+        # _cached_settings) instead of read 3x per controller poll.
+        self._settings_state: tuple[int, dict] | None = None
         self.counters = {"polls": 0, "ok": 0, "errors": 0}
 
     def start(self, settings: dict | None = None) -> None:
         self.stop()
         self._stop.clear()
         self._next_run.clear()
+        # Always the store's own read, not the `settings` argument: that can
+        # be the Service's live dict, updated before it is saved/clamped.
+        self._settings_state = (self.db._settings_generation, self.db.settings())
         self._executor = ThreadPoolExecutor(max_workers=4)
         self._spawn()
+
+    def _cached_settings(self) -> dict:
+        """Rebuilt when db._settings_generation moves. Read into a local
+        first: begin_stop() can clear this mid-poll from another thread."""
+        state = self._settings_state
+        generation = self.db._settings_generation
+        if state is None or generation != state[0]:
+            state = (generation, self.db.settings())
+            self._settings_state = state
+        return state[1]
 
     def stop(self) -> None:
         """Fast: cancels queued work and returns without waiting for a poll
@@ -127,6 +143,8 @@ class WirelessPoller(Worker):
 
     def begin_stop(self) -> None:
         self._stop.set()
+        # Dropped so a poll still draining reads live settings, not a stale cache.
+        self._settings_state = None
         if self._executor:
             self._executor.shutdown(wait=False, cancel_futures=True)
 
@@ -236,7 +254,7 @@ class WirelessPoller(Worker):
 
     def _poll_controller(self, controller) -> None:
         config = dict(controller)
-        self._verify_replies = bool(self.db.settings().get("v3_verify_replies", True))
+        self._verify_replies = bool(self._cached_settings().get("v3_verify_replies", True))
         # One budget for the whole controller's sweep, so a rack of
         # unreachable APs cannot add a timeout each to the cycle.
         self._ping_deadline = time.time() + PING_BUDGET_S
@@ -273,7 +291,7 @@ class WirelessPoller(Worker):
         now = time.time()
         seen: set[tuple[str, str]] = set()
         # This sweep's history samples, one executemany each at the end (record_samples).
-        self._history_sample_s = float(self.db.settings().get("history_sample_s", 300))
+        self._history_sample_s = float(self._cached_settings().get("history_sample_s", 300))
         ap_sample_rows: list[tuple] = []
         radio_sample_rows: list[tuple] = []
         for suffix, mac in macs.items():
@@ -336,7 +354,7 @@ class WirelessPoller(Worker):
         if ap_sample_rows or radio_sample_rows:
             self.db.record_samples(ap_sample_rows, radio_sample_rows)
         self.db.record_poll(controller["id"], ok=True)
-        stale_after_polls = int(self.db.settings().get("stale_after_polls", 5))
+        stale_after_polls = int(self._cached_settings().get("stale_after_polls", 5))
         removed = self.db.prune_stale(controller["id"], seen, stale_after_polls)
         for ap in removed:
             # prune_stale has already recorded the ap_removed row the
@@ -367,79 +385,83 @@ class WirelessPoller(Worker):
     def _walk_column(self, controller, config: dict, base_oid: str) -> dict[str, object]:
         values: dict[str, object] = {}
         current = base_oid
-        for _ in range(4096):
-            response = self._snmp_get_next(controller, config, current)
-            if not response.varbinds:
-                break
-            vb = response.varbinds[0]
-            oid = vb["oid"]
-            if not oid or not (oid == base_oid or oid.startswith(base_oid + ".")):
-                break
-            if vb["type"] in ("noSuchObject", "noSuchInstance", "endOfMibView"):
-                break
-            if oid_key(oid) <= oid_key(current):
-                # A broken or malicious agent that keeps answering GETNEXT
-                # with the same OID (or one that sorts no later) would
-                # otherwise spin through every iteration below, writing
-                # the same dict key each time and ending with a silently
-                # one-entry table. nodepoll.py's own walk
-                # (_walk_column_status) guards against exactly this by
-                # requiring the returned OID to have lexicographically
-                # advanced; mirrored here.
-                break
-            values[oid[len(base_oid) + 1:]] = vb["value"]
-            current = oid
-        else:
-            # The loop ran all 4096 iterations without ever breaking out
-            # -- unlike nodepoll.py's walk, which logs when it hits its
-            # row cap, this used to end with a truncated table and no
-            # sign anything was cut short.
-            self.log.add(WIRELESS, f"Table walk of {base_oid} on {controller['ip']} "
-                                   f"stopped at the 4096-row cap",
-                         target=controller["ip"])
-        return values
-
-    def _snmp_get_next(self, controller, config: dict, oid: str):
-        version = snmp_version_of(config)
+        # One socket for the whole walk, not one per row.
         session = _Session(controller["ip"], SNMP_PORT, 3.0, 2)
         try:
-            if version in (0, 1):
-                identity = credential_for(config).identity
-                request_id = random.randint(1, 2**16)
-                packet = build_request(version, identity or "public", PDU_GETNEXT,
-                                       request_id, [oid])
-                # The id filter is what makes a late reply to the previous
-                # GETNEXT a dropped datagram rather than this one's answer.
-                return session.request(packet, expect_request_id=request_id)
-            credential = credential_for(config)
-            identity, auth_proto, password = (
-                credential.identity, credential.auth_proto, credential.auth_password)
-            engine = self._engines.get(controller["id"])
-            if engine is None:
-                probe = discovery_probe()
-                response = session.request(probe)
-                if not response.engine_id:
-                    raise SnmpError(f"{controller['ip']}: no engine id in discovery reply")
-                self._engines.set(controller["id"], response.engine_id,
-                                  response.engine_boots, response.engine_time)
-                engine = self._engines.get(controller["id"])
-            engine_id, boots, engine_time, _learned_at = engine
-            auth_key = localized_key(auth_proto, password, engine_id) \
-                if auth_proto and password else None
-            request_id = random.randint(1, 2**16)
-            packet = build_v3_request(
-                random.randint(1, 2**16), request_id, PDU_GETNEXT, [oid],
-                engine_id=engine_id, engine_boots=boots, engine_time=engine_time,
-                user=identity or "", auth_proto=auth_proto, auth_key=auth_key)
-            response = session.request(packet, expect_request_id=request_id,
-                                       auth_proto=auth_proto, auth_key=auth_key,
-                                       verify=self._verify_replies)
-            if response.pdu_tag == PDU_REPORT:
-                self._engines.invalidate(controller["id"])
-                raise _AuthFailure(f"{controller['ip']}: engine resync required")
-            return response
+            for _ in range(4096):
+                response = self._snmp_get_next(controller, config, current, session)
+                if not response.varbinds:
+                    break
+                vb = response.varbinds[0]
+                oid = vb["oid"]
+                if not oid or not (oid == base_oid or oid.startswith(base_oid + ".")):
+                    break
+                if vb["type"] in ("noSuchObject", "noSuchInstance", "endOfMibView"):
+                    break
+                if oid_key(oid) <= oid_key(current):
+                    # A broken or malicious agent that keeps answering GETNEXT
+                    # with the same OID (or one that sorts no later) would
+                    # otherwise spin through every iteration below, writing
+                    # the same dict key each time and ending with a silently
+                    # one-entry table. nodepoll.py's own walk
+                    # (_walk_column_status) guards against exactly this by
+                    # requiring the returned OID to have lexicographically
+                    # advanced; mirrored here.
+                    break
+                values[oid[len(base_oid) + 1:]] = vb["value"]
+                current = oid
+            else:
+                # The loop ran all 4096 iterations without ever breaking out
+                # -- unlike nodepoll.py's walk, which logs when it hits its
+                # row cap, this used to end with a truncated table and no
+                # sign anything was cut short.
+                self.log.add(WIRELESS, f"Table walk of {base_oid} on {controller['ip']} "
+                                       f"stopped at the 4096-row cap",
+                             target=controller["ip"])
         finally:
             session.close()
+        return values
+
+    def _snmp_get_next(self, controller, config: dict, oid: str, session: "_Session"):
+        """One GETNEXT on a session the caller owns (opened and closed once
+        for the whole walk in _walk_column, not once per row)."""
+        version = snmp_version_of(config)
+        if version in (0, 1):
+            identity = credential_for(config).identity
+            request_id = session.next_request_id()
+            packet = build_request(version, identity or "public", PDU_GETNEXT,
+                                   request_id, [oid])
+            # The id filter is what makes a late reply to the previous
+            # GETNEXT a dropped datagram rather than this one's answer.
+            return session.request(packet, expect_request_id=request_id)
+        credential = credential_for(config)
+        identity, auth_proto, password = (
+            credential.identity, credential.auth_proto, credential.auth_password)
+        engine = self._engines.get(controller["id"])
+        if engine is None:
+            probe = discovery_probe()
+            response = session.request(probe)
+            if not response.engine_id:
+                raise SnmpError(f"{controller['ip']}: no engine id in discovery reply")
+            self._engines.set(controller["id"], response.engine_id,
+                              response.engine_boots, response.engine_time)
+            engine = self._engines.get(controller["id"])
+        engine_id, boots, engine_time, _learned_at = engine
+        auth_key = localized_key(auth_proto, password, engine_id) \
+            if auth_proto and password else None
+        request_id = session.next_request_id()
+        msg_id = session.next_request_id()
+        packet = build_v3_request(
+            msg_id, request_id, PDU_GETNEXT, [oid],
+            engine_id=engine_id, engine_boots=boots, engine_time=engine_time,
+            user=identity or "", auth_proto=auth_proto, auth_key=auth_key)
+        response = session.request(packet, expect_request_id=request_id,
+                                   auth_proto=auth_proto, auth_key=auth_key,
+                                   verify=self._verify_replies)
+        if response.pdu_tag == PDU_REPORT:
+            self._engines.invalidate(controller["id"])
+            raise _AuthFailure(f"{controller['ip']}: engine resync required")
+        return response
 
 
 def _split_vdom_name(suffix: str) -> tuple[str, str, str] | None:

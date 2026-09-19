@@ -1298,11 +1298,12 @@ class AlertEngine(Worker):
         rules = [r for r in self.db.rules() if r["enabled"] and r["kind"] == "threshold"]
         if not rules:
             return occurrences
-        # Per-device overrides, read once per RULE per tick rather than once
-        # per DEVICE, for the same reason metrics_for_families is batched
-        # below. Keyed by device even for an interface target: an override
-        # tuned for a hot closet is about the switch, not one port.
-        overrides_by_rule = {r["id"]: self.db.device_threshold_map(r["key"])
+        # Per-device overrides, read once per TICK for every rule at once
+        # rather than once per rule. Keyed by device even for an interface
+        # target: an override tuned for a hot closet is about the switch,
+        # not one port.
+        threshold_maps = self.db.device_threshold_maps([r["key"] for r in rules])
+        overrides_by_rule = {r["id"]: threshold_maps.get(r["key"], {})
                              for r in rules}
         # One query for the families the enabled rules actually name, not a
         # full `SELECT *` per device -- at 2,000 devices with ~90 metrics

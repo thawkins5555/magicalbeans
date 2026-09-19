@@ -416,7 +416,7 @@ nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
 
 
 # ============================================================ engine: read once
-print("\nengine: the override map is read once per rule per tick")
+print("\nengine: the override map is read once per tick, for every rule at once")
 
 nodes, alerts, snmp, syslog, ipam, engine = build("read_once")
 engine._tick()
@@ -425,8 +425,6 @@ for i in range(20):
     device_id = add_device(nodes, f"10.50.4.{i + 1}", f"acc-sw-{i:02d}")
     sample_temp(nodes, device_id, base, 40.0)   # nowhere near breaching
 
-threshold_rule_count = len([r for r in alerts.rules()
-                            if r["enabled"] and r["kind"] == "threshold"])
 statements = []
 alerts._conn.set_trace_callback(statements.append)
 try:
@@ -434,10 +432,46 @@ try:
 finally:
     alerts._conn.set_trace_callback(None)
 device_threshold_reads = [s for s in statements if "device_thresholds" in s]
-check("device_threshold_map runs exactly once per enabled threshold rule per "
-      "tick, not once per device (20 devices, one query per rule either way)",
-      len(device_threshold_reads) == threshold_rule_count,
-      (len(device_threshold_reads), threshold_rule_count))
+check("device_threshold_maps runs exactly once per tick, not once per "
+      "enabled threshold rule and not once per device (20 devices, several "
+      "rules, one query either way)",
+      len(device_threshold_reads) == 1, device_threshold_reads)
+nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+
+# ================================== engine: fleet read once per tick, windows
+print("\nengine: nodes_db.devices() is read once per tick when a window is active")
+
+nodes, alerts, snmp, syslog, ipam, engine = build("devices_once")
+covered = add_device(nodes, "10.50.6.1", "covered-sw")
+plain = add_device(nodes, "10.50.6.2", "plain-sw")
+now = time.time()
+alerts.add_window("cutover", "devices", now - 60, now + 3600,
+                  scope_device_ids=[covered])
+engine._tick()
+
+real_devices = nodes.devices
+calls = []
+def counting_devices(*args, **kwargs):
+    calls.append(1)
+    return real_devices(*args, **kwargs)
+nodes.devices = counting_devices
+try:
+    for offset in (0, 65, 130):
+        sample_temp(nodes, covered, now + offset, 80.0)
+        sample_temp(nodes, plain, now + offset, 80.0)
+        engine._tick()
+finally:
+    nodes.devices = real_devices
+check("nodes_db.devices() runs exactly once per tick regardless of how many "
+      "evaluators run this tick (3 ticks, one active window each)",
+      calls == [1, 1, 1], calls)
+check("...and the window it read still suppressed the covered device's alert",
+      not open_rows(alerts, "temp_chassis_high", covered), None)
+check("...while the same breach on the uncovered device opened as usual "
+      "-- the wrapper changed nothing about which devices() saw",
+      len(open_rows(alerts, "temp_chassis_high", plain)) == 1,
+      open_rows(alerts, "temp_chassis_high", plain))
 nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
 
 

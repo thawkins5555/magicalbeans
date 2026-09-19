@@ -45,6 +45,20 @@ A suite that cannot run for want of an optional dependency (paramiko,
 Playwright) exits `77` rather than failing; `run_all.py` reports that as
 SKIP, and "no suites ran" if that is all that happened.
 
+5.46.0 added seven suites proving the performance work counts real
+operations rather than timing them: `test_web_routing.py` (all 298 routes
+across all four HTTP methods resolve identically through the new bucketed
+route lookup as they did through the old linear scan), `test_cached_poll_singleflight.py`
+(a cache stampede on `Service.cached_poll` computes once, not once per
+caller), `test_extra_resolve_targets_cache.py` (the resolver's extra-address
+list is rebuilt at most once a minute, and immediately on a settings save),
+`test_wireless_settings_cache.py` and `test_fortipoll_session_reuse.py`
+(the FortiGate/wireless poller's settings cache and its one-socket-per-walk
+SNMP session), `test_wireless_aps_batch.py` (the AP list's per-radio data
+comes from one query, not one per AP) and `test_disabled_device_cache.py`
+(the disabled-device lookup uses the new partial index and refreshes on
+every device enable/disable/add/remove).
+
 One family is worth calling out by name: `test_frontend_contracts.py`,
 `test_time_contracts.py`, `test_layout_contracts.py`, `test_design_tokens.py`
 and `test_static_headers.py` read the shipped JS/HTML/CSS as text rather than
@@ -177,6 +191,11 @@ node tests/ui/walk.mjs                             # the checks
 It exits non-zero on the first failed assertion, and prints every console error
 and failed request it saw. The CI workflow's `ui-walk` job runs it on every
 push.
+
+`shoot()`, the walk's own screenshot helper, is a no-op unless `WALK_SHOTS=1`
+is set in the environment — a routine walk takes no screenshots at all; set
+that flag when a failure needs to be seen rather than just read from the
+walk's own JSON output.
 
 `tests/ui/pristine_login.mjs` is a second, much smaller browser check with a
 requirement `walk.mjs` cannot satisfy: an instance that has never had

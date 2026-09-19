@@ -728,6 +728,11 @@ ok(f"one FROM metrics statement per tick at 50 devices "
 nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
 
 
+# One statement against device_thresholds per tick, whatever the rule count,
+# is pinned in test_temp_thresholds.py (the suite that owns this table),
+# rather than duplicated here.
+
+
 # ---- streak state does not outlive the devices it is about
 nodes, alerts, snmp, syslog, ipam, engine = build()
 engine._tick()

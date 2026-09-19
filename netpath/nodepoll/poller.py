@@ -148,6 +148,8 @@ class NodePoller(Worker, DiscoveryMixin, PollMixin, VendorIdentifyMixin, Environ
         self._configs: dict | None = None
         self._configs_generation: int = -1
         self._configs_loaded: float = 0.0
+        # db.settings(), held the same way _configs is -- see _cached_settings.
+        self._settings_state: tuple[int, float, dict] | None = None
         # device_id -> when its ipAddrTable was last read. See
         # _refresh_addresses: once an hour, not once a poll.
         self._addresses_read: dict[int, float] = {}
@@ -354,6 +356,17 @@ class NodePoller(Worker, DiscoveryMixin, PollMixin, VendorIdentifyMixin, Environ
         return (int(settings.get("snmp_walk_max_rows", 16384) or 16384),
                 int(settings.get("snmp_bulk_max_repetitions", 40) or 0))
 
+    def _cached_settings(self) -> dict:
+        """db.settings(), rebuilt on the same trigger _configs uses. Read
+        into a local like _walk_limits: begin_stop() can clear this mid-poll."""
+        state = self._settings_state
+        now = time.time()
+        generation = self.db.config_generation()
+        if state is None or generation != state[0] or now - state[1] > self._CONFIG_REFRESH_S:
+            state = (generation, now, self.db.settings())
+            self._settings_state = state
+        return state[2]
+
     def _mac_walk_workers(self, settings: dict) -> int:
         return max(1, min(32, int(settings.get("mac_walk_workers",
                                                self._MAC_WALK_WORKERS) or 1)))
@@ -422,8 +435,10 @@ class NodePoller(Worker, DiscoveryMixin, PollMixin, VendorIdentifyMixin, Environ
 
     def begin_stop(self) -> None:
         self._stop.set()
-        # Dropped here so _walk_limits re-reads live settings instead of a stale cache.
+        # Dropped here so _walk_limits/_cached_settings re-read live settings
+        # instead of a stale cache while whatever is still draining finishes.
         self._walk_settings = None
+        self._settings_state = None
         for job in list(self._discovery_jobs.values()):
             job.cancel()
         if self._executor:

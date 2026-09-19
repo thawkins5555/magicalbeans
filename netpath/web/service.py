@@ -234,6 +234,10 @@ _MODULE_SCOPES = {
     "mapper": ("mapper_settings", "mapper_db", "Mapper settings applied", _apply_mapper),
 }
 
+# Scopes _extra_resolve_targets reads a resolve_* flag from; saving one
+# invalidates _cached_extra_targets's cache (see apply_settings).
+_EXTRA_TARGETS_SCOPES = frozenset({"netflow", "syslog", "snmp", "ipam", "nodes"})
+
 # The scopes whose effect is run off the request thread, by the serial
 # executor Service owns. Exactly the five that bounce a worker: every one of
 # them ends in _restart(), whose stop() joins each of the worker's threads for
@@ -383,6 +387,15 @@ class Service:
         # change faster than an operator can read them: storage sizes (30
         # stat() calls) and the reverse-DNS cache fill (three queries).
         self._poll_cache: dict[str, tuple[float, object]] = {}
+        # cached_poll's single-flight locks, one per key, created on first
+        # use and kept forever — bounded by the fixed set of literal keys
+        # callers pass, same as _poll_cache itself.
+        self._poll_locks: dict[str, threading.Lock] = {}
+        self._poll_locks_guard = threading.Lock()
+        # The Resolver's extra_ips callable's own cache — see
+        # _cached_extra_targets.
+        self._extra_targets_cache: tuple[float, list] | None = None
+        self._extra_targets_generation = 0
 
     def _open_stores(self, db_path: str, flow_db_path: str, syslog_db_path: str,
                      app_db_path: str, ipam_db_path: str, snmp_db_path: str,
@@ -481,7 +494,7 @@ class Service:
             timeout_s=float(self.settings["dns_timeout_s"]),
             cache_ttl_s=float(self.settings["dns_cache_days"]) * 86400,
             log=self.log,
-            extra_ips=self._extra_resolve_targets,
+            extra_ips=self._cached_extra_targets,
             server=str(self.settings.get("dns_server", "")),
             use_nslookup=bool(self.settings.get("dns_use_nslookup", True)),
             ipam_db=self.ipam_db,
@@ -996,13 +1009,23 @@ class Service:
 
         /api/state ran ten databases' size_bytes() (three stat() calls each)
         and the hostname cache's three queries on every 2-second poll of
-        every tab. Neither figure means anything at that resolution."""
+        every tab. Neither figure means anything at that resolution.
+
+        Single-flighted per key on a miss: concurrent callers block on that
+        key's own lock and reuse the result instead of each computing it."""
         now = time.time()
         hit = self._poll_cache.get(key)
         if hit and now - hit[0] < ttl_s:
             return hit[1]
-        value = compute()
-        self._poll_cache[key] = (now, value)
+        with self._poll_locks_guard:
+            lock = self._poll_locks.setdefault(key, threading.Lock())
+        with lock:
+            hit = self._poll_cache.get(key)
+            now = time.time()
+            if hit and now - hit[0] < ttl_s:
+                return hit[1]
+            value = compute()
+            self._poll_cache[key] = (now, value)
         return value
 
     def apply_global_settings(self, values: dict) -> dict:
@@ -1086,6 +1109,9 @@ class Service:
         # keeps whatever was posted. The clamp would then protect the file
         # and nothing else.
         settings.update(db.settings())
+        if scope in _EXTRA_TARGETS_SCOPES:
+            self._extra_targets_cache = None
+            self._extra_targets_generation += 1
         if scope in _DEFERRED_SCOPES:
             self._queue_restart(scope, apply_fn, settings)
         else:
@@ -1496,12 +1522,16 @@ class Service:
 
     # ---------------------------------------------------------- maintenance
 
+    # How long _cached_extra_targets may serve a stale set: four Resolver
+    # poll_s ticks (15 s each).
+    _EXTRA_TARGETS_TTL_S = 60.0
+
     def _extra_resolve_targets(self) -> list:
         """Addresses worth naming beyond NetPath's own hops, for the shared
         resolver: flow endpoints, syslog sources, and IPAM's discovered
         hosts, each gated by its own module's resolve setting."""
         addresses = []
-        if self.flow_db.settings().get("resolve_addresses"):
+        if self.flow_settings.get("resolve_addresses"):
             addresses.extend(self.flow_db.recent_endpoints())
         if self.syslog_settings.get("resolve_sources"):
             addresses.extend(row["source"] for row
@@ -1518,6 +1548,24 @@ class Service:
             # what puts a neighbour's address in it.
             addresses.extend(self.nodes_db.neighbour_addresses())
         return addresses
+
+    def _cached_extra_targets(self) -> list:
+        """The Resolver's `extra_ips` callable: _extra_resolve_targets(),
+        throttled to _EXTRA_TARGETS_TTL_S. _extra_resolve_targets() itself
+        stays live for any other caller (e.g. tests)."""
+        now = time.time()
+        hit = self._extra_targets_cache
+        if hit and now - hit[0] < self._EXTRA_TARGETS_TTL_S:
+            return hit[1]
+        # Captured before compute(): if a settings save bumps this while
+        # _extra_resolve_targets() below is mid-flight, that call read the
+        # old settings, so its answer must not overwrite the invalidation
+        # with a fresh-looking but stale entry.
+        generation = self._extra_targets_generation
+        value = self._extra_resolve_targets()
+        if generation == self._extra_targets_generation:
+            self._extra_targets_cache = (now, value)
+        return value
 
     def _maintenance_loop(self) -> None:
         while not self._stop.is_set():

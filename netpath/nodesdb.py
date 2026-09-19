@@ -183,6 +183,8 @@ CREATE TABLE IF NOT EXISTS devices (
 );
 CREATE INDEX IF NOT EXISTS ix_devices_group ON devices(group_id);
 CREATE INDEX IF NOT EXISTS ix_devices_status ON devices(status);
+-- Partial: disabled_device_ids() only wants the few disabled rows.
+CREATE INDEX IF NOT EXISTS ix_devices_disabled ON devices(id) WHERE enabled = 0;
 -- devices() always orders by this pair (with or without a WHERE clause), so
 -- this index lets SQLite satisfy the ORDER BY directly instead of a
 -- full-table sort on every Nodes page load.
@@ -1110,6 +1112,9 @@ class NodesDatabase(SqliteStore):
         # polled. The scheduler holds one merged config per device and
         # rebuilds it only when this moves — see config_generation().
         self._config_generation = 0
+        # disabled_device_ids(), held between calls -- see that method.
+        self._disabled_cache: set[int] | None = None
+        self._disabled_cache_generation: int = -1
         # Opened before super().__init__: _before_schema migrates into them.
         # Derived sibling paths, overridable here for tests, same as mapper.db.
         memory = (not path) or path == ":memory:" or path.startswith("file:")
@@ -2192,9 +2197,15 @@ class NodesDatabase(SqliteStore):
         return out
 
     def disabled_device_ids(self) -> set[int]:
-        with self._lock:
-            return {row[0] for row in self._conn.execute(
-                "SELECT id FROM devices WHERE enabled = 0").fetchall()}
+        """Rebuilt only when config_generation moves (every write that can
+        flip `enabled` bumps it), same trigger the poller's own caches use."""
+        generation = self.config_generation()
+        if self._disabled_cache is None or generation != self._disabled_cache_generation:
+            with self._lock:
+                self._disabled_cache = {row[0] for row in self._conn.execute(
+                    "SELECT id FROM devices WHERE enabled = 0").fetchall()}
+            self._disabled_cache_generation = generation
+        return self._disabled_cache
 
     def metrics_for_keys(self, keys) -> list[sqlite3.Row]:
         """The newest value of each named metric key, fleet-wide; excludes

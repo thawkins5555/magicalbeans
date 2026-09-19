@@ -408,6 +408,7 @@ async function waitForStpVlanBlockingLink(page, mapId) {
 }
 
 async function shoot(page, dir, name) {
+  if (process.env.WALK_SHOTS !== '1') return;
   try {
     await page.screenshot({ path: path.join(dir, `${name}.png`), fullPage: false });
   } catch { /* a screenshot is evidence, not an assertion */ }

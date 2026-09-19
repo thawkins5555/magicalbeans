@@ -96,8 +96,8 @@ def _ap_uptime_s(row):
     return round(ticks / 100 + max(0.0, time.time() - read_at))
 
 
-def _ap_json(service, row) -> dict:
-    radios = [_radio_json(r) for r in service.wireless_db.radios_for(row["id"])]
+def _ap_json(service, row, radio_rows) -> dict:
+    radios = [_radio_json(r) for r in radio_rows]
     # The at-a-glance table shows one tx-power figure per AP; a real AP
     # has one radio per band, so this is the strongest of them rather
     # than an arbitrary "first" pick.
@@ -251,7 +251,8 @@ def get_wireless_aps(service, params, body) -> dict:
     aps = service.wireless_db.access_points(
         controller_id=int(controller_id) if controller_id else None)
     text = (params.get("q") or "").strip().lower()
-    result = [_ap_json(service, r) for r in aps]
+    radios_by_ap = service.wireless_db.radios_for_aps([r["id"] for r in aps])
+    result = [_ap_json(service, r, radios_by_ap[r["id"]]) for r in aps]
     if text:
         result = [ap for ap in result if text in (ap["name"] or "").lower()
                  or text in (ap["mac_address"] or "").lower()
