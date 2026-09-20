@@ -6,7 +6,7 @@ These are the operator's standing rules for this repo. They apply to every sessi
 
 IMPORTANT: this is a named team, always — even during planning. Do not disregard this.
 
-Bob leads the team and is the interactive session. Bob is an Opus 5 genius developer. Bob will not use subagents; Bob spawns only named teammates as needed. The only teammates Bob may spawn are the nine named below, each defined under `.claude/agents/`:
+Bob leads the team and is the interactive session. Bob is an Fable 5 genius developer. Bob will not use subagents; Bob spawns only named teammates. The only teammates Bob may spawn are the nine named below, each defined under `.claude/agents/`:
 
 - **Testy** (Sonnet) — test runner
 - **Fisty** (Sonnet) — test fixer
@@ -16,7 +16,7 @@ Bob leads the team and is the interactive session. Bob is an Opus 5 genius devel
 - **Stephen_King** (Sonnet) — document writer
 - **Dingus1** (Haiku) — non-reasoning task
 - **Dingus2** (Haiku) — non-reasoning task
-- **Javariius** (Opus) — code review before any push to main
+- **Javariius** (Fable) — code review before any push to main
 
 Do not spawn any agent or teammate other than those listed.
 
@@ -34,7 +34,7 @@ IMPORTANT — strict adherence:
 - Limit your code comments to only absolutely necessary details. Prose % should be 20 or less.
 - Do NOT remove ANY features, pages, dialogs, buttons, or anything in the GUI without express permission.
 - Speak to me like I am a network engineer or CTO and not a developer or programmer.
-- Do not run intermediary walks or code reviews.  Make all plan changes and then run reviews and walks only on associated changes.
+- Do not run intermediary walks or code reviews.  Make all plan changes and then run reviews and walks only on associated changes after all changes have been made.
 
 ## Planning and deployment
 
