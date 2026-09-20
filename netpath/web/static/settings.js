@@ -108,7 +108,11 @@
     App.el('set-tacacs-servers').value = s.tacacs_servers || '';
     App.el('set-tacacs-timeout').value = s.tacacs_timeout_s ?? 5;
     App.el('set-tacacs-autocreate').checked = !!s.tacacs_auto_create;
-    App.el('set-tacacs-role').value = s.tacacs_default_role || 'viewer';
+    // 'admin' was withdrawn as a choice in 5.51.0; a site still holding it
+    // would otherwise select nothing and save an empty role.
+    App.el('set-tacacs-role').value =
+      ['viewer', 'operator'].includes(s.tacacs_default_role)
+        ? s.tacacs_default_role : 'viewer';
     // tacacs_secret is write-only and never comes back from the server —
     // the field starts blank every load, and tacacs_secret_set (read-only)
     // is what says whether a secret is saved at all.

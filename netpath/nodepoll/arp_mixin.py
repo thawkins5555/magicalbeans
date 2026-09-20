@@ -116,7 +116,8 @@ class ArpMixin:
         the one column that only ever removes rows.
         """
         try:
-            phys, complete, reason = self._walk_column_detail(device, config, phys_oid)
+            phys, complete, reason = self._walk_column_detail(device, config, phys_oid,
+                                                             raw=True)
         except SnmpError as exc:
             return None, False, f"SNMP error: {exc}"
         # Complete first, then empty: a timeout or an error on the very

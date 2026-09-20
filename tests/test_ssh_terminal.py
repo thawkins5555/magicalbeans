@@ -1223,6 +1223,17 @@ try:
           "broadcast addresses (including IPv4-mapped IPv6 and a non-literal "
           "numeric host) and allows loopback and ordinary ones")
 
+    # Loopback is still fine on an unrelated port, but not on this server's
+    # own web port or inside its relay port range.
+    assert sshterm._unsafe_destination(
+        "127.0.0.1", 22, web_port=8443, relay_range=(40000, 40999)) is None
+    assert sshterm._unsafe_destination(
+        "127.0.0.1", 8443, web_port=8443, relay_range=(40000, 40999)) is not None
+    assert sshterm._unsafe_destination(
+        "::1", 40500, web_port=8443, relay_range=(40000, 40999)) is not None
+    print("PASS: _unsafe_destination refuses loopback only on this server's "
+          "own web port or relay port range, not on an ordinary one")
+
 finally:
     for listener in ("stub", "stub2", "replacement"):
         try:

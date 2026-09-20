@@ -129,9 +129,15 @@ def _int_in(value, low: int, high: int, default: int) -> int:
 _BROADCAST = ipaddress.IPv4Address("255.255.255.255")
 
 
-def _unsafe_destination(host: str) -> str | None:
+def _unsafe_destination(host: str, port: int | None = None, *,
+                        web_port: int | None = None,
+                        relay_range: tuple[int, int] | None = None) -> str | None:
     """Why `host` must not be dialled, or None if it is fine. Loopback is
-    allowed -- the demo fleet and tests reach devices at 127.0.0.x."""
+    allowed -- the demo fleet and tests reach devices at 127.0.0.x -- except
+    for this server's own web port or relay port range, which a tunnel
+    dialling loopback must not be able to reach back into. That narrower
+    check only runs when the caller passes `port` alongside the setting it
+    applies to; leaving them out (the default) skips it."""
     try:
         addr = ipaddress.ip_address(host)
     except ValueError:
@@ -147,6 +153,11 @@ def _unsafe_destination(host: str) -> str | None:
         return "a multicast address"
     if addr == _BROADCAST:
         return "the broadcast address"
+    if port is not None and addr.is_loopback:
+        if port == web_port:
+            return "this server's own web port"
+        if relay_range is not None and relay_range[0] <= port <= relay_range[1]:
+            return "this server's own relay port range"
     return None
 
 
@@ -559,7 +570,14 @@ class SshSession:
         page)."""
         import paramiko
 
-        unsafe = _unsafe_destination(self.host)
+        from . import webrelay
+        low, high = webrelay.parse_port_range(
+            self.service.settings.get(
+                "web_relay_port_range", webrelay.DEFAULT_PORT_RANGE))
+        unsafe = _unsafe_destination(
+            self.host, self.port,
+            web_port=int(self.service.settings.get("web_port", 8443)),
+            relay_range=(low, high))
         if unsafe is not None:
             self._error(f"Refusing to connect to {self.host}: {unsafe}.")
             return "failed", None

@@ -1917,3 +1917,33 @@ usual, with nothing extra spun up.
 
 **Files changed for 5.50.0's documentation:** `netpath/__init__.py`
 (version), `CHANGELOG.md`, `FEATURES.md`, `INTERNALS.md`, and this file.
+
+## 5.51.0 — Loopback tunnel guard, TACACS+ auto-create role cleanup, and SNMP decode correctness
+
+**"Read the internal review document and plan the outstanding work."**
+The operator asked for the review document to be read and a plan drawn up
+for what it still left open. The plan covered three groups: the
+remaining security-hardening items, the performance items the phase-5
+releases (5.47.0–5.50.0) had deferred, and a round of test cleanup. The
+operator approved it as put forward.
+
+**Implementation ran across the team** against that approved plan: a
+loopback-tunnel restriction for the WEB relay and SSH terminal, a
+TACACS+ auto-create default-role cleanup, SNMP decode fixes for
+hardware-address and VLAN data, a Mapper canvas-redraw skip, an IPAM
+export row cap, and rollback guards on the syslog and nodes-database
+write paths.
+
+**A scope error was caught and corrected mid-flight.** One lane's first
+pass at the TACACS+ role cleanup nearly removed the **Admin** preset from
+the user-permission editor on Settings → Users — a different, unrelated
+control from the TACACS+ auto-create default role the plan actually
+called for changing. Caught before it reached review; the permission
+editor's preset was left exactly as it was, and only the TACACS+
+auto-create dropdown changed.
+
+**Files changed for 5.51.0's documentation:** `CHANGELOG.md`,
+`INTERNALS.md`, and this file. `FEATURES.md` needed no change — none of
+its existing wording was made false by this release. `netpath/__init__.py`'s
+version bump to 5.51.0 had already been made before this documentation
+pass started.

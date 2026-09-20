@@ -69,10 +69,10 @@ class VlanMixin:
         answered = False
         complete = True
 
-        def walk(oid: str, *, evidence: bool = True) -> dict:
+        def walk(oid: str, *, evidence: bool = True, raw: bool = False) -> dict:
             nonlocal answered, complete
             column, column_done = self._walk_column_status(
-                device, config, oid, deadline=deadline)
+                device, config, oid, deadline=deadline, raw=raw)
             if column and evidence:
                 answered = True
             # Every column, evidence=False included: half a bridge-port map is wrong too.
@@ -112,12 +112,12 @@ class VlanMixin:
 
         # (b) standards path
         static_names = walk(nodeoids.DOT1Q_VLAN_STATIC_NAME)
-        egress = walk(nodeoids.DOT1Q_VLAN_STATIC_EGRESS)
+        egress = walk(nodeoids.DOT1Q_VLAN_STATIC_EGRESS, raw=True)
         if not egress:
-            egress = walk(nodeoids.DOT1Q_VLAN_CURRENT_EGRESS)
-        untagged = walk(nodeoids.DOT1Q_VLAN_STATIC_UNTAGGED)
+            egress = walk(nodeoids.DOT1Q_VLAN_CURRENT_EGRESS, raw=True)
+        untagged = walk(nodeoids.DOT1Q_VLAN_STATIC_UNTAGGED, raw=True)
         if not untagged:
-            untagged = walk(nodeoids.DOT1Q_VLAN_CURRENT_UNTAGGED)
+            untagged = walk(nodeoids.DOT1Q_VLAN_CURRENT_UNTAGGED, raw=True)
 
         if static_names:
             for suffix, value in static_names.items():
@@ -222,7 +222,7 @@ class VlanMixin:
                 (nodeoids.VTP_TRUNK_VLANS_ENABLED_3K, 2048),
                 (nodeoids.VTP_TRUNK_VLANS_ENABLED_4K, 3072),
             ):
-                for suffix, raw in walk(oid).items():
+                for suffix, raw in walk(oid, raw=True).items():
                     try:
                         if_index = int(suffix)
                     except (TypeError, ValueError):

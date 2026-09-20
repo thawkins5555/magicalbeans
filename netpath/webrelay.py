@@ -491,7 +491,12 @@ class WebRelayRegistry:
               username: str, client_ip: str, token: str, host_header: str, *,
               device_id: int | None = None, ap_id: int | None = None,
               subject: str = "") -> dict:
-        unsafe = _unsafe_destination(target_ip)
+        low, high = parse_port_range(
+            self.service.settings.get("web_relay_port_range", DEFAULT_PORT_RANGE))
+        unsafe = _unsafe_destination(
+            target_ip, target_port,
+            web_port=int(self.service.settings.get("web_port", 8443)),
+            relay_range=(low, high))
         if unsafe is not None:
             raise ValueError(f"Refusing to open a tunnel to {target_ip}: {unsafe}.")
         client_ip = udpsock.normalise_source(str(client_ip or ""))
@@ -499,8 +504,6 @@ class WebRelayRegistry:
             raise ValueError(
                 "The relay could not tell which address you are connecting "
                 "from, and it will only admit that one address.")
-        low, high = parse_port_range(
-            self.service.settings.get("web_relay_port_range", DEFAULT_PORT_RANGE))
         bind_host = relay_bind_host(self.service.settings.get("web_host", "0.0.0.0"))
 
         # Whole admission decision under one lock: two clicks arriving

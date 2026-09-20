@@ -4252,7 +4252,12 @@ seconds is unusable.
 Three limits the walker did not have. `_WALK_MAX_BYTES` (4 MiB of retained
 values, counted as `len(str(value))`) stops a walk that the row cap cannot:
 16,384 rows of MAC addresses is well under a megabyte, 16,384 rows of 64 KB
-octet strings is gigabytes on one poll worker. A `_walk_column_detail` called
+octet strings is gigabytes on one poll worker. **From 5.51.0**, a column
+walked with `raw=True` (see "OCTET STRING decoding is best-effort", above)
+stores the wire bytes rather than the rendering, but this budget is still
+counted against `len(str(vb["value"]))` — the rendering, not the shorter
+raw bytes — so turning a walk's `raw` flag on did not quietly move this
+cap. A `_walk_column_detail` called
 with no `deadline` derives one from the device's own poll interval —
 `max(_WALK_BUDGET_FLOOR_S, _WALK_BUDGET_FRACTION × interval)`, 10 s and 0.5 —
 the way `_poll_interfaces` already derives its interface budget; without it an
@@ -6038,12 +6043,34 @@ review: this setting shipped with no control anywhere in the interface,
 so every device would have started its hourly walk on upgrade with no way
 to retune or disable it.
 
-**OCTET STRING decoding is best-effort, not lossless — a known limit, not
-a bug still open.** `_decode_port_list` (and, through it, `_decode_vlan_bitmap`)
-works from whatever `_octets_from_value` hands it, which for a value that
-came off the wire as text is `trapdecode._octets_text`'s printable
-rendering of the raw octets — the raw bytes themselves are discarded at
-BER-parse time in `trapdecode.py` and never reach this code. That
+**OCTET STRING decoding is best-effort, not lossless — for the paths still
+reading it as text.** `_decode_port_list` (and, through it,
+`_decode_vlan_bitmap`) works through `_octets_from_value`, which returns
+raw bytes immediately when it is handed them (`isinstance(raw, (bytes,
+bytearray))`) and only falls back to guessing at a rendering's original
+bytes otherwise. **From 5.51.0, the binary columns no longer take that
+fallback.** `snmppoll._read_varbinds` now returns each varbind with a
+`raw` key carrying an OCTET STRING's wire bytes alongside its `value`
+rendering (every other BER type's `raw` is `None`).
+`VendorIdentifyMixin._walk_column_detail` takes a `raw: bool` flag that,
+when set, stores `vb["raw"]` in the walk's result dict in place of
+`vb["value"]`; `vlan_mixin.py`'s VLAN-membership and VTP-bitmap walks and
+`arp_mixin.py`'s PhysAddress walk all pass `raw=True`, so
+`_decode_port_list`/`_decode_vlan_bitmap` see actual bytes and never reach
+the guesswork below. `identify_mixin.py`'s own interface-table MAC read
+(`_mac`) takes the same bytes directly, falling back to the `value`
+rendering only when `raw` is `None` (a stub, or a value read by code that
+predates this change) or isn't exactly 6 bytes long.
+
+What is left below is now the limit for a caller that holds nothing but
+the rendering — a stub, a value cached before this change, or a walk that
+never passed `raw=True` — chief among them **the LLDP chassis-id decode**
+(`lldp_neighbor`'s `chassis_id`), which is not a fixed-width binary column
+and has no `raw`-flag walk of its own. For that remaining case: the
+rendering itself, for a value that came off the wire as text, is
+`trapdecode._octets_text`'s printable rendering of the raw octets — the
+raw bytes themselves are discarded at BER-parse time in `trapdecode.py`
+and never reach this code. That
 rendering is not reversible in general: `_octets_text` collapses `0x0A`
 (LF), `0x0D` (CR) and `0x20` (space) to the identical character, and a
 short run of hex-looking characters with no separator is genuinely
@@ -6067,11 +6094,11 @@ manage, since an overstated limit is as unhelpful as an unstated one:
   right default — an agent's PortList reaches `_octets_text` as hex far
   more often than a switch answers in literal decimal — but it is a
   default, not a certainty, and no amount of care at this layer can make
-  it one without the bytes `trapdecode.py` already discarded. **This affects the
-pre-existing LLDP chassis-id path too** (`lldp_neighbor`'s `chassis_id`,
-read through the same shared OCTET STRING decoder), not only this VLAN
-walk — it was simply never named as a limitation until this release's own
-review went looking for one.
+  it one without the bytes `trapdecode.py` already discarded. Before
+  5.51.0 this applied to the VLAN/PortList/PhysAddress walks above too;
+  from 5.51.0 those carry the raw bytes forward instead and never reach
+  this heuristic, leaving the LLDP chassis-id path (above) as the one
+  still exposed to it.
 
 ### Per-device threshold overrides (see Alerts, below)
 
@@ -12655,6 +12682,19 @@ re-add and a version check would have to guess which world it is in. They are
 offering nothing better falls this far; the function is idempotent, so
 restarting the worker does not grow the lists. It runs once from `start()`,
 gated on the `allow_legacy_ssh` setting, because it edits class-level state.
+
+**That class-level state is process-global, so `allow_legacy_ssh` also
+governs the SSH terminal.** `_apply_legacy_algorithms` mutates
+`paramiko.Transport._preferred_kex` and `_preferred_keys` directly — not an
+instance's copy, but the class attribute every `Transport` in the process
+reads its default from, ConfigRX's own connections and `sshterm.py`'s
+interactive sessions alike. There is no separate switch for the terminal:
+turning `allow_legacy_ssh` on to reach one ConfigRX-only device widens the
+algorithm set the SSH terminal will offer to every device for the rest of
+that worker's life (until the next restart re-runs `start()`), and turning
+it off again does not retroactively narrow an already-open session. Worth
+knowing before adding a second, terminal-only toggle for this setting —
+one already exists, it just lives in `configrx.py`.
 
 Because paramiko 5 cannot be fixed in code, `requirements.txt` pins
 `paramiko>=3.4,<5`. `_connect_error_text()` covers the gap for an environment

@@ -190,8 +190,9 @@ set of table behaviours:
 - **Export CSV**, from 4.47.0, honours whatever filter the table currently
   has applied — it is the rows on screen, not a fixed dump — and writes
   RFC 4180-quoted CSV with a UTF-8 BOM and a timestamped filename. Alerts
-  exports up to 50,000 rows, well past its own console page; every other
-  table exports what its search already caps at. **From 5.23.0, the flow
+  exports up to 50,000 rows, well past its own console page; the IPAM Hosts
+  and DHCP Leases exports cap at 20,000 from 5.51.0, and every other table
+  exports what its search already caps at. **From 5.23.0, the flow
   record, Syslog and SNMP Trap exports lead with a plain local-time
   column** (`start`/`end` for flow records, `time` for Syslog and SNMP
   Trap) ahead of the raw epoch column each already carried — see

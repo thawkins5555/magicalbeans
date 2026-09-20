@@ -82,14 +82,16 @@ def only(base_oid, mapping):
     """A fake _walk_column_detail (which _walk_column/_walk_column_status
     both funnel through) that answers `mapping` for exactly `base_oid` and
     {} for everything else -- most cases here need only one column."""
-    def fake(device, config, oid, raise_on_timeout=False, deadline=None):
+    def fake(device, config, oid, raise_on_timeout=False, deadline=None,
+             raw=False):
         return (dict(mapping) if oid == base_oid else {}), True, ""
     return fake
 
 
 def table_walker(columns: dict):
     """A fake _walk_column_detail dispatching on a {oid: {suffix: value}} map."""
-    def fake(device, config, oid, raise_on_timeout=False, deadline=None):
+    def fake(device, config, oid, raise_on_timeout=False, deadline=None,
+             raw=False):
         return dict(columns.get(oid, {})), True, ""
     return fake
 
@@ -318,7 +320,8 @@ poller14 = new_poller()
 walked14 = []
 
 
-def counting(device, config, oid, raise_on_timeout=False, deadline=None):
+def counting(device, config, oid, raise_on_timeout=False, deadline=None,
+             raw=False):
     walked14.append(oid)
     return ({"1": 40} if oid == t.value else {}), True, ""
 

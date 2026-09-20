@@ -1925,21 +1925,29 @@ end
           f"{status} {payload}")
 
     # ------------------------------------- D22 what a refusal will read and drop
-    def raw_exchange(request_bytes, timeout=2.0):
-        """(bytes received, whether the server closed the connection)."""
+    def raw_exchange(request_bytes, timeout=2.0, patience=1):
+        """(bytes received, whether the server closed the connection).
+
+        A single socket.timeout on recv() only means "no more bytes arrived
+        within `timeout`s" -- under load the server can still be a beat away
+        from actually closing, which used to be misread as "not closed".
+        `patience` retries an idle recv, rather than concluding the
+        connection is still open, before giving up."""
         sock = socket.create_connection(("127.0.0.1", PORT), timeout=timeout)
         try:
             sock.sendall(request_bytes)
-            chunks, closed = [], False
-            while True:
+            chunks, closed, idle = [], False, 0
+            while idle <= patience:
                 try:
                     piece = sock.recv(65536)
                 except (socket.timeout, TimeoutError, OSError):
-                    break
+                    idle += 1
+                    continue
                 if not piece:
                     closed = True
                     break
                 chunks.append(piece)
+                idle = 0
             return b"".join(chunks), closed
         finally:
             sock.close()
@@ -1954,7 +1962,7 @@ end
         b"POST /api/nodes/devices HTTP/1.1\r\nHost: 127.0.0.1\r\n"
         b"Cookie: %s\r\nContent-Type: text/plain\r\n"
         b"Content-Length: %d\r\n\r\n" % (admin_cookie.encode(), len(big))
-        + big)
+        + big, patience=4)
     check("D22 a refused request with a large body is answered and closed, "
           "not read to the end", b" 415 " in reply.split(b"\r\n")[0] and closed,
           (reply[:60], closed))
@@ -2399,13 +2407,20 @@ end
     held = [api_mod._LOGIN_SLOTS.acquire(timeout=5) for _ in range(4)]
     real_wait = api_mod.auth._LOGIN_SLOT_WAIT_S
     api_mod.auth._LOGIN_SLOT_WAIT_S = 0.1
+    real_acquire = api_mod._LOGIN_SLOTS.acquire
+    acquire_waits = []
+
+    def spy_acquire(*a, _real=real_acquire, **kw):
+        acquire_waits.append(kw.get("timeout", a[0] if a else None))
+        return _real(*a, **kw)
+
+    api_mod._LOGIN_SLOTS.acquire = spy_acquire
     try:
-        started = time.time()
         status, head, payload = req("POST", "/api/login",
                                     {"username": "walkreader",
                                      "password": "Corr3ct-Horse-Battery"})
-        elapsed = time.time() - started
     finally:
+        api_mod._LOGIN_SLOTS.acquire = real_acquire
         api_mod.auth._LOGIN_SLOT_WAIT_S = real_wait
         for got in held:
             if got:
@@ -2414,8 +2429,9 @@ end
           all(held) and status == 503, f"{status} {payload} held={held}")
     check("D30b …with a Retry-After the browser can act on",
           head.get("retry-after") == "2", head.get("retry-after"))
-    check("D30b …and it gave up after the bounded wait, not the scrypt's",
-          elapsed < 4.0, f"{elapsed:.2f}s")
+    check("D30b …and it gave up after the bounded wait, not the scrypt's "
+          "(observed via the timeout it asked the semaphore for)",
+          acquire_waits == [0.1], acquire_waits)
     check("D30b …and the slots are all free again afterwards",
           api_mod._LOGIN_SLOTS.acquire(blocking=False)
           and not api_mod._LOGIN_SLOTS.release(),

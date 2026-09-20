@@ -55,10 +55,11 @@ check("colon-separated six-byte hex text (the MAC-style special case) "
       _decode_port_list("00:00:00:00:00:80") == [41],
       _decode_port_list("00:00:00:00:00:80"))
 
-# ------------------- 1b. _decode_port_list through the real OCTET_STRING
-# pipeline (Finding 5, 4.54.0 review): trapdecode._octets_text is not
-# losslessly reversible, so these feed it the exact bytes a live walk would
-# and check what comes back out the other end, not bytes handed in directly.
+# ------------------- 1b. _decode_port_list through the text fallback.
+# trapdecode._octets_text is not losslessly reversible. Since 5.51.0 a live
+# PortList walk carries the wire bytes and never reaches this path (see 1c),
+# but a stub, an LLDP chassis id or a reply parsed without `raw` still does,
+# so the best-effort readings below are still the contract for those.
 check("a literal space byte (0x20) decodes to port 3, not an empty list "
      "(the old code's own .strip() used to throw this away)",
       _decode_port_list(_octets_text(bytes([0x20]))) == [3],
@@ -90,6 +91,27 @@ check("two literal-looking hex characters with no separating space keep "
      "_octets_from_value)",
       _decode_port_list(_octets_text(bytes([0x31, 0x32]))) == [4, 7],
       _decode_port_list(_octets_text(bytes([0x31, 0x32]))))
+
+# ------------------- 1c. the same bytes carried raw (5.51.0). The two
+# ambiguities 1b documents are not resolvable from the rendering; they do
+# not arise at all once the wire bytes travel with the varbind.
+check("raw 0x0A decodes to ports 5 and 7, not to port 3 the way the "
+     "rendering's collapse of 0x0A/0x0D/0x20 forces",
+      _decode_port_list(bytes([0x0A])) == [5, 7],
+      _decode_port_list(bytes([0x0A])))
+check("raw 0x20 still decodes to port 3",
+      _decode_port_list(bytes([0x20])) == [3],
+      _decode_port_list(bytes([0x20])))
+check("raw 0x31 0x32 decodes as two literal bytes and is no longer "
+     "confused with the single byte 0x12",
+      _decode_port_list(bytes([0x31, 0x32])) == [3, 4, 8, 11, 12, 15],
+      _decode_port_list(bytes([0x31, 0x32])))
+check("raw 0x12 keeps its own reading, distinct from the pair above",
+      _decode_port_list(bytes([0x12])) == [4, 7],
+      _decode_port_list(bytes([0x12])))
+check("raw 0x41 decodes to ports 2 and 8, matching the rendering path",
+      _decode_port_list(bytes([0x41])) == [2, 8],
+      _decode_port_list(bytes([0x41])))
 
 # --------------------------------------- 2. _decode_vlan_bitmap, all four bases
 # CISCO-VTP-MIB's own bitmap is 0-based (octet 0's MSB is VLAN 0), NOT a

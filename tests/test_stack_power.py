@@ -92,7 +92,8 @@ ST_NAME = nodeoids.CSW_STACK_POWER_NAME
 def table_walker(columns: dict, calls: list | None = None):
     """Stubs _walk_column_detail, which _walk_column/_walk_column_status
     both funnel through. Every OID answers complete."""
-    def fake(device, config, oid, raise_on_timeout=False, deadline=None):
+    def fake(device, config, oid, raise_on_timeout=False, deadline=None,
+             raw=False):
         if calls is not None:
             calls.append(oid)
         return dict(columns.get(oid, {})), True, ""

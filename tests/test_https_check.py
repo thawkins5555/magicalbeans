@@ -69,6 +69,12 @@ if not CERT:
     raise SystemExit(77)
 
 
+# Well past any timeout_s this suite asks httpcheck.check for, so the
+# "returned near the timeout" assertion below keeps a wide, load-tolerant
+# margin between the timeout and this without losing what it is pinning.
+SLOW_DELAY_S = 8.0
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -91,7 +97,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/broken":
             self._body(503, b"service unavailable")
         elif path == "/slow":
-            time.sleep(3.0)
+            time.sleep(SLOW_DELAY_S)
             self._body(200)
         elif path == "/big":
             self._body(200, b"x" * (httpcheck.MAX_BODY_BYTES * 2))
@@ -186,13 +192,15 @@ try:
         os.unlink(garbage.name)
 
     print("httpcheck.check: timeouts")
+    TIMEOUT_S = 0.75
     started = time.monotonic()
-    result = httpcheck.check(f"{BASE}/slow", timeout_s=0.75, insecure=True)
+    result = httpcheck.check(f"{BASE}/slow", timeout_s=TIMEOUT_S, insecure=True)
     elapsed = time.monotonic() - started
     check("a page slower than the timeout is unavailable, reason 'timeout'",
           not result.ok and result.error == "timeout", result)
-    check("...and the check returned near the timeout, not the page's own delay",
-          elapsed < 2.5, elapsed)
+    check("...and the check returned near the timeout it was actually given, "
+          "not the page's own delay",
+          elapsed < TIMEOUT_S + 3.0, elapsed)
 
     print("httpcheck.check: redirects")
     result = httpcheck.check(f"{BASE}/hop3", timeout_s=5.0, insecure=True)

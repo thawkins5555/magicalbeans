@@ -517,51 +517,61 @@ class SyslogDatabase(SqliteStore):
 
         with self._lock:
             # Collapsing is decided under the lock so two writers cannot bump
-            # the same row concurrently.
-            to_insert, bumps = self._collapse(entries)
-            rows = [(e.ts, e.source, e.host, e.facility, e.severity, e.app,
-                     e.procid, e.msgid, e.message, e.raw, holder[0])
-                    for e, holder in to_insert]
-            if bumps:
+            # the same row concurrently. A failure partway through leaves an
+            # open write transaction on this shared connection -- rolled back
+            # here rather than left for the next caller to inherit, the same
+            # guard snmptrapd's batch insert takes around its own executemany.
+            try:
+                to_insert, bumps = self._collapse(entries)
+                rows = [(e.ts, e.source, e.host, e.facility, e.severity, e.app,
+                         e.procid, e.msgid, e.message, e.raw, holder[0])
+                        for e, holder in to_insert]
+                if bumps:
+                    self._conn.executemany(
+                        "UPDATE logs SET repeat_count = repeat_count + 1"
+                        " WHERE id = ?", [(row_id,) for row_id in bumps])
+                if not rows:
+                    # The hourly timeline still counts every message that
+                    # arrived: a storm that collapses to one row is still a
+                    # storm.
+                    self._conn.executemany(
+                        "INSERT INTO log_counts(hour, severity, n) VALUES (?,?,?)"
+                        " ON CONFLICT(hour, severity) DO UPDATE SET n = n + excluded.n",
+                        [(hour, severity, n) for (hour, severity), n in counts.items()])
+                    self._conn.commit()
+                    return 0, total_in
                 self._conn.executemany(
-                    "UPDATE logs SET repeat_count = repeat_count + 1"
-                    " WHERE id = ?", [(row_id,) for row_id in bumps])
-            if not rows:
-                # The hourly timeline still counts every message that arrived:
-                # a storm that collapses to one row is still a storm.
+                    "INSERT INTO logs(ts, source, host, facility, severity, app,"
+                    " procid, msgid, message, raw, repeat_count)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    rows)
+                if self.fts:
+                    # executemany leaves cursor.lastrowid unset, so ask SQLite
+                    # directly; ids are contiguous because one thread writes.
+                    last_id = self._conn.execute(
+                        "SELECT last_insert_rowid()").fetchone()[0]
+                    first_id = last_id - len(rows) + 1
+                    self._conn.executemany(
+                        "INSERT INTO logs_fts(rowid, message, app, host, source)"
+                        " VALUES (?,?,?,?,?)",
+                        [(first_id + index, entry.message, entry.app, entry.host,
+                          entry.source)
+                         for index, (entry, _holder) in enumerate(to_insert)])
+                else:
+                    last_id = self._conn.execute(
+                        "SELECT last_insert_rowid()").fetchone()[0]
+                    first_id = last_id - len(rows) + 1
+                self._remember(first_id, to_insert)
                 self._conn.executemany(
                     "INSERT INTO log_counts(hour, severity, n) VALUES (?,?,?)"
                     " ON CONFLICT(hour, severity) DO UPDATE SET n = n + excluded.n",
                     [(hour, severity, n) for (hour, severity), n in counts.items()])
                 self._conn.commit()
-                return 0, total_in
-            self._conn.executemany(
-                "INSERT INTO logs(ts, source, host, facility, severity, app,"
-                " procid, msgid, message, raw, repeat_count)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                rows)
-            if self.fts:
-                # executemany leaves cursor.lastrowid unset, so ask SQLite
-                # directly; ids are contiguous because one thread writes.
-                last_id = self._conn.execute(
-                    "SELECT last_insert_rowid()").fetchone()[0]
-                first_id = last_id - len(rows) + 1
-                self._conn.executemany(
-                    "INSERT INTO logs_fts(rowid, message, app, host, source)"
-                    " VALUES (?,?,?,?,?)",
-                    [(first_id + index, entry.message, entry.app, entry.host,
-                      entry.source)
-                     for index, (entry, _holder) in enumerate(to_insert)])
-            else:
-                last_id = self._conn.execute(
-                    "SELECT last_insert_rowid()").fetchone()[0]
-                first_id = last_id - len(rows) + 1
-            self._remember(first_id, to_insert)
-            self._conn.executemany(
-                "INSERT INTO log_counts(hour, severity, n) VALUES (?,?,?)"
-                " ON CONFLICT(hour, severity) DO UPDATE SET n = n + excluded.n",
-                [(hour, severity, n) for (hour, severity), n in counts.items()])
-            self._conn.commit()
+            except Exception:
+                # Broad on purpose, the way snmptrapd's guard is: a poisoned
+                # row raises InterfaceError, which is not a DatabaseError.
+                self._conn.rollback()
+                raise
         return len(rows), total_in - len(rows)
 
     # ------------------------------------------------------------------ query

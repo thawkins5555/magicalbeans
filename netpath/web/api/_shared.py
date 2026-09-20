@@ -57,8 +57,8 @@ def _csv_response(module: str, header: list[str], rows, *, truncated: bool = Fal
                   cap: int | None = None) -> dict:
     """The one shape every export handler below returns. `cap` is the
     export ceiling that applied (None when the underlying query has none —
-    devices, interfaces, IPAM hosts, DHCP leases and wireless APs are none
-    of them capped even on screen, so their export is not capped either);
+    devices, interfaces and wireless APs are none of them capped even on
+    screen, so their export is not capped either);
     `truncated` is whether the result actually hit it, the same "there is
     more than this" signal the search screens already use for SEARCH_ROW_CAP."""
     rows = list(rows)
@@ -901,8 +901,8 @@ SEARCH_ROW_CAP = 2000
 
 # The on-screen search stays capped at SEARCH_ROW_CAP — a "do not try to
 # render this many table rows" limit, not a data limit. An export exists to
-# leave with more than a screen can hold, so both the syslog and SNMP trap
-# exports get this taller ceiling instead.
+# leave with more than a screen can hold, so the syslog, SNMP trap, IPAM
+# hosts and DHCP lease exports get this taller ceiling instead.
 EXPORT_ROW_CAP = 20000
 def _tri(value):
     """None/0/1 -> None/False/True. A device's own override columns are

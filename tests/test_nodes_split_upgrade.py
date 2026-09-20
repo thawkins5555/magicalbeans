@@ -311,6 +311,35 @@ check(":memory: opens with in-memory siblings and works",
       len(mem.metrics(mem_did)) == 1 and mem.series_db.path == ":memory:")
 mem.close()
 
+# ------------------------------- _attached detaches even when the INSERT
+# ------------------------------- inside it raises
+attach_dir = tmpdir("nodes_split_attach_")
+good_legacy = os.path.join(attach_dir, "good-legacy.db")
+build_legacy(good_legacy)
+bad_legacy = os.path.join(attach_dir, "bad-legacy.db")
+sqlite3.connect(bad_legacy).close()   # a real sqlite file with no tables at all
+
+target_dir = tmpdir("nodes_split_attach_target_")
+target = NodesDatabase(os.path.join(target_dir, "nodes.db"))
+try:
+    target.series_db.import_legacy_metrics(bad_legacy)
+    check("import_legacy_metrics against a legacy file missing its table raises",
+          False)
+except sqlite3.DatabaseError:
+    check("import_legacy_metrics against a legacy file missing its table raises",
+          True)
+attached = [row[1] for row in
+           target.series_db._conn.execute("PRAGMA database_list").fetchall()]
+check("_attached detaches even though the INSERT inside it raised",
+      "old" not in attached, attached)
+# A later _attached, against a real legacy file, must not fail with
+# "database old is already in use" -- the symptom of a DETACH skipped above.
+here, there = target.series_db.import_legacy_metrics(good_legacy)
+check("a following _attached entry succeeds rather than finding 'old' "
+     "already in use",
+      (here, there) == (3, 3), (here, there))
+target.close()
+
 # ------------------------------------------- the missing-rollup retry path
 retry_dir = tmpdir("nodes_split_retry_")
 retry_path = os.path.join(retry_dir, "nodes.db")

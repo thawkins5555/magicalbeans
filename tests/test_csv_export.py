@@ -305,6 +305,8 @@ try:
     status, hosts_export = call("GET", "/api/ipam/hosts/export.csv", token=admin)
     check("ipam hosts export answers 200 and sees the inserted host",
           status == 200 and hosts_export.get("count", 0) >= 1, (status, hosts_export))
+    check("ipam hosts export is not marked truncated (comfortably under its cap)",
+          hosts_export.get("truncated") is False, hosts_export)
 
     dhcp_server_id = service.ipam_db.add_dhcp_server("10.9.9.5", "test-dhcp")
     service.ipam_db.replace_dhcp_leases(
@@ -313,6 +315,48 @@ try:
     status, leases_export = call("GET", "/api/ipam/dhcp/leases/export.csv", token=admin)
     check("dhcp leases export answers 200 and sees the inserted lease",
           status == 200 and leases_export.get("count", 0) >= 1, (status, leases_export))
+    check("dhcp leases export is not marked truncated (comfortably under its cap)",
+          leases_export.get("truncated") is False, leases_export)
+
+    # IPAM hosts/leases are capped at EXPORT_ROW_CAP (20000) the same way
+    # syslog/traps/alerts are above -- past it, the export must return
+    # exactly the cap and say so, not silently drop the rest while claiming
+    # untruncated.
+    print("ipam hosts + dhcp leases export past EXPORT_ROW_CAP")
+    EXPORT_ROW_CAP = 20000
+    HOST_N = EXPORT_ROW_CAP + 1
+    with service.ipam_db._lock:
+        service.ipam_db._conn.executemany(
+            "INSERT INTO hosts(ip, subnet_id, mac, alive, first_seen, last_seen)"
+            " VALUES (?,NULL,NULL,0,?,?)",
+            [(f"10.{(i >> 16) & 255}.{(i >> 8) & 255}.{i & 255}", time.time(), time.time())
+             for i in range(1, HOST_N + 1)])
+        service.ipam_db._conn.commit()
+    status, bulk_hosts = call("GET", "/api/ipam/hosts/export.csv", token=admin)
+    check("ipam hosts export answers 200 for the bulk fixture",
+          status == 200, (status, bulk_hosts))
+    check(f"ipam hosts export is capped at EXPORT_ROW_CAP, not all {HOST_N} rows",
+          bulk_hosts.get("count") == EXPORT_ROW_CAP, bulk_hosts.get("count"))
+    check("ipam hosts export reports truncated once past the cap",
+          bulk_hosts.get("truncated") is True, bulk_hosts)
+    check("ipam hosts export cap is EXPORT_ROW_CAP (20000)",
+          bulk_hosts.get("cap") == EXPORT_ROW_CAP, bulk_hosts.get("cap"))
+
+    LEASE_N = EXPORT_ROW_CAP + 1
+    service.ipam_db.replace_dhcp_leases(
+        dhcp_server_id,
+        [{"ip": f"10.{(i >> 16) & 255}.{(i >> 8) & 255}.{i & 255}",
+          "mac": "11:22:33:44:55:66", "hostname": f"host-{i}", "scope_id": "s1"}
+         for i in range(1, LEASE_N + 1)])
+    status, bulk_leases = call("GET", "/api/ipam/dhcp/leases/export.csv", token=admin)
+    check("dhcp leases export answers 200 for the bulk fixture",
+          status == 200, (status, bulk_leases))
+    check(f"dhcp leases export is capped at EXPORT_ROW_CAP, not all {LEASE_N} rows",
+          bulk_leases.get("count") == EXPORT_ROW_CAP, bulk_leases.get("count"))
+    check("dhcp leases export reports truncated once past the cap",
+          bulk_leases.get("truncated") is True, bulk_leases)
+    check("dhcp leases export cap is EXPORT_ROW_CAP (20000)",
+          bulk_leases.get("cap") == EXPORT_ROW_CAP, bulk_leases.get("cap"))
 
     # ------------------------------------------------------- wireless
     print("wireless aps export")

@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.51.0 — Loopback tunnel guard, TACACS+ auto-create role cleanup, and SNMP decode correctness](#5510--loopback-tunnel-guard-tacacs-auto-create-role-cleanup-and-snmp-decode-correctness)
 - [5.50.0 — Spanning-tree polling cadence; no samples for down ports](#5500--spanning-tree-polling-cadence-no-samples-for-down-ports)
 - [5.49.0 — Low-risk poll and API performance](#5490--low-risk-poll-and-api-performance)
 - [5.48.0 — First-run administrator password; low-severity fixes](#5480--first-run-administrator-password-low-severity-fixes)
@@ -183,6 +184,70 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.51.0 — Loopback tunnel guard, TACACS+ auto-create role cleanup, and SNMP decode correctness
+
+Follows the same internal review behind 5.47.0, 5.49.0 and 5.50.0; the fix
+set below is what the operator approved out of it. As with 5.47.0, the
+review's own findings stay off this public repository — only their effect
+on the operator is described here.
+
+**Operator-visible**
+
+1. **The WEB relay and SSH terminal now also refuse a loopback target
+   sitting on the server's own web port or inside its configured relay
+   port range.** 5.48.0 already closed off unspecified, link-local,
+   multicast and broadcast destinations for both; this closes the one gap
+   loopback left open — a device-facing tunnel pointed back at the
+   application's own web port or its relay range. Every other loopback
+   target (the demo fleet, and a device that legitimately proxies back to
+   itself) is unaffected.
+2. **`admin` is withdrawn as a choice for the TACACS+ auto-create default
+   role.** Under Settings → Sign-in → AAA (TACACS+), the **Default role**
+   dropdown now offers **Viewer** and **Operator** only, and saving AAA
+   settings with `admin` set is refused. **Upgrade note, act on this:** a
+   site whose stored default role is `admin` keeps that stored value until
+   someone re-saves the form, and auto-create is now **refused** while it
+   is set — an unknown TACACS+ username gets "Sign-in is misconfigured"
+   and no account, with the reason in the event log. The dropdown shows
+   **Viewer** on load; open Settings → Sign-in → AAA (TACACS+), pick
+   Viewer or Operator and save to restore auto-create. Existing accounts,
+   including ones TACACS+ auto-created earlier, sign in as before and keep
+   the permissions they have; the separate **Admin** preset
+   in the user-permission editor (Settings → Users) is unaffected — this
+   only withdraws `admin` as the *auto-create* default.
+3. **SNMP interface/ARP hardware addresses and VLAN data now decode
+   correctly in a case that used to fail.** The poller used to re-derive a
+   binary column's value from its printed text form; it now carries the
+   raw bytes forward for interface and ARP hardware addresses, VLAN port
+   lists, and per-trunk VLAN bitmaps. The old text-then-reparse path lost
+   information for a hardware address whose six raw bytes all happened to
+   print as ordinary text — it showed up on screen as that text instead of
+   as a MAC address — and could turn a VLAN port list into the wrong
+   ports. Both now read correctly. No action needed: every affected value
+   corrects itself the next time that device is polled.
+4. **The Mapper no longer redraws its canvas on a poll that came back with
+   exactly the same data it already had.** A drag in progress now survives
+   an automatic refresh instead of being interrupted mid-move. Switching
+   light/dark theme still forces a redraw, so the canvas still picks up
+   the new theme's colours even though most refreshes are now skipped.
+5. **The IPAM Hosts and DHCP Leases CSV exports are now capped at 20,000
+   rows**, the ceiling the Syslog and SNMP Trap exports already carry, and
+   say on the export when they've hit it. They took no ceiling before, and
+   on a large swept space or DHCP estate that made the export the largest
+   single response the server would build.
+
+**Correctness / robustness** (no operator action needed)
+
+6. A failed batch write to the syslog store now rolls back cleanly instead
+   of leaving a half-applied transaction behind for the next write to
+   silently inherit and commit alongside its own rows — a state that could
+   leave the Syslog overview's hourly counts under-reporting against what
+   the message table itself holds.
+7. The one-time database upgrade that runs the first time NetPath starts
+   against an older nodes database now rolls back a failed batch before
+   detaching the old database, so a failure partway through can no longer
+   leave the old database still attached afterward.
 
 ### 5.50.0 — Spanning-tree polling cadence; no samples for down ports
 

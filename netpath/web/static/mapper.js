@@ -418,6 +418,9 @@
     const select = App.el('mp-map');
     if (select.value !== String(id ?? '')) select.value = String(id ?? '');
     if (!opts.keepView) {
+      // The reset below changes what draw() would paint even when the payload
+      // is identical, so the skip must not apply to this load.
+      lastMapPayloadJson = null;
       view.needsFit = true;
       view.pan = { x: 0, y: 0 };
       view.selection.clear();
@@ -533,9 +536,16 @@
     }
   }
 
+  // Fingerprint of the last drawn payload's body: a poll that comes back
+  // byte-for-byte the same has nothing to redraw, so draw()/drawDetail()/
+  // drawVlanTable()/drawLegend() are skipped and the in-flight drag (if any)
+  // that draw() would otherwise cancel survives the poll.
+  let lastMapPayloadJson = null;
+
   async function loadMapData() {
     const generation = ++view.loadGen;
     if (view.mapId === null) {
+      lastMapPayloadJson = null;
       view.map = null; view.nodes = []; view.links = []; view.peersByKey = new Map(); view.vlans = [];
       view.frames = []; view.notes = [];
       rebuildLookups();
@@ -545,6 +555,9 @@
     }
     const payload = await App.get(`/api/mapper/maps/${view.mapId}`);
     if (view.loadGen !== generation) return;   // a newer selectMap/refresh already superseded this
+    const payloadJson = JSON.stringify(payload);
+    const unchanged = payloadJson === lastMapPayloadJson;
+    lastMapPayloadJson = payloadJson;
     view.map = payload.map;
     view.nodes = payload.nodes || [];
     view.links = payload.links || [];
@@ -572,6 +585,7 @@
     App.el('mp-map-name').textContent = view.map ? view.map.name : '';
     App.el('mp-snap').checked = !!view.settings.snap_to_grid;
     drawStatus();
+    if (unchanged) return;
     draw();
     drawDetail();
     drawVlanTable();
@@ -3924,6 +3938,10 @@
         if (App.state.tab === 'mapper' && !gestureActive()) requestDraw();
       });
     }
+    // app.js dispatches this on a theme switch; with loadMapData now
+    // skipping the redraw on an unchanged payload, this is the only path
+    // left that picks up the new font on the canvas.
+    window.addEventListener('theme-changed', () => requestDraw());
   }
 
   /* #/mapper/<mapId>: deliverRoute (app.js) awaits refreshNow('mapper')

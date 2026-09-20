@@ -566,14 +566,14 @@ def _octets_from_value(raw) -> bytes:
     printable (that decoder's MAC-address special case), or space-separated
     uppercase hex otherwise.
 
-    That decode is NOT losslessly reversible, despite this file previously
-    documenting it as such, and this function cannot make it so — the raw
-    octets are gone before it is ever called. `trapdecode._decode_value`
-    returns an OCTET STRING's printable rendering as the value itself, so
-    the bytes are discarded at BER-parse time; recovering them would mean
-    re-implementing v1/v2c/v3 parsing here. INTERNALS.md records this as a
-    known limit of the whole SNMP path — the LLDP chassis-id decode has it
-    too — rather than of this function alone.
+    That decode is NOT losslessly reversible, and this function cannot make
+    it so. As of 5.51.0 it does not have to for the binary columns: varbinds
+    carry the wire bytes alongside the rendering (snmppoll._read_varbinds),
+    and the PortList, VTP-bitmap and PhysAddress walks ask for them, so
+    those reach the `isinstance(bytes)` branch below and the guesswork never
+    runs. The text branch remains for callers and stubs that hold only a
+    rendering, and for the paths still on it — the LLDP chassis-id decode
+    among them. INTERNALS.md records which those are.
 
     What this DOES do is narrow the guess to the shapes `_octets_text`
     provably produces — its six-group lowercase colon-hex MAC form, or a

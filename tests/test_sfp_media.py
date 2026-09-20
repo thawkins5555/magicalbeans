@@ -437,7 +437,8 @@ poller = NodePoller(db)
 walked: list = []
 
 
-def empty_complete_walk(device, config, oid, raise_on_timeout=False, deadline=None):
+def empty_complete_walk(device, config, oid, raise_on_timeout=False, deadline=None,
+                        raw=False):
     walked.append(oid)
     return {}, True, ""
 

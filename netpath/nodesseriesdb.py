@@ -1113,6 +1113,13 @@ class NodesSeriesDatabase(SqliteStore):
                 return store._conn
 
             def __exit__(self, *exc):
+                # A raised INSERT leaves a write transaction open, which
+                # DETACH then refuses; guarded separately so a failing
+                # rollback cannot skip the DETACH.
+                try:
+                    store._conn.rollback()
+                except Exception:
+                    pass
                 try:
                     store._conn.execute("DETACH DATABASE old")
                 except sqlite3.DatabaseError:

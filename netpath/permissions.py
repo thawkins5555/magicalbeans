@@ -72,6 +72,13 @@ class Forbidden(PermissionError):
     """
 
 
+# What TACACS+ auto-create may grant. `admin` was withdrawn in 5.51.0: an
+# unknown username arriving from the AAA server must not be able to become an
+# administrator. role_grants itself still knows `admin` -- a local account's
+# permission editor offers it.
+AUTO_CREATE_ROLES = ("viewer", "operator")
+
+
 def role_grants(name: str) -> dict:
     """Permission grid a TACACS+ auto-created account starts with; mirrors settings.js's ROLE_PRESETS."""
     if name == "viewer":

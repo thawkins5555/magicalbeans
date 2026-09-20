@@ -900,6 +900,31 @@ def test_c7_syslog_robustness() -> None:
     # A different source in between must not break the run.
     syslog_db.close()
 
+    # --- a failed batch rolls back, the way the trap side's _insert_batch --
+    # --- guards its own executemany (test_r5_v1_oversized_integer_clamped_ -
+    # --- and_batch_survives in test_collector_errors.py) -------------------
+    syslog_db = SyslogDatabase(db_path("c7-rollback.db"))
+    poisoned = [LogEntry(ts=base, source="10.7.7.7", severity=3, message="ok"),
+               LogEntry(ts=base + 1, source="10.7.7.7", severity=3,
+                        message=object())]     # a type sqlite3 cannot bind
+    try:
+        syslog_db.insert(poisoned)
+        check(False, "a batch sqlite cannot bind should raise, not succeed")
+    except Exception:
+        pass
+    check(syslog_db._conn.in_transaction is False,
+          "a failed insert() leaves the connection out of a transaction, "
+          "not mid-transaction for the next caller to inherit")
+    check(syslog_db.max_id() == 0,
+          "...and none of the failed batch reached the table")
+    stored, collapsed = syslog_db.insert(
+        [LogEntry(ts=base + 2, source="10.7.7.7", severity=3, message="fresh")])
+    check(stored == 1 and collapsed == 0,
+          f"the next successful insert stores only its own row ({stored}, {collapsed})")
+    check(syslog_db.max_id() == 1,
+          "...not any row from the failed batch")
+    syslog_db.close()
+
     # --- the per-source token bucket --------------------------------------
     syslog_db = SyslogDatabase(db_path("c7-rate.db"))
     syslog = SyslogCollector(syslog_db)

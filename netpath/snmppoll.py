@@ -332,6 +332,7 @@ def _read_varbinds(data: bytes, start: int, end: int) -> list[dict]:
         except BerError:
             break
         pair = Reader(data, bs, be)
+        raw = None
         try:
             os_, oe = pair.expect(T_OID)
             oid = _oid(data, os_, oe)
@@ -340,9 +341,14 @@ def _read_varbinds(data: bytes, start: int, end: int) -> list[dict]:
             else:
                 tag, vs, ve = pair.read_tlv()
                 kind, text, value = _decode_value(data, tag, vs, ve, 4096)
+                if tag == T_OCTET_STRING:
+                    raw = data[vs:ve]
         except BerError:
             continue
-        out.append({"oid": oid, "type": kind, "value": value, "text": text})
+        # `value` is _octets_text's rendering, which is not reversible; the
+        # binary columns read `raw` instead.
+        out.append({"oid": oid, "type": kind, "value": value, "text": text,
+                    "raw": raw})
     return out
 
 

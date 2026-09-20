@@ -9,7 +9,7 @@ from ... import namelookup
 from ...ipamdb import mac_search_digits, scope_size
 from ...eventlog import IPAM as IPAM_CATEGORY
 
-from ._shared import _audit, _audit_diff, _clear_credential, _csv_response, _encrypt_secret, _pick, _require, _window
+from ._shared import EXPORT_ROW_CAP, _audit, _audit_diff, _clear_credential, _csv_response, _encrypt_secret, _pick, _require, _window
 
 
 # ---------------------------------------------------------------------- ipam
@@ -233,11 +233,14 @@ def get_ipam_hosts_export(service, params, body) -> dict:
     hosts = get_ipam_hosts(service, params, body)["hosts"]
     if params.get("alive_only") is not None:
         hosts = [h for h in hosts if h["alive"]]
+    truncated = len(hosts) > EXPORT_ROW_CAP
+    hosts = hosts[:EXPORT_ROW_CAP]
     header = ["ip", "mac", "alive", "hostname", "subnet_label",
              "first_seen", "last_seen", "last_up",
              "seen_source", "seen_detail", "switch_port", "dhcp"]
     csv_rows = [[h.get(key) for key in header] for h in hosts]
-    return _csv_response("ipam-hosts", header, csv_rows)
+    return _csv_response("ipam-hosts", header, csv_rows, truncated=truncated,
+                         cap=EXPORT_ROW_CAP)
 
 
 def get_ipam_conflicts(service, params, body) -> dict:
@@ -486,11 +489,14 @@ def get_ipam_dhcp_leases(service, params, body) -> dict:
 
 def get_ipam_dhcp_leases_export(service, params, body) -> dict:
     leases = get_ipam_dhcp_leases(service, params, body)["leases"]
+    truncated = len(leases) > EXPORT_ROW_CAP
+    leases = leases[:EXPORT_ROW_CAP]
     header = ["server_label", "scope_id", "ip", "mac", "hostname",
              "address_state", "lease_expires", "is_reservation",
              "in_use_only", "seen_detail", "description", "polled"]
     csv_rows = [[lease.get(key) for key in header] for lease in leases]
-    return _csv_response("ipam-dhcp-leases", header, csv_rows)
+    return _csv_response("ipam-dhcp-leases", header, csv_rows, truncated=truncated,
+                         cap=EXPORT_ROW_CAP)
 
 
 def get_ipam_dhcp_scope_history(service, params, body) -> dict:

@@ -83,7 +83,8 @@ def table_walker(columns: dict):
     """Stubs _walk_column_detail, which _walk_column/_walk_column_status
     both funnel through (the tests/test_poller_behaviour.py convention),
     so both wrappers see the same fake table. Every OID answers complete."""
-    def fake(device, config, oid, raise_on_timeout=False, deadline=None):
+    def fake(device, config, oid, raise_on_timeout=False, deadline=None,
+             raw=False):
         return dict(columns.get(oid, {})), True, ""
     return fake
 
@@ -230,7 +231,8 @@ check("a device answering neither table is latched incapable, once",
 def recording_walker(columns: dict, calls: list):
     """Same _walk_column_detail stub shape as table_walker, plus a record
     of every OID asked for."""
-    def fake(device, config, oid, raise_on_timeout=False, deadline=None):
+    def fake(device, config, oid, raise_on_timeout=False, deadline=None,
+             raw=False):
         calls.append(oid)
         return dict(columns.get(oid, {})), True, ""
     return fake
@@ -404,7 +406,8 @@ dev_ctx = device(CISCO_OID, id=25)
 poller_ctx._poll_vendor_sensors(25, dev_ctx, CONFIG, 1_700_000_000.0)
 
 
-def fake_class_timeout(device, config, oid, raise_on_timeout=False, deadline=None):
+def fake_class_timeout(device, config, oid, raise_on_timeout=False, deadline=None,
+                       raw=False):
     if oid == fru.class_col:
         return {}, False, "cut short"
     return dict(ctx_cols.get(oid, {})), True, ""
@@ -436,7 +439,8 @@ poller_pcache._poll_vendor_sensors(26, dev_pcache, CONFIG, 1_700_000_000.0)
 poller_pcache._vendor_psu_static.pop((26, fru.state), None)
 
 
-def one_of_two_class_rows(device, config, oid, raise_on_timeout=False, deadline=None):
+def one_of_two_class_rows(device, config, oid, raise_on_timeout=False, deadline=None,
+                          raw=False):
     if oid == fru.class_col:
         return {"10": 6}, False, "cut short"   # only 1 of 2 rows reached
     return dict(pcache_cols.get(oid, {})), True, ""

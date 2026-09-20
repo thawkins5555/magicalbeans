@@ -108,6 +108,27 @@ def test_counter_rate_caps_error_discard_reset_spikes():
           f"against the absolute ceiling ({no_speed_rate})")
 
 
+def test_read_varbinds_raw_octets_do_not_leak_across_varbinds():
+    """_read_varbinds puts `raw` on every varbind: the wire bytes for an
+    OCTET STRING, None for anything else -- and `raw` is reset per varbind,
+    so an OCTET STRING is never left over on the INTEGER that follows it in
+    the same response."""
+    octets = bytes([0x02, 0x00, 0x00, 0x00, 0x00, 0x2a])
+    body = (enc_varbind("1.3.6.1.2.1.1.1.0", enc_octets(octets)) +
+           enc_varbind("1.3.6.1.2.1.1.3.0", enc_int(42)))
+    pdu = _tlv(PDU_RESPONSE, enc_int(1) + enc_int(0) + enc_int(0) +
+              _tlv(T_SEQUENCE, body))
+    packet = _tlv(T_SEQUENCE, enc_int(1) + enc_octets("public") + pdu)
+    reply = decode_response(packet)
+
+    check(reply.varbinds[0]["type"] == "STRING" and reply.varbinds[0]["raw"] == octets,
+          f"an OCTET STRING varbind's raw is the exact wire bytes "
+          f"({reply.varbinds[0]})")
+    check(reply.varbinds[1]["type"] == "INTEGER" and reply.varbinds[1]["raw"] is None,
+          f"...and the INTEGER varbind right after it has raw=None, not the "
+          f"previous varbind's octets leaking onto it ({reply.varbinds[1]})")
+
+
 # ------------------------------------------------------- in-process stub agent
 
 class _OneInterfaceAgent:
@@ -494,6 +515,8 @@ class _ReassignableInterfaceAgent:
         if oid == f"{IF['if_oper_status']}.1":
             return enc_int(1 if self.if_oper == "up" else 2)
         if oid == f"{IF['if_phys_addr']}.1":
+            if self.if_phys_addr is None:
+                return _tlv(T_NO_SUCH_INSTANCE, b"")
             return enc_octets(self.if_phys_addr)
         if oid == f"{IF['if_speed']}.1":
             return enc_unsigned(T_GAUGE32, 1_000_000_000)
@@ -635,6 +658,52 @@ def test_link_down_recorded_without_reboot():
               f"poll 2: ordinary up -> down (no reboot) still records "
               f"link_down -- the identity gate hasn't broken the everyday "
               f"path (got {kinds})")
+    finally:
+        agent.stop()
+        db.close()
+
+
+def test_mac_rendering_from_raw_octets():
+    """identify_mixin._mac() reads ifPhysAddress from the varbind's raw
+    wire bytes rather than _octets_text's rendering: a genuine six-byte
+    value renders as lowercase colon hex, anything else falls back to the
+    rendering _val would have used, and an OID that did not answer at all
+    gives ''."""
+    agent, db, poller, device_id = _setup_reassignable_device(
+        "poller_review_mac_", "mac-stub")
+    try:
+        # The case the whole change exists for: six bytes that all happen to
+        # be printable. _octets_text renders these as the text "ABCDEF", so
+        # the old rendering-derived path stored that instead of an address.
+        # A revert fails here and nowhere else.
+        agent.if_phys_addr = bytes([0x41, 0x42, 0x43, 0x44, 0x45, 0x46])
+        _poll_once(poller, db, device_id)
+        ifaces = {row["if_index"]: row for row in db.interfaces(device_id)}
+        check(ifaces[1]["phys_addr"] == "41:42:43:44:45:46",
+              f"six printable bytes render as an address, not as their text "
+              f"({ifaces[1]['phys_addr']!r})")
+
+        agent.if_phys_addr = bytes([0x02, 0x00, 0x00, 0x00, 0x00, 0x2a])
+        _poll_once(poller, db, device_id)
+        ifaces = {row["if_index"]: row for row in db.interfaces(device_id)}
+        check(ifaces[1]["phys_addr"] == "02:00:00:00:00:2a",
+              f"a six-byte value renders as lowercase colon hex "
+              f"({ifaces[1]['phys_addr']!r})")
+
+        agent.if_phys_addr = bytes([0x02, 0x00, 0x00, 0x00, 0x00])  # 5 bytes
+        _poll_once(poller, db, device_id)
+        ifaces = {row["if_index"]: row for row in db.interfaces(device_id)}
+        check(ifaces[1]["phys_addr"] == "02 00 00 00 00",
+              f"a value that is not six bytes falls back to the previous "
+              f"(space-separated upper-hex) rendering "
+              f"({ifaces[1]['phys_addr']!r})")
+
+        agent.if_phys_addr = None    # answers noSuchInstance
+        _poll_once(poller, db, device_id)
+        ifaces = {row["if_index"]: row for row in db.interfaces(device_id)}
+        check(ifaces[1]["phys_addr"] == "",
+              f"a missing/noSuchInstance varbind gives '' "
+              f"({ifaces[1]['phys_addr']!r})")
     finally:
         agent.stop()
         db.close()
@@ -1004,6 +1073,57 @@ def test_a_column_walk_is_bounded_by_bytes_not_only_rows():
         agent.stop()
 
 
+def test_a_column_walk_raw_hits_the_byte_cap_at_the_same_point():
+    """The retained-bytes budget is charged on the rendering (see the
+    `retained +=` line in _walk_column_detail), not on the raw bytes
+    raw=True stores instead of it -- so this must trip the byte cap at the
+    same row count as test_a_column_walk_is_bounded_by_bytes_not_only_rows
+    above, not three times later just because raw octets are a third the
+    size of their rendering."""
+    agent = _BigColumnAgent(value_bytes=60_000)
+    agent.start()
+    db, poller, device = _walk_device("poller_review_rawbytecap_", agent.port)
+    try:
+        db.save_settings({**db.settings(), "snmp_walk_max_rows": 200})
+        rendered, complete_r, reason_r = poller._walk_column_detail(
+            device, db.effective_config(device), agent.BASE)
+        raw_values, complete_raw, reason_raw = poller._walk_column_detail(
+            device, db.effective_config(device), agent.BASE, raw=True)
+        check(complete_raw is False and "byte" in reason_raw,
+              f"raw=True still stops at the byte cap, not the row cap "
+              f"({reason_raw!r})")
+        check(len(raw_values) == len(rendered),
+              f"...at the same row count as raw=False ({len(raw_values)} vs "
+              f"{len(rendered)})")
+        check(all(v == agent.value for v in raw_values.values()),
+              "...retaining the raw wire bytes, not the rendering")
+    finally:
+        db.close()
+        agent.stop()
+
+
+def test_walk_column_detail_raw_stores_bytes_not_the_rendering():
+    """raw=True stores the wire bytes; the default raw=False still stores
+    _octets_text's rendering -- pinned against the same stub data (one
+    small non-printable octet string, well under either cap)."""
+    agent = _BigColumnAgent(value_bytes=8)
+    agent.start()
+    db, poller, device = _walk_device("poller_review_rawwalk_", agent.port)
+    try:
+        db.save_settings({**db.settings(), "snmp_walk_max_rows": 5})
+        rendered, _, _ = poller._walk_column_detail(
+            device, db.effective_config(device), agent.BASE)
+        raw_values, _, _ = poller._walk_column_detail(
+            device, db.effective_config(device), agent.BASE, raw=True)
+        check(len(rendered) == 5 and all(isinstance(v, str) for v in rendered.values()),
+              f"raw=False (default) still stores the rendering ({rendered})")
+        check(len(raw_values) == 5 and all(v == agent.value for v in raw_values.values()),
+              f"raw=True stores the exact wire bytes instead ({raw_values})")
+    finally:
+        db.close()
+        agent.stop()
+
+
 def test_a_column_walk_has_a_deadline_even_when_the_caller_gives_none():
     """Of the ~30 column walks a full poll makes, two passed a deadline. An
     agent that answers each request just inside its timeout could hold a
@@ -1136,7 +1256,8 @@ def test_an_unencodable_oid_does_not_freeze_the_device():
 
 def _stub_columns(poller, answers: dict, seen: list):
     """Drives every column walk from a table of base OID -> (values, complete); stubs _walk_column_detail, which both _walk_column and _walk_column_status funnel through."""
-    def detail(device, config, base_oid, raise_on_timeout=False, deadline=None):
+    def detail(device, config, base_oid, raise_on_timeout=False, deadline=None,
+               raw=False):
         seen.append((base_oid, deadline))
         values, complete = answers.get(base_oid, ({}, True))
         return dict(values), complete, "" if complete else "cut short"
@@ -1854,6 +1975,7 @@ def test_a_refused_community_is_not_printed():
 def main():
     test_counter_rate_width_matters()
     test_counter_rate_caps_error_discard_reset_spikes()
+    test_read_varbinds_raw_octets_do_not_leak_across_varbinds()
     test_format_ticks_divides_by_a_hundred()
     test_reboot_note_is_human_units()
     test_reboot_uptimes_refuses_the_legacy_sentence()
@@ -1863,10 +1985,13 @@ def main():
     test_link_down_recorded_after_reboot_when_identity_unchanged()
     test_link_down_suppressed_after_reboot_when_identity_changed()
     test_link_down_recorded_without_reboot()
+    test_mac_rendering_from_raw_octets()
     test_fortipoll_walk_terminates_on_stuck_oid()
     test_fortipoll_walk_hits_row_cap()
     test_interface_cap_is_a_note_not_an_error()
     test_a_column_walk_is_bounded_by_bytes_not_only_rows()
+    test_a_column_walk_raw_hits_the_byte_cap_at_the_same_point()
+    test_walk_column_detail_raw_stores_bytes_not_the_rendering()
     test_a_column_walk_has_a_deadline_even_when_the_caller_gives_none()
     test_the_interface_read_opens_one_socket_and_decrypts_once()
     test_an_unencodable_oid_does_not_freeze_the_device()

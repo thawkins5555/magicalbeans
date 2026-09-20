@@ -144,12 +144,18 @@ def post_login(service, params, body) -> dict:
             # the timing a dummy hash exists to flatten.
             role = str(service.settings.get("tacacs_default_role", "viewer"))
             try:
+                if role not in _permissions.AUTO_CREATE_ROLES:
+                    # Saving it is refused, but a value stored before 5.51.0
+                    # is still in the settings row until someone re-saves.
+                    raise ValueError(
+                        "auto-create may grant only "
+                        + " or ".join(_permissions.AUTO_CREATE_ROLES))
                 grants = _permissions.role_grants(role)
             except ValueError as exc:
                 service.log.add(
                     ERROR_CATEGORY,
                     f"Refused auto-create for {label}: tacacs_default_role "
-                    f"{role!r} is not a known role: {exc}")
+                    f"{role!r} cannot be granted -- {exc}")
                 raise PermissionError(
                     "Sign-in is misconfigured. Contact an administrator."
                 ) from exc

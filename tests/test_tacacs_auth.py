@@ -587,6 +587,13 @@ try:
             token=admin_cookie)
         check("an unknown tacacs_default_role is refused (400) at save time",
               status == 400, f"{status} {payload}")
+        status, payload, _h = call(
+            "POST", "/api/settings",
+            {"scope": "global", "values": {"tacacs_default_role": "admin"}},
+            token=admin_cookie)
+        check("tacacs_default_role of admin specifically is refused (400) "
+              "at save time, withdrawn from auto-create in 5.51.0",
+              status == 400, f"{status} {payload}")
 
         status, payload, _h = call(
             "POST", "/api/users",
@@ -696,6 +703,17 @@ try:
         check("an unknown username that FAILs is not created",
               status == 401 and service.app_db.user("nosuchperson") is None,
               f"{status} {payload}")
+
+        status, payload, _h = enable_tacacs(auto_srv, auto_create=True,
+                                            default_role="viewer")
+        check("setup: default_role switched to viewer",
+              status == 200, f"{status} {payload}")
+        newgal_cookie, status, payload = login("newgal", "correct-horse")
+        check("auto-create with default_role viewer also succeeds",
+              status == 200 and bool(newgal_cookie), f"{status} {payload}")
+        grants = service.app_db.permissions_for("newgal")
+        check("…and the viewer role's grants",
+              grants == permissions.role_grants("viewer"), grants)
 
         print("auto-create off: an unknown username gets the plain 401")
         status, payload, _h = enable_tacacs(auto_srv, auto_create=False)
@@ -879,6 +897,24 @@ try:
          "not a 500", status == 401, f"{status} {payload}")
     check("...and no half-created account is left behind",
           service.app_db.user("roleprobe") is None)
+
+    # admin is a real role name (role_grants knows it) but was withdrawn
+    # from auto-create in 5.51.0 -- a pre-5.51.0 install could still hold
+    # it stored, the way apply_global_settings bypasses the save-time check
+    # here to simulate.
+    service.apply_global_settings({"tacacs_default_role": "admin"})
+    status, payload, _h = call(
+        "POST", "/api/login", {"username": "adminprobe", "password": "whatever"})
+    check("a stored tacacs_default_role of admin is refused (401), not "
+         "honoured as a real role", status == 401, f"{status} {payload}")
+    check("...with the misconfigured-signin message",
+          "misconfigured" in str(payload.get("error", "")).lower(), payload)
+    check("...and no account was created",
+          service.app_db.user("adminprobe") is None)
+    log_messages = [e.message for e in service.log.all()]
+    check("...and the refusal reaches the event log",
+          any("adminprobe" in m and "tacacs_default_role" in m
+              for m in log_messages), log_messages[-5:])
     service.apply_global_settings({"tacacs_default_role": "viewer"})
 
     service.apply_global_settings({"tacacs_secret_enc": "not valid base64 at all!!"})

@@ -3246,6 +3246,22 @@ check("tacacs_secret_set" in SETTINGS66,
       "ever painting a saved secret into the field")
 check("AUTH_SOURCE_LABEL" in SETTINGS66 and "scope=\"col\">Source<" in SETTINGS66,
       "the users table gets a Source column naming local/LDAP/TACACS+")
+check("['viewer', 'operator'].includes(s.tacacs_default_role)\n"
+      "        ? s.tacacs_default_role : 'viewer'" in SETTINGS66,
+      "a stored tacacs_default_role of anything but viewer/operator (admin, "
+      "withdrawn in 5.51.0, or garbage) falls back to viewer in the select, "
+      "not painted in as-is")
+TACACS_ROLE_SELECT = re.search(
+    r'<select id="set-tacacs-role">.*?</select>', INDEX66, re.S).group(0)
+check(TACACS_ROLE_SELECT.count("<option") == 2
+      and 'value="viewer"' in TACACS_ROLE_SELECT
+      and 'value="operator"' in TACACS_ROLE_SELECT
+      and 'value="admin"' not in TACACS_ROLE_SELECT,
+      "#set-tacacs-role offers only viewer and operator, not admin")
+check("admin: (mods) => Object.fromEntries(mods.map((m) => [m, 'write']))"
+      in js_const(SETTINGS66, "ROLE_PRESETS"),
+      "ROLE_PRESETS still carries its admin entry -- a separate, local-account "
+      "feature that must not be removed by accident again")
 
 # --- 67. Dashboard zoom: rounded t0/t1, ctrl-gated wheel, debounced saves --
 DASH67 = read("dashboard.js")

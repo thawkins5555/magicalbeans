@@ -425,6 +425,19 @@ class VendorIdentifyMixin:
                         return None
                     return vb["value"]
 
+                def _mac(_values=values, _index=if_index):
+                    # From the wire bytes: _octets_text renders six printable
+                    # bytes as text, about 1 row in 400.
+                    vb = _values.get(f"{nodeoids.IF_TABLE['if_phys_addr']}.{_index}")
+                    if not vb:
+                        return ""
+                    octets = vb.get("raw")
+                    if octets is None:
+                        return str(vb["value"] or "")
+                    if len(octets) != 6:
+                        return str(vb["value"] or "")
+                    return ":".join(f"{b:02x}" for b in octets)
+
                 speed = _val(nodeoids.IF_TABLE, "if_speed")
                 high_speed = _val(nodeoids.IFX_TABLE, "if_high_speed")
                 if_type = _val(nodeoids.IF_TABLE, "if_type")
@@ -460,7 +473,7 @@ class VendorIdentifyMixin:
                     "descr": _val(nodeoids.IF_TABLE, "if_descr") or "",
                     "name": _val(nodeoids.IFX_TABLE, "if_name") or "",
                     "alias": _val(nodeoids.IFX_TABLE, "if_alias") or "",
-                    "phys_addr": (_val(nodeoids.IF_TABLE, "if_phys_addr") or ""),
+                    "phys_addr": _mac(),
                     "speed_bps": speed_bps,
                     "admin_status": {1: "up", 2: "down", 3: "testing"}.get(
                         int(admin_raw), "") if admin_raw is not None else "",
@@ -508,29 +521,36 @@ class VendorIdentifyMixin:
 
     def _walk_column(self, device, config: dict, base_oid: str,
                      raise_on_timeout: bool = False,
-                     deadline: float | None = None) -> dict[str, object]:
+                     deadline: float | None = None,
+                     raw: bool = False) -> dict[str, object]:
         """One table column's values. See _walk_column_status, which this
         wraps for the callers that do not need to know whether the walk
         finished."""
         return self._walk_column_status(device, config, base_oid,
                                         raise_on_timeout=raise_on_timeout,
-                                        deadline=deadline)[0]
+                                        deadline=deadline, raw=raw)[0]
 
     def _walk_column_status(self, device, config: dict, base_oid: str,
                             raise_on_timeout: bool = False,
-                            deadline: float | None = None) -> tuple:
+                            deadline: float | None = None,
+                            raw: bool = False) -> tuple:
         """(index suffix -> value, whether the walk reached the end). See
         _walk_column_detail, which this wraps for the callers that do not
         need to know WHY a walk stopped."""
         return self._walk_column_detail(device, config, base_oid,
                                         raise_on_timeout=raise_on_timeout,
-                                        deadline=deadline)[:2]
+                                        deadline=deadline, raw=raw)[:2]
 
     def _walk_column_detail(self, device, config: dict, base_oid: str,
                             raise_on_timeout: bool = False,
-                            deadline: float | None = None) -> tuple:
+                            deadline: float | None = None,
+                            raw: bool = False) -> tuple:
         """(index suffix -> value, whether the walk reached the end, why it
         stopped when it did not).
+
+        `raw` gives the binary columns — PhysAddress, PortList, the VTP VLAN
+        bitmaps — the wire bytes instead of _octets_text's rendering, which
+        is not reversible. Every other column keeps the rendering.
 
         `complete` is False whenever the walk stopped for a reason that is
         not "the table ended": a timeout, an SNMP error, the row cap, an
@@ -669,7 +689,13 @@ class VendorIdentifyMixin:
                                   f"OID ({oid}) — its SNMP agent is misbehaving")
                         stop = True
                         break
-                    values[oid[len(base_oid) + 1:]] = vb["value"]
+                    stored = vb["value"]
+                    if raw and vb.get("raw") is not None:
+                        stored = vb["raw"]
+                    values[oid[len(base_oid) + 1:]] = stored
+                    # Budgeted on the rendering, not on `stored`: raw octets
+                    # are a third of the size, and moving the cap with them
+                    # would silently triple how much a walk may retain.
                     retained += len(str(vb["value"]))
                     current = oid
                     if len(values) >= max_rows:

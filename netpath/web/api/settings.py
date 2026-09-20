@@ -287,9 +287,9 @@ def _check_tacacs_settings(values: dict) -> None:
         except tacacsclient.TacacsConfigError as exc:
             raise ValueError(f"tacacs_servers: {exc}") from exc
     if "tacacs_default_role" in values:
-        if values["tacacs_default_role"] not in ("viewer", "operator", "admin"):
+        if values["tacacs_default_role"] not in _permissions.AUTO_CREATE_ROLES:
             raise ValueError(
-                "tacacs_default_role must be viewer, operator or admin")
+                "tacacs_default_role must be viewer or operator")
 
 
 def _check_disk_free_settings(service, values: dict) -> None:
