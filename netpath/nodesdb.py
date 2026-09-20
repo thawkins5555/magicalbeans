@@ -1297,7 +1297,8 @@ class NodesDatabase(SqliteStore):
             "poe_capable": "INTEGER",
             "stp_capable": "INTEGER",
             # nodepoll._cisco_vlan_stp's own latch; unlike stp_capable a
-            # miss is re-tried hourly, not forever (self._stp_vlan_read).
+            # miss is re-tried on the walk's own cadence, not forever
+            # (see nodepoll._maybe_walk_stp_vlan).
             "stp_vlan_capable": "INTEGER",
             "ups_capable": "INTEGER",
             "sensor_capable": "INTEGER",

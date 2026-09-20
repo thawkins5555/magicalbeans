@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.50.0 — Spanning-tree polling cadence; no samples for down ports](#5500--spanning-tree-polling-cadence-no-samples-for-down-ports)
 - [5.49.0 — Low-risk poll and API performance](#5490--low-risk-poll-and-api-performance)
 - [5.48.0 — First-run administrator password; low-severity fixes](#5480--first-run-administrator-password-low-severity-fixes)
 - [5.47.0 — Review fixes: security, correctness, history maintenance](#5470--review-fixes-security-correctness-history-maintenance)
@@ -182,6 +183,70 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.50.0 — Spanning-tree polling cadence; no samples for down ports
+
+Fourth release out of the phase-5 review's follow-up plan (see 5.47.0
+below). The remaining item on that plan, GETBULK for Nodes' own interface
+polling, was investigated and dropped rather than shipped: measured at
+realistic port counts it saved nothing, because the gain that was expected
+assumed a request shape the interface poller's own walk engine does not
+build. This release carries the two operator-visible items instead —
+spanning tree's per-VLAN read moving off every poll, and a down port no
+longer storing readings that mean nothing — plus one alert-behaviour
+change that follows directly from the second.
+
+**Operator-visible**
+
+1. **Per-VLAN spanning-tree polling now runs on its own schedule, not
+   every poll.** On a Cisco switch running per-VLAN spanning tree
+   (PVST+/Rapid-PVST), every poll used to walk up to 48 separate VLAN
+   contexts just to read per-VLAN port state — 50 to 100 extra SNMP round
+   trips per switch, every cycle, whether or not anything had changed.
+   That walk now runs on the same schedule as the VLAN membership walk
+   instead of on every poll. Three things still force it to run
+   immediately regardless of schedule: the first time a device is seen,
+   any time the switch's own topology-change counter moves, and a Poll
+   Now from the screen. The one-request read of the switch's overall
+   spanning-tree status still happens every poll, so watching for that
+   counter to move costs nothing extra. **What to expect:** if a
+   spanning-tree change is confined to a single VLAN and the switch's own
+   overall counters don't reflect it — the known case is a change confined
+   to one VLAN under PVST+ — a blocking alert for that VLAN can now
+   arrive up to one schedule interval later than before, rather than on
+   the very next poll. Poll Now always forces a fresh read regardless.
+2. **No metric readings are stored for a port while it is operationally
+   down.** A down port was producing ten stored readings every poll, all
+   of them meaningless — at fleet scale, on the order of 800,000 rows a
+   poll cycle across a large estate. While a port stays down the poller
+   now records that it was checked but stores no readings for it. What
+   this looks like on screen: a down port's charts show a gap for the
+   time it was down, instead of a flat line at zero or a frozen last
+   reading; its rate figures go blank instead of showing the rate it had
+   before it dropped; it drops out of the busiest-port and top-talker
+   lists while it is down; and its last-polled time keeps updating, so a
+   down port is never mistaken for a device that has stopped answering
+   altogether. A device's own "worst port" figures now ignore down ports,
+   and show nothing at all — rather than a stale number — when every port
+   on a device is down. Readings resume on the first poll after the port
+   comes back up.
+3. **Alert behaviour to know about.** Because a down port now reports no
+   reading rather than a reading of zero, an already-open per-port
+   threshold alert on that port no longer clears itself while the port
+   stays down — it stays open until the port comes back up and reports a
+   value back under its threshold. This is deliberate, not a defect: a
+   zero from a dead port was never a genuine recovery, and treating it as
+   one is what let those alerts go quiet on their own before. Alongside
+   it, a correctness fix that pairs with this: the alert engine no longer
+   counts a port going down as the start of a threshold breach, so an
+   outage itself can no longer be mistaken for time spent breaching once
+   the port comes back and a rule waits for a sustained breach.
+
+**Also in this release.** Javariius, the team's code-review step before
+anything reaches `main`, now runs on Opus rather than Fable.
+
+**Not in this release.** GETBULK for Nodes' own interface polling was
+investigated for this release and dropped — see above.
 
 ### 5.49.0 — Low-risk poll and API performance
 

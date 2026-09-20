@@ -576,6 +576,21 @@ own subtabs.
   a Windows PC, a printer, most appliances — so a device whose CPU and
   disk already worked through HOST-RESOURCES-MIB gets memory too, at no
   extra cost to a device that already had a working `mem_pct`.
+- **From 5.50.0, a port that is operationally down stores no traffic,
+  error, discard or utilisation readings while it stays down.** Those
+  readings were being written for a dead port on every single poll, with
+  nothing behind them worth keeping. The device is still recorded as
+  polled, so nothing about its last-polled time changes; what does change
+  is that the port's own charts show a gap for the time it was down
+  rather than a flat line at zero or a frozen last reading, its rate
+  figures on the interface table go blank rather than showing whatever it
+  was carrying before it dropped, and it drops out of any ranked list of
+  the busiest or highest-traffic ports while it is down. A device's own
+  worst-port figures — used on its status pane and by the device-wide
+  interface alert rules, see Alerts → Rules — now ignore down ports
+  altogether, and report nothing at all rather than a stale number on a
+  device where every port is down. Readings resume on the first poll
+  after the port comes back up.
 - **A UPS wired to SNMP is asked how it is, not just left to shout.**
   Battery status, seconds on battery, estimated runtime and charge,
   battery voltage and temperature, input voltage, output load and active
@@ -1946,6 +1961,15 @@ From 4.47.0, Nodes walks past the SNMP poll to see the wire itself.
   blocked VLAN ids in the cell's tooltip; a port blocked in every VLAN
   it carries still reads the plain `blocking`, and a device this
   per-VLAN read doesn't cover shows the same as it always has.
+- **From 5.50.0, the per-VLAN read behind that column moved off every
+  single poll onto its own schedule** — the same one the VLAN membership
+  walk already uses — instead of opening dozens of extra per-VLAN reads
+  on a busy PVST+ switch every cycle. A device is still read immediately
+  the first time it is seen, whenever its own overall spanning-tree
+  counters move, or on a manual Poll Now, so the change is only felt when
+  a spanning-tree event is confined to one VLAN that those overall
+  counters miss: the blocking column for that VLAN can then lag by up to
+  one schedule interval instead of catching it on the very next poll.
 - **PoE power draw** — budget and per-port wattage, Cisco's own per-port
   milliwatt object where present — appears on the interface table for a
   device that answers POWER-ETHERNET-MIB. A device is asked for any of
@@ -2571,6 +2595,15 @@ alerts and optionally emailing about them.
   about. On upgrade, the device-wide interface alerts left open by the
   previous behaviour are resolved with a note, since nothing would ever
   have cleared them.
+- **From 5.50.0, a per-port threshold alert no longer clears itself just
+  because the port went down.** A down port now reports no reading rather
+  than a reading of zero (see Nodes → Devices and polling), so an open
+  alert on it stays open until the port comes back up and reports a value
+  back under its threshold — a zero from a dead port was never a genuine
+  recovery, and closing the alert on it was masking that. A port going
+  down is also no longer counted as time spent breaching: a rule that
+  waits for a sustained breach starts timing again once real readings
+  resume, rather than crediting the outage itself toward that wait.
 - **A threshold rule can alert on a value falling, from 5.1.0.** Every
   rule before it meant "at or above the threshold is the fault", which is
   right for temperature, utilization and loss and wrong for an optic's

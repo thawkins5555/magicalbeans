@@ -1,8 +1,8 @@
 """Per-VLAN spanning-tree state (5.37.0): nodepoll._cisco_vlan_stp, the
 merge into interfaces.stp_state/stp_blocking_vlans/stp_vlan_count in
-_poll_stp, the devices.stp_vlan_capable latch and its hourly re-probe, and
-the cut-short rule that keeps stored per-VLAN detail rather than write a
-partial view."""
+_poll_stp, the devices.stp_vlan_capable latch, its own cadence off the poll
+pool (5.50.0, _maybe_walk_stp_vlan/_run_stp_vlan_pass), and the cut-short
+rule that keeps stored per-VLAN detail rather than write a partial view."""
 import time
 
 import _paths
@@ -199,14 +199,15 @@ try:
     check("...after one probe", len(calls) == 1, calls)
 
     poller._poll_stp(did, db.device(did), config)
-    check("...and is not re-probed inside the hourly reprobe window",
+    check("...and is not re-probed on a later poll with no topology change",
           len(calls) == 1, calls)
 
-    # Force the hourly reprobe window open, the same way a test of
-    # _mau_read/_cage_read's own cadence would.
-    poller._stp_vlan_read[did] = time.time() - poller._SENSOR_REPROBE_S - 1
-    poller._poll_stp(did, db.device(did), config)
-    check("...but is re-probed once the hour is up",
+    # The negative verdict is now re-tried by the per-VLAN walk's own
+    # cadence (_maybe_walk_stp_vlan), off the poll pool -- called directly
+    # here the same way test_port_vlans.py exercises _run_vlan_table
+    # directly, independent of when the scheduler judges it due.
+    poller._run_stp_vlan_pass(db.device(did), config)
+    check("...but is re-probed by the per-VLAN walk's own cadence",
           len(calls) == 2, calls)
     db.close()
 finally:
@@ -439,6 +440,265 @@ try:
         device, scoped, nodeoids.DOT1D_STP_PORT_STATE + ".7")
     check("v1, noSuchName with zero rows accepted: complete=False",
           complete_empty is False, complete_empty)
+    db.close()
+finally:
+    stub.kill()
+
+# ---------------------------------- 5.50.0: topology-change bypasses cadence
+
+stub, port = spawn_stub("stub_agent_l2.py", "stp")
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
+try:
+    db = new_db("pvst_topo_trigger")
+    did = device_against(db, port, "topo-sw")
+    two_ports(db, did)
+    mark_cisco(db, did)
+    poller = NodePoller(db)
+    device = db.device(did)
+    config = db.effective_config(device)
+
+    calls = []
+    real_cisco_vlan_stp = poller._cisco_vlan_stp
+
+    def spy(device_arg, config_arg, port_map_arg):
+        calls.append(1)
+        return real_cisco_vlan_stp(device_arg, config_arg, port_map_arg)
+    poller._cisco_vlan_stp = spy
+
+    poller._poll_stp(did, device, config)
+    check("the per-VLAN pass runs on a device's first sighting",
+          len(calls) == 1, calls)
+
+    poller._poll_stp(did, db.device(did), config)
+    check("...but not on a later poll with no topology change",
+          len(calls) == 1, calls)
+
+    stub_stat(port, b"BUMP_TOPO")
+    poller._poll_stp(did, db.device(did), config)
+    check("...and runs again the moment dot1dStpTopChanges moves, without "
+          "waiting for the cadence",
+          len(calls) == 2, calls)
+    db.close()
+finally:
+    stub.kill()
+
+# ------------------------------ 5.50.0: _maybe_walk_stp_vlan's own cadence
+
+db = new_db("stp_vlan_schedule")
+gid = db.ensure_default_group()
+db.update_group(gid, snmp_version=1, community="public")
+did_on = db.add_device("10.1.0.1", name="cadence-sw", group_id=gid,
+                       vlan_interval_s=900)
+did_off = db.add_device("10.1.0.2", name="cadence-off-sw", group_id=gid,
+                        vlan_interval_s=0)
+did_noncisco = db.add_device("10.1.0.3", name="cadence-generic-sw",
+                             group_id=gid, vlan_interval_s=900)
+mark_cisco(db, did_on)
+mark_cisco(db, did_off)
+poller = NodePoller(db)
+now = time.time()
+
+did_not_bridge = db.add_device("10.1.0.4", name="not-a-bridge-sw",
+                               group_id=gid, vlan_interval_s=900)
+mark_cisco(db, did_not_bridge)
+db.set_stp_capable(did_not_bridge, False)
+
+# The scheduling loop (_loop -> _schedule_pass) hands _maybe_walk_stp_vlan
+# schedule_rows()' narrow row -- no vendor, no stp_capable -- so vendor and
+# stp_capable can only be checked once a walk is actually due, not on
+# every pass. Exercised for real here rather than assumed: schedule_rows()
+# itself, not a full db.device() row.
+narrow_on = next(r for r in db.schedule_rows() if r["id"] == did_on)
+config_on = db.effective_config(db.device(did_on))
+poller._maybe_walk_stp_vlan(narrow_on, config_on, now)
+check("the narrow scheduling-pass row (no vendor/stp_capable columns) "
+      "does not crash the first-sighting stagger",
+      did_on in poller._next_stp_vlan_walk, poller._next_stp_vlan_walk)
+poller._next_stp_vlan_walk.pop(did_on, None)
+
+for did in (did_on, did_off, did_noncisco, did_not_bridge):
+    device_row = db.device(did)
+    config_row = db.effective_config(device_row)
+    poller._maybe_walk_stp_vlan(device_row, config_row, now)
+check("every v1/v2c device with a community is staggered on first sighting, "
+      "regardless of vendor or stp_capable -- both need a full row this "
+      "call never had a reason to fetch yet",
+      all(did in poller._next_stp_vlan_walk
+          for did in (did_on, did_off, did_noncisco, did_not_bridge)),
+      poller._next_stp_vlan_walk)
+check("...off vlan_interval_s=0 still falls inside the hourly fallback",
+      now <= poller._next_stp_vlan_walk[did_off] <= now + poller._SENSOR_REPROBE_S,
+      poller._next_stp_vlan_walk)
+
+# The due-firing path itself: a fake executor that only records what was
+# submitted, so the flag/next-walk bookkeeping can be checked without
+# racing a real background job to completion.
+submitted = []
+
+
+class _FakeExecutor:
+    def submit(self, fn, device_id):
+        submitted.append((fn, device_id))
+
+
+poller._mac_executor = _FakeExecutor()
+for did in (did_on, did_off, did_noncisco, did_not_bridge):
+    poller._next_stp_vlan_walk[did] = now - 1
+    poller._maybe_walk_stp_vlan(db.device(did), db.effective_config(db.device(did)), now)
+
+check("a due, capable Cisco device takes the in-flight guard and submits",
+      did_on in poller._stp_vlan_running
+      and (poller._run_stp_vlan_walk_job, did_on) in submitted,
+      (poller._stp_vlan_running, submitted))
+check("...advancing next-walk by a full interval",
+      poller._next_stp_vlan_walk[did_on] == now + 900, poller._next_stp_vlan_walk)
+check("a due Cisco device with vlan_interval_s=0 also submits, on its "
+      "hourly fallback cadence",
+      (poller._run_stp_vlan_walk_job, did_off) in submitted, submitted)
+check("a due non-Cisco device is checked once due but never submitted",
+      did_noncisco not in poller._stp_vlan_running
+      and not any(d == did_noncisco for _, d in submitted), submitted)
+check("a due device already confirmed not a bridge is never submitted "
+      "either -- it can't be a PVST+ one",
+      did_not_bridge not in poller._stp_vlan_running
+      and not any(d == did_not_bridge for _, d in submitted), submitted)
+db.close()
+
+# ------------------------------------ 5.50.0: a stale cache does not merge
+
+stub, port = spawn_stub("stub_agent_l2.py", "pvst")
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
+try:
+    db = new_db("pvst_stale_cache")
+    did = device_against(db, port, "stale-sw", vlan_interval_s=60)
+    two_ports(db, did)
+    mark_cisco(db, did)
+    poller = NodePoller(db)
+    device = db.device(did)
+    config = db.effective_config(device)
+
+    poller._poll_stp(did, device, config)   # first sighting: warms the cache
+    ifaces = {i["if_index"]: dict(i) for i in db.interfaces(did)}
+    check("sanity: the fresh per-VLAN merge blocks ifIndex 2",
+          ifaces[2]["stp_state"] == "blocking", ifaces[2])
+
+    poller._stp_vlan_cache[did]["ts"] = time.time() - 2 * poller._stp_vlan_cadence_s(config) - 1
+    poller._poll_stp(did, db.device(did), config)   # no trigger: cache would be reused if fresh
+    ifaces = {i["if_index"]: dict(i) for i in db.interfaces(did)}
+    check("a cache older than 2x the cadence is not merged -- the fresh "
+          "DEFAULT-context read (forwarding) stands instead of a stale "
+          "'blocking' verdict",
+          ifaces[2]["stp_state"] == "forwarding", ifaces[2])
+    db.close()
+finally:
+    stub.kill()
+
+# --------------------------------- 5.50.0: an empty answer clears the cache
+
+stub, port = spawn_stub("stub_agent_l2.py", "pvst_no_vtp")
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
+try:
+    db = new_db("pvst_cache_clear")
+    did = device_against(db, port, "clear-sw")
+    two_ports(db, did)
+    mark_cisco(db, did)
+    poller = NodePoller(db)
+    device = db.device(did)
+    config = db.effective_config(device)
+
+    poller._stp_vlan_cache[did] = {
+        "rows": {2: {"blocking": ["20"], "vlans": 1, "states": {"blocking"}}},
+        "ts": time.time()}
+    rows, answered, complete = poller._run_stp_vlan_pass(device, config)
+    check("a complete walk that answers no VLANs returns no rows",
+          rows == {} and answered is False and complete is True,
+          (rows, answered, complete))
+    check("...and clears whatever was cached, rather than leaving it to "
+          "override the fresh global read forever",
+          did not in poller._stp_vlan_cache, poller._stp_vlan_cache)
+    db.close()
+finally:
+    stub.kill()
+
+# --------------------- 5.50.0: topology trigger reaches a scalarless device
+
+stub, port = spawn_stub("stub_agent_l2.py", "pvst-no-scalars")
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
+try:
+    db = new_db("pvst_no_scalars_trigger")
+    did = device_against(db, port, "no-scalars-topo-sw")
+    two_ports(db, did)
+    mark_cisco(db, did)
+    poller = NodePoller(db)
+    device = db.device(did)
+    config = db.effective_config(device)
+
+    calls = []
+    real_cisco_vlan_stp = poller._cisco_vlan_stp
+
+    def spy(device_arg, config_arg, port_map_arg):
+        calls.append(1)
+        return real_cisco_vlan_stp(device_arg, config_arg, port_map_arg)
+    poller._cisco_vlan_stp = spy
+
+    poller._poll_stp(did, device, config)
+    check("the per-VLAN pass runs on first sighting with no default-context "
+          "scalars at all",
+          len(calls) == 1, calls)
+
+    # This device's dot1dStpProtocolSpec never answers, so the old
+    # (unhoisted) topology check never even ran for it. Forcing it open
+    # here proves the check itself now reaches a scalarless device -- the
+    # exact case the trigger exists for -- rather than proving the stub can
+    # move a counter it does not have.
+    poller._stp_topology_changed = lambda *a, **k: True
+    poller._poll_stp(did, db.device(did), config)
+    check("...and a topology-change trigger still reaches it",
+          len(calls) == 2, calls)
+    db.close()
+finally:
+    stub.kill()
+
+# --------------------- 5.50.0 review: guard already held, cache still merges
+stub, port = spawn_stub("stub_agent_l2.py", "pvst")
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
+try:
+    db = new_db("pvst_guard_held")
+    did = device_against(db, port, "guard-sw")
+    two_ports(db, did)
+    mark_cisco(db, did)
+    poller = NodePoller(db)
+    device = db.device(did)
+    config = db.effective_config(device)
+
+    calls = []
+    real_cisco_vlan_stp = poller._cisco_vlan_stp
+
+    def spy(device_arg, config_arg, port_map_arg):
+        calls.append(1)
+        return real_cisco_vlan_stp(device_arg, config_arg, port_map_arg)
+    poller._cisco_vlan_stp = spy
+
+    # Simulate a cadence walk already in flight on the mac executor: the
+    # guard is held and a fresh cache entry already stored, so this poll's
+    # own inline trigger (first sighting) must merge the cache rather than
+    # race the in-flight walk with a second 48-context walk.
+    poller._stp_vlan_running.add(did)
+    poller._stp_vlan_cache[did] = {
+        "rows": {2: {"blocking": ["20"], "vlans": 2, "states": {"blocking"}}},
+        "ts": time.time()}
+
+    poller._poll_stp(did, device, config)
+
+    check("a poll that finds the guard already held does not run a second "
+          "per-VLAN walk",
+          calls == [], calls)
+    ifaces = {i["if_index"]: dict(i) for i in db.interfaces(did)}
+    check("...but still merges the pre-seeded cache onto the interfaces",
+          ifaces[2]["stp_blocking_vlans"] == "20"
+          and ifaces[2]["stp_vlan_count"] == 2, ifaces[2])
+    check("...and does not release a guard it never took",
+          did in poller._stp_vlan_running, poller._stp_vlan_running)
     db.close()
 finally:
     stub.kill()

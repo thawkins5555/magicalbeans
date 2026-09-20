@@ -1597,8 +1597,10 @@ class AlertEngine(Worker):
                         # and a hand-resolved but still-breaching alert
                         # re-opens as a new run.
                         previous_ts, streak, first_breach_ts = None, 0, None
-                    if stale:
+                    if stale or value is None:
                         # Otherwise breach_seconds would span the silent gap
+                        # (a stale sample, or a metric that read NULL this
+                        # poll without going stale -- an interface down)
                         # and fire for_seconds instantly on resume.
                         first_breach_ts = None
                     elif (previous_ts is not None and stale_after > 0

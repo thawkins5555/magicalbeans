@@ -9,7 +9,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from ..eventlog import ERROR, NODES, NullLog
 from ..nodediscover import DiscoveryJob
-from ..nodesdb import NodesDatabase
+from ..nodesdb import NodesDatabase, detected_vendor
 from ..worker import Worker, ago
 from .discovery_mixin import DiscoveryMixin
 from .poll_mixin import PollMixin
@@ -20,7 +20,7 @@ from .arp_mixin import ArpMixin
 from .lldp_cdp_mixin import LldpCdpMixin
 from .vlan_mixin import VlanMixin
 from ._consts import _DEFAULT_POLL_COST, _POLL_COST_ALPHA, _POLL_COST_CEILING_S, _STAGGER_MIN_FRACTION, _STARTUP_SPREAD_S
-from ._session import EngineCache
+from ._session import EngineCache, snmp_version_of
 
 
 class NodePoller(Worker, DiscoveryMixin, PollMixin, VendorIdentifyMixin, EnvironmentMixin, VendorSensorPsuMixin, ArpMixin, LldpCdpMixin, VlanMixin):
@@ -190,9 +190,29 @@ class NodePoller(Worker, DiscoveryMixin, PollMixin, VendorIdentifyMixin, Environ
         # entPhysicalClass answered, probe-once-remember like _mau_read.
         self._cage_read: dict[int, float] = {}
         self._cage_capable: dict[int, bool] = {}
-        # device_id -> when the per-VLAN STP pass was last tried. See
-        # _cisco_vlan_stp/devices.stp_vlan_capable.
-        self._stp_vlan_read: dict[int, float] = {}
+        # device_id -> when the per-VLAN STP pass (_cisco_vlan_stp) is next
+        # due, and which walks are in flight -- _next_vlan_walk/_vlan_running's
+        # own shape, off the poll pool on its own cadence (see
+        # _maybe_walk_stp_vlan) instead of every single poll.
+        self._next_stp_vlan_walk: dict[int, float] = {}
+        self._stp_vlan_running: set[int] = set()
+        # device_id -> the last per-VLAN STP walk's {if_index: detail},
+        # merged into every poll's own dot1dStp read (_poll_stp) so a port's
+        # blocking state stays correct between cadence ticks.
+        self._stp_vlan_cache: dict[int, dict] = {}
+        # device_id -> whether a per-VLAN STP attempt has ever been made in
+        # this process's lifetime, so _poll_stp runs it inline once (a
+        # device's first sighting, mirroring the old probe-once latches)
+        # rather than waiting a whole cadence for the first answer.
+        self._stp_vlan_seen: set[int] = set()
+        # device_id -> the last (dot1dStpTopChanges, dot1dStpTimeSinceChange)
+        # pair _poll_stp read, so a topology change wakes the per-VLAN walk
+        # immediately instead of waiting for its cadence.
+        self._stp_topology_seen: dict[int, tuple] = {}
+        # device_id -> {"map", "ts"}: dot1dBasePortIfIndex is a static
+        # table, cached rather than re-walked every poll. See
+        # _cached_bridge_port_map.
+        self._bridge_port_map_cache: dict[int, dict] = {}
         # device_id -> when UCD-SNMP was last tried/whether it answered,
         # probe-once-remember'd like _mau_read/_mau_capable.
         self._ucd_read: dict[int, float] = {}
@@ -716,8 +736,14 @@ class NodePoller(Worker, DiscoveryMixin, PollMixin, VendorIdentifyMixin, Environ
              self._next_vlan_walk, self._run_vlan_table),
             ("arp_table_interval_s", self._arp_running,
              self._next_arp_walk, self._run_arp_table),
+            (self._stp_vlan_cadence_s, self._stp_vlan_running,
+             self._next_stp_vlan_walk, self._run_stp_vlan_walk_job),
         ):
-            interval = float(config.get(interval_key) or 0)
+            # A callable interval_key is the per-VLAN STP pass' own cadence
+            # (never "off" the way a raw config lookup can be) rather than
+            # a setting to read directly.
+            interval = (interval_key(config) if callable(interval_key)
+                       else float(config.get(interval_key) or 0))
             if interval <= 0:
                 continue
             with self._lock:
@@ -850,6 +876,7 @@ class NodePoller(Worker, DiscoveryMixin, PollMixin, VendorIdentifyMixin, Environ
             self._maybe_walk_lldp(device, config, now)
             self._maybe_walk_vlans(device, config, now)
             self._maybe_walk_arp_table(device, config, now)
+            self._maybe_walk_stp_vlan(device, config, now)
         self._autoscale_pass(now, demand)
 
     # How long the pool has to look saturated before it is worth telling
@@ -1069,14 +1096,16 @@ class NodePoller(Worker, DiscoveryMixin, PollMixin, VendorIdentifyMixin, Environ
         # cost a scheduling pass.
         for cache in (self._next_run, self._last_ping, self._next_mac_walk,
                       self._next_lldp_walk, self._next_vlan_walk,
-                      self._next_arp_walk,
+                      self._next_arp_walk, self._next_stp_vlan_walk,
+                      self._stp_vlan_cache, self._stp_topology_seen,
+                      self._bridge_port_map_cache,
                       self._credentials, self._credential_probe_failed,
                       self._addresses_read, self._bulk_repetitions,
                       self._sensor_read, self._sensor_threshold_read,
                       self._vendor_sensor_read, self._vendor_sensor_threshold_read,
                       self._mau_read, self._mau_capable,
                       self._cage_read, self._cage_capable,
-                      self._stp_vlan_read, self._ucd_read, self._ucd_capable,
+                      self._ucd_read, self._ucd_capable,
                       self._stack_power_read, self._stack_power_capable,
                       self._sensor_diag_ts, self._snmp_backoff,
                       self._snmp_failing_count, self._get_batch,
@@ -1100,7 +1129,8 @@ class NodePoller(Worker, DiscoveryMixin, PollMixin, VendorIdentifyMixin, Environ
         # once rather than every cycle.
         for members in (self._arp_unanswered, self._staggered,
                         self._auth_failing, self._access_denied,
-                        self._downgraded, self._method_seeded):
+                        self._downgraded, self._method_seeded,
+                        self._stp_vlan_seen):
             members.difference_update(
                 [k for k in list(members) if k not in keep])
         with self._lock:
@@ -1256,6 +1286,56 @@ class NodePoller(Worker, DiscoveryMixin, PollMixin, VendorIdentifyMixin, Environ
         except (RuntimeError, AttributeError):
             with self._lock:
                 self._arp_running.discard(device_id)
+
+    def _maybe_walk_stp_vlan(self, device, config: dict, now: float) -> None:
+        """Queue the Cisco per-VLAN STP walk (_cisco_vlan_stp) when this
+        device's own cadence (_stp_vlan_cadence_s) has come round --
+        _maybe_walk_vlans' own scheduling. _poll_stp still runs this pass
+        inline on a device's first sighting and on a topology-change
+        trigger (see _stp_topology_changed); this cadence only covers the
+        routine refresh in between, off the poll pool.
+
+        The _loop caller hands this schedule_rows()' narrow row (id, name,
+        ip, status, consecutive_fail, last_poll_ts only -- no vendor, no
+        stp_capable), so vendor/stp_capable are checked against a full row
+        fetched only once due, not on every second-by-second scheduling
+        pass; every other gate here uses only config, which is always the
+        full merged one regardless of which row shape was handed in.
+        """
+        if not config.get("stp_enabled", True) or not config.get("snmp_enabled", True):
+            return
+        if device["status"] == "down" or device["consecutive_fail"]:
+            return
+        if snmp_version_of(config) == 3 or not config.get("community"):
+            return
+        device_id = device["id"]
+        interval = self._stp_vlan_cadence_s(config)
+        due = self._next_stp_vlan_walk.get(device_id)
+        if due is None:
+            # First seen: spread the first walk over one interval so a
+            # restart does not walk every capable switch at once.
+            self._next_stp_vlan_walk[device_id] = now + random.uniform(0, interval)
+            return
+        if due - now > interval:
+            due = self._next_stp_vlan_walk[device_id] = now + interval   # backward clock step
+        if now < due:
+            return
+        self._next_stp_vlan_walk[device_id] = now + interval
+        full = device if "stp_capable" in device.keys() else self.db.device(device_id)
+        # stp_capable=0 means this device answers no dot1dStp at all -- not
+        # a bridge, so it can never be a PVST+ one either; skip it the same
+        # way _poll_stp's own early return does.
+        if full is None or full["stp_capable"] == 0 or detected_vendor(full).lower() != "cisco":
+            return
+        with self._lock:
+            if device_id in self._stp_vlan_running:
+                return
+            self._stp_vlan_running.add(device_id)
+        try:
+            self._mac_executor.submit(self._run_stp_vlan_walk_job, device_id)
+        except (RuntimeError, AttributeError):
+            with self._lock:
+                self._stp_vlan_running.discard(device_id)
 
     def _submit(self, device_id: int) -> bool:
         """True when this call put the device on the pool; False when it was

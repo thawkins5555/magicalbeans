@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import time
+import traceback
 from .. import nodeoids
 from ..alertrules import DARK_OPTIC_DBM, is_dark_optic
-from ..eventlog import NODES
+from ..eventlog import ERROR, NODES
 from ..nodesdb import detected_vendor
 from ..snmppoll import SnmpError
 from ._decode import _COPPER_MAU_ARCS, _COPPER_TEXT, _FIBER_MAU_ARCS, _SFP_METRICS, _TRANSCEIVER_TEXT, _canonical_if_name, _envmon_rows, _int_keyed, _optic_mode, _optical_direction
@@ -1522,6 +1523,127 @@ class EnvironmentMixin:
             self.db.update_interface_poe(
                 device_id, [{"if_index": i, **fields} for i, fields in rows.items()])
 
+    def _stp_vlan_cadence_s(self, config: dict) -> float:
+        """vlan_interval_s when set; the hourly sensor cadence when the VLAN
+        membership walk is off. vlan_interval_s=0 only means "skip the
+        membership walk" -- it was never a switch for PVST+ blocking
+        detection, so that case must not silently go quiet too."""
+        interval = float(config.get("vlan_interval_s") or 0)
+        return interval if interval > 0 else self._SENSOR_REPROBE_S
+
+    def _cached_bridge_port_map(self, device, config: dict, now: float) -> dict:
+        """dot1dBasePortIfIndex, a static table, re-walked at
+        _stp_vlan_cadence_s instead of on every poll like the rest of
+        _poll_stp. An incomplete/empty walk is not cached, the same rule
+        _vendor_psu_rows' own static cache follows. Also dropped early on a
+        recorded reboot: IOS can renumber ifIndex across a reload, and the
+        poll loop that detects that (poll_mixin.py) is not this cache's
+        caller, so it is read back off device_events instead."""
+        device_id = device["id"]
+        cached = self._bridge_port_map_cache.get(device_id)
+        if cached is not None:
+            age = now - cached["ts"]
+            if (age < self._stp_vlan_cadence_s(config)
+                    and not self.db.device_events(
+                        device_id, since_s=age, kinds=["rebooted"], limit=1)):
+                return cached["map"]
+            self._bridge_port_map_cache.pop(device_id, None)
+        port_map = self._bridge_port_map(device, config)
+        if port_map:
+            self._bridge_port_map_cache[device_id] = {"map": port_map, "ts": now}
+        return port_map
+
+    def _apply_stp_vlan_latches(self, device_id: int, device, vlan_answered: bool) -> None:
+        """stp_capable/stp_vlan_capable latch updates after any per-VLAN STP
+        attempt, complete or cut short -- shared by _poll_stp's inline runs
+        and _run_stp_vlan_pass's own cadence runs."""
+        if device["stp_capable"] is None:
+            self.db.set_stp_capable(device_id, bool(vlan_answered))
+        if vlan_answered:
+            if not device["stp_vlan_capable"]:
+                self.db.set_stp_vlan_capable(device_id, True)
+        elif device["stp_vlan_capable"] is None:
+            self.db.set_stp_vlan_capable(device_id, False)
+
+    def _stp_topology_changed(self, device_id: int, top_changes, time_since_change) -> bool:
+        """True when dot1dStpTopChanges moved or dot1dStpTimeSinceTopology-
+        Change reset since the last poll -- the signal that bypasses the
+        per-VLAN walk's own cadence for an immediate refresh. A poll that
+        read neither (a failed GET) does not overwrite what was last seen,
+        so a change straddling one missed poll is still caught on the next."""
+        prior = self._stp_topology_seen.get(device_id)
+        if top_changes is not None or time_since_change is not None:
+            self._stp_topology_seen[device_id] = (top_changes, time_since_change)
+        if prior is None:
+            return False
+        prior_top, prior_since = prior
+        if top_changes is not None and prior_top is not None and top_changes != prior_top:
+            return True
+        return (time_since_change is not None and prior_since is not None
+                and time_since_change < prior_since)
+
+    def _run_stp_vlan_pass(self, device, config: dict) -> tuple:
+        """One Cisco per-VLAN STP walk (_cisco_vlan_stp): latches
+        stp_capable/stp_vlan_capable and refreshes _stp_vlan_cache.
+        _poll_stp stays the sole writer of interfaces.stp_state/
+        stp_blocking_vlans/stp_vlan_count, on its own next poll, so a
+        cadence-driven run here can never race a poll's own merge-and-write.
+
+        Guard-free by design: the caller (either _poll_stp inline, holding
+        _stp_vlan_running itself, or _run_stp_vlan_walk_job on its own
+        cadence) owns _stp_vlan_running, so an inline trigger and a due
+        cadence tick never run two 48-context walks against the same
+        switch at once.
+        """
+        device_id = device["id"]
+        cisco_v2c = (detected_vendor(device).lower() == "cisco"
+                    and snmp_version_of(config) != 3 and bool(config.get("community")))
+        if (not cisco_v2c or not config.get("stp_enabled", True)
+                or device["stp_capable"] == 0):
+            return {}, False, True
+        port_map = self._cached_bridge_port_map(device, config, time.time())
+        vlan_rows, vlan_answered, vlan_complete = self._cisco_vlan_stp(
+            device, config, port_map)
+        self._apply_stp_vlan_latches(device_id, device, vlan_answered)
+        if vlan_complete:
+            if vlan_rows:
+                self._stp_vlan_cache[device_id] = {"rows": vlan_rows, "ts": time.time()}
+            else:
+                # Nothing to merge -- most often the per-VLAN contexts have
+                # stopped answering at all (ACL/community change). A stale
+                # cache must not go on overriding the fresh global read.
+                self._stp_vlan_cache.pop(device_id, None)
+        elif vlan_answered:
+            self._log_media_diag(
+                device, f"Per-VLAN STP scan on {device['ip']}: cut "
+                        f"short, stored per-VLAN detail kept",
+                "stp_vlan_cut_short")
+        return vlan_rows, vlan_answered, vlan_complete
+
+    def _run_stp_vlan_walk_job(self, device_id: int) -> None:
+        """_run_stp_vlan_pass, off the poll pool on its own cadence -- the
+        _mac_executor entry point _maybe_walk_stp_vlan/_walk_now submit.
+        Re-fetches the device's working credential itself (the one it
+        actually answers on, not just its profile's primary) since this
+        runs well after whatever poll last had cred_config in hand."""
+        try:
+            device = self.db.device(device_id)
+            if device is None:
+                return
+            if detected_vendor(device).lower() != "cisco" or device["stp_capable"] == 0:
+                # _walk_now queues this for every device, so gate here too:
+                # working_config() below can probe credentials on the wire.
+                return
+            config = self.working_config(device)
+            self._run_stp_vlan_pass(device, config)
+        except Exception:
+            self._bump("errors")
+            self.log.add(ERROR, f"Per-VLAN STP walk failed for device #{device_id}",
+                         detail=traceback.format_exc())
+        finally:
+            with self._lock:
+                self._stp_vlan_running.discard(device_id)
+
     def _poll_stp(self, device_id: int, device, config: dict) -> None:
         """BRIDGE-MIB dot1dStp: bridge-wide spanning-tree state
         every poll once the device is known to be a bridge, plus per-port
@@ -1562,14 +1684,21 @@ class EnvironmentMixin:
                 self.db.set_stp_capable(device_id, False)
             return
 
+        # Hoisted out of the branch below: a pure-PVST+ device -- the whole
+        # reason the per-VLAN pass exists -- has no default-context scalars
+        # at all, so gating this on protocol_spec_n being present would
+        # leave the trigger permanently dead on exactly those devices.
+        time_since_change = num(nodeoids.DOT1D_STP_TIME_SINCE_CHANGE)
+        top_changes = num(nodeoids.DOT1D_STP_TOP_CHANGES)
+        topology_changed = self._stp_topology_changed(
+            device_id, top_changes, time_since_change)
+
         if protocol_spec_n is not None:
             if capable is None:
                 self.db.set_stp_capable(device_id, True)
                 capable = True
 
             priority = num(nodeoids.DOT1D_STP_PRIORITY)
-            time_since_change = num(nodeoids.DOT1D_STP_TIME_SINCE_CHANGE)
-            top_changes = num(nodeoids.DOT1D_STP_TOP_CHANGES)
             root_cost = num(nodeoids.DOT1D_STP_ROOT_COST)
             root_port = num(nodeoids.DOT1D_STP_ROOT_PORT)
             root_vb = values.get(nodeoids.DOT1D_STP_DESIGNATED_ROOT)
@@ -1603,7 +1732,9 @@ class EnvironmentMixin:
             port_state = self._walk_column(device, config, nodeoids.DOT1D_STP_PORT_STATE)
         except SnmpError:
             port_state = {}
-        port_map = self._bridge_port_map(device, config) if (port_state or cisco_v2c) else {}
+        now = time.time()
+        port_map = (self._cached_bridge_port_map(device, config, now)
+                   if (port_state or cisco_v2c) else {})
         rows: dict[int, dict] = {}
         for suffix, value in port_state.items():
             try:
@@ -1619,50 +1750,63 @@ class EnvironmentMixin:
 
         # Per-VLAN pass (see _cisco_vlan_stp), the only source of state for a
         # PVST+ device whose default context has no dot1dStp scalars at all.
-        # Probed once like stp_capable, but a miss is re-tried hourly rather
-        # than latched forever.
+        # Walked on its own cadence (_maybe_walk_stp_vlan) rather than every
+        # poll; run inline here only on a device's first-ever sighting or a
+        # topology-change trigger, so this merge always has an answer to
+        # apply without paying for a fresh walk on every single poll.
         skip_interface_update = False
         if cisco_v2c:
-            vlan_capable = device["stp_vlan_capable"]
-            now = time.time()
-            due = now - self._stp_vlan_read.get(device_id, 0.0) >= self._SENSOR_REPROBE_S
-            if vlan_capable != 0 or due:
-                self._stp_vlan_read[device_id] = now
-                vlan_rows, vlan_answered, vlan_complete = self._cisco_vlan_stp(
-                    device, config, port_map)
-                if capable is None:
-                    self.db.set_stp_capable(device_id, bool(vlan_answered))
-                if vlan_answered:
-                    if not vlan_capable:
-                        self.db.set_stp_vlan_capable(device_id, True)
-                elif vlan_capable is None:
-                    self.db.set_stp_vlan_capable(device_id, False)
-                if vlan_answered and vlan_complete:
-                    for if_index, detail in vlan_rows.items():
-                        blocking = detail["blocking"]
-                        states = detail.get("states", set())
-                        row = rows.setdefault(if_index, {})
-                        if blocking:
-                            row["stp_state"] = "blocking"
-                        elif "forwarding" in states:
-                            row["stp_state"] = "forwarding"
-                        elif len(states) == 1:
-                            row["stp_state"] = next(iter(states))
-                        elif "stp_state" in row:
-                            pass
-                        elif states:
-                            row["stp_state"] = min(states)
-                        row["stp_blocking_vlans"] = ",".join(sorted(blocking, key=int))
-                        row["stp_vlan_count"] = detail["vlans"]
-                elif vlan_answered and not vlan_complete:
-                    # SFP badge scan's own cut-short rule: keep what is
-                    # stored — the global read is skipped too, so a blocked
-                    # uplink doesn't flap to forwarding for this poll.
-                    skip_interface_update = True
-                    self._log_media_diag(
-                        device, f"Per-VLAN STP scan on {device['ip']}: cut "
-                                f"short, stored per-VLAN detail kept",
-                        "stp_vlan_cut_short")
+            if device_id not in self._stp_vlan_seen or topology_changed:
+                # Take _stp_vlan_running ourselves rather than assume it is
+                # free: a due cadence tick (_maybe_walk_stp_vlan) can be
+                # running the same 48-context walk on _mac_executor right
+                # now. If it already holds the guard, this poll just merges
+                # whatever is cached instead of racing it.
+                took_guard = False
+                with self._lock:
+                    if device_id not in self._stp_vlan_running:
+                        self._stp_vlan_running.add(device_id)
+                        took_guard = True
+                if took_guard:
+                    try:
+                        # Refetch: the scalar block above may have just
+                        # written stp_capable this same poll, and `device`
+                        # (handed in by the caller) still predates that.
+                        fresh_device = self.db.device(device_id) or device
+                        _, vlan_answered, vlan_complete = self._run_stp_vlan_pass(
+                            fresh_device, config)
+                    finally:
+                        with self._lock:
+                            self._stp_vlan_running.discard(device_id)
+                    if vlan_complete:
+                        # Only a complete attempt counts as "seen" -- a
+                        # cut-short one is retried inline next poll instead
+                        # of waiting out the whole cadence.
+                        self._stp_vlan_seen.add(device_id)
+                    if vlan_answered and not vlan_complete:
+                        # SFP badge scan's own cut-short rule: keep what is
+                        # stored — the global read is skipped too, so a
+                        # blocked uplink doesn't flap to forwarding here.
+                        skip_interface_update = True
+            cached = self._stp_vlan_cache.get(device_id)
+            stale = cached and now - cached["ts"] >= 2 * self._stp_vlan_cadence_s(config)
+            if cached and not skip_interface_update and not stale:
+                for if_index, detail in cached["rows"].items():
+                    blocking = detail["blocking"]
+                    states = detail.get("states", set())
+                    row = rows.setdefault(if_index, {})
+                    if blocking:
+                        row["stp_state"] = "blocking"
+                    elif "forwarding" in states:
+                        row["stp_state"] = "forwarding"
+                    elif len(states) == 1:
+                        row["stp_state"] = next(iter(states))
+                    elif "stp_state" in row:
+                        pass
+                    elif states:
+                        row["stp_state"] = min(states)
+                    row["stp_blocking_vlans"] = ",".join(sorted(blocking, key=int))
+                    row["stp_vlan_count"] = detail["vlans"]
 
         if rows and not skip_interface_update:
             self.db.update_interface_stp(

@@ -5149,6 +5149,66 @@ might no longer hold:
 `_forget_devices` sweeps both dicts for any device id no longer live,
 alongside every other per-device poll cache it already swept.
 
+### A down port's metric tuples are emitted as `None`, not dropped (`nodepoll/poll_mixin.py`, `nodesseriesdb.py`) — 5.50.0
+
+In `poll_mixin.py`'s per-interface metrics loop (the same loop 5.49.0's
+write-path change above touches), each of the ten per-port tuples
+(`in_bps`, `out_bps`, `in_err`, `out_err`, `in_error_rate`,
+`out_error_rate`, `in_discard_rate`, `out_discard_rate`, `in_util_pct`,
+`out_util_pct`) is still emitted for a port whose `oper_status` is not
+`up` — it is never dropped — but its value is forced to `None` in place
+of whatever the rate/utilisation math actually computed. That distinction
+matters: `record_metric_samples` (`nodesseriesdb.py`) already treats a
+tuple carrying `value=None` as its own documented "polled, no answer"
+case — it updates the metric's `last_ts`, clears `last_value`, and writes
+no row into the samples table — while simply never emitting the tuple at
+all would leave `last_ts` stuck wherever it last was, which is exactly
+the "looks like a dead device" failure the last-polled-timestamp
+guarantee (`CHANGELOG.md` 5.50.0) exists to avoid. The whole fix is
+therefore inside `poll_mixin.py`'s loop: stop keeping a real number for a
+down port's rate/utilisation calculation and hand the existing store
+contract the `None` it already knows how to file correctly.
+
+The device-level "worst port" aggregates (`_DEVICE_MAX_KEYS`) only fold a
+port's reading in when it is both up and non-`None`
+(`value is not None and suffix in _DEVICE_MAX_KEYS`), so a down port can
+no longer set or keep a device's worst-port ceiling. When every interface
+on a device is down (`any_port_up` stays `False`), the aggregate tuples
+are still emitted, each `None`-valued, rather than left out — the same
+"answered nothing" contract applied at the device level, so a device
+whose ports are all down reads as no-data rather than freezing at
+whatever it last measured while still partly up.
+
+`tests/test_poll_down_ports.py` stubs `_poll_interfaces` directly — oper
+status per port is all it needs to control — and checks all ten per-port
+suffixes come back `None`/no-sample for a down port while an up port on
+the same poll keeps its ordinary readings.
+
+**The alert engine no longer lets a down port's silence count as breach
+time.** `_evaluate_thresholds` (`alertengine.py`) used to reset a
+streak's `first_breach_ts` only when the sample was stale
+(`if stale:`); it now also resets it whenever the current value is
+`None` (`if stale or value is None:`). Before this fix, `breaches()`/
+`evaluate_threshold()` already refused to count a `None` reading as a
+breach, so the streak itself stopped correctly — but `first_breach_ts`
+was left sitting at whatever it was before the port went down. Because
+`last_ts` keeps advancing even while a port reports nothing, `sample_ts -
+first_breach_ts` would then span the whole outage the instant the port
+came back and started breaching again, long enough that a `for_seconds`
+rule (packet loss ships one; any custom rule can set one) could fire on
+the very first sample back — crediting the down time itself as sustained
+breach time. Resetting `first_breach_ts` on `value is None` the same way
+a stale gap already does closes that: a `for_seconds` rule now has to
+observe a genuine, continuous breach after the port returns before it
+opens. `tests/test_alert_per_port.py`'s new case (P16) drives a
+`for_seconds=120` custom rule through exactly this sequence — a short
+breach under threshold, several polls of `None` while the port is down
+(never stale, since `last_ts` keeps moving), recovery, and a fresh
+sustained breach — and checks the alert stays silent on the first sample
+back, still opens once a genuine 120 seconds of breach follow it, and
+that a `None` reading never clears an already-open alert either, matching
+what a stale reading already did.
+
 ### One socket for identity and UCD-SNMP, closed on every path (`nodepoll/poll_mixin.py`)
 
 The scalar-read phase used to open one SNMP session for the identity GET
@@ -6774,6 +6834,126 @@ and the `Blocking in VLANs` title in `nodes.js`, and the `(VLANs `
 fragment in `mapper.js`. `tests/test_mapper_api.py` checks the map JSON's
 `a_stp_vlans`/`b_stp_vlans` keys, `None` on a manual link, and the CSV
 row's VLAN suffix.
+
+### Per-VLAN spanning-tree walk moves off every poll onto its own cadence (`nodepoll/poller.py`, `nodepoll/environment_mixin.py`) — 5.50.0
+
+**The walk-scheduler table gains a fourth entry.** `_schedule_pass`'s and
+`_walk_now`'s shared tuple list of `(interval key, running set, next-walk
+map, runner)` — the one the MAC-table, LLDP, VLAN and ARP walks already
+sit in — gains `(self._stp_vlan_cadence_s, self._stp_vlan_running,
+self._next_stp_vlan_walk, self._run_stp_vlan_walk_job)`. The first
+element for every other entry is a config-key string
+(`"mac_table_interval_s"` and so on) the loop reads with
+`float(config.get(interval_key) or 0)`; the per-VLAN entry's is instead a
+bound method, and the loop now checks `callable(interval_key)` and calls
+it with `config` in that case. A raw config lookup can't serve here
+because `vlan_interval_s=0` only ever meant "skip the VLAN membership
+walk" — it was never a switch for PVST+ blocking detection, so the
+per-VLAN pass must keep running (on the hourly fallback, see below) even
+when that setting is off, which a plain `config.get()` can't express.
+Because `_walk_now` (the Poll Now path) shares this exact tuple list, a
+manual poll forcing a fresh per-VLAN read costs nothing beyond the entry
+itself — no separate wiring was needed for that guarantee.
+
+`_stp_vlan_cadence_s(config)` (`environment_mixin.py`) is that callable:
+`vlan_interval_s` when it is set above zero, else `_SENSOR_REPROBE_S`
+(3600 s, the same hourly constant every other probe-once latch in this
+file falls back to). `_maybe_walk_stp_vlan` gates on `stp_enabled`/
+`snmp_enabled`, a device that isn't down or currently failing, and
+v1/v2c with a community (SNMPv3 is out of scope, as it always was for
+this feature); a device seen for the first time is staggered to
+`now + uniform(0, interval)` rather than walked immediately, so a
+restart doesn't fire every capable switch's 48-context walk at once, and
+a due time more than one interval stale is clamped forward the same
+`due = now + interval` way every other scheduler in this file handles a
+backward clock step.
+
+**One implementation, two callers, so they cannot diverge.**
+`_run_stp_vlan_pass(device, config)` (`environment_mixin.py`) is now the
+sole body of a per-VLAN walk — vendor/version/community gating, the
+`_cisco_vlan_stp` call itself, the `stp_capable`/`stp_vlan_capable` latch
+update (`_apply_stp_vlan_latches`), and the cache write below — called
+from both `_poll_stp`'s inline trigger (first sighting, or a topology
+change) and `_run_stp_vlan_walk_job(device_id)`, the cadence job
+`_maybe_walk_stp_vlan`/`_walk_now` submit to `_mac_executor`. Taking
+`device` and the working credential `config` as plain parameters, rather
+than being written once inline and duplicated for the cadence path, is
+what stops the two call sites' gating logic from drifting apart as
+either one is touched later. `_run_stp_vlan_walk_job` re-fetches the
+device row and calls `working_config(device)` itself — the credential
+the device actually answers on, not just its profile's primary — since
+it runs well after whatever poll last had a working config in hand.
+
+**The in-flight guard.** `_stp_vlan_running: set[int]` is the one guard
+both call paths take before a 48-context walk runs: the cadence path
+takes it (under `self._lock`) before submitting to `_mac_executor`;
+`_poll_stp`'s inline trigger takes it itself before calling
+`_run_stp_vlan_pass` synchronously, and only actually runs the pass if it
+won the guard — if a due cadence tick already holds it for that device,
+the poll just merges whatever is already cached instead of racing it.
+`_run_stp_vlan_pass` itself takes no lock and asserts no guard — it
+trusts whichever caller invoked it to be holding `_stp_vlan_running`
+already, so the guard is acquired and released in exactly one place per
+call path rather than duplicated inside the shared function.
+
+**The cache, its staleness, and reboot invalidation.**
+`_stp_vlan_cache: dict[int, {"rows", "ts"}]` holds the last *complete*
+per-VLAN result; `_poll_stp` merges it into every poll's own dot1dStp
+read the same way an inline result used to be merged directly, so a
+port's blocking state stays correct on the polls that fall between
+cadence walks. The merge is skipped — falling back to whatever the plain
+default-context read decided — once the cache ages past
+`2 * _stp_vlan_cadence_s(config)`, so a per-VLAN verdict old enough to
+have gone stale twice over can never keep overriding a fresh global
+read. A complete walk that answers no VLANs at all (most often the
+per-VLAN contexts have stopped answering — an ACL or community change)
+pops the cache entirely instead of leaving a stale verdict to override
+the global read indefinitely. Separately, `_stp_vlan_seen: set[int]`
+tracks whether a per-VLAN attempt has completed at least once in this
+process's lifetime, so a device's very first sighting still runs the
+pass inline rather than waiting out a whole cadence interval for a first
+answer — only a *complete* attempt counts as seen, so a cut-short one is
+retried inline on the very next poll rather than waiting for the
+cadence.
+
+**The topology-change trigger reaches a scalarless device.**
+`_stp_topology_changed(device_id, top_changes, time_since_change)`
+compares this poll's `dot1dStpTopChanges`/
+`dot1dStpTimeSinceTopologyChange` scalars against the previous poll's.
+Reading those two scalars is hoisted out of the `if protocol_spec_n is
+not None:` branch that gates the rest of the default-context scalar
+block, specifically because a pure-PVST+ device — the whole reason the
+per-VLAN pass exists — answers no default-context scalars at all, and
+gating the trigger on that branch would leave it permanently dead on
+exactly the devices it matters most for. A poll that reads neither value
+(a failed GET) leaves what was last seen untouched, so a change spanning
+one missed poll is still caught on the next.
+
+**The static bridge-port map moves onto the same cadence.**
+`_cached_bridge_port_map(device, config, now)` re-walks
+`dot1dBasePortIfIndex` — a table that only changes when ports are added
+or removed, or the device reboots — at `_stp_vlan_cadence_s` instead of
+on every poll the way the rest of `_poll_stp` does. Beyond ordinary
+age-out it is also invalidated by a recorded `rebooted` device event
+newer than the cached copy, read back off `device_events` rather than
+detected inline, since the poll step that notices a reboot
+(`poll_mixin.py`) is not this cache's own caller. This matters
+specifically because IOS can renumber ifIndex across a reload; without
+the reboot check a stale bridge-port map would go on attributing one
+port's per-VLAN state to a different interface until the cache next aged
+out on its own.
+
+**Tests.** `tests/test_stp_vlan.py` covers: the negative `stp_vlan_
+capable` verdict now being re-tried by `_run_stp_vlan_pass` directly
+rather than an hourly `_stp_vlan_read` stamp; a topology-change trigger
+firing mid-poll without waiting for the cadence, including on a device
+with no default-context scalars at all; `_maybe_walk_stp_vlan` handling
+the narrow `schedule_rows()` row (no `vendor`/`stp_capable` columns) on
+the first-sighting stagger path without needing a full row fetch; the
+due-firing path against a fake executor, checking the in-flight guard is
+taken and `_next_stp_vlan_walk` advances by a full interval; a cache
+older than twice the cadence being discarded rather than merged; and a
+complete-but-empty per-VLAN answer clearing a previously cached result.
 
 ### Notes: `map_notes` (`mapperdb.py`, `web/api/mapper.py`, `mapper.js`, `app.css`) — 5.38.0
 

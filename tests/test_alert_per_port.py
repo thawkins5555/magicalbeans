@@ -861,6 +861,82 @@ check("...and a saved one survives a reopen as an int",
 store.close()
 
 
+# =================================================================== P16
+print("\nP16 - a NULL reading (a down port, 5.50.0) does not leak breach time")
+
+# 5.50.0 stops storing per-port samples for a down interface: the metric's
+# last_value goes NULL but last_ts stays current (nodesseriesdb's own "no
+# answer" contract). For a for_polls rule this was always safe -- breaches()
+# already refuses a None value, so the streak resets to 0 on every down
+# poll and the count restarts clean on recovery. The hazard is a for_seconds
+# rule (only packet_loss_high ships one, but any custom rule can set it):
+# first_breach_ts must reset the same way the pre-existing stale branch
+# resets it, or the down period's whole span reads as continuous breach
+# time and the alert fires on the very first sample back.
+nodes, alerts, snmp, syslog, ipam, engine = build()
+try:
+    alerts.add_rule("custom_util_slow", "Custom slow-breach rule", "threshold",
+                    "if_in_util_pct", comparison="above", threshold=90.0,
+                    clear_threshold=80.0, for_seconds=120)
+    engine._tick()
+    did = add_device(nodes, "10.20.11.1", "slow-rule-sw")
+    nodes.replace_interfaces(did, [PORTS[0]])
+    rule_id = alerts.rule_by_key("custom_util_slow")["id"]
+
+    def open_slow():
+        return [r for r in alerts.alerts(state="unresolved")
+               if r["rule_id"] == rule_id]
+
+    base = time.time()
+    for i in range(3):
+        nodes.record_metric_sample(did, "if_in_util_pct.7", "port 7", "%",
+                                   "gauge", base + i, 97.0)
+        engine._tick()
+    check("a short breach under for_seconds=120 opens nothing yet",
+          open_slow() == [], [dict(r) for r in open_slow()])
+
+    # The port goes down: NULL samples with last_ts still advancing, 100s
+    # apart, well under threshold_stale_s (900s) -- this must NOT be read
+    # as a stale/silent gap, only as "no reading".
+    down_start = base + 3
+    for i in range(5):
+        nodes.record_metric_sample(did, "if_in_util_pct.7", "port 7", "%",
+                                   "gauge", down_start + i * 100, None)
+        engine._tick()
+    check("still nothing open while the port is down",
+          open_slow() == [], [dict(r) for r in open_slow()])
+
+    recover_ts = down_start + 5 * 100 + 1
+    nodes.record_metric_sample(did, "if_in_util_pct.7", "port 7", "%",
+                               "gauge", recover_ts, 97.0)
+    engine._tick()
+    check("recovering into a breach does NOT fire instantly -- the old "
+          "first_breach_ts from before the outage must not have survived",
+          open_slow() == [], [dict(r) for r in open_slow()])
+
+    # A fresh for_seconds=120 of real breach time after recovery still
+    # fires normally -- the fix must not have broken the rule outright.
+    nodes.record_metric_sample(did, "if_in_util_pct.7", "port 7", "%",
+                               "gauge", recover_ts + 130, 97.0)
+    engine._tick()
+    check("...but a genuine 130s of continuous breach after recovery "
+          "still opens the alert",
+          len(open_slow()) == 1, [dict(r) for r in open_slow()])
+
+    # A NULL reading must not CLEAR an open alert either -- matching what a
+    # stale reading already does today (evaluate_threshold(None) is never
+    # "clear", only ever "" or, on the dark-optic floor, unreachable here).
+    nodes.record_metric_sample(did, "if_in_util_pct.7", "port 7", "%",
+                               "gauge", recover_ts + 200, None)
+    engine._tick()
+    check("a NULL reading on an open alert leaves it open, exactly like a "
+          "stale reading would -- neither clears it",
+          len(open_slow()) == 1, [dict(r) for r in open_slow()])
+finally:
+    engine.stop()
+    close_all(nodes, alerts, snmp, syslog, ipam)
+
+
 print()
 print("FAILURES:", FAILS if FAILS else "none")
 print(f"{len(PASSED)} PER-PORT ASSERTIONS PASSED")

@@ -1771,6 +1771,7 @@ def test_forget_devices_sweeps_every_per_device_container_mechanically():
                                                 # still needs _started
             "_mac_running", "_lldp_running",   # in-flight walk flags, the
             "_vlan_running", "_arp_running",   # same shape and reason
+            "_stp_vlan_running",
             "_configs",                        # wholly replaced every
                                                 # generation -- its key set
                                                 # IS the "keep" argument

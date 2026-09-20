@@ -540,6 +540,7 @@ class PollMixin:
             # no interface suffix, and "the worst port on this box" is what
             # a device-level rule can usefully mean.
             worst: dict[str, float] = {}
+            any_port_up = False
             for row in interfaces:
                 if_index = row["if_index"]
                 prior = existing.get(if_index)
@@ -645,19 +646,37 @@ class PollMixin:
                                 + (" (spanning tree blocked)" if blocked else ""))
                 if interface_id is not None:
                     label = row.get("descr") or f"if{if_index}"
+                    # A down port's counters are not "zero traffic" -- they
+                    # are nothing worth storing. The tuple is still emitted
+                    # (never dropped) so record_metric_samples updates
+                    # last_ts and clears last_value, matching its own "polled,
+                    # no answer" contract; only an up port's normal None
+                    # skip (a rate genuinely not computable this poll) is
+                    # unchanged below.
+                    port_up = row.get("oper_status") == "up"
+                    if port_up:
+                        any_port_up = True
                     for suffix, unit, value in _INTERFACE_METRICS(
                             in_bps, out_bps, in_err_rate, out_err_rate,
                             in_disc_rate, out_disc_rate, in_util, out_util):
-                        if value is None:
+                        if not port_up:
+                            value = None
+                        elif value is None:
                             continue
                         samples.append((f"if_{suffix}.{if_index}",
                                         f"{label} {suffix}", unit, "gauge",
                                         now, value))
-                        if suffix in _DEVICE_MAX_KEYS:
+                        if value is not None and suffix in _DEVICE_MAX_KEYS:
                             worst[suffix] = max(worst.get(suffix, value), value)
             for suffix, value in worst.items():
                 unit, label = _DEVICE_MAX_KEYS[suffix]
                 samples.append((f"if_{suffix}", label, unit, "gauge", now, value))
+            if interfaces and not any_port_up:
+                # Every port down: the worst-port aggregates have nothing to
+                # report, but must say so rather than silently freeze at
+                # whatever they last read while the device was reachable.
+                for suffix, (unit, label) in _DEVICE_MAX_KEYS.items():
+                    samples.append((f"if_{suffix}", label, unit, "gauge", now, None))
             # T3 — every interface's counters and rates.
             self.db.update_interface_rates(device_id, rate_rows)
 

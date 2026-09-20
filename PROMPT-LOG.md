@@ -1879,3 +1879,41 @@ limiter leaving it alone.
 **Files changed for 5.49.0's documentation:** `netpath/__init__.py`
 (version), `CHANGELOG.md`, `FEATURES.md`, `INTERNALS.md`,
 `tests/README.md`, and this file.
+
+## 5.50.0 — Spanning-tree polling cadence; no samples for down ports
+
+Last release of the phase-5 review's follow-up plan (see 5.47.0 above: A
+= 5.47.0, B = 5.48.0, C = 5.49.0, D and E covered here, after which the
+review's full findings are due to be published).
+
+**"What's left?"** Asked once 5.49.0 shipped. Two items remained on the
+plan — GETBULK for Nodes' own interface polling, and spanning-tree walk
+cadence together with down-port sample storage.
+
+**A plan was asked for, then approved.** GETBULK for interface polling
+was investigated first, since it was next in line. Measurement at
+realistic port counts showed no saving: the gain expected for it assumed
+a request shape the interface poller's own walk engine doesn't build, so
+batching more rows per request there does not cut round trips the way it
+did for the wireless-controller walk in 5.49.0. That item was dropped
+rather than shipped. With nothing left to justify a release of its own,
+the two remaining items — spanning-tree cadence and down-port sample
+storage — were combined into this one release instead. The operator
+approved that plan.
+
+**"Javariius should run on Opus, not Fable."** Then a follow-up asking
+whether Bob was still on Fable: he was not — the lead session had been
+running on Opus 5 — and the operator chose to leave it there for the
+day. `.claude/agents/javariius.md` and `CLAUDE.md`'s team section were
+updated for both, and the roster now reads Javariius (Opus) with Bob an
+Opus 5 developer. Noted here for the record; no document in this file's
+own remit changed for that edit beyond this note.
+
+**"Just Thing1 and Thing2 — no Thing3/Thing4."** Reaffirmed the standing
+limit set after 5.48.0's own withdrawal of the extra Sonnet teammates.
+This release's two work lanes — the spanning-tree cadence change and the
+down-port storage change — were split between the two named teammates as
+usual, with nothing extra spun up.
+
+**Files changed for 5.50.0's documentation:** `netpath/__init__.py`
+(version), `CHANGELOG.md`, `FEATURES.md`, `INTERNALS.md`, and this file.
