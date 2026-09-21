@@ -219,7 +219,12 @@ account: `GET /api/account/sms`, `POST /api/account/sms/start`,
 number, or just forgets a pending code) — each audited as
 `account.sms.start` / `.confirm` / `.stop` / `.cancel`. The code is kept
 as a SHA-256 hash, never in the clear, and the notification row recorded
-for the verification text has the code itself masked.
+for the verification text has the code itself masked. Deleting a pending
+code only clears it while the 60-second resend guard is still running,
+keeping the row (and the guard) until that window passes, so canceling
+can't be used to request a fresh code early; starting the flow while
+texts are already on is refused, telling the account to press Stop texts
+first.
 
 **Two fixed texts, worded for the same campaign review as 5.20.1's
 notice.** Verification: "SappiWhere: your alert text verification code is
@@ -251,7 +256,8 @@ the code TTL/attempt/resend limits, the `user_sms` store, the engine
 merge and a Twilio-STOP number being turned off), `tests/test_alert_sms.py`
 gains the 21610 case, `test_frontend_contracts.py` §103 pins the
 fieldset's ids, its legend, the terms sentence and the two account
-routes.
+routes, `tests/test_web_gates.py` (`UNGATED_EXPECTED` and
+`KNOWN_NOT_WRITES` gain the four account SMS routes).
 
 ### 5.51.0 — Loopback tunnel guard, TACACS+ auto-create role cleanup, and SNMP decode correctness
 

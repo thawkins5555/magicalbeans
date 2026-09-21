@@ -544,7 +544,11 @@ class AlertEngine(Worker):
         # never receive another text until it re-opts in with Twilio
         # directly, so a per-user opt-in is turned off right away rather
         # than failing silently on every future send.
-        sms_to_default = job.settings.get("sms_to_default", [])
+        raw_to_default = job.settings.get("sms_to_default", [])
+        if isinstance(raw_to_default, str):
+            sms_to_default = [a.strip() for a in raw_to_default.split(",") if a.strip()]
+        else:
+            sms_to_default = [str(a).strip() for a in raw_to_default if str(a).strip()]
         for number, err in getattr(job, "number_errors", []):
             if alertmail.twilio_error_code(err) != alertmail.TWILIO_STOP_CODE:
                 continue

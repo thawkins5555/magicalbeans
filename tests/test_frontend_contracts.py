@@ -4947,7 +4947,7 @@ check("App.get('/api/nodes/devices', { ...query, fields: 'list' })" in _REFRESH1
       "nodes.js's device list refresh asks for the 'list' projection")
 
 # ---------------------------------------------------------------------------
-# 103. Account modal (5.50.0): the SMS opt-in fieldset carries its ids, the
+# 103. Account modal (5.52.0): the SMS opt-in fieldset carries its ids, the
 #      exact consent sentence, and the number interpolation is escaped.
 ACCOUNT_MODAL103 = js_function(APP, "accountModal")
 for sms_id in ("am-sms-number", "am-sms-consent", "am-sms-start",

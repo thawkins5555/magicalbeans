@@ -73,6 +73,16 @@ def login(username, password):
     return cookie.split("sw_session=")[1].split(";")[0]
 
 
+def backdate_code(username, seconds):
+    """Push a user_sms row's code_sent_ts back by `seconds`, the same trick
+    section 6 uses inline, so a later start/DELETE call lands outside the
+    60 s resend guard instead of tripping it."""
+    service.app_db._conn.execute(
+        "UPDATE user_sms SET code_sent_ts = code_sent_ts - ?"
+        " WHERE username = ? COLLATE NOCASE", (seconds, username))
+    service.app_db._conn.commit()
+
+
 SID = "AC" + "a" * 32
 NUMBER = "+15559990000"
 
@@ -199,9 +209,76 @@ try:
           NUMBER not in service.app_db.sms_opted_in_numbers(),
           service.app_db.sms_opted_in_numbers())
 
+    backdate_code("grunt", 700)
+    status, payload = call("POST", "/api/account/sms/start",
+                           {"number": NUMBER, "consent": True}, token=grunt)
+    check("start after a stop succeeds", status == 200 and payload["status"] == "pending",
+          (status, payload))
+
     status, payload = call("DELETE", "/api/account/sms", {}, token=grunt)
-    check("DELETE on an already-stopped row just cancels it, no error",
+    check("DELETE inside the resend window clears the code, not the row",
           status == 200 and payload["status"] == "off", (status, payload))
+    row = service.app_db.user_sms("grunt")
+    check("...the row itself is kept (guard stays intact)",
+          row is not None and row["number"] == NUMBER, row)
+
+    status, payload = call("POST", "/api/account/sms/start",
+                           {"number": NUMBER, "consent": True}, token=grunt)
+    check("start->delete->start inside 60s is still gated",
+          status == 400 and "Wait" in payload.get("error", ""), (status, payload))
+
+    backdate_code("grunt", 70)
+    status, payload = call("DELETE", "/api/account/sms", {}, token=grunt)
+    check("DELETE outside the resend window forgets the row",
+          status == 200 and payload["status"] == "off", (status, payload))
+    status, payload = call("GET", "/api/account/sms", token=grunt)
+    check("...GET now shows off with no number",
+          status == 200 and payload["status"] == "off" and payload["number"] == "",
+          (status, payload))
+
+    # ------------------------------------------------------ 8a. lockout
+    backdate_code("grunt", 700)
+    status, payload = call("POST", "/api/account/sms/start",
+                           {"number": NUMBER, "consent": True}, token=grunt)
+    assert status == 200, (status, payload)
+    for attempt in range(1, 5):
+        status, payload = call("POST", "/api/account/sms/confirm", {"code": "000000"}, token=grunt)
+        check(f"wrong code attempt {attempt} is a 400 with tries left",
+              status == 400 and "tries left" in payload.get("error", ""), (status, payload))
+    status, payload = call("POST", "/api/account/sms/confirm", {"code": "000000"}, token=grunt)
+    check("the 5th wrong code locks out with 'Too many wrong codes'",
+          status == 400 and "Too many wrong codes" in payload.get("error", ""), (status, payload))
+    status, payload = call("GET", "/api/account/sms", token=grunt)
+    check("...and GET shows off after lockout", status == 200 and payload["status"] == "off",
+          (status, payload))
+
+    # -------------------------------------------------- 8b. already-on refusal
+    backdate_code("grunt", 700)
+    status, payload = call("POST", "/api/account/sms/start",
+                           {"number": NUMBER, "consent": True}, token=grunt)
+    assert status == 200, (status, payload)
+    to_number, text = SENT[-1]
+    code = "".join(c for c in text if c.isdigit())[:6]
+    status, payload = call("POST", "/api/account/sms/confirm", {"code": code}, token=grunt)
+    assert status == 200 and payload["status"] == "on", (status, payload)
+
+    status, payload = call("POST", "/api/account/sms/start",
+                           {"number": NUMBER, "consent": True}, token=grunt)
+    check("start while already on is a 400", status == 400
+          and "already on" in payload.get("error", ""), (status, payload))
+
+    # ------------------------------------------------ 8c. per-account isolation
+    status, payload = call("GET", "/api/account/sms", token=admin)
+    check("a second account's SMS status is independent (off)",
+          status == 200 and payload["status"] == "off", (status, payload))
+
+    status, payload = call("DELETE", "/api/account/sms", {}, token=admin)
+    check("...its own DELETE is a no-op", status == 200 and payload["status"] == "off",
+          (status, payload))
+
+    status, payload = call("GET", "/api/account/sms", token=grunt)
+    check("...and leaves the first account's opt-in untouched",
+          status == 200 and payload["status"] == "on", (status, payload))
 
     # ------------------------------------------------- 9. sms_stop_number
     other_number = "+15559990001"
@@ -211,6 +288,15 @@ try:
     check("sms_stop_number reports one row stopped", stopped == 1, stopped)
     row = service.app_db.user_sms("grunt")
     check("...stopped_by is 'stop'", row["stopped_by"] == "stop", dict(row))
+
+    # ------------------------------------------- 9a. sms_stop_number: pending untouched
+    ghost_number = "+15559990099"
+    service.app_db.sms_start("ghost", ghost_number, "deadbeef", time.time())
+    stopped = service.app_db.sms_stop_number(ghost_number, time.time())
+    check("sms_stop_number ignores a pending (unconfirmed) row", stopped == 0, stopped)
+    check("...the row is still pending",
+          sms_status(service.app_db.user_sms("ghost")) == "pending",
+          sms_status(service.app_db.user_sms("ghost")))
 
     # ---------------------------------------------------- 10. engine _sms_numbers
     engine = service.alert_engine

@@ -9351,13 +9351,14 @@ dataclass alongside `MailJob`, not a variant of it, with `to_addrs` and
 so the shared result-recording path (`_mail_result`-shaped consumers) can
 read one job or the other without an `isinstance` check.
 
-**One Twilio call per destination number, the job failed on the first
-error.** `SmsQueue._deliver()` loops `job.to_numbers` and calls
-`alertmail.send_sms()` for each; any exception is re-raised carrying which
-number failed, and the whole job — every number in it — is recorded as one
-failure rather than partially sent. Twilio's REST API takes one recipient
-per request (unlike SMTP's one connection, many `RCPT TO`s), so there is no
-cheaper way to fan a text out to several destination numbers.
+**One Twilio call per destination number, every number attempted even
+after one fails.** `SmsQueue._deliver()` loops `job.to_numbers` and calls
+`alertmail.send_sms()` for each, collecting per-number errors rather than
+stopping at the first one; the job is recorded as delivered if any number
+went through, and only a job where every number failed counts toward the
+breaker. Twilio's REST API takes one recipient per request (unlike SMTP's
+one connection, many `RCPT TO`s), so there is no cheaper way to fan a text
+out to several destination numbers.
 
 **`sms_text()` builds the fixed one-line format and enforces the 160-character
 ceiling itself**, rather than leaving truncation to the caller: `[TAG] rule
@@ -9493,7 +9494,12 @@ change another's opt-in, and no module-permission gate, the same as
 (checks the code, sends the opt-in text) and `DELETE /api/account/sms`
 (stops a live number, or just forgets a pending code / an already-stopped
 row via `sms_forget` — nothing to audit as a "stop" if texts were never
-actually on). Each is audited as `account.sms.start` / `.confirm` /
+actually on). While the 60-second resend guard on a pending code is still
+running, delete only clears the code and leaves the row in place, so
+canceling and restarting can't be used to dodge the guard; the row itself
+is only forgotten once that window has passed. Starting the flow while
+texts are already on for the account is refused, telling the caller to
+press Stop texts first. Each is audited as `account.sms.start` / `.confirm` /
 `.stop` / `.cancel`. `_sms_available()` mirrors the checks
 `post_alerts_sms_test` already makes (SMS on, a credential on file, a
 From number or Messaging Service SID, the right fields for the
@@ -9533,11 +9539,7 @@ on the same timing and against the same `sms_max_per_hour` budget.
 Twilio's own code for "this number has opted out" (most often a prior
 STOP reply). `SmsJob` gained `number_errors`, a `(number, error text)`
 list `SmsQueue._deliver` fills alongside the `errors` string it already
-built — note that `_deliver` here is the current one, which attempts
-every number and only counts the job as failed if none delivered; the
-older "one Twilio call per number, the job failed on the first error"
-paragraph above describes a since-changed shape and is not what
-`number_errors` is layered onto. After a send, `AlertEngine` walks
+built. After a send, `AlertEngine` walks
 `job.number_errors`: a 21610 against a number calls
 `appdb.sms_stop_number(number, now)` (marks `stopped_by='stop'`, but only
 on a row that was `on`, so a number a Twilio filter or typo rejects

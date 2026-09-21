@@ -733,6 +733,8 @@ def post_account_sms_start(service, params, body) -> dict:
                          "administrator turns them on under Alerts → Settings")
     now = time.time()
     row = service.app_db.user_sms(me)
+    if _appdb.sms_status(row) == "on":
+        raise ValueError("Alert texts are already on for this account; press Stop texts first")
     if row is not None and now - row["code_sent_ts"] < SMS_CODE_RESEND_S:
         remaining = max(1, int(SMS_CODE_RESEND_S - (now - row["code_sent_ts"])) + 1)
         raise ValueError(f"Wait {remaining} s before requesting another code")
@@ -793,7 +795,13 @@ def delete_account_sms(service, params, body) -> dict:
         service.app_db.sms_stop(me, time.time(), "user")
         _audit(service, params, "account.sms.stop", target=me)
     elif row is not None:
-        service.app_db.sms_forget(me)
+        if time.time() - row["code_sent_ts"] < SMS_CODE_RESEND_S:
+            # A resend guard is still running on this row's code_sent_ts;
+            # forgetting it here would let start->delete->start bypass the
+            # guard, so just drop the code and keep the row (and guard).
+            service.app_db.sms_clear_code(me)
+        else:
+            service.app_db.sms_forget(me)
         _audit(service, params, "account.sms.cancel", target=me)
     return _account_sms(service, service.app_db.user_sms(me))
 
