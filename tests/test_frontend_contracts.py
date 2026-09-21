@@ -4971,8 +4971,9 @@ check('href="/sms-terms"' in ACCOUNT_MODAL103 and 'href="/sms-privacy"' in ACCOU
       "accountModal's SMS paragraph links the full terms and privacy pages")
 check(ACCOUNT_MODAL103.count('rel="noopener"') >= 2,
       "the SMS terms/privacy links open in a new tab without a window handle back")
-check('type="checkbox" checked' not in ACCOUNT_MODAL103 and "checked>" not in ACCOUNT_MODAL103,
-      "neither SMS checkbox is pre-ticked")
+for _cb in ("am-sms-terms-ok", "am-sms-consent"):
+    _tag = ACCOUNT_MODAL103[ACCOUNT_MODAL103.rfind("<input", 0, ACCOUNT_MODAL103.index(f'id="{_cb}"')):ACCOUNT_MODAL103.index(">", ACCOUNT_MODAL103.index(f'id="{_cb}"'))]
+    check(" checked" not in _tag, f"#{_cb} is not pre-ticked")
 check("Yes, sign me up" in ACCOUNT_MODAL103,
       "the SMS sign-up button carries explicit sign-up language")
 check("Msg & data rates may apply" in ACCOUNT_MODAL103,
