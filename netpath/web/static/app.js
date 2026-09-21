@@ -247,7 +247,7 @@ const App = (() => {
           };
           smsBody.querySelector('#am-sms-resend').onclick = async () => {
             try {
-              const result = await post('/api/account/sms/start', { number: info.number, consent: true });
+              const result = await post('/api/account/sms/start', { number: info.number, consent: true, terms: true });
               renderSms(result);
               announce('Verification code sent');
             } catch (error) { showModalError(box, error.message); }
@@ -274,21 +274,24 @@ const App = (() => {
             ? `<p class="hint" id="am-sms-stopped">Alert texts to <b>${number}</b> were stopped `
               + `${escapeHtml(when(info.stopped_ts))}${info.stopped_by === 'stop' ? ' when STOP was texted to Twilio' : ''}.</p>`
             : '';
-          const startLabel = info.status === 'stopped' ? 'Turn texts back on' : 'Send verification code';
           smsBody.innerHTML = `
             ${stoppedLine}
             <label>Mobile number <input id="am-sms-number" type="tel" autocomplete="tel" placeholder="+15551234567" value="${number}"></label>
-            <p class="hint" id="am-sms-terms">By entering your mobile number and ticking the box you agree to receive automated network alert text messages from SappiWhere at that number. Messages are sent only when an alert fires or clears; frequency varies with network activity. Message and data rates may apply. Reply STOP at any time to opt out, or HELP for help; you can also stop texts here. Your number is used only for these alerts and is not shared. Full terms: <a href="/sms-terms" target="_blank" rel="noopener">SMS Terms</a> · <a href="/sms-privacy" target="_blank" rel="noopener">SMS Privacy</a>.</p>
-            <label class="check"><input type="checkbox" id="am-sms-consent"> I agree to receive alert text messages at this number and accept the terms above</label>
-            <div class="row"><button type="button" id="am-sms-start">${startLabel}</button></div>
+            <p class="hint" id="am-sms-terms">SappiWhere sends automated network alert text messages (operational, not marketing) to this number: a text when an alert fires and one when it clears. Message frequency varies with network activity. Msg & data rates may apply. Reply STOP at any time to opt out, or HELP for help; you can also stop texts here. Your number is used only for these alerts and is not shared.</p>
+            <label class="check"><input type="checkbox" id="am-sms-terms-ok"> I have read and agree to the <a href="/sms-terms" target="_blank" rel="noopener">SMS Terms</a> and <a href="/sms-privacy" target="_blank" rel="noopener">SMS Privacy Policy</a></label>
+            <label class="check"><input type="checkbox" id="am-sms-consent"> Yes, I agree to receive automated network alert text messages from SappiWhere at this number</label>
+            <div class="row"><button type="button" id="am-sms-start">Yes, sign me up</button></div>
+            <p class="hint">We text a one-time code to this number to confirm it.</p>
             <p class="hint" id="am-sms-status"></p>`;
           smsBody.querySelector('#am-sms-start').onclick = async () => {
             const numberValue = smsBody.querySelector('#am-sms-number').value.trim();
+            const termsOk = smsBody.querySelector('#am-sms-terms-ok').checked;
             const consent = smsBody.querySelector('#am-sms-consent').checked;
             if (!numberValue) { showModalError(box, 'Enter your mobile number'); return; }
-            if (!consent) { showModalError(box, 'Tick the box to accept the terms'); return; }
+            if (!termsOk) { showModalError(box, 'Tick the box to accept the SMS Terms and Privacy Policy'); return; }
+            if (!consent) { showModalError(box, 'Tick the box to agree to receive alert texts'); return; }
             try {
-              const result = await post('/api/account/sms/start', { number: numberValue, consent });
+              const result = await post('/api/account/sms/start', { number: numberValue, consent: true, terms: true });
               renderSms(result);
               announce('Verification code sent');
             } catch (error) { showModalError(box, error.message); }

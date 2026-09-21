@@ -5,6 +5,18 @@ grouped by the version that carries it. This is a working record for the
 operator — the full story of each change is in `CHANGELOG.md`, and this file
 does not replace it.
 
+## 5.54.0 — Opt-in form: separate terms and consent checkboxes
+
+**"Twilio's A2P 10DLC web-form checklist" audit against nine
+requirements plus two notes** turned up two gaps in the Account dialog's
+sign-up form: the terms/privacy checkbox and the messaging-consent
+checkbox were combined into one, and the submit button didn't read like
+a sign-up action ("Send verification code"). Split into two required,
+unchecked-by-default checkboxes and a "Yes, sign me up" button; the
+server now refuses the request unless both are ticked. Decision: no
+separate marketing-consent checkbox, since SappiWhere sends no marketing
+texts — only operational network alerts.
+
 ## 5.53.1 — Terms and privacy links on the Alerts SMS settings
 
 **"Add links to those two pages in the Alerts sms settings area."**

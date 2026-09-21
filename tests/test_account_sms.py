@@ -117,12 +117,17 @@ try:
           status == 400 and "terms" in payload.get("error", ""), (status, payload))
 
     status, payload = call("POST", "/api/account/sms/start",
-                           {"number": "5551234567", "consent": True}, token=grunt)
+                           {"number": NUMBER, "consent": True}, token=grunt)
+    check("consent without terms is a 400 naming the Terms",
+          status == 400 and "Terms" in payload.get("error", ""), (status, payload))
+
+    status, payload = call("POST", "/api/account/sms/start",
+                           {"number": "5551234567", "consent": True, "terms": True}, token=grunt)
     check("start with a non-E.164 number is a 400",
           status == 400 and "E.164" in payload.get("error", ""), (status, payload))
 
     status, payload = call("POST", "/api/account/sms/start",
-                           {"number": NUMBER, "consent": True}, token=grunt)
+                           {"number": NUMBER, "consent": True, "terms": True}, token=grunt)
     check("start before Alerts SMS is configured is a 400",
           status == 400 and "not set up" in payload.get("error", ""), (status, payload))
 
@@ -139,7 +144,7 @@ try:
 
     # ------------------------------------------------------------- 3. start
     status, payload = call("POST", "/api/account/sms/start",
-                           {"number": NUMBER, "consent": True}, token=grunt)
+                           {"number": NUMBER, "consent": True, "terms": True}, token=grunt)
     check("start succeeds", status == 200 and payload["status"] == "pending", (status, payload))
     check("...one text was sent", len(SENT) == 1, SENT)
     to_number, text = SENT[-1]
@@ -160,7 +165,7 @@ try:
 
     # ---------------------------------------------------- 4. resend too soon
     status, payload = call("POST", "/api/account/sms/start",
-                           {"number": NUMBER, "consent": True}, token=grunt)
+                           {"number": NUMBER, "consent": True, "terms": True}, token=grunt)
     check("resending within the window is a 400",
           status == 400 and "Wait" in payload.get("error", ""), (status, payload))
     check("...no second text was sent", len(SENT) == 1, SENT)
@@ -185,7 +190,7 @@ try:
 
     # ----------------------------------------------------- 7. start again, confirm
     status, payload = call("POST", "/api/account/sms/start",
-                           {"number": NUMBER, "consent": True}, token=grunt)
+                           {"number": NUMBER, "consent": True, "terms": True}, token=grunt)
     check("starting again after expiry succeeds", status == 200, (status, payload))
     to_number, text = SENT[-1]
     code = "".join(c for c in text if c.isdigit())[:6]
@@ -211,7 +216,7 @@ try:
 
     backdate_code("grunt", 700)
     status, payload = call("POST", "/api/account/sms/start",
-                           {"number": NUMBER, "consent": True}, token=grunt)
+                           {"number": NUMBER, "consent": True, "terms": True}, token=grunt)
     check("start after a stop succeeds", status == 200 and payload["status"] == "pending",
           (status, payload))
 
@@ -223,7 +228,7 @@ try:
           row is not None and row["number"] == NUMBER, row)
 
     status, payload = call("POST", "/api/account/sms/start",
-                           {"number": NUMBER, "consent": True}, token=grunt)
+                           {"number": NUMBER, "consent": True, "terms": True}, token=grunt)
     check("start->delete->start inside 60s is still gated",
           status == 400 and "Wait" in payload.get("error", ""), (status, payload))
 
@@ -239,7 +244,7 @@ try:
     # ------------------------------------------------------ 8a. lockout
     backdate_code("grunt", 700)
     status, payload = call("POST", "/api/account/sms/start",
-                           {"number": NUMBER, "consent": True}, token=grunt)
+                           {"number": NUMBER, "consent": True, "terms": True}, token=grunt)
     assert status == 200, (status, payload)
     for attempt in range(1, 5):
         status, payload = call("POST", "/api/account/sms/confirm", {"code": "000000"}, token=grunt)
@@ -255,7 +260,7 @@ try:
     # -------------------------------------------------- 8b. already-on refusal
     backdate_code("grunt", 700)
     status, payload = call("POST", "/api/account/sms/start",
-                           {"number": NUMBER, "consent": True}, token=grunt)
+                           {"number": NUMBER, "consent": True, "terms": True}, token=grunt)
     assert status == 200, (status, payload)
     to_number, text = SENT[-1]
     code = "".join(c for c in text if c.isdigit())[:6]
@@ -263,7 +268,7 @@ try:
     assert status == 200 and payload["status"] == "on", (status, payload)
 
     status, payload = call("POST", "/api/account/sms/start",
-                           {"number": NUMBER, "consent": True}, token=grunt)
+                           {"number": NUMBER, "consent": True, "terms": True}, token=grunt)
     check("start while already on is a 400", status == 400
           and "already on" in payload.get("error", ""), (status, payload))
 

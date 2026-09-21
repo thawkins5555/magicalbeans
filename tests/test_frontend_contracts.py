@@ -4949,10 +4949,11 @@ check("App.get('/api/nodes/devices', { ...query, fields: 'list' })" in _REFRESH1
       "nodes.js's device list refresh asks for the 'list' projection")
 
 # ---------------------------------------------------------------------------
-# 103. Account modal (5.52.0): the SMS opt-in fieldset carries its ids, the
-#      exact consent sentence, and the number interpolation is escaped.
+# 103. Account modal (5.54.0): the SMS opt-in fieldset carries its ids, the
+#      exact consent sentence, separate terms/consent checkboxes (neither
+#      pre-ticked), and the number interpolation is escaped.
 ACCOUNT_MODAL103 = js_function(APP, "accountModal")
-for sms_id in ("am-sms-number", "am-sms-consent", "am-sms-start",
+for sms_id in ("am-sms-number", "am-sms-terms-ok", "am-sms-consent", "am-sms-start",
                "am-sms-code", "am-sms-confirm", "am-sms-stop"):
     check("id=\"%s\"" % sms_id in ACCOUNT_MODAL103,
           "accountModal renders #%s" % sms_id)
@@ -4970,6 +4971,18 @@ check('href="/sms-terms"' in ACCOUNT_MODAL103 and 'href="/sms-privacy"' in ACCOU
       "accountModal's SMS paragraph links the full terms and privacy pages")
 check(ACCOUNT_MODAL103.count('rel="noopener"') >= 2,
       "the SMS terms/privacy links open in a new tab without a window handle back")
+check('type="checkbox" checked' not in ACCOUNT_MODAL103 and "checked>" not in ACCOUNT_MODAL103,
+      "neither SMS checkbox is pre-ticked")
+check("Yes, sign me up" in ACCOUNT_MODAL103,
+      "the SMS sign-up button carries explicit sign-up language")
+check("Msg & data rates may apply" in ACCOUNT_MODAL103,
+      "the SMS terms paragraph carries the carrier-required rates sentence")
+check("(operational, not marketing)" in ACCOUNT_MODAL103,
+      "the SMS terms paragraph distinguishes alert texts from marketing")
+_termsOkLabel103 = ACCOUNT_MODAL103[ACCOUNT_MODAL103.index('id="am-sms-terms-ok"'):
+                                    ACCOUNT_MODAL103.index("</label>", ACCOUNT_MODAL103.index('id="am-sms-terms-ok"'))]
+check('href="/sms-terms"' in _termsOkLabel103 and 'href="/sms-privacy"' in _termsOkLabel103,
+      "the SMS Terms and Privacy links sit inside the am-sms-terms-ok label")
 
 # ---------------------------------------------------------------------------
 # 104. SMS Terms / SMS Privacy (Twilio 10DLC campaign): the public pages

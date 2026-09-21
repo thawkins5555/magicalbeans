@@ -9490,7 +9490,10 @@ caller's own account** — there is no route for one account to read or
 change another's opt-in, and no module-permission gate, the same as
 **Change password**: `GET /api/account/sms` (current status),
 `POST /api/account/sms/start` (validates consent and an E.164 number via
-`alertmail.is_e164`, sends the code), `POST /api/account/sms/confirm`
+`alertmail.is_e164`, sends the code — from 5.54.0 it also requires a
+separate `terms: true` flag alongside `consent: true`, one per checkbox
+on the Account dialog's form, and the audit detail names both: "terms
+accepted, alert-text consent given"), `POST /api/account/sms/confirm`
 (checks the code, sends the opt-in text) and `DELETE /api/account/sms`
 (stops a live number, or just forgets a pending code / an already-stopped
 row via `sms_forget` — nothing to audit as a "stop" if texts were never

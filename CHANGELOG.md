@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.54.0 — Opt-in form: separate terms and consent checkboxes](#5540--opt-in-form-separate-terms-and-consent-checkboxes)
 - [5.53.1 — Terms and privacy links on the Alerts SMS settings](#5531--terms-and-privacy-links-on-the-alerts-sms-settings)
 - [5.53.0 — Public SMS terms and privacy pages](#5530--public-sms-terms-and-privacy-pages)
 - [5.52.0 — Per-user SMS opt-in with verified consent](#5520--per-user-sms-opt-in-with-verified-consent)
@@ -187,6 +188,35 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.54.0 — Opt-in form: separate terms and consent checkboxes
+
+Twilio's A2P 10DLC web-form checklist was audited against the Account
+dialog's Text alerts (SMS) sign-up form: it wants terms/privacy
+acceptance as its own checkbox, separate from the messaging-consent
+checkbox, and a submit button with explicit sign-up wording. The form
+had one combined checkbox and a button reading "Send verification code."
+
+**Two required checkboxes, both unchecked by default**: "I have read
+and agree to the SMS Terms and SMS Privacy Policy" (with the two links
+inside that label) and "Yes, I agree to receive automated network alert
+text messages from SappiWhere at this number." The sign-up button now
+reads "Yes, sign me up" in both the off and stopped states — the
+"Turn texts back on" wording is gone since the form itself already says
+so. The program description above the checkboxes now states plainly
+that the texts are operational, not marketing, states how often they go
+out, "Msg & data rates may apply," STOP and HELP, and a line noting a
+one-time code is texted to confirm the number. No marketing checkbox
+was added: SappiWhere sends no marketing texts, so there is nothing for
+a marketing consent to cover.
+
+`POST /api/account/sms/start` now requires `terms: true` in addition to
+`consent: true`, and the audit row records that both terms acceptance
+and alert-text consent were given, not just one blended "consent."
+
+Files: `netpath/web/static/app.js`, `netpath/web/api/auth.py`.
+
+Verification: `tests/test_account_sms.py`, `tests/test_frontend_contracts.py`.
 
 ### 5.53.1 — Terms and privacy links on the Alerts SMS settings
 

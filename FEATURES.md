@@ -3130,6 +3130,10 @@ hard to trip — a path monitor that cries wolf gets turned off.
   page. A number opted in this way is texted alongside the Default
   numbers list above — merged in, de-duplicated — for every alert this
   section already covers, on the same timing and the same hourly cap.
+  From 5.54.0 that dialog has two required checkboxes, both unchecked
+  by default — one to accept the SMS Terms and Privacy Policy, one to
+  agree to receive the alert texts — and a **Yes, sign me up** button;
+  the server refuses to start the opt-in unless both boxes were ticked.
 - **From 5.53.0, two pages describing the program are public — no
   sign-in needed — at `/sms-terms` and `/sms-privacy`.** Twilio's
   campaign review wants a terms-of-service and privacy-policy URL it
