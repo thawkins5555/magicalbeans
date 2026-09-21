@@ -216,9 +216,11 @@ Files: `netpath/web/static/sms-terms.html`, `netpath/web/static/sms-privacy.html
 `netpath/web/server.py`, `netpath/web/static/app.js`.
 
 Verification: `tests/test_web_gates.py` (`PUBLIC_PATHS_EXPECTED` gains
-the four new paths), an unauthenticated 200 check for each page, and
-`tests/test_frontend_contracts.py` pins the consent notice's two links
-and each page's required sentence.
+the four new paths), `tests/test_account_sms.py` fetches both pages
+unauthenticated and checks STOP and the no-sharing sentence in the served
+bytes with the version stamped, and `tests/test_frontend_contracts.py`
+pins the consent notice's two links and the privacy page's no-sharing
+sentence.
 
 ### 5.52.0 — Per-user SMS opt-in with verified consent
 

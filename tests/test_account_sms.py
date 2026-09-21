@@ -353,6 +353,8 @@ try:
           status == 200 and head.get("Content-Type", "").startswith("text/html"))
     check("/sms-terms mentions STOP",
           b"STOP" in body)
+    check("/sms-terms has the version stamped in",
+          b"__SW_VERSION__" not in body)
 
     status, head, body = get_public("/sms-privacy")
     check("unauthenticated GET /sms-privacy is 200 text/html",
