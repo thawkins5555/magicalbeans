@@ -9561,7 +9561,9 @@ stamp) and its login-page body shell, so they pick up the current theme
 and brand mark without their own styling. Static files were chosen over
 a rendered page because the content is fixed prose a carrier reviewer
 reads once — there is no per-account or per-request data to inject, and
-a template would only add a rendering step with nothing to vary.
+a template would only add a rendering step with nothing to vary. From
+5.53.1 the Alerts settings consent notice (`#as-sms-consent`) carries
+the same two links as the Account dialog's.
 
 ### Reports (`report.py`, `web/api/nodes_reports.py`) — 4.49.0
 

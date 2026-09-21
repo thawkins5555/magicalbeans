@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.53.1 — Terms and privacy links on the Alerts SMS settings](#5531--terms-and-privacy-links-on-the-alerts-sms-settings)
 - [5.53.0 — Public SMS terms and privacy pages](#5530--public-sms-terms-and-privacy-pages)
 - [5.52.0 — Per-user SMS opt-in with verified consent](#5520--per-user-sms-opt-in-with-verified-consent)
 - [5.51.0 — Loopback tunnel guard, TACACS+ auto-create role cleanup, and SNMP decode correctness](#5510--loopback-tunnel-guard-tacacs-auto-create-role-cleanup-and-snmp-decode-correctness)
@@ -186,6 +187,21 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.53.1 — Terms and privacy links on the Alerts SMS settings
+
+5.53.0 put `/sms-terms` and `/sms-privacy` behind a link in the Account
+dialog's own consent notice, but the older notice on Alerts → Settings →
+TEXT MESSAGES (TWILIO) → Default numbers — the one an administrator sees
+when entering numbers by hand — still ended at "Reply STOP to
+unsubscribe, HELP for help." with no way to reach either page. That
+notice now ends "Full terms:" followed by the same two links, opening in
+a new tab.
+
+Files: `netpath/web/static/alerts.js`.
+
+Verification: `tests/test_frontend_contracts.py` pins both links beside
+its existing `as-sms-consent` check.
 
 ### 5.53.0 — Public SMS terms and privacy pages
 

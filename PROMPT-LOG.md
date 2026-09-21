@@ -5,6 +5,13 @@ grouped by the version that carries it. This is a working record for the
 operator — the full story of each change is in `CHANGELOG.md`, and this file
 does not replace it.
 
+## 5.53.1 — Terms and privacy links on the Alerts SMS settings
+
+**"Add links to those two pages in the Alerts sms settings area."**
+The Account dialog's consent notice already linked to `/sms-terms` and
+`/sms-privacy` (5.53.0); the older consent notice on Alerts → Settings →
+Default numbers now ends with the same two links.
+
 ## 5.53.0 — Public SMS terms and privacy pages
 
 **"Where are the terms of service and privacy policy?"** Twilio's

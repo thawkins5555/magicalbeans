@@ -3122,7 +3122,8 @@ hard to trip — a path monitor that cries wolf gets turned off.
   administrator, this is that opt-in evidence. Twilio's own Advanced
   Opt-Out still blocks a number that has texted STOP, and from 5.52.0
   below that same reply is also recorded inside the app, turning that
-  account's own opt-in off.
+  account's own opt-in off. From 5.53.1 it links to the SMS Terms and
+  SMS Privacy pages.
 - **From 5.52.0, any signed-in account can opt its own phone in from the
   Account dialog** (see **Text alerts (SMS)** under Permissions, below),
   rather than an administrator entering every number on this settings

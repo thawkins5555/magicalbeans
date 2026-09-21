@@ -3093,6 +3093,8 @@ check("for the selected method before saving" in NODES63,
       "Save refuses to silently switch auth mode without a new secret")
 check('id="as-sms-consent"' in NODES63, "the SMS number list carries the A2P consent notice")
 check("Reply STOP to unsubscribe" in NODES63, "...with STOP/HELP wording carriers expect")
+check('href="/sms-terms"' in NODES63 and 'href="/sms-privacy"' in NODES63,
+      "...and links to the SMS Terms and SMS Privacy pages (5.53.1)")
 
 # --- 64. 5.21.0: the modular Dashboard --------------------------------------
 DASH64 = read("dashboard.js")

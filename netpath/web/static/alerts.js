@@ -1729,7 +1729,9 @@
         <p class="hint" id="as-sms-consent">By adding a number you confirm the person at that
           number has agreed to receive network alert text messages from SappiWhere. Message
           frequency varies by network activity. Message and data rates may apply.
-          Reply STOP to unsubscribe, HELP for help.</p>
+          Reply STOP to unsubscribe, HELP for help. Full terms:
+          <a href="/sms-terms" target="_blank" rel="noopener">SMS Terms</a> ·
+          <a href="/sms-privacy" target="_blank" rel="noopener">SMS Privacy</a>.</p>
         ${number('as-sms-maxhour', 'Max texts per hour', s.sms_max_per_hour ?? 30, 'min=1')}
         <p class="hint">One text per number per notification, cut to 160
           characters, with its own hourly budget apart from email's.</p>
