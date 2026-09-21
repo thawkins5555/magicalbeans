@@ -2,15 +2,27 @@
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 import secrets
 import threading
 import time
 
 from ...eventlog import ERROR as ERROR_CATEGORY, SYSTEM as SYSTEM_CATEGORY
+from ... import appdb as _appdb
 from ... import permissions as _permissions
 
 from ._shared import ALERT_TOTAL_CAP, THEMES, _alert_filters, _audit, request_permissions
+
+# ------------------------------------------------------------- account SMS
+
+# A code is good for this long after it is sent...
+SMS_CODE_TTL_S = 600
+# ...and a fresh one cannot be requested more often than this, so a typo'd
+# number cannot be used to spam an arbitrary phone with texts.
+SMS_CODE_RESEND_S = 60
+# Past this many wrong guesses the code is dead; request a new one.
+SMS_CODE_MAX_ATTEMPTS = 5
 
 
 # --------------------------------------------------------------------- auth
@@ -630,6 +642,160 @@ def put_account_theme(service, params, body) -> dict:
     service.app_db.set_user_theme(me, theme)
     _audit(service, params, "account.theme", target=me, detail=f"theme: {theme}")
     return {"theme": theme}
+
+
+def _sms_available(service) -> bool:
+    """Whether Alerts is set up well enough to send a text at all — the
+    same conditions _sms_notify checks before it will use the queue, plus
+    a credential actually being on file."""
+    settings = service.alerts_settings
+    if not settings.get("sms_enabled"):
+        return False
+    if not settings.get("twilio_account_sid"):
+        return False
+    if not (settings.get("twilio_from") or settings.get("twilio_messaging_service_sid")):
+        return False
+    if not service.alerts_db.sms_token_enc():
+        return False
+    auth_mode = str(settings.get("twilio_auth_mode", "auth_token") or "auth_token").strip()
+    if auth_mode == "api_key" and not settings.get("twilio_api_key_sid"):
+        return False
+    return True
+
+
+def _sms_send(service, number, text, kind: str, record_text: str | None = None) -> None:
+    """One text, sent with the stored Twilio credential the same way
+    post_alerts_sms_test resolves it, and recorded to notifications either
+    way. `record_text` overrides what is stored for the notification row
+    (sms_verify masks its code); raises with the send error on failure."""
+    from ... import alertmail, dpapi
+
+    settings = dict(service.alerts_settings)
+    logged_text = text if record_text is None else record_text
+    blob = service.alerts_db.sms_token_enc()
+    wanted = alertmail.sms_binding(settings)
+    saved = service.alerts_db.sms_credential_binding()
+    if blob and wanted != (saved["auth_mode"], saved["account_sid"], saved["api_key_sid"]):
+        error = ("The stored Twilio credential does not match the Alerts "
+                 "settings; ask an administrator to re-enter it")
+        service.alerts_db.record_notification(None, kind, number, logged_text, False, error)
+        raise ValueError(error)
+    token = None
+    if blob:
+        try:
+            token = dpapi.unprotect(blob).decode("utf-8")
+        except Exception:
+            token = None
+    try:
+        alertmail.send_sms(settings, token, number, text)
+        ok, error = True, ""
+    except Exception as exc:
+        ok, error = False, str(exc)
+    finally:
+        token = None
+    service.alerts_db.record_notification(None, kind, number, logged_text, ok, error)
+    if not ok:
+        raise ValueError(error)
+
+
+def _account_sms(service, row) -> dict:
+    return {
+        "available": _sms_available(service),
+        "status": _appdb.sms_status(row),
+        "number": row["number"] if row else "",
+        "consent_ts": row["consent_ts"] if row else 0.0,
+        "verified_ts": row["verified_ts"] if row else 0.0,
+        "stopped_ts": row["stopped_ts"] if row else 0.0,
+        "stopped_by": row["stopped_by"] if row else "",
+        "code_sent_ts": row["code_sent_ts"] if row else 0.0,
+    }
+
+
+def get_account_sms(service, params, body) -> dict:
+    me = params.get("_username", "")
+    return _account_sms(service, service.app_db.user_sms(me))
+
+
+def post_account_sms_start(service, params, body) -> dict:
+    """Begin (or restart) opting the caller's own account into alert texts:
+    stores the number, sends a six-digit code, and leaves the row pending
+    until post_account_sms_confirm verifies it."""
+    from ... import alertmail
+
+    me = params.get("_username", "")
+    if body.get("consent") is not True:
+        raise ValueError("Accept the terms to receive alert texts")
+    number = str(body.get("number", "")).strip()
+    if not alertmail.is_e164(number):
+        raise ValueError("A mobile number in E.164 form (+15551234567) is required")
+    if not _sms_available(service):
+        raise ValueError("Alert texts are not set up on this server; an "
+                         "administrator turns them on under Alerts → Settings")
+    now = time.time()
+    row = service.app_db.user_sms(me)
+    if row is not None and now - row["code_sent_ts"] < SMS_CODE_RESEND_S:
+        remaining = max(1, int(SMS_CODE_RESEND_S - (now - row["code_sent_ts"])) + 1)
+        raise ValueError(f"Wait {remaining} s before requesting another code")
+    code = f"{secrets.randbelow(1000000):06d}"
+    code_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()
+    service.app_db.sms_start(me, number, code_hash, now)
+    text = (f"SappiWhere: your alert text verification code is {code}. It "
+           f"expires in 10 minutes. Reply STOP to opt out, HELP for help. "
+           f"Msg & data rates may apply.")
+    try:
+        _sms_send(service, number, text, "sms_verify", record_text=text.replace(code, "******"))
+    except Exception as exc:
+        service.app_db.sms_clear_code(me)
+        raise ValueError(str(exc)) from exc
+    _audit(service, params, "account.sms.start", target=me, detail=f"code sent to {number}")
+    return _account_sms(service, service.app_db.user_sms(me))
+
+
+def post_account_sms_confirm(service, params, body) -> dict:
+    """Confirm the code post_account_sms_start sent and turn texts on."""
+    me = params.get("_username", "")
+    row = service.app_db.user_sms(me)
+    if _appdb.sms_status(row) != "pending":
+        raise ValueError("No verification code is outstanding; request one first")
+    now = time.time()
+    if now - row["code_sent_ts"] > SMS_CODE_TTL_S:
+        service.app_db.sms_clear_code(me)
+        raise ValueError("That code has expired; request a new one")
+    code = str(body.get("code", "")).strip()
+    code_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()
+    if not secrets.compare_digest(code_hash, row["code_hash"]):
+        attempts = service.app_db.sms_code_attempt(me)
+        if attempts >= SMS_CODE_MAX_ATTEMPTS:
+            service.app_db.sms_clear_code(me)
+            raise ValueError("Too many wrong codes; request a new one")
+        raise ValueError(f"Wrong code ({SMS_CODE_MAX_ATTEMPTS - attempts} tries left)")
+    number = row["number"]
+    service.app_db.sms_confirm(me, now)
+    text = ("SappiWhere alerts: you are now opted in to network alert texts "
+           "at this number. Msg frequency varies. Msg & data rates may "
+           "apply. Reply STOP to opt out, HELP for help.")
+    try:
+        _sms_send(service, number, text, "sms_optin")
+    except Exception as exc:
+        service.log.add(ERROR_CATEGORY,
+                        f"Alert text opt-in confirmation to {number} failed: {exc}")
+    _audit(service, params, "account.sms.confirm", target=me, detail=f"texts on for {number}")
+    return _account_sms(service, service.app_db.user_sms(me))
+
+
+def delete_account_sms(service, params, body) -> dict:
+    """Turn the caller's own alert texts off: stops a live number, or just
+    forgets a pending code / a previously stopped number."""
+    me = params.get("_username", "")
+    row = service.app_db.user_sms(me)
+    status = _appdb.sms_status(row)
+    if status == "on":
+        service.app_db.sms_stop(me, time.time(), "user")
+        _audit(service, params, "account.sms.stop", target=me)
+    elif row is not None:
+        service.app_db.sms_forget(me)
+        _audit(service, params, "account.sms.cancel", target=me)
+    return _account_sms(service, service.app_db.user_sms(me))
 
 
 # ------------------------------------------------------------- API tokens

@@ -125,6 +125,10 @@ const App = (() => {
           session using this account, including this one.</p>
       </fieldset>
       ${appearanceHtml}
+      ${forced ? '' : `
+      <fieldset id="am-sms"><legend>Text alerts (SMS)</legend>
+        <div id="am-sms-body"><p class="hint">Loading…</p></div>
+      </fieldset>`}
       ${version ? `<p class="hint">SappiWhere v${escapeHtml(version)}</p>` : ''}`,
       [
         // Forced, this dialog is the only thing the account can do — the
@@ -213,6 +217,92 @@ const App = (() => {
           window.open(`${window.location.origin}/?${params}#/${first}`, '_blank', 'noopener');
         };
       }
+      // Renders the SMS fieldset by status; each button wires its own
+      // handler and re-renders from the response rather than the whole
+      // modal reopening. Focus is only restored into the fieldset if it
+      // already held focus, so the initial load never steals it from the
+      // password fields above.
+      const renderSms = (info) => {
+        const smsBody = box.querySelector('#am-sms-body');
+        if (!smsBody) return;
+        const hadFocus = smsBody.contains(document.activeElement);
+        const number = escapeHtml(info.number || '');
+        if (!info.available) {
+          smsBody.innerHTML = '<p class="hint">Alert texts are not set up on this server. '
+            + 'An administrator turns them on under Alerts → Settings → Text messages.</p>';
+        } else if (info.status === 'pending') {
+          smsBody.innerHTML = `
+            <p class="hint">A verification code was texted to <b>${number}</b>. Enter it to turn alert texts on.</p>
+            <label>Code <input id="am-sms-code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]*"></label>
+            <div class="row"><button type="button" id="am-sms-confirm">Confirm</button> <button type="button" id="am-sms-resend">Resend code</button> <button type="button" id="am-sms-cancel">Cancel</button></div>
+            <p class="hint" id="am-sms-status"></p>`;
+          smsBody.querySelector('#am-sms-confirm').onclick = async () => {
+            try {
+              const result = await post('/api/account/sms/confirm', {
+                code: smsBody.querySelector('#am-sms-code').value,
+              });
+              renderSms(result);
+              announce('Alert texts turned on');
+            } catch (error) { showModalError(box, error.message); }
+          };
+          smsBody.querySelector('#am-sms-resend').onclick = async () => {
+            try {
+              const result = await post('/api/account/sms/start', { number: info.number, consent: true });
+              renderSms(result);
+              announce('Verification code sent');
+            } catch (error) { showModalError(box, error.message); }
+          };
+          smsBody.querySelector('#am-sms-cancel').onclick = async () => {
+            try { renderSms(await del('/api/account/sms')); } catch (error) { showModalError(box, error.message); }
+          };
+        } else if (info.status === 'on') {
+          smsBody.innerHTML = `
+            <p id="am-sms-on">Alert texts are <b>on</b> for <b>${number}</b>, confirmed ${escapeHtml(when(info.verified_ts))}.</p>
+            <p class="hint">Reply STOP to any alert text, or press Stop texts, to opt out at any time.</p>
+            <div class="row"><button type="button" id="am-sms-stop">Stop texts</button></div>
+            <p class="hint" id="am-sms-status"></p>`;
+          smsBody.querySelector('#am-sms-stop').onclick = async () => {
+            try {
+              renderSms(await del('/api/account/sms'));
+              announce('Alert texts stopped');
+            } catch (error) { showModalError(box, error.message); }
+          };
+        } else {
+          // off, or stopped (the same form, with a status line above it and
+          // the number pre-filled so re-enabling doesn't ask for it again).
+          const stoppedLine = info.status === 'stopped'
+            ? `<p class="hint" id="am-sms-stopped">Alert texts to <b>${number}</b> were stopped `
+              + `${escapeHtml(when(info.stopped_ts))}${info.stopped_by === 'stop' ? ' when STOP was texted to Twilio' : ''}.</p>`
+            : '';
+          const startLabel = info.status === 'stopped' ? 'Turn texts back on' : 'Send verification code';
+          smsBody.innerHTML = `
+            ${stoppedLine}
+            <label>Mobile number <input id="am-sms-number" type="tel" autocomplete="tel" placeholder="+15551234567" value="${number}"></label>
+            <p class="hint" id="am-sms-terms">By entering your mobile number and ticking the box you agree to receive automated network alert text messages from SappiWhere at that number. Messages are sent only when an alert fires or clears; frequency varies with network activity. Message and data rates may apply. Reply STOP at any time to opt out, or HELP for help; you can also stop texts here. Your number is used only for these alerts and is not shared.</p>
+            <label class="check"><input type="checkbox" id="am-sms-consent"> I agree to receive alert text messages at this number and accept the terms above</label>
+            <div class="row"><button type="button" id="am-sms-start">${startLabel}</button></div>
+            <p class="hint" id="am-sms-status"></p>`;
+          smsBody.querySelector('#am-sms-start').onclick = async () => {
+            const numberValue = smsBody.querySelector('#am-sms-number').value.trim();
+            const consent = smsBody.querySelector('#am-sms-consent').checked;
+            if (!numberValue) { showModalError(box, 'Enter your mobile number'); return; }
+            if (!consent) { showModalError(box, 'Tick the box to accept the terms'); return; }
+            try {
+              const result = await post('/api/account/sms/start', { number: numberValue, consent });
+              renderSms(result);
+              announce('Verification code sent');
+            } catch (error) { showModalError(box, error.message); }
+          };
+        }
+        if (hadFocus) {
+          const toFocus = smsBody.querySelector('input, button');
+          if (toFocus) toFocus.focus();
+        }
+      };
+      get('/api/account/sms').then(renderSms).catch((error) => {
+        const smsBody = box.querySelector('#am-sms-body');
+        if (smsBody) smsBody.innerHTML = `<p class="hint">${escapeHtml(error.message || 'Failed to load')}</p>`;
+      });
     }
     // Escape and a backdrop click must not dismiss this one. Without the
     // lock the prompt was advisory: it closed on a stray keypress, came back

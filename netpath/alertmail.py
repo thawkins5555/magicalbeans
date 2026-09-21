@@ -951,6 +951,20 @@ def _twilio_error_text(exc: urllib.error.HTTPError) -> str:
     return f"Twilio returned HTTP {exc.code}"
 
 
+# Twilio's own error code for "this number has opted out" (an unsubscribed
+# recipient, most often a prior STOP reply) — see _sms_result.
+TWILIO_STOP_CODE = 21610
+
+_TWILIO_ERROR_CODE_RE = re.compile(r"Twilio error (\d+)")
+
+
+def twilio_error_code(text: str) -> int | None:
+    """The numeric code out of a `_twilio_error_text` string, or None when
+    `text` is not one of those (a timeout, a redirect refusal, ...)."""
+    match = _TWILIO_ERROR_CODE_RE.search(text or "")
+    return int(match.group(1)) if match else None
+
+
 @dataclass
 class SmsJob:
     """One text to every number, resolved on the tick thread like MailJob."""
@@ -961,6 +975,10 @@ class SmsJob:
     alert_id: int | None = None
     kind: str = "sms_alert"
     alert_ids: list | None = None
+    # (number, error text) for every number that failed, alongside the
+    # joined `errors` string _deliver already builds — _sms_result reads
+    # this to single out a Twilio STOP reply per number.
+    number_errors: list = field(default_factory=list)
 
     # _mail_result-shaped consumers read these two names.
     @property
@@ -988,12 +1006,15 @@ class SmsQueue(MailQueue):
             self._finish(job, False, blocked)
             return
         errors = []
+        job.number_errors = []
         delivered = 0
         for number in list(job.to_numbers):
             try:
                 send_sms(job.settings, job.token, number, job.text)
             except Exception as exc:
-                errors.append(f"{number}: {str(exc) or exc.__class__.__name__}")
+                text = str(exc) or exc.__class__.__name__
+                errors.append(f"{number}: {text}")
+                job.number_errors.append((number, text))
             else:
                 delivered += 1
         job.token = None

@@ -205,6 +205,8 @@ def fake_send_sms(settings, token, to_number, text):
     calls.append((to_number, text, token))
     if text.startswith("fail") or to_number == "+15550009999":
         raise ValueError("boom")
+    if to_number == "+15559990010":
+        raise ValueError("Twilio error 21610: unsubscribed recipient")
 
 
 alertmail.send_sms = fake_send_sms
@@ -257,6 +259,17 @@ try:
           (len(calls) - n, results[-1][1:], breaker[-1:]))
     check("the email breaker text is untouched",
           alertmail.MailQueue.breaker_error == alertmail.BREAKER_ERROR)
+    time.sleep(0.35)
+    stop_job = alertmail.SmsJob(settings=dict(BASE), token="tok",
+                                to_numbers=["+15559990010", "+15557654321"],
+                                text="hello", alert_id=5)
+    q.submit(stop_job)
+    q.wait_idle(3)
+    check("a 21610 (STOP) reply lands in the job's number_errors",
+          stop_job.number_errors
+          and stop_job.number_errors[0][0] == "+15559990010"
+          and alertmail.twilio_error_code(stop_job.number_errors[0][1]) == 21610,
+          stop_job.number_errors)
     q.stop()
 finally:
     alertmail.send_sms = real_send_sms

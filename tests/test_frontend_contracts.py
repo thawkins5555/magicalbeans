@@ -4946,6 +4946,25 @@ _REFRESH102 = js_function(NODES102, "refresh")
 check("App.get('/api/nodes/devices', { ...query, fields: 'list' })" in _REFRESH102,
       "nodes.js's device list refresh asks for the 'list' projection")
 
+# ---------------------------------------------------------------------------
+# 103. Account modal (5.50.0): the SMS opt-in fieldset carries its ids, the
+#      exact consent sentence, and the number interpolation is escaped.
+ACCOUNT_MODAL103 = js_function(APP, "accountModal")
+for sms_id in ("am-sms-number", "am-sms-consent", "am-sms-start",
+               "am-sms-code", "am-sms-confirm", "am-sms-stop"):
+    check("id=\"%s\"" % sms_id in ACCOUNT_MODAL103,
+          "accountModal renders #%s" % sms_id)
+check("Text alerts (SMS)" in ACCOUNT_MODAL103,
+      "accountModal's SMS fieldset carries its legend")
+check("Reply STOP at any time to opt out, or HELP for help" in ACCOUNT_MODAL103,
+      "the SMS terms sentence is intact")
+check("/api/account/sms/start" in ACCOUNT_MODAL103,
+      "accountModal calls the SMS start route")
+check("/api/account/sms/confirm" in ACCOUNT_MODAL103,
+      "accountModal calls the SMS confirm route")
+check("const number = escapeHtml(" in ACCOUNT_MODAL103,
+      "the SMS number is escaped before it is interpolated")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

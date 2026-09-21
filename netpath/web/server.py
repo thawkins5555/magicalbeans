@@ -220,6 +220,12 @@ ROUTES = [
     ("POST", r"^/api/users/permissions$", api.post_user_permissions, ("admin", W)),
     ("POST", r"^/api/password$", api.post_password, _password_requirement),
     ("PUT", r"^/api/account/theme$", api.put_account_theme, None),
+    # Per-user SMS opt-in: self-service like the theme route above, gated
+    # by signed-in-session alone rather than a module permission.
+    ("GET", r"^/api/account/sms$", api.get_account_sms, None),
+    ("POST", r"^/api/account/sms/start$", api.post_account_sms_start, None),
+    ("POST", r"^/api/account/sms/confirm$", api.post_account_sms_confirm, None),
+    ("DELETE", r"^/api/account/sms$", api.delete_account_sms, None),
     # An API token is a service-account credential, not a person's:
     # issuing or revoking one is as administrative an act as creating or
     # deleting the account it authenticates as, so it sits behind the same

@@ -47,6 +47,21 @@ CREATE TABLE IF NOT EXISTS user_permissions (
     PRIMARY KEY (username, module)
 );
 
+-- Per-user SMS opt-in for alert texts, distinct from the admin-set
+-- sms_to_default list: a row only exists once an account has started the
+-- opt-in flow. See sms_status() for how these columns map to one status.
+CREATE TABLE IF NOT EXISTS user_sms (
+    username      TEXT PRIMARY KEY,
+    number        TEXT NOT NULL DEFAULT '',
+    consent_ts    REAL NOT NULL DEFAULT 0,
+    verified_ts   REAL NOT NULL DEFAULT 0,
+    stopped_ts    REAL NOT NULL DEFAULT 0,
+    stopped_by    TEXT NOT NULL DEFAULT '',
+    code_hash     TEXT NOT NULL DEFAULT '',
+    code_sent_ts  REAL NOT NULL DEFAULT 0,
+    code_attempts INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS hostnames (
     ip          TEXT PRIMARY KEY,
     hostname    TEXT,
@@ -306,6 +321,21 @@ GLOBAL_DEFAULTS = {
 # exists in both files and has to be split by key, because netpath.db keeps its
 # own module settings.
 MIGRATED_TABLES = ("users", "hostnames")
+
+
+def sms_status(row) -> str:
+    """One word for a user_sms row: 'off' (no row, or opted out and never
+    finished), 'pending' (code sent, not yet confirmed), 'on' (verified and
+    live) or 'stopped' (opted out, by the user or a Twilio STOP reply)."""
+    if row is None or not row["number"]:
+        return "off"
+    if row["stopped_ts"] > 0:
+        return "stopped"
+    if row["verified_ts"] > 0:
+        return "on"
+    if row["code_hash"]:
+        return "pending"
+    return "off"
 
 
 class AppDatabase(SqliteStore):
@@ -635,7 +665,89 @@ class AppDatabase(SqliteStore):
             self._conn.execute(
                 "DELETE FROM api_tokens WHERE username = ? COLLATE NOCASE",
                 (username,))
+            self._conn.execute(
+                "DELETE FROM user_sms WHERE username = ? COLLATE NOCASE",
+                (username,))
             self._conn.commit()
+
+    # ------------------------------------------------------------- user sms
+
+    def user_sms(self, username: str) -> sqlite3.Row | None:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM user_sms WHERE username = ? COLLATE NOCASE",
+                (username,)).fetchone()
+
+    def sms_start(self, username: str, number: str, code_hash: str, now: float) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO user_sms(username, number, consent_ts, verified_ts,"
+                " stopped_ts, stopped_by, code_hash, code_sent_ts, code_attempts)"
+                " VALUES (?,?,?,0,0,'',?,?,0)"
+                " ON CONFLICT(username) DO UPDATE SET number=excluded.number,"
+                " consent_ts=excluded.consent_ts, verified_ts=0, stopped_ts=0,"
+                " stopped_by='', code_hash=excluded.code_hash,"
+                " code_sent_ts=excluded.code_sent_ts, code_attempts=0",
+                (username, number, now, code_hash, now))
+            self._conn.commit()
+
+    def sms_code_attempt(self, username: str) -> int:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE user_sms SET code_attempts = code_attempts + 1"
+                " WHERE username = ? COLLATE NOCASE", (username,))
+            row = self._conn.execute(
+                "SELECT code_attempts FROM user_sms WHERE username = ?"
+                " COLLATE NOCASE", (username,)).fetchone()
+            self._conn.commit()
+            return int(row["code_attempts"]) if row else 0
+
+    def sms_clear_code(self, username: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE user_sms SET code_hash = '', code_attempts = 0"
+                " WHERE username = ? COLLATE NOCASE", (username,))
+            self._conn.commit()
+
+    def sms_confirm(self, username: str, now: float) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE user_sms SET verified_ts = ?, code_hash = '',"
+                " code_attempts = 0 WHERE username = ? COLLATE NOCASE",
+                (now, username))
+            self._conn.commit()
+
+    def sms_stop(self, username: str, now: float, by: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE user_sms SET stopped_ts = ?, stopped_by = ?,"
+                " code_hash = '', code_attempts = 0"
+                " WHERE username = ? COLLATE NOCASE", (now, by, username))
+            self._conn.commit()
+
+    def sms_forget(self, username: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM user_sms WHERE username = ? COLLATE NOCASE",
+                (username,))
+            self._conn.commit()
+
+    def sms_opted_in_numbers(self) -> list[str]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT number FROM user_sms WHERE verified_ts > 0"
+                " AND stopped_ts = 0 AND number != ''"
+                " ORDER BY username COLLATE NOCASE").fetchall()
+        return [row["number"] for row in rows]
+
+    def sms_stop_number(self, number: str, now: float) -> int:
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE user_sms SET stopped_ts = ?, stopped_by = 'stop'"
+                " WHERE number = ? AND verified_ts > 0 AND stopped_ts = 0",
+                (now, number))
+            self._conn.commit()
+            return cursor.rowcount or 0
 
     # ------------------------------------------------------------ api tokens
     #

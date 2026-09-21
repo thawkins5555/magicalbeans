@@ -540,6 +540,20 @@ class AlertEngine(Worker):
             self.db.record_notification(alert_id, job.kind,
                                         ", ".join(job.to_numbers), job.text,
                                         ok, error)
+        # A Twilio STOP reply (error code 21610) means that number will
+        # never receive another text until it re-opts in with Twilio
+        # directly, so a per-user opt-in is turned off right away rather
+        # than failing silently on every future send.
+        sms_to_default = job.settings.get("sms_to_default", [])
+        for number, err in getattr(job, "number_errors", []):
+            if alertmail.twilio_error_code(err) != alertmail.TWILIO_STOP_CODE:
+                continue
+            if self.app_db is not None:
+                self.app_db.sms_stop_number(number, time.time())
+            self.log.add(ERROR, f"{number} replied STOP to Twilio; alert texts "
+                                f"to it are off" + (
+                                    " (remove it from Alerts → Settings → "
+                                    "Default numbers)" if number in sms_to_default else ""))
 
     def _sms_breaker(self, is_open: bool, error: str) -> None:
         """The SMS path itself became (un)usable — same reasoning as
@@ -3307,11 +3321,18 @@ class AlertEngine(Worker):
 
     def _sms_numbers(self, settings) -> list:
         """sms_to_default, tolerant of a comma string like smtp_to_default's
-        own upgrade fallback in _notify."""
+        own upgrade fallback in _notify, plus every account's own opted-in
+        number, de-duplicated."""
         raw_to = settings.get("sms_to_default", [])
         if isinstance(raw_to, str):
-            return [a.strip() for a in raw_to.split(",") if a.strip()]
-        return [str(a).strip() for a in raw_to if str(a).strip()]
+            numbers = [a.strip() for a in raw_to.split(",") if a.strip()]
+        else:
+            numbers = [str(a).strip() for a in raw_to if str(a).strip()]
+        if self.app_db is not None:
+            for number in self.app_db.sms_opted_in_numbers():
+                if number not in numbers:
+                    numbers.append(number)
+        return numbers
 
     def _sms_token(self, settings) -> str | None:
         """The stored secret, only when the configured Account SID, API Key
