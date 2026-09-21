@@ -447,6 +447,19 @@ try:
                                "session's username, schema-validated body",
         "delete_dashboard_layout": "same self-service shape: resets only the "
                                   "caller's own saved layout to the default",
+        "post_account_sms_start": "self-service write to the caller's OWN "
+                                 "user_sms row plus a notification-log row for "
+                                 "a text sent to the caller's own entered "
+                                 "number; audited as account.sms.start; the "
+                                 "send itself is rate-limited by the 60 s "
+                                 "resend guard and code TTL",
+        "post_account_sms_confirm": "self-service write to the caller's OWN "
+                                   "user_sms row plus a notification-log row "
+                                   "for a text sent to the caller's own "
+                                   "verified number; audited as "
+                                   "account.sms.confirm; the send itself is "
+                                   "rate-limited by the 60 s resend guard and "
+                                   "code TTL",
     }
 
     missing_handlers = [(m, p, h) for m, p, h, r in ROUTES_PARSED if h not in API_FUNCS]
@@ -524,13 +537,14 @@ try:
           server_mod.PUBLIC_API == PUBLIC_API_EXPECTED,
           server_mod.PUBLIC_API ^ PUBLIC_API_EXPECTED)
 
-    # The 12 routes with no gate at all, each justified in server.py's own
+    # The 16 routes with no gate at all, each justified in server.py's own
     # comments (pre-auth, a property of the host, or — state/config/dashboard
     # — filtered per-module inside the handler, which the /api/state and
     # /api/config checks earlier in this suite already exercise; the theme
-    # PUT and the three dashboard-layout routes are self-service, own account
-    # only, see KNOWN_NOT_WRITES). A 13th route reaching this set is a
-    # deliberate act with this test to update, not an omission nobody notices.
+    # PUT, the three dashboard-layout routes, and the four account/sms
+    # routes are self-service, own account only, see KNOWN_NOT_WRITES). A
+    # 17th route reaching this set is a deliberate act with this test to
+    # update, not an omission nobody notices.
     UNGATED_EXPECTED = {
         ("POST", r"^/api/login$"), ("POST", r"^/api/logout$"),
         ("POST", r"^/api/heartbeat$"), ("GET", r"^/api/session$"),
@@ -539,6 +553,8 @@ try:
         ("PUT", r"^/api/account/theme$"),
         ("GET", r"^/api/dashboard/layout$"), ("PUT", r"^/api/dashboard/layout$"),
         ("DELETE", r"^/api/dashboard/layout$"),
+        ("GET", r"^/api/account/sms$"), ("POST", r"^/api/account/sms/start$"),
+        ("POST", r"^/api/account/sms/confirm$"), ("DELETE", r"^/api/account/sms$"),
     }
     ungated_actual = {(m, p) for m, p, h, r in ROUTES_PARSED if r is None}
     check("the ungated route set is exactly what it was when this was audited",
