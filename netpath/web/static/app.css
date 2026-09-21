@@ -1506,6 +1506,8 @@ body.login-page {
 .login-box button { margin-top: var(--space-lg); padding: var(--space-sm); font-size: var(--fs-md); }
 .login-box .err { margin: var(--space-md) 0 0; font-size: var(--fs-xs); }
 .login-box .hint { margin: 14px 0 0; line-height: 1.5; }
+/* SMS terms/privacy: prose is too wide for the sign-in box's fixed width. */
+.login-box.doc { max-width: 44rem; width: min(44rem, calc(100vw - 32px)); text-align: left; }
 
 /* ---------------------------------------------------------------- modal */
 .modal, .ssh-overlay {

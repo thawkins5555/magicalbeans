@@ -3129,6 +3129,14 @@ hard to trip — a path monitor that cries wolf gets turned off.
   page. A number opted in this way is texted alongside the Default
   numbers list above — merged in, de-duplicated — for every alert this
   section already covers, on the same timing and the same hourly cap.
+- **From 5.53.0, two pages describing the program are public — no
+  sign-in needed — at `/sms-terms` and `/sms-privacy`.** Twilio's
+  campaign review wants a terms-of-service and privacy-policy URL it
+  can point a carrier reviewer at; since SappiWhere is self-hosted, it
+  serves both itself rather than relying on an external policy page.
+  The privacy page states plainly that no mobile information is shared
+  with third parties or affiliates for marketing or promotional
+  purposes.
 
 ### Templates
 
@@ -5213,7 +5221,8 @@ gathers **Appearance · this browser** — theme and the kiosk launcher (see
 being on a page of settings the server stores for everyone. From 5.52.0
 it also gathers **Text alerts (SMS)**, an account's own opt-in for alert
 texts to its own phone (see **Text messages (Twilio)**, above, for the
-opt-in flow and what it does to the send list). Resetting a
+opt-in flow and what it does to the send list); from 5.53.0 its consent
+notice links to the SMS terms and privacy pages. Resetting a
 *different* account's password requires Admin write, same as adding,
 editing or removing an account.
 

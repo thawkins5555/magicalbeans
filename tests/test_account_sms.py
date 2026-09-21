@@ -338,6 +338,27 @@ try:
     service.app_db.remove_user("grunt")
     check("delete_user removes the user_sms row too",
           service.app_db.user_sms("grunt") is None)
+
+    # --------------------------------------- 13. public SMS terms/privacy
+    def get_public(path):
+        conn = http.client.HTTPConnection("127.0.0.1", web_port, timeout=20)
+        conn.request("GET", path)
+        response = conn.getresponse()
+        raw = response.read()
+        conn.close()
+        return response.status, dict(response.getheaders()), raw
+
+    status, head, body = get_public("/sms-terms")
+    check("unauthenticated GET /sms-terms is 200 text/html",
+          status == 200 and head.get("Content-Type", "").startswith("text/html"))
+    check("/sms-terms mentions STOP",
+          b"STOP" in body)
+
+    status, head, body = get_public("/sms-privacy")
+    check("unauthenticated GET /sms-privacy is 200 text/html",
+          status == 200 and head.get("Content-Type", "").startswith("text/html"))
+    check("/sms-privacy carries the carrier-required no-sharing sentence",
+          b"No mobile information will be shared" in body)
 finally:
     alertmail.send_sms = real_send_sms
     server.stop()

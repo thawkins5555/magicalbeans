@@ -9549,6 +9549,20 @@ Default numbers when that same number sits in `sms_to_default` — Twilio
 will keep refusing it there too, so a mixed admin/opt-in number is not
 left silently retried forever.
 
+**From 5.53.0, `/sms-terms` and `/sms-privacy` are static files, not
+rendered pages, gated only by `PUBLIC_PATHS` membership.** `server.py`'s
+static handler maps the bare path to its `.html` file the same way it
+already maps `/login` to `login.html`, so the two content files
+(`netpath/web/static/sms-terms.html`, `sms-privacy.html`) are the whole
+implementation — no route handler, no template context, nothing to
+render per request. They share `login.html`'s `<head>` (`tokens.css`,
+`app.css`, `boot.js`, each cache-busted with the same `__SW_VERSION__`
+stamp) and its login-page body shell, so they pick up the current theme
+and brand mark without their own styling. Static files were chosen over
+a rendered page because the content is fixed prose a carrier reviewer
+reads once — there is no per-account or per-request data to inject, and
+a template would only add a rendering step with nothing to vary.
+
 ### Reports (`report.py`, `web/api/nodes_reports.py`) — 4.49.0
 
 Sits above `nodesdb.py`/`alertsdb.py` rather than inside either — it reads

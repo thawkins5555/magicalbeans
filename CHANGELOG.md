@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.53.0 — Public SMS terms and privacy pages](#5530--public-sms-terms-and-privacy-pages)
 - [5.52.0 — Per-user SMS opt-in with verified consent](#5520--per-user-sms-opt-in-with-verified-consent)
 - [5.51.0 — Loopback tunnel guard, TACACS+ auto-create role cleanup, and SNMP decode correctness](#5510--loopback-tunnel-guard-tacacs-auto-create-role-cleanup-and-snmp-decode-correctness)
 - [5.50.0 — Spanning-tree polling cadence; no samples for down ports](#5500--spanning-tree-polling-cadence-no-samples-for-down-ports)
@@ -185,6 +186,39 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.53.0 — Public SMS terms and privacy pages
+
+Twilio's A2P 10DLC campaign review also wants a privacy policy URL and a
+terms-of-service URL that describe the SMS program and its no-sharing
+commitment. SappiWhere is self-hosted with no public web presence to
+point Twilio at, so it serves its own two pages.
+
+**Two new pages, reachable without signing in: `/sms-terms` and
+`/sms-privacy`.** Terms covers the SappiWhere alert-text program,
+eligibility (a SappiWhere login, your own number only, confirmed by a
+texted code), frequency and cost, how to stop (STOP by text or the Stop
+texts button in the Account dialog), how to get help (HELP by text, or
+Thomas Hawkins in Sappi IT), that carriers aren't liable for delivery,
+and how changes are communicated. Privacy lists exactly what's kept
+(the number, when consent was given, when it was verified, any opt-out,
+and the sent-text log — the verification code itself only as a hash,
+never in the clear), how it's used, that delivery runs through Twilio
+with **no mobile information shared with third parties or affiliates for
+marketing or promotional purposes**, that it lives in SappiWhere's own
+database, and that it's kept until the account is removed.
+
+**The Account dialog's consent notice now links to both**, opening in a
+new tab, so the same wording a carrier reviewer asked for is one click
+from where an account actually opts in.
+
+Files: `netpath/web/static/sms-terms.html`, `netpath/web/static/sms-privacy.html`,
+`netpath/web/server.py`, `netpath/web/static/app.js`.
+
+Verification: `tests/test_web_gates.py` (`PUBLIC_PATHS_EXPECTED` gains
+the four new paths), an unauthenticated 200 check for each page, and
+`tests/test_frontend_contracts.py` pins the consent notice's two links
+and each page's required sentence.
 
 ### 5.52.0 — Per-user SMS opt-in with verified consent
 

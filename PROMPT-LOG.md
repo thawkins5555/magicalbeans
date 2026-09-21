@@ -5,6 +5,21 @@ grouped by the version that carries it. This is a working record for the
 operator — the full story of each change is in `CHANGELOG.md`, and this file
 does not replace it.
 
+## 5.53.0 — Public SMS terms and privacy pages
+
+**"Where are the terms of service and privacy policy?"** Twilio's
+campaign review also wants a terms-of-service URL and a privacy-policy
+URL, separate from the consent wording already in the Account dialog.
+Since SappiWhere is self-hosted with no public site to link to, the
+decision was to serve two static pages from inside the app itself
+(`/sms-terms`, `/sms-privacy`), reachable without signing in, rather
+than standing up or relying on an external policy page.
+
+**"Option #2 - Organization name is Sappi and support person is Thomas
+Hawkins."** Filled in the two placeholders the pages needed: the
+organization named in the program description is Sappi, and the HELP
+contact is Thomas Hawkins in Sappi IT.
+
 ## 5.52.0 — Per-user SMS opt-in with verified consent
 
 **"We are now going to set up an A2P Twilio campaign for sending text

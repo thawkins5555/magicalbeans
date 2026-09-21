@@ -278,7 +278,7 @@ const App = (() => {
           smsBody.innerHTML = `
             ${stoppedLine}
             <label>Mobile number <input id="am-sms-number" type="tel" autocomplete="tel" placeholder="+15551234567" value="${number}"></label>
-            <p class="hint" id="am-sms-terms">By entering your mobile number and ticking the box you agree to receive automated network alert text messages from SappiWhere at that number. Messages are sent only when an alert fires or clears; frequency varies with network activity. Message and data rates may apply. Reply STOP at any time to opt out, or HELP for help; you can also stop texts here. Your number is used only for these alerts and is not shared.</p>
+            <p class="hint" id="am-sms-terms">By entering your mobile number and ticking the box you agree to receive automated network alert text messages from SappiWhere at that number. Messages are sent only when an alert fires or clears; frequency varies with network activity. Message and data rates may apply. Reply STOP at any time to opt out, or HELP for help; you can also stop texts here. Your number is used only for these alerts and is not shared. Full terms: <a href="/sms-terms" target="_blank" rel="noopener">SMS Terms</a> · <a href="/sms-privacy" target="_blank" rel="noopener">SMS Privacy</a>.</p>
             <label class="check"><input type="checkbox" id="am-sms-consent"> I agree to receive alert text messages at this number and accept the terms above</label>
             <div class="row"><button type="button" id="am-sms-start">${startLabel}</button></div>
             <p class="hint" id="am-sms-status"></p>`;

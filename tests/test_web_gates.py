@@ -528,9 +528,12 @@ try:
     # is the worst thing that can happen to this table, so both are an exact
     # expected set rather than a substring or "at least" check.
     PUBLIC_PATHS_EXPECTED = {"/login", "/login.html", "/login.js", "/tokens.css",
-                            "/app.css", "/boot.js", "/favicon.ico", "/favicon.svg"}
+                            "/app.css", "/boot.js", "/favicon.ico", "/favicon.svg",
+                            "/sms-terms", "/sms-terms.html",
+                            "/sms-privacy", "/sms-privacy.html"}
     PUBLIC_API_EXPECTED = {"/api/login", "/api/session"}
-    check("PUBLIC_PATHS is exactly the sign-in page's own static assets",
+    check("PUBLIC_PATHS is exactly the sign-in page's own static assets plus "
+          "the SMS terms and privacy pages",
           server_mod.PUBLIC_PATHS == PUBLIC_PATHS_EXPECTED,
           server_mod.PUBLIC_PATHS ^ PUBLIC_PATHS_EXPECTED)
     check("PUBLIC_API is exactly /api/login and /api/session",

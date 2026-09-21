@@ -744,9 +744,12 @@ def _route_candidates(method: str, path: str):
 
 # Reachable without a session: the sign-in page and what it needs to render.
 # tokens.css is the stylesheet app.css reads its colours from; the sign-in
-# page links both, before there is a session to be gated on.
+# page links both, before there is a session to be gated on. The SMS terms
+# and privacy pages are public so the consent notice can link to them and a
+# carrier reviewer can read them without an account.
 PUBLIC_PATHS = {"/login", "/login.html", "/login.js", "/tokens.css", "/app.css", "/boot.js",
-                "/favicon.ico", "/favicon.svg"}
+                "/favicon.ico", "/favicon.svg",
+                "/sms-terms", "/sms-terms.html", "/sms-privacy", "/sms-privacy.html"}
 PUBLIC_API = {"/api/login", "/api/session"}
 
 # What an account whose password must still be changed may reach.
@@ -1575,6 +1578,10 @@ class Handler(BaseHTTPRequestHandler):
             path = "/index.html"
         if path == "/login":
             path = "/login.html"
+        elif path == "/sms-terms":
+            path = "/sms-terms.html"
+        elif path == "/sms-privacy":
+            path = "/sms-privacy.html"
         # Resolve inside the static directory and refuse anything that
         # escapes. commonpath rather than startswith: the directory name is
         # a prefix of its own siblings' names ("static_notes"), and a prefix

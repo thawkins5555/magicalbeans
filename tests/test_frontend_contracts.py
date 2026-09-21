@@ -4964,6 +4964,24 @@ check("/api/account/sms/confirm" in ACCOUNT_MODAL103,
       "accountModal calls the SMS confirm route")
 check("const number = escapeHtml(" in ACCOUNT_MODAL103,
       "the SMS number is escaped before it is interpolated")
+check('href="/sms-terms"' in ACCOUNT_MODAL103 and 'href="/sms-privacy"' in ACCOUNT_MODAL103,
+      "accountModal's SMS paragraph links the full terms and privacy pages")
+check(ACCOUNT_MODAL103.count('rel="noopener"') >= 2,
+      "the SMS terms/privacy links open in a new tab without a window handle back")
+
+# ---------------------------------------------------------------------------
+# 104. SMS Terms / SMS Privacy (Twilio 10DLC campaign): the public pages
+#      exist, carry the versioned asset links, and the carrier-required
+#      no-sharing sentence is present verbatim.
+SMS_TERMS104 = static_text("sms-terms.html")
+SMS_PRIVACY104 = static_text("sms-privacy.html")
+for name, text in (("sms-terms.html", SMS_TERMS104), ("sms-privacy.html", SMS_PRIVACY104)):
+    for asset in ("/tokens.css?v=__SW_VERSION__", "/app.css?v=__SW_VERSION__",
+                  "/boot.js?v=__SW_VERSION__"):
+        check(asset in text, "%s links %s" % (name, asset))
+check("No mobile information will be shared with third parties or affiliates "
+      "for marketing or promotional purposes." in SMS_PRIVACY104,
+      "sms-privacy.html carries the carrier-required no-sharing sentence verbatim")
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))
