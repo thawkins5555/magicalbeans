@@ -5,6 +5,43 @@ grouped by the version that carries it. This is a working record for the
 operator — the full story of each change is in `CHANGELOG.md`, and this file
 does not replace it.
 
+## 5.52.0 — Per-user SMS opt-in with verified consent
+
+**"We are now going to set up an A2P Twilio campaign for sending text
+messages from SappiWhere directly to users who need them ... please
+provide me with a Campaign Description."** A campaign description was
+drafted for the operator to submit to Twilio, describing SappiWhere's
+network-monitoring alert texts and the consent path behind them.
+
+**"Lets implement the opt in feature - I will need screenshots that I
+can provide and also what do I insert into the 'Message Flow: How do
+end-users consent to receive messages' field?"** Two design questions
+came out of that: whether consent should be a double opt-in confirmed by
+a texted code, or an inbound STOP/START webhook Twilio itself relays;
+and whether opt-in should be a per-account setting stored against each
+sign-in, or a simple standalone form. A texted-code double opt-in was
+chosen over a webhook — it produces its own proof of consent (the code
+sent, the code confirmed) without standing up a public inbound endpoint
+for Twilio to reach — and it was tied to each account's own sign-in
+rather than a bare form, so the same number can't be opted in twice or
+opted in by someone who isn't its owner. The Message Flow field's answer
+follows straight from that: the account enters its number, reads the
+fixed terms and ticks a consent box on its own Account dialog, receives
+a one-time code by text and confirms it, and can stop the texts from the
+same dialog at any time. Screenshots for the campaign form were produced
+from a headless run of the Account dialog through each state of the
+flow (empty, code sent, confirmed, stopped) rather than a live phone.
+Deployment mode ran the shipped design straight through — no further
+questions were needed.
+
+**Files changed for 5.52.0:** `netpath/appdb.py`, `netpath/web/api/auth.py`,
+`netpath/web/server.py`, `netpath/alertengine.py`, `netpath/alertmail.py`,
+`netpath/web/static/app.js`, `tests/test_account_sms.py` (new),
+`tests/test_alert_sms.py`, `tests/test_frontend_contracts.py`, and
+`netpath/__init__.py`'s version bump. Documentation for this release —
+`CHANGELOG.md`, `FEATURES.md`, `INTERNALS.md`, and this file — follows
+in the same pass.
+
 ## 5.41.0 — Link detail pane names which switch is STP-blocking a VLAN
 
 **Operator prompt:** "On Mapper -> Nodes -> Link Details -> Step Blocked

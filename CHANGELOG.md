@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.52.0 — Per-user SMS opt-in with verified consent](#5520--per-user-sms-opt-in-with-verified-consent)
 - [5.51.0 — Loopback tunnel guard, TACACS+ auto-create role cleanup, and SNMP decode correctness](#5510--loopback-tunnel-guard-tacacs-auto-create-role-cleanup-and-snmp-decode-correctness)
 - [5.50.0 — Spanning-tree polling cadence; no samples for down ports](#5500--spanning-tree-polling-cadence-no-samples-for-down-ports)
 - [5.49.0 — Low-risk poll and API performance](#5490--low-risk-poll-and-api-performance)
@@ -184,6 +185,73 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.52.0 — Per-user SMS opt-in with verified consent
+
+Twilio's A2P 10DLC campaign registration wants documented double opt-in —
+proof that the person at a number asked for texts, in their own action —
+plus STOP/HELP handling the app itself can show evidence of. 5.20.1
+covered numbers an administrator enters on Alerts settings; this release
+lets any signed-in account opt its own phone in, with a texted code
+proving the number is real, and lets that same account stop the texts at
+any time.
+
+**A new "Text alerts (SMS)" fieldset on the Account dialog, after
+Appearance.** The account enters a mobile number (E.164), reads a fixed
+terms paragraph, ticks "I agree to receive alert text messages at this
+number and accept the terms above", and presses **Send verification
+code**. A 6-digit code is texted — good for 10 minutes, 5 wrong guesses
+before it's dead, and a resend is held to one per 60 seconds so a typo'd
+number can't be turned into a way to spam an arbitrary phone. Entering the
+code and pressing **Confirm** sends a second, opt-in confirmation text and
+turns texts on; the fieldset then reads "Alert texts are on for
+`<number>`, confirmed `<time>`" with a **Stop texts** button. A stopped
+number shows when it stopped and whether the account pressed Stop or the
+number itself replied STOP to Twilio, with **Turn texts back on** to
+restart the flow. When Alerts isn't set up for SMS on this install, the
+fieldset says so and points at Alerts → Settings → Text messages instead
+of offering the form.
+
+**A new `user_sms` table, one row per account that has started the
+flow.** Four routes, session-only and always against the caller's own
+account: `GET /api/account/sms`, `POST /api/account/sms/start`,
+`POST /api/account/sms/confirm`, `DELETE /api/account/sms` (stops a live
+number, or just forgets a pending code) — each audited as
+`account.sms.start` / `.confirm` / `.stop` / `.cancel`. The code is kept
+as a SHA-256 hash, never in the clear, and the notification row recorded
+for the verification text has the code itself masked.
+
+**Two fixed texts, worded for the same campaign review as 5.20.1's
+notice.** Verification: "SappiWhere: your alert text verification code is
+123456. It expires in 10 minutes. Reply STOP to opt out, HELP for help.
+Msg & data rates may apply." Opt-in confirmation, sent once the code is
+confirmed: "SappiWhere alerts: you are now opted in to network alert
+texts at this number. Msg frequency varies. Msg & data rates may apply.
+Reply STOP to opt out, HELP for help."
+
+**The alert engine now texts these numbers too.** `_sms_numbers` merges
+the admin-set `sms_to_default` list with every verified, un-stopped
+opted-in number, de-duplicated, so both the ordinary alert path and the
+mass-outage digest reach them exactly as they reach the default list.
+
+**A Twilio STOP reply now opts the account out inside the app, not only
+at Twilio.** Twilio error 21610 ("unsubscribed recipient") on a send is
+now recognised: the matching account's number is marked stopped (by
+'stop', not by the account itself) and an ERROR log line names the
+number — adding a note to remove it from Alerts → Settings → Default
+numbers when it's also sitting in that admin list, since Twilio will keep
+refusing it there too.
+
+Files: `netpath/appdb.py`, `netpath/web/api/auth.py`,
+`netpath/web/server.py`, `netpath/alertengine.py`, `netpath/alertmail.py`,
+`netpath/web/static/app.js`.
+
+Verification: `tests/test_account_sms.py` (new — the route lifecycle,
+the code TTL/attempt/resend limits, the `user_sms` store, the engine
+merge and a Twilio-STOP number being turned off), `tests/test_alert_sms.py`
+gains the 21610 case, `test_frontend_contracts.py` §103 pins the
+fieldset's ids, its legend, the terms sentence and the two account
+routes.
 
 ### 5.51.0 — Loopback tunnel guard, TACACS+ auto-create role cleanup, and SNMP decode correctness
 

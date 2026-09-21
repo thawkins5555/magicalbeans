@@ -3119,8 +3119,16 @@ hard to trip — a path monitor that cries wolf gets turned off.
   list**, beside **Add number** — Twilio's A2P 10DLC campaign review
   wants the exact wording and a screenshot of where it is collected,
   and since numbers are only ever entered here by an authenticated
-  administrator, this is that opt-in evidence. STOP and HELP are
-  handled by Twilio's Advanced Opt-Out, not by the app.
+  administrator, this is that opt-in evidence. Twilio's own Advanced
+  Opt-Out still blocks a number that has texted STOP, and from 5.52.0
+  below that same reply is also recorded inside the app, turning that
+  account's own opt-in off.
+- **From 5.52.0, any signed-in account can opt its own phone in from the
+  Account dialog** (see **Text alerts (SMS)** under Permissions, below),
+  rather than an administrator entering every number on this settings
+  page. A number opted in this way is texted alongside the Default
+  numbers list above — merged in, de-duplicated — for every alert this
+  section already covers, on the same timing and the same hourly cap.
 
 ### Templates
 
@@ -5202,7 +5210,10 @@ of the Settings tab, rather than being gated like everything else there.
 The same dialog also shows how long the current session has left and
 gathers **Appearance · this browser** — theme and the kiosk launcher (see
 **On a wall**, above) — a per-browser preference that has no business
-being on a page of settings the server stores for everyone. Resetting a
+being on a page of settings the server stores for everyone. From 5.52.0
+it also gathers **Text alerts (SMS)**, an account's own opt-in for alert
+texts to its own phone (see **Text messages (Twilio)**, above, for the
+opt-in flow and what it does to the send list). Resetting a
 *different* account's password requires Admin write, same as adding,
 editing or removing an account.
 

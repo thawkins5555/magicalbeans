@@ -9468,6 +9468,85 @@ builds on — and so, through that, the HTTPS page monitor — so the senders,
 the self-updater and the HTTPS monitor all clear that one flag from one
 place.
 
+**From 5.52.0, `appdb.py` gains a `user_sms` table and a per-account
+opt-in flow, distinct from the admin-set `sms_to_default` list above.**
+`user_sms(username PRIMARY KEY, number, consent_ts, verified_ts,
+stopped_ts, stopped_by, code_hash, code_sent_ts, code_attempts)` holds at
+most one row per account, created only once that account starts the
+flow. `appdb.sms_status(row)` folds those columns into one word a caller
+switches on — `off` (no row, or a stale row with no number), `pending`
+(a code is outstanding), `on` (verified and live) or `stopped` — rather
+than every caller re-deriving it from four columns. `sms_start` upserts
+the row on a fresh or repeated attempt (`ON CONFLICT` resets
+`verified_ts`/`stopped_ts`/`stopped_by` to their "never happened" values,
+so restarting the flow on a number that was previously stopped clears the
+old stop cleanly); `sms_code_attempt`, `sms_clear_code`, `sms_confirm`,
+`sms_stop` and `sms_forget` each touch only the columns their name
+implies. `remove_user` now also deletes the account's `user_sms` row.
+
+**Four routes in `web/api/auth.py`, all session-only and scoped to the
+caller's own account** — there is no route for one account to read or
+change another's opt-in, and no module-permission gate, the same as
+**Change password**: `GET /api/account/sms` (current status),
+`POST /api/account/sms/start` (validates consent and an E.164 number via
+`alertmail.is_e164`, sends the code), `POST /api/account/sms/confirm`
+(checks the code, sends the opt-in text) and `DELETE /api/account/sms`
+(stops a live number, or just forgets a pending code / an already-stopped
+row via `sms_forget` — nothing to audit as a "stop" if texts were never
+actually on). Each is audited as `account.sms.start` / `.confirm` /
+`.stop` / `.cancel`. `_sms_available()` mirrors the checks
+`post_alerts_sms_test` already makes (SMS on, a credential on file, a
+From number or Messaging Service SID, the right fields for the
+configured auth mode) so the Account dialog can tell a genuinely
+unconfigured server from a user error, and `_sms_send()` sends one text
+through the same credential-binding and `record_notification` path
+`post_alerts_sms_test` uses, with a `record_text` override so the
+verification text's row stores the code masked (`123456` → `******`)
+while the text actually sent carries the real code.
+
+**The code itself is never stored — only its SHA-256 hash**
+(`hashlib.sha256(code.encode()).hexdigest()`), compared with
+`secrets.compare_digest` so a wrong guess can't be timed byte-by-byte.
+It's good for `SMS_CODE_TTL_S` (600s / 10 minutes) from
+`code_sent_ts`; a confirm attempt past that clears the code and asks for
+a new one. Each wrong guess counts through `sms_code_attempt`; the
+`SMS_CODE_MAX_ATTEMPTS`th (5) wrong guess clears the code the same way an
+expiry does, rather than letting attempts run on indefinitely. A resend —
+`sms_start` called again with a code already outstanding — is refused
+under `SMS_CODE_RESEND_S` (60s) since `code_sent_ts`, so a mistyped
+number can't be turned into a way to spam an arbitrary phone with texts
+on demand; past that window it behaves exactly like a first attempt,
+including sending a fresh code to a possibly-different number.
+
+**`AlertEngine._sms_numbers` merges the admin list with this table.**
+Beyond its existing `sms_to_default` handling, it now appends every
+number `appdb.sms_opted_in_numbers()` returns — verified, not stopped,
+non-empty — skipping any already in the admin list, so a number entered
+in both places is only ever texted once. Both `_sms_notify` and
+`_sms_digest` read numbers through this one method, so an opted-in
+account receives the same alert and digest texts a Default number does,
+on the same timing and against the same `sms_max_per_hour` budget.
+
+**A Twilio 21610 reply now closes the loop back into `user_sms`.**
+`alertmail.twilio_error_code()` pulls the numeric code out of a
+`_twilio_error_text`-shaped error string; `TWILIO_STOP_CODE` is 21610,
+Twilio's own code for "this number has opted out" (most often a prior
+STOP reply). `SmsJob` gained `number_errors`, a `(number, error text)`
+list `SmsQueue._deliver` fills alongside the `errors` string it already
+built — note that `_deliver` here is the current one, which attempts
+every number and only counts the job as failed if none delivered; the
+older "one Twilio call per number, the job failed on the first error"
+paragraph above describes a since-changed shape and is not what
+`number_errors` is layered onto. After a send, `AlertEngine` walks
+`job.number_errors`: a 21610 against a number calls
+`appdb.sms_stop_number(number, now)` (marks `stopped_by='stop'`, but only
+on a row that was `on`, so a number a Twilio filter or typo rejects
+outright is not mistaken for a real STOP) and logs an ERROR line naming
+the number, appending a note to remove it from Alerts → Settings →
+Default numbers when that same number sits in `sms_to_default` — Twilio
+will keep refusing it there too, so a mixed admin/opt-in number is not
+left silently retried forever.
+
 ### Reports (`report.py`, `web/api/nodes_reports.py`) — 4.49.0
 
 Sits above `nodesdb.py`/`alertsdb.py` rather than inside either — it reads
