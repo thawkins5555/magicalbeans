@@ -3071,6 +3071,8 @@ for _id in ("as-sms", "as-twilio-sid", "as-twilio-from", "as-twilio-msid",
           "the alerts settings dialog has the %s control for Twilio SMS" % _id)
 check("App.post('/api/alerts/sms/test'" in NODES62,
       "Send test text posts to the SMS test route")
+check("label: 'Send test email'" in NODES62,
+      "the SMTP test button says what it sends")
 check("App.post('/api/alerts/sms/credential'" in NODES62,
       "Save stores a typed Twilio auth token through the SMS credential route")
 check("texts sent" in NODES62,
@@ -5027,7 +5029,8 @@ check("badge badge-dac" in NODES106 and "r.media === 'dac'" in NODES106,
       "sfpBadge renders the DAC case off the stored media column, same as "
       "DOM/SFP/COP")
 CSS106 = read("app.css")
-check(".badge-dac" in CSS106, "app.css styles the DAC badge")
+check(".badge-dac { background: var(--muted)" in CSS106,
+      "app.css styles the DAC badge in the same grey as DOM/SFP/COP")
 check("result.dac_count" in NODES106,
       "the SFP report summary line counts DAC ports alongside DOM/SFP/COP")
 _REPORT106 = python_text("report")

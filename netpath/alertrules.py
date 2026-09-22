@@ -389,6 +389,9 @@ CLEARS_COMPANIONS: dict[str, tuple[str, ...]] = {
     "interface_down": ("priority_interface_down",),
 }
 
+# A repeat inside the alert's lifetime is a fresh event, so it earns its own notice.
+NOTIFY_EVERY_OCCURRENCE = ("device_rebooted",)
+
 
 # PREDICATES: rule kind -> whether one rule of that kind is about one
 # occurrence, asked after the kind itself has matched. Whatever is true of

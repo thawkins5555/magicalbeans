@@ -5,6 +5,47 @@ grouped by the version that carries it. This is a working record for the
 operator — the full story of each change is in `CHANGELOG.md`, and this file
 does not replace it.
 
+## 5.56.0 — Every reboot emails; silent email drops say why; DAC badge grey; Send test email
+
+**"Make the 'DAC' interface tag the same color gray as the DOM, SFP, and
+COP badges."** DAC had shipped in 5.55.0 on a different neutral so it
+would stand apart from COP; it now uses the same grey (`var(--muted)`)
+as all three.
+
+**"The Device Rebooted alerts are not sending out emails even though
+email alert is enabled on the Alert rule/template."** The operator
+confirmed what was on screen: the alert's count was above 1 (so reboots
+were being detected and logged) and its Notifications pane read "None
+sent." Two things were found, both fixed:
+
+- A reboot alert has no clearing event and stays open 24 hours from the
+  last reboot; a second reboot inside that window only bumped the open
+  alert's count, and the engine only ever mailed the first reboot that
+  opened the alert. Repeat reboots now go through the same notification
+  path as the first one — the rule's flags, the severity floor, the
+  hourly budget and the recipients all still apply, and a repeat inside
+  the roll-up hold window is folded into that one held notice rather than
+  doubled.
+- Separately — and we could not tell from "count above 1" plus "None
+  sent." alone which of the two was actually in play here — the "Email
+  alerts of severity … and worse" floor can drop the reboot rule's own
+  emails with nothing recorded, since the rule ships at warning and a
+  floor of error or stricter silently swallows it. "None sent." looked
+  identical to email being off entirely. The floor, and a rule missing
+  its email template, now write a reason onto the alert ("not sent:
+  warning is milder than the … setting (error)" / "not sent: the rule
+  has no email template"), the way the hourly cap and the roll-up drops
+  already did — so either cause now shows up on the alert itself, and an
+  install seeing this should check that setting.
+
+**"Change 'Send Test' button on alert settings to 'Send Test Email'."**
+Done — it now reads **Send test email**, matching **Send test text**
+beside it.
+
+**Outcome.** Shipping as 5.56.0. Stephen_King wrote the docs and bumped
+the version; Testy and Javariius take it from here — test run and
+whole-diff review before the push to main.
+
 ## 5.55.0 — Priority star on the device list; DAC transceiver badge
 
 **"If a device has a port marked 'Priority Port' ... it should also

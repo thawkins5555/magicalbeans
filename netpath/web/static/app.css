@@ -463,8 +463,7 @@ body.tiny .brand span { display: none; }
 .badge-sfp { background: var(--muted); color: var(--bg); letter-spacing: 0.04em; }
 .badge-dom { background: var(--muted); color: var(--bg); letter-spacing: 0.04em; }
 .badge-cop { background: var(--muted); color: var(--bg); letter-spacing: 0.04em; }
-/* DAC gets --line, a sibling neutral, so it reads apart from COP at a glance. */
-.badge-dac { background: var(--line); color: var(--bg); letter-spacing: 0.04em; }
+.badge-dac { background: var(--muted); color: var(--bg); letter-spacing: 0.04em; }
 .conn { color: var(--dim); font: var(--fs-xs) var(--mono); padding-right: var(--space-xs); }
 .conn.user { color: var(--muted); }
 /* Reaches both <a> and <button>, or an anchor renders as browser-default

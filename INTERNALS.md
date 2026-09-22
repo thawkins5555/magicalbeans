@@ -8598,6 +8598,26 @@ undeliverable case in that loop is: `_skip_held_open_notify(..., "not sent:
 the device is in maintenance mode")`. The mute branch beside it is
 unchanged.
 
+**5.56.0: a repeat occurrence can still be news, even though it is not a
+new alert.** `_apply()`'s `if is_new:` branch is what has always decided
+whether an occurrence gets a notice — a *repeat* occurrence only ever
+bumped `open_or_increment`'s count and fell through to the (removed)
+renotify comparison below it, on the reasoning that "still true" is not
+"just happened." That reasoning does not hold for a rule in
+`alertrules.NOTIFY_EVERY_OCCURRENCE` (`device_rebooted` only, for now): a
+second reboot inside the alert's 24-hour auto-resolve window is a second
+event, not the first one still being true, and used to go completely
+unmailed because no new row ever opened for it. The `elif` beside
+`is_new` calls `_notify()` for exactly that case — `(rule["key"] or "")
+in NOTIFY_EVERY_OCCURRENCE`. It is skipped, via `_first_notice_held()`,
+whenever the alert's own first notice is itself still waiting on the
+roll-up hold (`last_notified_ts IS NULL` and `notify_rollup_delay_s > 0`):
+`_sweep_notify_rollup` will pick that row up once the hold expires, by
+which point `open_or_increment` has already folded the repeat's count and
+message into it, so sending here too would mail the same reboot twice —
+once for the repeat, once more when the held first notice finally goes
+out.
+
 **Decided is not final: ending the maintenance re-arms it.** Deciding alone
 lost the notice for good on the default settings — re-notify is off, so
 `_sweep_renotify` returns before it looks at anything, and the first-notify
@@ -9213,6 +9233,26 @@ is asked in `_sweep_notify_rollup` (the one path that can hand a batch to
 `_send_digest` instead of to `_notify`) and defensively in `_send_digest`
 itself. It is unrelated to `min_severity`, which is a filter on syslog
 ingest.
+
+**5.56.0: the floor and a missing template now record why, the same as
+the hourly cap and the roll-up drops already did.** Both used to
+`mark_notified`/`return` bare, so an alert silenced by either read
+exactly like one nobody had looked at — a bare "None sent." — and an
+operator with the floor set above the reboot rule's own severity (ships
+at warning) had no way to tell a silent drop from email simply being
+switched off. `_notify()` now calls `record_notification(alert_row["id"],
+kind, "", "", False, f"not sent: {severity} is milder than the "
+f"“Email alerts of severity” setting ({floor})")` ahead of the floor's
+`mark_notified`, and the template lookup a few lines further down calls it
+with `"not sent: the rule has no email template"` when
+`rule_row["template_id"]` resolves to nothing. `_severity_name()` (a
+small helper mirroring `severity_tag`'s own out-of-range guard) names
+both the alert's own severity and the floor, e.g. "warning" and "error"
+rather than the bare integers `alerts.severity` stores. Both are guarded
+by `kind == "alert"`, so a renotify never re-records the reason its first
+notice already carries, and the template case is further guarded by
+`template_override is None`, since a synthesized clear notification
+always supplies its own template and is never the thing missing.
 
 **5.30.0: `alertmail.severity_tag(severity)` is the `[SEVERITY]` formatter,
 pulled out of `build_context()` so `alertengine.py` can call it too.** It is

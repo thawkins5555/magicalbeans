@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.56.0 — Every reboot emails; silent email drops say why; DAC badge grey; Send test email](#5560--every-reboot-emails-silent-email-drops-say-why-dac-badge-grey-send-test-email)
 - [5.55.0 — Priority star on the device list; DAC transceiver badge](#5550--priority-star-on-the-device-list-dac-transceiver-badge)
 - [5.54.0 — Opt-in form: separate terms and consent checkboxes](#5540--opt-in-form-separate-terms-and-consent-checkboxes)
 - [5.53.1 — Terms and privacy links on the Alerts SMS settings](#5531--terms-and-privacy-links-on-the-alerts-sms-settings)
@@ -189,6 +190,59 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.56.0 — Every reboot emails; silent email drops say why; DAC badge grey; Send test email
+
+An operator reported that Device Rebooted alerts had stopped emailing even
+though the rule's email flag was on — the alert list showed the count above
+1, and its Notifications pane read "None sent." with no explanation either
+way.
+
+**Device rebooted alerts now email on every reboot.** A reboot alert has no
+clearing event and stays open 24 hours from the last reboot, so a device
+that rebooted again inside that window only bumped the alert's count — the
+engine only mailed when a NEW row opened, and every reboot after the first
+one in that window went out silently. A repeat reboot now goes through the
+same notification path as the first: the rule's email/text flags, the
+severity floor, the hourly budget and the recipient list all apply exactly
+as they do to a fresh alert. Where the roll-up hold (**Alerts → Settings →
+Hold notifications for roll-up**, `notify_rollup_delay_s`) still owns the
+alert's first notice, the repeat is folded into that one held notice
+rather than sent twice. Mechanism: `alertrules.NOTIFY_EVERY_OCCURRENCE`
+(`device_rebooted` only for now — a reboot is a fresh event each time,
+not a condition still holding true) and `AlertEngine._first_notice_held`.
+
+**Silent drops now say why.** An alert dropped by **Alerts → Settings →
+Email alerts of severity … and worse**, or by a rule whose email template
+is missing, used to read "None sent." in its Notifications pane with
+nothing more. It now records "not sent: warning is milder than the “Email
+alerts of severity” setting (error)" (severity names taken from the alert
+and the setting) or "not sent: the rule has no email template", the way the
+hourly cap and the roll-up drops already did. The first notice, and each
+repeat reboot, record this reason; a renotify or a clear never does. Note
+for operators: the
+reboot rule ships at severity 4 (warning), so a floor of error (3) or
+stricter silently dropped every reboot while outages (severity 1) still
+mailed — an install seeing "None sent." on a reboot alert should check
+that setting, and the pane now names the reason either way.
+
+**The DAC badge** on the Interfaces tile is now the same grey as DOM, SFP
+and COP (`var(--muted)`) — it previously used a different neutral
+(`var(--line)`) that made it read as a different state rather than the same
+copper family.
+
+**Alerts → Settings**: the **Send test** button is now **Send test
+email**, matching **Send test text** beside it.
+
+Files: `netpath/alertengine.py`, `netpath/alertrules.py`,
+`netpath/web/static/alerts.js`, `netpath/web/static/app.css`,
+`RUNBOOK.md`.
+
+Verification: `tests/test_alert_engine.py` B15 covers a repeat reboot with
+the roll-up hold off and on, the rule's email flag toggled off, and the two
+new "not sent" reasons (severity floor, missing template).
+`tests/test_frontend_contracts.py` pins the **Send test email** label and
+the DAC badge's grey.
 
 ### 5.55.0 — Priority star on the device list; DAC transceiver badge
 

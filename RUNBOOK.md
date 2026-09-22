@@ -289,7 +289,7 @@ raised in the application instead.
 
 **Checks, in order.**
 
-1. **Alerts → Settings → Notifications → Send test.** The error it returns is
+1. **Alerts → Settings → Notifications → Send test email.** The error it returns is
    the real one.
 2. **The usual causes**, in order of likelihood: the relay stopped accepting
    mail from this host's address; a certificate expired and verification is on;

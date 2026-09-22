@@ -1796,7 +1796,7 @@
       // (bad host, auth failure) lands in .modal-error like every other
       // failure in this dialog, since a result whose ok is false is not a
       // rejected request but still has to be reported as one.
-      { label: 'Send test', onClick: (box, button) => {
+      { label: 'Send test email', onClick: (box, button) => {
         if (!App.requireFields(box, [['#as-testto', 'A recipient']])) return;
         const to = box.querySelector('#as-testto').value.trim();
         return App.runJob(button, { queued: 'Sending…', done: 'Sent' },

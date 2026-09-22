@@ -1754,6 +1754,162 @@ for name in EXEMPT - {"_drain_from"}:
 ok("the two structurally different drains are left alone")
 
 
+# ================================================================== B15
+print("\nB15 — every device_rebooted earns its own email, and a silent "
+      "email drop leaves a reason")
+
+# ---- B15a: hold off (default) — a repeat reboot inside the alert's 24h
+# lifetime still emails, instead of being swallowed by open_or_increment's
+# open/acked dedup.
+nodes, alerts, snmp, syslog, ipam, engine = build(**MAIL_SETTINGS)
+fake = FakeMail()
+alertmail.send = fake
+try:
+    engine._tick()
+    did = add_device(nodes, "10.15.0.1", "core-sw-b15a")
+    nodes.record_device_event(did, "rebooted", "reboot 1")
+    engine._tick()
+    assert engine._mail.wait_idle(10.0)
+    nodes.record_device_event(did, "rebooted", "reboot 2")
+    engine._tick()
+    assert engine._mail.wait_idle(10.0)
+finally:
+    alertmail.send = real_send
+
+rows = open_rows(alerts, "device_rebooted", did)
+assert len(rows) == 1 and rows[0]["count"] == 2, [dict(r) for r in rows]
+ok("two reboots dedup into one open alert with count 2")
+reboot_subjects = [s for s in fake.attempts if "rebooted" in s]
+assert len(reboot_subjects) == 2, fake.attempts
+ok("...but each reboot still sends its own email")
+sent_ok = [n for n in alerts.notifications_for(rows[0]["id"]) if n["ok"] == 1]
+assert len(sent_ok) == 2, [dict(n) for n in sent_ok]
+ok("...recorded as two separate successful notifications on the one alert")
+nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+# ---- B15b: hold on — the roll-up hold hands the FIRST notice to
+# _sweep_notify_rollup; a reboot after that notice went out still gets its
+# own email through the new elif in _apply.
+nodes, alerts, snmp, syslog, ipam, engine = build(
+    notify_rollup_delay_s=240, **MAIL_SETTINGS)
+fake = FakeMail()
+alertmail.send = fake
+try:
+    engine._tick()
+    did = add_device(nodes, "10.15.0.2", "core-sw-b15b")
+    nodes.record_device_event(did, "rebooted", "reboot 1")
+    engine._tick()
+    nodes.record_device_event(did, "rebooted", "reboot 2")
+    engine._tick()
+    assert engine._mail.wait_idle(10.0)
+    assert fake.attempts == [], fake.attempts
+    ok("two reboots inside the roll-up hold send no email yet")
+
+    conn = sqlite3.connect(alerts.path)
+    conn.execute("UPDATE alerts SET opened_ts = opened_ts - 300")
+    conn.commit(); conn.close()
+    engine._tick()
+    assert engine._mail.wait_idle(10.0)
+    assert len(fake.attempts) == 1, fake.attempts
+    ok("once the hold elapses, the sweep sends exactly one email covering "
+       "both reboots")
+
+    nodes.record_device_event(did, "rebooted", "reboot 3")
+    engine._tick()
+    assert engine._mail.wait_idle(10.0)
+    assert len(fake.attempts) == 2, fake.attempts
+    ok("a further reboot after the first notice went out earns its own email")
+finally:
+    alertmail.send = real_send
+nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+# ---- B15c: the rule's own email flag, off when the alert opened and
+# turned on later, is read fresh on every occurrence, not just the first.
+nodes, alerts, snmp, syslog, ipam, engine = build(**MAIL_SETTINGS)
+reboot_rule_b15c = alerts.rule_by_key("device_rebooted")
+alerts.update_rule(reboot_rule_b15c["id"], notify=0)
+fake = FakeMail()
+alertmail.send = fake
+try:
+    engine._tick()
+    did = add_device(nodes, "10.15.0.3", "core-sw-b15c")
+    nodes.record_device_event(did, "rebooted", "reboot 1")
+    engine._tick()
+    assert engine._mail.wait_idle(10.0)
+    assert fake.attempts == [], fake.attempts
+    ok("a reboot opened while the rule's email flag is off sends nothing")
+
+    alerts.update_rule(reboot_rule_b15c["id"], notify=1)
+    nodes.record_device_event(did, "rebooted", "reboot 2")
+    engine._tick()
+    assert engine._mail.wait_idle(10.0)
+    assert len(fake.attempts) == 1, fake.attempts
+    ok("turning the flag on, the next reboot on the same alert sends its own "
+       "email")
+finally:
+    alertmail.send = real_send
+nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+# ---- B15d: the email severity floor leaves a reason instead of a silent
+# drop; a device_down at its own (lower) severity is unaffected.
+nodes, alerts, snmp, syslog, ipam, engine = build(
+    notify_min_severity=3, **MAIL_SETTINGS)
+fake = FakeMail()
+alertmail.send = fake
+try:
+    engine._tick()
+    did = add_device(nodes, "10.15.0.4", "core-sw-b15d")
+    nodes.record_device_event(did, "rebooted", "reboot 1")
+    engine._tick()
+    assert engine._mail.wait_idle(10.0)
+    assert fake.attempts == [], fake.attempts
+    rows = open_rows(alerts, "device_rebooted", did)
+    assert len(rows) == 1, [dict(r) for r in rows]
+    notes = alerts.notifications_for(rows[0]["id"])
+    assert len(notes) == 1 and notes[0]["ok"] == 0, [dict(n) for n in notes]
+    assert "milder than" in notes[0]["error"], notes[0]["error"]
+    ok("a reboot below the “Email alerts of severity” floor leaves a reason "
+       "on the alert instead of reading “None sent.” unexplained")
+
+    nodes.record_device_event(did, "down", "stopped responding")
+    engine._tick()
+    assert engine._mail.wait_idle(10.0)
+    assert len(fake.attempts) == 1, fake.attempts
+    ok("a device_down occurrence for the same device still emails at its "
+       "own, more severe, level")
+finally:
+    alertmail.send = real_send
+nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+# ---- B15e: a rule pointing at a deleted template leaves a reason instead
+# of silently rendering nothing.
+nodes, alerts, snmp, syslog, ipam, engine = build(**MAIL_SETTINGS)
+reboot_rule_b15e = alerts.rule_by_key("device_rebooted")
+doomed_template = alerts.add_template("b15e_doomed", "B15e doomed",
+                                      "subject", "body")
+alerts.update_rule(reboot_rule_b15e["id"], template_id=doomed_template)
+assert alerts.remove_template(doomed_template), "the template did not delete"
+fake = FakeMail()
+alertmail.send = fake
+try:
+    engine._tick()
+    did = add_device(nodes, "10.15.0.5", "core-sw-b15e")
+    nodes.record_device_event(did, "rebooted", "reboot 1")
+    engine._tick()
+    assert engine._mail.wait_idle(10.0)
+    assert fake.attempts == [], fake.attempts
+finally:
+    alertmail.send = real_send
+rows = open_rows(alerts, "device_rebooted", did)
+assert len(rows) == 1, [dict(r) for r in rows]
+notes = alerts.notifications_for(rows[0]["id"])
+assert len(notes) == 1 and notes[0]["ok"] == 0, [dict(n) for n in notes]
+assert "no email template" in notes[0]["error"], notes[0]["error"]
+ok("a rule whose template was deleted leaves a reason instead of a silent "
+   "drop")
+nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+
 # ============================================================ storage trim
 print("\nStorage — alerts.db opens tightly and reclaims without VACUUM")
 

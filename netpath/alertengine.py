@@ -24,9 +24,10 @@ from dataclasses import asdict
 from . import alertmail
 from . import namelookup
 from .alertrules import BASELINE_FAMILIES, CLEARS, CLEARS_COMPANIONS, FALLBACK_OF, \
+    NOTIFY_EVERY_OCCURRENCE, \
     PREDICATES, \
     PUBLISHED_HYSTERESIS, \
-    SENSOR_FAMILIES, \
+    SENSOR_FAMILIES, SEVERITY_NAMES, \
     PUBLISHED_THRESHOLD_RULES, ROLLED_UP_BY, ROLLS_UP, ROLLUP_ENTITY_KINDS, \
     UNMANAGED_ONLY_RULES, Occurrence, breaches, dedup_key, device_id_for, \
     comparison_of, evaluate_flapping, evaluate_threshold, interface_label, \
@@ -46,6 +47,11 @@ _SYSTEM_OCCURRENCES_CAP = 1000
 # Re-log interval for a stage stuck on the same error, so it does not age
 # out of the event ring while alerts stay stalled.
 _STAGE_ERROR_RELOG_S = 3600.0
+
+
+def _severity_name(n: int) -> str:
+    """Name a severity level, mirroring alertmail.severity_tag's own range check."""
+    return SEVERITY_NAMES[n] if 0 <= n <= 7 else str(n)
 
 # device_events kinds that exist only to back the status timeline's split
 # SNMP/ping lanes (see nodesdb.device_method_segments) and carry no alert
@@ -2609,6 +2615,12 @@ class AlertEngine(Worker):
             delay = 0.0
         return max(0.0, min(delay, NOTIFY_ROLLUP_DELAY_MAX_S))
 
+    def _first_notice_held(self, alert_row, settings) -> bool:
+        """True while the roll-up hold still owns this alert's first notice."""
+        return (self._notify_rollup_delay(settings) > 0
+                and "last_notified_ts" in alert_row.keys()
+                and alert_row["last_notified_ts"] is None)
+
     def _skip_held_open_notify(self, alert_row, settings, reason: str, *,
                                maintenance_held: bool = False) -> bool:
         """Close out an alert's still-pending FIRST notification without
@@ -2946,6 +2958,11 @@ class AlertEngine(Worker):
                 # _notify runs right here, exactly as it always has.
                 if self._notify_rollup_delay(settings) <= 0:
                     self._notify(row, rule, occurrence, settings)
+            elif (rule["key"] or "") in NOTIFY_EVERY_OCCURRENCE \
+                    and not self._first_notice_held(row, settings):
+                # A repeat reboot is news; while its first notice is still
+                # held, the sweep sends it with the refreshed count instead.
+                self._notify(row, rule, occurrence, settings)
             # Renotify is NOT decided here any more. It used to compare
             # against row["last_ts"], which open_or_increment had just set to
             # this occurrence's timestamp a statement earlier, so the
@@ -3097,6 +3114,11 @@ class AlertEngine(Worker):
         # unstamped would come back through _sweep_notify_rollup forever.
         floor = int(settings.get("notify_min_severity", 7) or 0)
         if alert_row["severity"] > floor:
+            if kind == "alert":
+                self.db.record_notification(
+                    alert_row["id"], kind, "", "", False,
+                    f"not sent: {_severity_name(alert_row['severity'])} is milder than the "
+                    f"“Email alerts of severity” setting ({_severity_name(floor)})")
             self.db.mark_notified(alert_row["id"])
             return
         now = time.time()
@@ -3132,6 +3154,10 @@ class AlertEngine(Worker):
             template = (self.db.template(rule_row["template_id"])
                        if rule_row["template_id"] else None)
         if template is None:
+            if template_override is None and kind == "alert":
+                self.db.record_notification(
+                    alert_row["id"], kind, "", "", False,
+                    "not sent: the rule has no email template")
             return
         # alerts.entity_id is the device's stable database id, not its IP
         # (so an IP change later doesn't orphan the dedup key) — the
@@ -3540,6 +3566,10 @@ class AlertEngine(Worker):
                 # because this sweep is the one path that can hand an alert
                 # to _send_digest instead, and because a "due" alert nothing
                 # will ever notify about must stop being due.
+                self.db.record_notification(
+                    alert_row["id"], "alert", "", "", False,
+                    f"not sent: {_severity_name(alert_row['severity'])} is milder than the "
+                    f"“Email alerts of severity” setting ({_severity_name(floor)})")
                 self.db.mark_notified(alert_row["id"])
                 continue
             if alert_row["state"] == "resolved":

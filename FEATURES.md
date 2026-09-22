@@ -699,7 +699,9 @@ own subtabs.
   in the module's own description are checked before the copper text,
   since some vendor wording (HP's "Direct Attach Copper Cable") would
   otherwise match both; a DAC cable carries no light levels, the same
-  as a BASE-T copper module.
+  as a BASE-T copper module. **From 5.56.0, DAC's badge is the same
+  grey as DOM, SFP and COP** — all four are one neutral colour, not a
+  severity, so none of them reads as more urgent than another.
 - **From 5.35.0, the cage scan runs even on a switch that answers no DOM
   or sensor rows at all.** A switch whose optics carry no light-level
   data to read used to skip the whole badge scan along with the sensor
@@ -2984,6 +2986,25 @@ hard to trip — a path monitor that cries wolf gets turned off.
   email one) on the system rules (`smtp_failing`, `sms_failing` and the
   like), which would otherwise be able to text about their own channel
   failing.
+- **From 5.56.0, the severity floor and a missing template say so on the
+  alert.** An alert dropped by the floor above, or by a rule whose email
+  template has been deleted, used to leave the Notifications pane reading
+  "None sent." with no reason. It now records "not sent: warning is
+  milder than the “Email alerts of severity” setting (error)" or "not
+  sent: the rule has no email template" — the same place the hourly cap
+  and the roll-up hold already explain a drop. The first notice, and each
+  repeat reboot, get this reason; a renotify or a clear never does.
+- **A reboot alert re-notifies on every reboot, from 5.56.0.** The
+  built-in **Device rebooted** rule's alert stays open 24 hours and has no
+  clearing event, so a second reboot inside that window used to only bump
+  the alert's count on screen — the engine mailed only the first reboot in
+  the window, and a floor set to error or stricter (the reboot rule ships
+  at warning) silently dropped that one too, with nothing to show for it.
+  A repeat reboot now goes through the same notification path as a fresh
+  alert, honouring the rule's email/text flags, the severity floor, the
+  hourly budget and the recipient list; if the alert's own first notice is
+  still waiting on the roll-up hold, the repeat is folded into that one
+  notice instead of sending twice.
 - **Email over the standard library's `smtplib`** — none, STARTTLS or
   SSL/TLS, with or without certificate verification (turning verification
   off is a deliberate, explicit opt-out, never a silent downgrade). A
@@ -3067,9 +3088,11 @@ hard to trip — a path monitor that cries wolf gets turned off.
   `[RECOVER]` only when previewing the recovery template itself
   (`device_up`); every other template still previews as the opening alert
   it is.
-- **Test sends a real email** to an address typed in, using whatever SMTP
-  settings are currently in the form before they are saved — the same
-  "test what's typed" idiom as IPAM's DHCP test.
+- **Send test email** (renamed from plain **Send test**, from 5.56.0, to
+  read the same way **Send test text** beside it does) sends a real email
+  to an address typed in, using whatever SMTP settings are currently in
+  the form before they are saved — the same "test what's typed" idiom as
+  IPAM's DHCP test.
 - **Default recipients are a list**, in Alerts settings — add an address
   or remove one from the visible list rather than editing a single
   comma-separated field.
