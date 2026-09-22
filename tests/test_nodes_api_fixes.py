@@ -236,6 +236,21 @@ try:
                                     "priority": True}, (status, put))
     check("...and it is stored", service.nodes_db.priority_if_indexes(ports) == {7},
           service.nodes_db.priority_if_indexes(ports))
+    check("priority_device_ids of an empty iterable is an empty set",
+          service.nodes_db.priority_device_ids([]) == set(),
+          service.nodes_db.priority_device_ids([]))
+    check("...and ids the flag does not cover are not returned",
+          service.nodes_db.priority_device_ids([core]) == set(),
+          service.nodes_db.priority_device_ids([core]))
+
+    status, list_payload = call("GET", "/api/nodes/devices?fields=list", token=admin)
+    list_rows = {r["id"]: r for r in list_payload.get("devices", [])}
+    check("the device-list projection flags the starred device",
+          status == 200 and list_rows.get(ports, {}).get("priority_port") is True,
+          (status, list_rows.get(ports)))
+    check("...and leaves an unflagged device alone",
+          list_rows.get(core, {}).get("priority_port") is False,
+          list_rows.get(core))
 
     status, flagged = call("GET", f"/api/nodes/devices/{ports}/interfaces?if_index=7",
                            token=admin)
@@ -269,6 +284,12 @@ try:
     check("...and priority_if_indexes agrees",
           service.nodes_db.priority_if_indexes(ports) == set(),
           service.nodes_db.priority_if_indexes(ports))
+
+    status, cleared_list = call("GET", "/api/nodes/devices?fields=list", token=admin)
+    cleared_rows = {r["id"]: r for r in cleared_list.get("devices", [])}
+    check("...and the device-list star is gone once cleared",
+          status == 200 and cleared_rows.get(ports, {}).get("priority_port") is False,
+          (status, cleared_rows.get(ports)))
 
     status, missing = call(
         "PUT", "/api/nodes/devices/999999/interfaces/7/priority",

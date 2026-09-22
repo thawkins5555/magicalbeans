@@ -1543,6 +1543,31 @@ that port optic or copper, exactly the same "advisory only" treatment
 `'sfp'`/`'sfp_empty'` already had — a slow device does not flicker a
 copper badge off and back every five minutes either.
 
+**5.55.0 adds a fourth medium, `'dac'`, checked ahead of `'copper'` on
+the same text.** `_DAC_TEXT` (`nodepoll/_decode.py`) matches Cisco's
+`-CUxM`/`-ACUxM` part-number suffixes (`SFP-10GBase-ACU10M`,
+`SFP-H10GB-CU3M`), the `10GBASE-CU`/`-CR`/`-CR4` family, and the words
+twinax/DAC/"direct attach" a module's own text may use — all of it
+already inside text `_TRANSCEIVER_TEXT` matched, so no new gate is
+opened. It runs *before* `_COPPER_TEXT` in `names_dac`/`names_copper`
+(`environment_mixin.py`) because some vendor wording matches both — HP's
+"Direct Attach Copper Cable" is both a copper phrase and a direct-attach
+phrase — and a DAC hit takes the badge over a copper one at every site
+that decision is made: the bare-entity case, the cage case and its
+occupants. Everywhere else in `_poll_environment` that tested
+`media == 'copper'` now tests `media in ('copper', 'dac')` instead —
+the sensor-vs-cage merge, the MAU-MIB fiber veto, the cut-short
+preservation whitelist — so a DAC cable is copper's twin in every way
+except the label it wears: it takes precedence over MAU-MIB fiber
+voting the same way, survives a partial walk the same way, and reports
+no DOM light levels. `interfaces_with_media`, `report.py`'s
+`_MEDIA_KIND`/`MEDIA_MEDIUM`, and `mapper.link_is_fiber` all gained the
+`'dac'` value the same release; see the enumeration list below and the
+SFP inventory section for the report side. On the page, `sfpBadge`
+gained the `DAC` case (`.badge-dac`), and the device dialog's live-DOM
+guard quoted above now reads `r.media !== 'copper' && r.media !== 'dac'`
+so a DAC row is never promoted to `'optic'` either.
+
 ### The cage scan runs without a sensor answer, and says why a port stayed unbadged: `_cage_capable`/`_cage_read`, `_log_media_diag` (`nodepoll/environment_mixin.py`) — 5.35.0
 
 **Decoupling the cage scan from the sensor gate.** `_poll_environment`
@@ -1565,8 +1590,8 @@ protects stored badges is that this walk's own completion flag
 (`sensor_complete`) is carried to the badge-preservation step later in
 `_poll_environment`, gated on `not slots_complete or not sensor_complete`,
 so stored `'optic'` badges are preserved right alongside
-`'sfp'`/`'sfp_empty'`/`'copper'`: a slow device must not read as one that
-lost its optics. `sensor_capable`'s own latch
+`'sfp'`/`'sfp_empty'`/`'copper'`/`'dac'` (5.55.0): a slow device must not
+read as one that lost its optics. `sensor_capable`'s own latch
 (`self.db.set_sensor_capable`) is unaffected either way — it is still
 about whether the DOM/sensor tables themselves answer, nothing else.
 
@@ -6452,13 +6477,13 @@ touched, so Mapper stays the active tab underneath the dialog.
 
 **The verdict is a pure function.** `mapper.link_is_fiber(a_media,
 b_media)` takes each end's `interfaces.media` value — `"optic"`,
-`"copper"`, `"sfp"`, `"sfp_empty"` or `None`, the same column the
-DOM/SFP/COP badge (5.24.0/5.25.0) already reads — and returns a bool:
-`optic` on either end wins outright, else `copper` on either end reads
-copper, else `sfp` on either end (with neither end copper) reads fiber,
-else `False`. It touches no database and takes no device id, so
-`tests/test_mapper_links.py` exercises the whole precedence table with
-plain strings.
+`"copper"`, `"sfp"`, `"sfp_empty"`, `"dac"` (5.55.0) or `None`, the same
+column the DOM/SFP/COP/DAC badge (5.24.0/5.25.0/5.55.0) already reads —
+and returns a bool: `optic` on either end wins outright, else `copper`
+or `dac` on either end reads copper, else `sfp` on either end (with
+neither end copper) reads fiber, else `False`. It touches no database
+and takes no device id, so `tests/test_mapper_links.py` exercises the
+whole precedence table with plain strings.
 
 **Fetching the media is one query, not one per link.**
 `nodesdb.interface_media_for_devices(device_ids)` chunks the on-map
@@ -9706,11 +9731,12 @@ their JSON routes build.
 
 **`nodesdb.interfaces_with_media(device_ids=None, include_empty=False)`
 is a plain join, not a new poll.** `interfaces.media` (`'optic'` /
-`'sfp'` / `'copper'` (5.25.0) / `'sfp_empty'` / `NULL`, set by the
-existing entity-sensor and transceiver-presence walk in `nodepoll/environment_mixin.py`)
-already backs the DOM/SFP/COP badge on the interface list; this method
-is the first caller to select on it directly. It filters `media IN
-('optic', 'sfp', 'copper')`, adding `'sfp_empty'` to that list only
+`'sfp'` / `'copper'` (5.25.0) / `'dac'` (5.55.0) / `'sfp_empty'` /
+`NULL`, set by the existing entity-sensor and transceiver-presence walk
+in `nodepoll/environment_mixin.py`) already backs the DOM/SFP/COP/DAC
+badge on the interface list; this method is the first caller to select
+on it directly. It filters `media IN ('optic', 'sfp', 'copper',
+'dac')`, adding `'sfp_empty'` to that list only
 when `include_empty` is set — a `NULL` media (a fixed copper port whose
 entity text named nothing at all, or a cage never walked) is never a
 row — and
@@ -9734,17 +9760,23 @@ contract exactly.** `device_label(row, dns_names)` — manual name, then
 `dns_names`/`hostnames` reverse DNS, then the IP — fills `SfpRow.name`,
 and `device` mirrors Firmware inventory's own field: `"name (ip)"`, or
 the bare IP when the label already is the IP. `_MEDIA_KIND = {"optic":
-"DOM", "sfp": "SFP", "copper": "COP", "sfp_empty": "Empty cage"}` is
-the one place the media value is turned into the label a row's **Kind**
-column shows, so the report and its CSV can never disagree on the
-wording. **5.25.0 adds a second lookup beside it,** `MEDIA_MEDIUM =
-{"optic": "Laser", "sfp": "Laser", "copper": "Copper", "sfp_empty":
-""}`, read by both `report.py` and `reportsched.py` rather than
-duplicating the mapping — DOM and SFP are both laser transceivers (they
-differ only in whether DOM sensors answered, which `Kind` already
-says), copper is BASE-T, and an empty cage is neither until something
-is proven in it, so it renders blank rather than a guess. `SfpRow`
-gains a `medium` field (`MEDIA_MEDIUM.get(row["media"], "")`) sitting
+"DOM", "sfp": "SFP", "copper": "COP", "dac": "DAC" (5.55.0),
+"sfp_empty": "Empty cage"}` is the one place the media value is turned
+into the label a row's **Kind** column shows, so the report and its CSV
+can never disagree on the wording. **5.25.0 adds a second lookup beside
+it,** `MEDIA_MEDIUM = {"optic": "Laser", "sfp": "Laser", "copper":
+"Copper", "dac": "Copper" (5.55.0), "sfp_empty": ""}`, read by both
+`report.py` and `reportsched.py` rather than duplicating the mapping —
+DOM and SFP are both laser transceivers (they differ only in whether
+DOM sensors answered, which `Kind` already says), copper and DAC are
+both BASE-T/twinax copper and so share **Copper**, and an empty cage is
+neither until something is proven in it, so it renders blank rather
+than a guess. `SfpReport` gains a `dac_count` alongside `copper_count`
+(dataclass field, `to_dict`, computed in `sfp_inventory` the same way
+`copper_count` is), shown in the on-screen summary and the
+`reportsched.py` scheduled-mail line right after the COP figure.
+`SfpRow` gains a `medium` field (`MEDIA_MEDIUM.get(row["media"], "")`)
+sitting
 right after `kind`, and `SFP_CSV_HEADER` gains `"medium"` in the same
 position — `[..., "alias", "kind", "medium", "media", "oper_status",
 ...]` — so the CSV, the on-screen table and the client's own mirrored
@@ -9755,8 +9787,9 @@ still an identifiable row rather than blank. `SfpReport` carries
 `device_count` (distinct devices seen, not the group's whole
 membership — a device in the group with no transceiver at all
 contributes no row and is not counted), `port_count`, and
-`dom_count`/`sfp_count`/`copper_count`/`empty_count` split by `media`,
-all folded once here rather than recomputed by every caller.
+`dom_count`/`sfp_count`/`copper_count`/`dac_count` (5.55.0)/
+`empty_count` split by `media`, all folded once here rather than
+recomputed by every caller.
 
 **The two routes share one body, the same pattern Firmware inventory's
 export already set.** `web/api._sfp_report(service, params)` parses
@@ -9783,8 +9816,9 @@ accepts `include_empty` (coerced to `bool`) and an optional
 calls `reportmod.sfp_inventory` with `device_ids` resolved from
 `device_group_id` via the same `_device_ids_for_group` helper every
 other group-scoped renderer uses, builds a subject line
-(`"SFP inventory — N port(s) on M device(s), D DOM / S SFP / C COP"`,
-the COP count added in 5.25.0), a body listing up to `_BODY_ROW_CAP`
+(`"SFP inventory — N port(s) on M device(s), D DOM / S SFP / C COP /
+A DAC"`, the COP count added in 5.25.0 and the DAC count in 5.55.0), a
+body listing up to `_BODY_ROW_CAP`
 rows (name, port, kind, medium — `medium` added in 5.25.0) with a "…and
 N more" tail, and the full CSV as the attachment — the same
 subject/body/CSV shape `_render_firmware` returns, so `run_due` and
@@ -13303,14 +13337,14 @@ itself. `_device_rows_json` computes `keys` once from `rows[0]` and passes
 it to every `_device_json` call in the batch. Measured on a full-row list
 request: 3.8 ms down to about 3.1 ms.
 
-`_DEVICE_LIST_FIELDS` is the frozenset of the 28 fields nodes.js's
+`_DEVICE_LIST_FIELDS` is the frozenset of the 29 fields nodes.js's
 `COLUMNS` array can ever read for the Nodes table — every column it ships
 with plus every optional one an operator can switch on without a page
 reload, which is why the optional ones' data has to be in the response
 already rather than fetched on demand. `_device_list_rows_json` builds the
 normal full `_device_rows_json` list — same permission gate, same secret
 redaction, since nothing about how a row is built changes — and then
-filters each device dict down to just those 28 keys before it goes on the
+filters each device dict down to just those 29 keys before it goes on the
 wire: about 700 bytes per device against the full row's ~2,050 (66%
 smaller).
 
@@ -13328,6 +13362,21 @@ enforces that the projection stays in sync with `COLUMNS`, other than
 `tests/test_frontend_contracts.py`, which pins the literal request shape
 nodes.js sends and would need updating alongside a `COLUMNS` change
 anyway.
+
+**5.55.0 adds `priority_port` to the list this way: one read for the
+whole page, not one per row.** `nodesdb.priority_device_ids(device_ids)`
+takes the id set already on the page and returns which of them have at
+least one row in `interface_flags` with `priority = 1`, chunked through
+`_id_chunks(ids, self._IDS_PER_QUERY)` the same way `interfaces_with_media`
+already does, so a full page of devices costs one query (or a handful,
+past the 500-id chunk size) rather than a subquery per row. `_device_rows_json`
+calls it once, alongside the existing per-page `addresses`/`maintenance`
+reads, and sets `device["priority_port"] = row["id"] in starred` on
+every row; `priority_port` was added to `_DEVICE_LIST_FIELDS` so the
+`fields=list` projection carries it through to nodes.js, which renders
+the ★ right after the device name. `_device_index_rows_json` is
+untouched — the lookup table it builds has no name cell to put a star
+on.
 
 ### `Service.cached_poll`: a cache stampede computes once, not once per caller (`web/service.py`) — 5.46.0
 

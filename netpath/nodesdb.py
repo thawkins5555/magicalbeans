@@ -1350,8 +1350,9 @@ class NodesDatabase(SqliteStore):
         # and refreshed by the same poll cycle rather than a table of its own.
         # media: 'optic' once a port-mapped ENTITY-SENSOR row proves a
         # transceiver with DOM, 'sfp' for a transceiver the ENTITY-MIB names
-        # but that reports no DOM, 'copper' for a BASE-T transceiver (module
-        # text or MAU-MIB proves it, and that proof outranks a DOM reading),
+        # but that reports no DOM, 'copper' for a BASE-T transceiver or 'dac'
+        # for a twinax/direct-attach one (module text or MAU-MIB proves it,
+        # and that proof outranks a DOM reading),
         # 'sfp_empty' for a cage with nothing in it, else NULL. Written by
         # _poll_environment — IF-MIB has no media column of its own.
         # optic_mode: 'sm'/'mm' from the transceiver's own type text for an
@@ -3326,11 +3327,11 @@ class NodesDatabase(SqliteStore):
     def interfaces_with_media(self, device_ids=None,
                               include_empty: bool = False) -> list[sqlite3.Row]:
         """Every interface row carrying a transceiver (media = 'optic',
-        'sfp' or 'copper'; also 'sfp_empty' cages when `include_empty`),
+        'sfp', 'copper' or 'dac'; also 'sfp_empty' cages when `include_empty`),
         joined to the device columns a report needs to label and export it
         by. Excludes purged devices the way device() does. `device_ids`
         narrows the fleet; omitted, every device is considered."""
-        media_values = ["optic", "sfp", "copper"]
+        media_values = ["optic", "sfp", "copper", "dac"]
         if include_empty:
             media_values.append("sfp_empty")
         clauses = ["i.media IN ({})".format(",".join("?" * len(media_values))),
@@ -4461,8 +4462,8 @@ class NodesDatabase(SqliteStore):
                 raise
 
     def update_interface_media(self, device_id: int, rows: list[dict]) -> None:
-        """Per-port media kind ('optic', 'sfp', 'sfp_empty' or None) and optic
-        mode ('sm'/'mm' or None), batched like update_interface_poe."""
+        """Per-port media kind ('optic', 'sfp', 'copper', 'dac', 'sfp_empty' or
+        None) and optic mode ('sm'/'mm' or None), batched like update_interface_poe."""
         if not rows:
             return
         params = [(row.get("media"), row.get("optic_mode"), device_id, row["if_index"])
@@ -4598,6 +4599,22 @@ class NodesDatabase(SqliteStore):
                 "SELECT if_index FROM interface_flags"
                 " WHERE device_id = ? AND priority = 1", (device_id,)).fetchall()
         return {row["if_index"] for row in rows}
+
+    def priority_device_ids(self, device_ids) -> set[int]:
+        """Which of `device_ids` have at least one flagged port -- the
+        device-list star reads this once per page rather than per row."""
+        ids = [int(i) for i in dict.fromkeys(device_ids)]
+        if not ids:
+            return set()
+        starred: set[int] = set()
+        with self._lock:
+            for chunk in _id_chunks(ids, self._IDS_PER_QUERY):
+                rows = self._conn.execute(
+                    "SELECT DISTINCT device_id FROM interface_flags"
+                    " WHERE priority = 1 AND device_id IN ({})".format(
+                        ",".join("?" * len(chunk))), chunk).fetchall()
+                starred.update(row["device_id"] for row in rows)
+        return starred
 
     def priority_interfaces(self) -> set[tuple[int, int]]:
         """Every flagged (device_id, if_index) fleet-wide, in one read --

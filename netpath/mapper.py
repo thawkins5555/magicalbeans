@@ -799,11 +799,11 @@ def render_plan(link, *, threshold, max_strands, width_min, width_max,
 
 def link_is_fiber(a_media, b_media) -> bool:
     """A link is fiber if either end is a lit optic, copper if either end is
-    proven copper (and neither end is a lit optic), else fiber only if
-    either end is an unproven SFP."""
+    proven copper or DAC (and neither end is a lit optic), else fiber only
+    if either end is an unproven SFP."""
     if a_media == "optic" or b_media == "optic":
         return True
-    if a_media == "copper" or b_media == "copper":
+    if a_media in ("copper", "dac") or b_media in ("copper", "dac"):
         return False
     return a_media == "sfp" or b_media == "sfp"
 

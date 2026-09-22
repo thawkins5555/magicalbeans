@@ -107,6 +107,14 @@ _COPPER_TEXT = re.compile(
     r"\b(?:\d+g?base-?tx?|glc-te?|sfp-?(?:10g|1ge?|ge)?-?t(?:-s|-x)?|rj-?45"
     r"|copper|cat[56][ae]?)\b", re.I)
 
+# Twinax/direct-attach copper. Checked before _COPPER_TEXT because HP's
+# "Direct Attach Copper Cable" matches both.
+_DAC_TEXT = re.compile(
+    r"\b(?:twinax(?:ial)?|dac|direct[- ]attach(?:ed)?|(?:passive|active) copper)\b"
+    r"|\b\d+g?base-?c[ru]\d?\b"
+    r"|-a?cu\d+(?:[.-]\d+)?m\b|-ac\d+m\b"
+    r"|-cr\d?\b", re.I)
+
 # Multimode (850 nm) and single-mode (1270-1610 nm) proof out of the same
 # transceiver text, built from _MEDIA_MODE. Copper/DAC/AOC text matches
 # neither; the wavelength arm catches a module that quotes no PMD at all.

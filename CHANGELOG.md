@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.55.0 — Priority star on the device list; DAC transceiver badge](#5550--priority-star-on-the-device-list-dac-transceiver-badge)
 - [5.54.0 — Opt-in form: separate terms and consent checkboxes](#5540--opt-in-form-separate-terms-and-consent-checkboxes)
 - [5.53.1 — Terms and privacy links on the Alerts SMS settings](#5531--terms-and-privacy-links-on-the-alerts-sms-settings)
 - [5.53.0 — Public SMS terms and privacy pages](#5530--public-sms-terms-and-privacy-pages)
@@ -188,6 +189,56 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.55.0 — Priority star on the device list; DAC transceiver badge
+
+Two operator asks: a device with a priority-flagged port was invisible
+as such on the Nodes → Devices list — the ★ only showed once you had
+already opened its Interfaces tile — and a switch port carrying a
+direct-attach copper (twinax) cable, such as Cisco's
+`SFP-10GBase-ACU10M`, was badged plain **SFP** the same as an
+unidentified laser part, because the media classifier only knew
+BASE-T copper text.
+
+**A device with any priority-flagged port now shows a ★ right after
+its name on the Nodes → Devices list**, not only in its own Interfaces
+tile. `nodesdb.priority_device_ids(device_ids)` answers, in one
+chunked read per page (the same `id_chunks` pattern every other
+multi-device lookup uses), which of the devices on screen have at
+least one flagged port; the list's `list` projection carries the
+result as a new `priority_port` field per row, and the interface
+dialog's priority toggle refreshes the list immediately so the star
+appears or clears without waiting for the page's own refresh cadence.
+
+**A new `dac` media value picks out twinax/direct-attach copper
+cables and badges them DAC instead of SFP.** A second pattern,
+`_DAC_TEXT`, is checked before the existing copper text — Cisco's
+`-CUxM`/`-ACUxM` part-number suffixes, the `10GBASE-CU`/`-CR`/`-CR4`
+family, and the words twinax, DAC and "direct attach" a module's own
+ENTITY-MIB description or model name may use. HP's "Direct Attach
+Copper Cable" wording matches both patterns, which is exactly why DAC
+is decided first. A DAC cable is treated as part of the copper family
+everywhere copper already gets special handling: it takes precedence
+over MAU-MIB fiber/copper voting the same way, it counts as copper for
+the Mapper's fiber-vs-copper link colouring, and it reports no DOM
+light levels. **SFP Inventory** gains a DAC **Kind** (medium
+**Copper**) and its own count, shown in the on-screen summary, both
+CSV exports, and the scheduled-report mail line alongside the existing
+DOM/SFP/COP counts.
+
+Files: `netpath/nodesdb.py`, `netpath/web/api/nodes.py`,
+`netpath/web/static/nodes.js`, `netpath/web/static/app.css`,
+`netpath/nodepoll/_decode.py`, `netpath/nodepoll/environment_mixin.py`,
+`netpath/report.py`, `netpath/reportsched.py`, `netpath/mapper.py`,
+`demo/personas.py`.
+
+Verification: `tests/test_nodes_api_fixes.py` covers `priority_port` on
+the list projection, set and cleared. `tests/test_sfp_media.py` adds
+DAC-positive and DAC-negative part numbers and confirms DAC reports no
+optic mode. `tests/test_sfp_report.py` covers the DAC kind, medium and
+count. `tests/test_mapper_links.py` extends the fiber/copper
+precedence table with `dac`. `tests/test_frontend_contracts.py` pins
+the new `priorityStar`/`priority-star` and `badge-dac` literals.
 
 ### 5.54.0 — Opt-in form: separate terms and consent checkboxes
 

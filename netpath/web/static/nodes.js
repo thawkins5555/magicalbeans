@@ -290,6 +290,11 @@
       `${row.override_count} override${row.override_count === 1 ? '' : 's'}</span>`;
   }
 
+  function priorityStar(row) {
+    if (!row.priority_port) return '';
+    return ` <span class="priority-star" title="Has a priority port">★</span>`;
+  }
+
   const COLUMNS = [
     { key: 'check', label: '', sortable: false, fixed: true, width: 34,
       // Named, because a column of identical unlabelled checkboxes is
@@ -305,7 +310,7 @@
       // The mute lives in Alerts but is shown here on purpose: an operator
       // who silenced a device an hour ago and later wonders why it has gone
       // quiet should not have to go looking for the reason.
-      cell: (r) => `${escape(displayName(r))}<div class="ip-line">${deviceIpCell(r)}` +
+      cell: (r) => `${escape(displayName(r))}${priorityStar(r)}<div class="ip-line">${deviceIpCell(r)}` +
         `${maintenanceTag(r)}${mutedTag(r)}${overridesTag(r)}</div>` },
     { key: 'group', label: 'Profile', width: 130, on: true,
       value: (r) => r._groupName || '',
@@ -1406,6 +1411,10 @@
       return '<span class="badge badge-cop" title="Copper transceiver ' +
         '(BASE-T); no light levels">COP</span> ';
     }
+    if (r.media === 'dac') {
+      return '<span class="badge badge-dac" title="Direct-attach copper ' +
+        '(twinax) cable; no light levels">DAC</span> ';
+    }
     return '';
   }
 
@@ -1817,9 +1826,9 @@
     function paintDialogIfaces() {
       if (!dialogIfaces || !current()) return;
       if (dialogOptics) {
-        // Only ever an upgrade: a live dBm read can promote a port to 'optic' but never downgrades 'sfp', and never touches a stored 'copper' row.
+        // Only ever an upgrade: a live dBm read can promote a port to 'optic' but never downgrades 'sfp', and never touches a stored 'copper'/'dac' row.
         dialogIfaces.forEach((r) => {
-          if (r.media !== 'copper' && dialogOptics.has(r.if_index)) r.media = 'optic';
+          if (r.media !== 'copper' && r.media !== 'dac' && dialogOptics.has(r.if_index)) r.media = 'optic';
         });
       }
       // Opening a port from here replaces this dialog — there is only one
@@ -2619,6 +2628,7 @@
         App.toast(on ? 'Flagged as a priority port' : 'Priority flag cleared', 'ok');
         const h2 = box.querySelector('h2');
         if (h2) h2.innerHTML = ifaceTitle(iface, ifIndex, deviceId);
+        refresh().catch(() => {});
       } catch (error) {
         checkbox.checked = !on;
         App.toast(`Could not save: ${error.message}`, 'fail');
@@ -4446,6 +4456,7 @@
       App.setText(App.el('nd-rep-sfp-summary'),
         `${result.port_count} port(s) on ${result.device_count} device(s) · ` +
         `${result.dom_count} DOM · ${result.sfp_count} SFP · ${result.copper_count} COP` +
+        ` · ${result.dac_count} DAC` +
         (result.empty_count ? ` · ${result.empty_count} empty` : ''));
       return result;
     })());

@@ -519,6 +519,9 @@ for a_media, b_media, expected, why in (
     ("sfp_empty", None, False, "an empty cage on one end, nothing on the other"),
     (None, None, False, "no media known on either end"),
     ("copper", "copper", False, "copper on both ends"),
+    ("dac", "sfp", False, "DAC on one end outranks an unproven sfp on the other"),
+    ("optic", "dac", True, "a lit optic outranks the far end's DAC text"),
+    ("dac", "dac", False, "DAC on both ends"),
 ):
     got = link_is_fiber(a_media, b_media)
     check(f"link_is_fiber({a_media!r}, {b_media!r}) is {expected} -- {why}",

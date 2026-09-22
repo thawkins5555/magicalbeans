@@ -463,6 +463,8 @@ body.tiny .brand span { display: none; }
 .badge-sfp { background: var(--muted); color: var(--bg); letter-spacing: 0.04em; }
 .badge-dom { background: var(--muted); color: var(--bg); letter-spacing: 0.04em; }
 .badge-cop { background: var(--muted); color: var(--bg); letter-spacing: 0.04em; }
+/* DAC gets --line, a sibling neutral, so it reads apart from COP at a glance. */
+.badge-dac { background: var(--line); color: var(--bg); letter-spacing: 0.04em; }
 .conn { color: var(--dim); font: var(--fs-xs) var(--mono); padding-right: var(--space-xs); }
 .conn.user { color: var(--muted); }
 /* Reaches both <a> and <button>, or an anchor renders as browser-default
@@ -1045,6 +1047,7 @@ tr.bulk-checked.selected td { background: var(--checked-strong); }
 table.grid tr.revealed td { background: var(--reveal); }
 /* Priority port: faint accent wash, mixed against --panel so the zebra stripe does not show through. */
 tr.priority td { background: color-mix(in srgb, var(--accent) 10%, var(--panel)); }
+.priority-star { color: var(--accent); margin-left: 4px; }
 /* Severity 1 and 2 are the alerts somebody is meant to walk over to, so
    they colour the whole row rather than one 62px badge. Severity is the
    syslog scale and counts DOWN — 0 (emergency) is worse than 1 — so the

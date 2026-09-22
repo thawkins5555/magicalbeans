@@ -100,6 +100,12 @@ Modes:
              ("SFP-10G-SR") -- must read 'mm' off the descendant, never
              'sm' off the chassis model name; if 19, the same chassis
              ancestor with no transceiver text anywhere -- must read None.
+             Plus, for the DAC badge (5.55.0): if 20, a twinax module named
+             by text alone ("10GBase-CU SFP+" / SFP-H10GB-CU3M), no sensor
+             -> 'dac'; if 21, the same text plus an ifMauType arc 41
+             (10GBASE-CX4) -> still 'dac'; if 22, the same text plus a
+             fiber ifMauType arc (36) -> vetoed down to 'sfp', same as
+             copper text under a fiber arc.
   sfp_media_no_class
              `sfp_media`, except that every request into the
              entPhysicalClass column goes unanswered -- the flaky device
@@ -531,6 +537,14 @@ CISCO_DOM_THRESHOLD_TABLE = {
 #   if 13 combo port text, real Rx dBm sensor -> 'optic' beats copper text
 #   if 14 ambiguous transceiver text, a MAU row under the wrong OID prefix
 #         -> ignored, stays 'sfp'
+#
+# DAC (twinax), added without renumbering the ports above (5.55.0):
+#   if 20 module text "10GBase-CU SFP+" / model "SFP-H10GB-CU3M", no sensor
+#         -> media 'dac' from text alone
+#   if 21 the same text plus an ifMauType arc 41 (10GBASE-CX4) -> still
+#         'dac' -- the copper-family MAU arc agrees with the text
+#   if 22 the same text plus a fiber ifMauType arc (36) -> vetoed to 'sfp',
+#         the same as copper text under a fiber arc (if 12)
 SFP_MEDIA_TABLE = {
     # --- if 1: an ordinary DOM optic
     "1.3.6.1.2.1.47.1.1.1.1.2.101": ("str", "GigabitEthernet1/0/1"),
@@ -792,6 +806,43 @@ SFP_MEDIA_TABLE = {
     "1.3.6.1.2.1.99.1.1.1.3.419": ("int", 1),
     "1.3.6.1.2.1.99.1.1.1.4.419": ("int", -70),                # -7.0 dBm
     "1.3.6.1.2.1.99.1.1.1.5.419": ("int", 1),
+
+    # --- if 20: DAC module text, no sensor at all
+    "1.3.6.1.2.1.47.1.1.1.1.2.220": ("str", "SFP+ container"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.220": ("int", 5),                # container
+    "1.3.6.1.2.1.47.1.1.1.1.2.270": ("str", "GigabitEthernet1/0/20"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.270": ("int", 10),
+    "1.3.6.1.2.1.47.1.1.1.1.4.270": ("int", 220),
+    "1.3.6.1.2.1.47.1.3.2.1.2.270.1": ("str", "1.3.6.1.2.1.2.2.1.1.20"),
+    "1.3.6.1.2.1.47.1.1.1.1.2.320": ("str", "10GBase-CU SFP+"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.320": ("int", 9),                # module
+    "1.3.6.1.2.1.47.1.1.1.1.4.320": ("int", 220),
+    "1.3.6.1.2.1.47.1.1.1.1.13.320": ("str", "SFP-H10GB-CU3M"),
+
+    # --- if 21: the same DAC text, plus an ifMauType arc 41 (SFP_MAU_TABLE)
+    "1.3.6.1.2.1.47.1.1.1.1.2.221": ("str", "SFP+ container"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.221": ("int", 5),
+    "1.3.6.1.2.1.47.1.1.1.1.2.271": ("str", "GigabitEthernet1/0/21"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.271": ("int", 10),
+    "1.3.6.1.2.1.47.1.1.1.1.4.271": ("int", 221),
+    "1.3.6.1.2.1.47.1.3.2.1.2.271.1": ("str", "1.3.6.1.2.1.2.2.1.1.21"),
+    "1.3.6.1.2.1.47.1.1.1.1.2.321": ("str", "10GBase-CU SFP+"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.321": ("int", 9),
+    "1.3.6.1.2.1.47.1.1.1.1.4.321": ("int", 221),
+    "1.3.6.1.2.1.47.1.1.1.1.13.321": ("str", "SFP-H10GB-CU3M"),
+
+    # --- if 22: the same DAC text, plus a fiber ifMauType arc (36) that
+    # must veto it down to 'sfp', same as copper text under a fiber arc
+    "1.3.6.1.2.1.47.1.1.1.1.2.222": ("str", "SFP+ container"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.222": ("int", 5),
+    "1.3.6.1.2.1.47.1.1.1.1.2.272": ("str", "GigabitEthernet1/0/22"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.272": ("int", 10),
+    "1.3.6.1.2.1.47.1.1.1.1.4.272": ("int", 222),
+    "1.3.6.1.2.1.47.1.3.2.1.2.272.1": ("str", "1.3.6.1.2.1.2.2.1.1.22"),
+    "1.3.6.1.2.1.47.1.1.1.1.2.322": ("str", "10GBase-CU SFP+"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.322": ("int", 9),
+    "1.3.6.1.2.1.47.1.1.1.1.4.322": ("int", 222),
+    "1.3.6.1.2.1.47.1.1.1.1.13.322": ("str", "SFP-H10GB-CU3M"),
 }
 
 # MAU-MIB ifMauType rows (ifIndex.mauIndex -> an OID whose last arc is a
@@ -799,7 +850,8 @@ SFP_MEDIA_TABLE = {
 # copper/fiber from the wire; 3/4 pin the entity-scan gate (an empty cage
 # and a bare copper port must not be confirmed copper by the arc alone);
 # 12 is the fiber-veto-with-no-sensor case; 14 is the wrong-OID-prefix
-# case. Merged into 'sfp_media' only, never into 'sfp_media_no_class' or
+# case; 21/22 are the DAC equivalents of 10/12 (arc 41 confirms, arc 36
+# vetoes). Merged into 'sfp_media' only, never into 'sfp_media_no_class' or
 # 'sfp_media_no_mau', so those two keep exercising the no-MAU-answered path.
 IF_MAU_TYPE = "1.3.6.1.2.1.26.2.1.1.3"
 SFP_MAU_TABLE = {
@@ -810,6 +862,8 @@ SFP_MAU_TABLE = {
     f"{IF_MAU_TYPE}.11.1": ("oid", "1.3.6.1.2.1.26.4.36"),
     f"{IF_MAU_TYPE}.12.1": ("oid", "1.3.6.1.2.1.26.4.36"),
     f"{IF_MAU_TYPE}.14.1": ("oid", "1.3.6.1.4.1.9.9.99.30"),
+    f"{IF_MAU_TYPE}.21.1": ("oid", "1.3.6.1.2.1.26.4.41"),   # 10GBASE-CX4
+    f"{IF_MAU_TYPE}.22.1": ("oid", "1.3.6.1.2.1.26.4.36"),   # 10GBASE-SR: fiber veto
 }
 
 # sfp_media_no_sensors (5.35.0, F1): the cage/alias/containment rows, with

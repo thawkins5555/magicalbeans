@@ -692,6 +692,14 @@ own subtabs.
   has no media column of its own. A badge is cleared by the first walk
   that answers and finds nothing there; a walk that times out leaves it
   alone rather than blinking the whole fleet's optics out of existence.
+  **From 5.55.0, a direct-attach copper (twinax) cable gets its own
+  DAC badge instead of reading as plain SFP.** Cisco's
+  `-CUxM`/`-ACUxM` part numbers (`SFP-10GBase-ACU10M` and the like),
+  the 10GBASE-CU/-CR family, and the words twinax or "direct attach"
+  in the module's own description are checked before the copper text,
+  since some vendor wording (HP's "Direct Attach Copper Cable") would
+  otherwise match both; a DAC cable carries no light levels, the same
+  as a BASE-T copper module.
 - **From 5.35.0, the cage scan runs even on a switch that answers no DOM
   or sensor rows at all.** A switch whose optics carry no light-level
   data to read used to skip the whole badge scan along with the sensor
@@ -1856,6 +1864,9 @@ unchanged. **From 5.24.0, a flagged port's row also gets a faint accent
 tint in both copies of the interface table** — the device details
 dialog and its embedded view — so a priority port stands out at a
 glance instead of only after sorting or filtering by the ★ column.
+**From 5.55.0, a device with any flagged port also carries a ★ right
+after its name on the Nodes → Devices list itself** — an operator no
+longer has to open a device to learn it has a priority port at all.
 
 **From 5.16.0, the dialog shows what's already stored before it asks
 the device again.** The MAC section used to be empty until the live SNMP
@@ -2112,20 +2123,20 @@ transceiver, fleet-wide or narrowed to a device **Group**: device, IP,
 port, alias, a **Kind**, a **Medium** (from 5.25.0), oper status, speed
 and last seen. **Kind** is **DOM** for an optic that reports light
 levels and so can be alerted on, **COP** for a copper (BASE-T)
-transceiver, plain **SFP** for a laser transceiver the switch
-identifies by ENTITY-MIB but that publishes no sensors of its own, and
-— only with **Include empty cages** ticked (off by default) — **Empty
-cage** for a slot with nothing plugged in. **Medium** spells the same
-distinction out in one word — **Copper** or **Laser** — blank for an
-empty cage, since nothing is proven either way until something is
-plugged in. DAC/twinax parts (SFP-H10GB-CU, 10GBASE-CR) read as plain
-**SFP** by design — they carry no copper form-factor text the badge
-logic knows. The summary line carries a COP count alongside the
-DOM/SFP ones; both CSV exports carry the **Medium** column instead,
-not a count. Nothing new is polled for this:
-every row comes from the same per-port media read behind the DOM/SFP/
-COP badge already on the interface list (see *Drill-down*, below), so
-the report is free. **From 5.36.0, Medium** also spells out single-mode
+transceiver, **DAC** (from 5.55.0) for a direct-attach copper/twinax
+cable such as SFP-H10GB-CU or 10GBASE-CR, plain **SFP** for a laser
+transceiver the switch identifies by ENTITY-MIB but that publishes no
+sensors of its own, and — only with **Include empty cages** ticked
+(off by default) — **Empty cage** for a slot with nothing plugged in.
+**Medium** spells the same distinction out in one word — **Copper**
+(DAC included) or **Laser** — blank for an empty cage, since nothing
+is proven either way until something is plugged in. The summary line
+carries COP and DAC counts alongside the DOM/SFP ones; both CSV
+exports carry the **Medium** column instead, not a count. Nothing new
+is polled for this: every row comes from the same per-port media read
+behind the DOM/SFP/COP/DAC badge already on the interface list (see
+*Drill-down*, below), so the report is free. **From 5.36.0, Medium**
+also spells out single-mode
 versus multimode once the transceiver's own type text says which —
 "Laser · SM" or "Laser · MM" in place of plain "Laser" — and both CSV
 exports gain an `optic_mode` column right beside `medium` for the same
@@ -4823,9 +4834,10 @@ like any other module.
   preference only, remembered per browser like Drag pans — nothing is
   written to the map, and toggling it never refetches or redraws the
   data underneath. The glow is included in **Export PNG**. The call is
-  made from the same port media already behind the DOM/SFP/COP badges
-  (see Nodes, above): a lit optic on either end of a link is fiber; failing
-  that, proven copper on either end is copper; failing that, a
+  made from the same port media already behind the DOM/SFP/COP/DAC
+  badges (see Nodes, above): a lit optic on either end of a link is fiber;
+  failing that, proven copper (DAC included) on either end is copper;
+  failing that, a
   transceiver present on either end with nothing proving it copper is
   still called fiber; an empty cage, a fixed port with no transceiver
   data, or nothing known at all is not fiber. A link is judged on

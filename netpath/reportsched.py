@@ -221,7 +221,8 @@ def _render_sfp(service, params: dict, now: float):
         include_empty=include_empty)
     subject = (f"SFP inventory — {report.port_count} port(s) on "
               f"{report.device_count} device(s), {report.dom_count} DOM / "
-              f"{report.sfp_count} SFP / {report.copper_count} COP")
+              f"{report.sfp_count} SFP / {report.copper_count} COP / "
+              f"{report.dac_count} DAC")
     lines = [subject,
             f"Generated {time.strftime('%Y-%m-%d %H:%M', time.localtime(now))}", ""]
     for r in report.rows[:_BODY_ROW_CAP]:

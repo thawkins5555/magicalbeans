@@ -1306,6 +1306,12 @@ def _build_cisco_access(wrap32: bool, ports: int, vlan: str | None) -> dict:
         access - 1: (names[access - 2], "1000BaseT SFP", "GLC-T"),
         access: (names[access - 1], "10GBase-T SFP+", "SFP-10G-T-S"),
     }))
+    # A DAC (twinax) cage for the DAC badge: same shape as the copper cages
+    # above, with MAU arc 41 (10GBASE-CX4) below in place of the fixed-port
+    # default arc 30.
+    entries.update(sfp_cages(populated={
+        access - 3: (names[access - 4], "10GBase-CU SFP+", "SFP-H10GB-CU3M"),
+    }))
     # A 100Base-FX module (5.38.0): a multimode optic whose media code is
     # neither SX nor SR, so the badge it gets proves the classifier reads
     # the PMD suffix rather than a list of part numbers.
@@ -1316,9 +1322,11 @@ def _build_cisco_access(wrap32: bool, ports: int, vlan: str | None) -> dict:
     # Every fixed copper port answers arc 30 too, as a real Catalyst does --
     # except the FX cage's, which answers 100BaseFX(12): a copper MAU arc
     # outranks module text, so arc 30 there would badge the port copper and
-    # the FX fixture would prove nothing.
+    # the FX fixture would prove nothing. The DAC cage answers 41
+    # (10GBASE-CX4) as a real one does; a DAC slot stays DAC under any
+    # copper arc.
     entries.update(if_mau_type({**{i: 30 for i in range(1, access - 2)},
-                               access - 2: 12, access - 1: 30,
+                               access - 3: 41, access - 2: 12, access - 1: 30,
                                access: 54, access + 1: 36}))
     entries.update(host_resources(1, [("Physical memory", 1024, 524288, 0.61)]))
     entries.update(arc_objects(9, {

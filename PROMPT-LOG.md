@@ -5,6 +5,34 @@ grouped by the version that carries it. This is a working record for the
 operator — the full story of each change is in `CHANGELOG.md`, and this file
 does not replace it.
 
+## 5.55.0 — Priority star on the device list; DAC transceiver badge
+
+**"If a device has a port marked 'Priority Port' ... it should also
+add a star next to the name of the device in the Nodes → Devices ...
+so that an operator can tell at a glance."** A priority-flagged port
+already showed its ★ in the device's own Interfaces tile, but the
+Nodes → Devices list gave no hint at all. The list now carries a
+`priority_port` flag per device (one read for the whole page, not one
+per row) and shows the same ★ right after the device name — updated
+immediately when a port is flagged or cleared, not just on the next
+refresh.
+
+**"There are a few switches that directly attached copper twinax
+cables ... SFP-10GBase-ACU10M ... update the badge to 'DAC'."** These
+were reading as plain **SFP** because the copper classifier only knew
+BASE-T text. A new twinax/direct-attach pattern, checked ahead of the
+copper one, gives them their own **DAC** badge — treated as part of
+the copper family everywhere copper already gets special handling
+(MAU-MIB precedence, the Mapper's fiber-vs-copper link colour), with
+its own kind, medium and count in the SFP Inventory report and the
+scheduled-report mail line.
+
+**Outcome.** Shipping as 5.55.0. Thing1 built the priority-star feature
+end to end; Thing2 built the DAC classifier, the report/Mapper/mail
+changes and the demo persona end to end; Stephen_King wrote the docs
+and bumped the version; Testy and Javariius take it from here — test
+run and whole-diff review before the push to main.
+
 ## 5.54.0 — Opt-in form: separate terms and consent checkboxes
 
 **"Twilio's A2P 10DLC web-form checklist" audit against nine

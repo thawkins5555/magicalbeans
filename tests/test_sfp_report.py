@@ -113,6 +113,17 @@ check("an empty device_ids list reports on nothing rather than the fleet",
 check("...same for interfaces_with_media directly",
       db.interfaces_with_media(device_ids=[]) == [], "")
 
+sw3 = db.add_device("10.60.0.3", "acc-sw-03", group_id=gid)
+db.replace_interfaces(sw3, PORTS[:1])
+db.update_interface_media(sw3, [{"if_index": 1, "media": "dac"}])
+dac_result = report.sfp_inventory(db)
+dac_row = next(r for r in dac_result.rows if r.device_id == sw3)
+check("a dac port is a row with kind 'DAC', medium 'Copper'",
+      dac_row.kind == "DAC" and dac_row.medium == "Copper", dac_row)
+check("dac_count counts it, copper_count is unaffected",
+      dac_result.dac_count == 1 and dac_result.copper_count == result.copper_count,
+      dac_result.to_dict())
+
 db.request_device_removal([sw1])
 purged = report.sfp_inventory(db)
 check("a purged device's ports drop out of the report",

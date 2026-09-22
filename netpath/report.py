@@ -524,16 +524,16 @@ def firmware_inventory(nodesdb, device_ids: list[int] | None = None,
         unknown_count=sum(1 for r in rows if not r.sw_version), rows=rows)
 
 
-_MEDIA_KIND = {"optic": "DOM", "sfp": "SFP", "copper": "COP",
+_MEDIA_KIND = {"optic": "DOM", "sfp": "SFP", "copper": "COP", "dac": "DAC",
               "sfp_empty": "Empty cage"}
 
 # The "what does the light do" column beside kind's "what did we prove it
 # with": DOM and SFP are both laser transceivers (they differ only in
-# whether DOM sensors answered), copper is BASE-T, and an empty cage is
-# neither yet. api.py and reportsched.py both read this rather than
-# repeating the mapping.
+# whether DOM sensors answered), copper is BASE-T, DAC is twinax copper, and
+# an empty cage is neither yet. api.py and reportsched.py both read this
+# rather than repeating the mapping.
 MEDIA_MEDIUM = {"optic": "Laser", "sfp": "Laser", "copper": "Copper",
-                "sfp_empty": ""}
+                "dac": "Copper", "sfp_empty": ""}
 
 
 @dataclass
@@ -571,6 +571,7 @@ class SfpReport:
     dom_count: int
     sfp_count: int
     copper_count: int
+    dac_count: int
     empty_count: int
     rows: list[SfpRow]
 
@@ -581,6 +582,7 @@ class SfpReport:
                 "dom_count": self.dom_count,
                 "sfp_count": self.sfp_count,
                 "copper_count": self.copper_count,
+                "dac_count": self.dac_count,
                 "empty_count": self.empty_count,
                 "rows": [r.to_dict() for r in self.rows]}
 
@@ -590,7 +592,8 @@ def sfp_inventory(nodesdb, device_ids: list[int] | None = None,
                   include_empty: bool = False) -> SfpReport:
     """Every switch port holding a transceiver: DOM (optic, with sensors),
     SFP (named by ENTITY-MIB, no DOM), COP (copper, module text or
-    MAU-MIB) and, when `include_empty`, empty cages. `dns_names`/
+    MAU-MIB), DAC (twinax/direct-attach copper) and, when `include_empty`,
+    empty cages. `dns_names`/
     `hostnames` name a device the same way firmware_inventory does when it
     has neither a manual name nor a sysName."""
     rows_in = nodesdb.interfaces_with_media(device_ids=device_ids,
@@ -623,6 +626,7 @@ def sfp_inventory(nodesdb, device_ids: list[int] | None = None,
         dom_count=sum(1 for r in rows if r.media == "optic"),
         sfp_count=sum(1 for r in rows if r.media == "sfp"),
         copper_count=sum(1 for r in rows if r.media == "copper"),
+        dac_count=sum(1 for r in rows if r.media == "dac"),
         empty_count=sum(1 for r in rows if r.media == "sfp_empty"),
         rows=rows)
 

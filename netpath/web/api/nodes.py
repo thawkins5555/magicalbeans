@@ -383,6 +383,9 @@ def _device_rows_json(service, params, rows) -> list[dict]:
     # so the whole set rides along, in one read for the page rather than one
     # per row.
     aliases = service.nodes_db.addresses_for_devices(row["id"] for row in rows)
+    # Same one-read-for-the-page shape: which of these devices has a
+    # flagged port, for the list's priority-port star.
+    starred = service.nodes_db.priority_device_ids(row["id"] for row in rows)
     reveal = _may_read_secrets(service, params, "nodes")
     # Every row here comes from the one `devices()` query, so they share one
     # column set -- computed once rather than by every _device_json call.
@@ -397,6 +400,7 @@ def _device_rows_json(service, params, rows) -> list[dict]:
         device["maintenance"] = _maintenance_json(maint_row) if maint_row else None
         device["addresses"] = _device_addresses_json(
             row, aliases.get(row["id"], ()))
+        device["priority_port"] = row["id"] in starred
         devices.append(device)
     return devices
 
@@ -416,6 +420,7 @@ def _device_index_rows_json(service, params, rows) -> list[dict]:
 _DEVICE_LIST_FIELDS = frozenset({
     "id", "status", "name", "sys_name", "ip", "display_name_source",
     "addresses", "maintenance", "muted_until", "rule_muted_count",
+    "priority_port",
     "override_count", "override_fields", "group_id", "device_group_id",
     "vendor", "vendor_source", "vendor_confidence",
     "ping_rtt_ms", "snmp_ok", "ping_ok", "last_poll_ts", "sys_uptime_s",

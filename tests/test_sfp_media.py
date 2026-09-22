@@ -49,7 +49,10 @@ PORTS = [{"if_index": 1, "descr": "GigabitEthernet1/0/1"},
          {"if_index": 16, "descr": "GigabitEthernet1/0/16"},
          {"if_index": 17, "descr": "GigabitEthernet1/0/17"},
          {"if_index": 18, "descr": "GigabitEthernet1/0/18"},
-         {"if_index": 19, "descr": "GigabitEthernet1/0/19"}]
+         {"if_index": 19, "descr": "GigabitEthernet1/0/19"},
+         {"if_index": 20, "descr": "GigabitEthernet1/0/20"},
+         {"if_index": 21, "descr": "GigabitEthernet1/0/21"},
+         {"if_index": 22, "descr": "GigabitEthernet1/0/22"}]
 
 IF_MAU_TYPE = "1.3.6.1.2.1.26.2.1.1.3"
 
@@ -175,6 +178,15 @@ try:
     check("module text 'SFP-GE-T' alone (5.25.1's widened _COPPER_TEXT) is "
           "'copper'",
           media.get(15) == "copper", media)
+    check("a DAC module named by text alone ('10GBase-CU SFP+' / "
+          "SFP-H10GB-CU3M), no sensor at all, is 'dac'",
+          media.get(20) == "dac", media)
+    check("the same DAC text plus an ifMauType arc 41 (10GBASE-CX4) is "
+          "still 'dac' -- the copper-family MAU arc agrees with the text",
+          media.get(21) == "dac", media)
+    check("the same DAC text vetoed to 'sfp' by a fiber ifMauType arc (36), "
+          "same as copper text under a fiber arc",
+          media.get(22) == "sfp", media)
 
     optic_mode = {r["if_index"]: r["optic_mode"] for r in db.interfaces(did)}
     check("if 2's module text (10Gbase-LR SFP+ / SFP-10G-LR) reads 'sm' "
@@ -190,6 +202,9 @@ try:
     check("copper ports never carry an optic_mode",
           optic_mode.get(8) is None and optic_mode.get(9) is None
           and optic_mode.get(10) is None, optic_mode)
+    check("DAC ports never carry an optic_mode either",
+          optic_mode.get(20) is None and optic_mode.get(21) is None,
+          optic_mode)
     check("a DOM-lit port whose parent chain carries a chassis model name "
           "(N9K-C93180YC-EX) reads 'mm' off its transceiver child "
           "(SFP-10G-SR), not 'sm' off the chassis -- the fallback scan's "
@@ -388,7 +403,8 @@ try:
     mark_cisco(db, did)
     db.replace_interfaces(did, PORTS)
     db.update_interface_media(did, [{"if_index": 2, "media": "sfp"},
-                                    {"if_index": 3, "media": "sfp_empty"}])
+                                    {"if_index": 3, "media": "sfp_empty"},
+                                    {"if_index": 20, "media": "dac"}])
     poller = NodePoller(db)
     device = db.device(did)
     poller._poll_environment(did, device, db.effective_config(device), set(),
@@ -398,6 +414,8 @@ try:
           "keeps its stored SFP badges -- a half-mapped pass must not "
           "strip them",
           (media.get(2), media.get(3)) == ("sfp", "sfp_empty"), media)
+    check("...and a stored 'dac' row survives the same truncated walk",
+          media.get(20) == "dac", media)
     db.close()
 finally:
     stub.kill()
@@ -575,6 +593,18 @@ for text in FIBER_NEGATIVES:
     check(f"_COPPER_TEXT does not match laser part {text!r}",
           not _COPPER_TEXT.search(text))
 
+# ------------------------------------- § 5b _DAC_TEXT, regex-only (5.55.0)
+_DAC_TEXT = nodepoll_mod._DAC_TEXT
+DAC_POSITIVES = ["SFP-10GBase-ACU10M", "SFP-H10GB-CU3M", "SFP-H10GB-ACU7M",
+                 "QSFP-H40G-CU5M", "QSFP-100G-CR4", "10GBASE-CR",
+                 "10GBase-CU SFP+", "SFP+ Twinax", "Direct Attach Copper Cable",
+                 "SFP-H10GB-CU1-5M", "QSFP-H40G-CU0-5M", "QSFP-4X10G-AC7M"]
+DAC_NEGATIVES = COPPER_POSITIVES + FIBER_NEGATIVES + ["SFP-10G-AOC3M"]
+for text in DAC_POSITIVES:
+    check(f"_DAC_TEXT matches {text!r}", bool(_DAC_TEXT.search(text)))
+for text in DAC_NEGATIVES:
+    check(f"_DAC_TEXT does not match {text!r}", not _DAC_TEXT.search(text))
+
 # --------------------------------- § 6 _optic_mode, real Cisco part numbers
 _optic_mode = nodepoll_mod._optic_mode
 OPTIC_MODE_TABLE = [
@@ -586,6 +616,7 @@ OPTIC_MODE_TABLE = [
     ("SFP-10G-BX40-U", "sm"), ("SFP-10G-BX40-D", "sm"),
     ("SFP-10G-SRL", "mm"), ("SFP-LX10", "sm"), ("QSFP-100G-ER4L-S", "sm"),
     ("GLC-T", None), ("SFP-H10GB-CU1M", None),
+    ("SFP-10GBase-ACU10M", None), ("QSFP-H40G-CU5M", None),
 ]
 for text, expected in OPTIC_MODE_TABLE:
     check(f"_optic_mode({text!r}) is {expected!r}",

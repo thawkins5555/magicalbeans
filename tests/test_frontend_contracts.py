@@ -3624,8 +3624,9 @@ check(".badge-cop" in APP_CSS,
       "app.css styles the COP badge, or it inherits the amber warning fill "
       "every other badge uses")
 _DEV_DIALOG80 = js_function(NODES80, "deviceDialog")
-check("r.media !== 'copper' && dialogOptics.has(r.if_index)" in _DEV_DIALOG80,
-      "a stored COP row is never upgraded to DOM by the live /dom read, "
+check("r.media !== 'copper' && r.media !== 'dac' && dialogOptics.has(r.if_index)"
+      in _DEV_DIALOG80,
+      "a stored COP/DAC row is never upgraded to DOM by the live /dom read, "
       "whatever it carries for that port")
 check("dialogOptics = new Set(rows.filter((s) => s.unit === 'dBm')" in _DEV_DIALOG80,
       "the live read only counts an optical-power (dBm) row toward DOM -- "
@@ -4998,6 +4999,43 @@ for name, text in (("sms-terms.html", SMS_TERMS104), ("sms-privacy.html", SMS_PR
 check("No mobile information will be shared with third parties or affiliates "
       "for marketing or promotional purposes." in SMS_PRIVACY104,
       "sms-privacy.html carries the carrier-required no-sharing sentence verbatim")
+
+# ---------------------------------------------------------------------------
+# 105. Priority-port star on the device list: the list's name cell marks a
+#      starred device, and toggling the flag refreshes the list at once.
+NODES105 = read("nodes.js")
+check("function priorityStar(" in NODES105,
+      "nodes.js defines priorityStar")
+check("${escape(displayName(r))}${priorityStar(r)}" in NODES105,
+      "the name column cell places the star right after the escaped name")
+_IFD_PRIORITY105 = js_function(NODES105, "interfaceDialog")
+_HANDLER105 = _IFD_PRIORITY105[_IFD_PRIORITY105.index("#ifd-priority"):]
+check("refresh().catch(() => {});" in _HANDLER105[:_HANDLER105.index("};")],
+      "the #ifd-priority handler refreshes the list on a successful toggle")
+CSS105 = read("app.css")
+check(".priority-star" in CSS105,
+      "app.css styles the priority star")
+NODES_PY105 = python_text("web.api.nodes")
+check('"priority_port"' in NODES_PY105,
+      "nodes.py's device-list projection carries priority_port")
+
+# ---------------------------------------------------------------------------
+# 106. DAC (twinax) transceiver badge (5.55.0): sfpBadge's new case, its
+#      app.css fill, and the report's dac_count carried through both ends.
+NODES106 = read("nodes.js")
+check("badge badge-dac" in NODES106 and "r.media === 'dac'" in NODES106,
+      "sfpBadge renders the DAC case off the stored media column, same as "
+      "DOM/SFP/COP")
+CSS106 = read("app.css")
+check(".badge-dac" in CSS106, "app.css styles the DAC badge")
+check("result.dac_count" in NODES106,
+      "the SFP report summary line counts DAC ports alongside DOM/SFP/COP")
+_REPORT106 = python_text("report")
+check("dac_count" in _REPORT106,
+      "report.py's SfpReport carries dac_count through to_dict/sfp_inventory")
+_NODEPOLL106 = python_text("nodepoll")
+check("_DAC_TEXT" in _NODEPOLL106,
+      "nodepoll's _decode.py defines the twinax/direct-attach regex")
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))
