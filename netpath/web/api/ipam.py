@@ -330,6 +330,16 @@ def post_ipam_dhcp_server_poll(service, params, body, server_id) -> dict:
     return {"ok": True}
 
 
+def _text_or_none(value, field):
+    """A credential field read straight out of the JSON body: str, or absent
+    (None), never anything else -- a list or number here would otherwise
+    reach os.environ[...] = value in ipam_dhcp._run and fail as a TypeError,
+    a 500 for what is really a malformed request."""
+    if value is None or isinstance(value, str):
+        return value
+    raise ValueError(f"{field} must be text")
+
+
 def _test_dhcp_connection(service, address, username, password) -> dict:
     """The PowerShell round trip itself, shared by the id-based Test button
     (an already-saved server) and the Add dialog's Test connection (nothing
@@ -369,7 +379,9 @@ def post_ipam_dhcp_server_test_unsaved(service, params, body) -> dict:
     address = str(body.get("address", "")).strip()
     if not address:
         raise ValueError("A hostname or address is required")
-    return _test_dhcp_connection(service, address, body.get("username"), body.get("password"))
+    username = _text_or_none(body.get("username"), "username")
+    password = _text_or_none(body.get("password"), "password")
+    return _test_dhcp_connection(service, address, username, password)
 
 
 def post_ipam_dhcp_server_credential(service, params, body, server_id) -> dict:

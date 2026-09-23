@@ -66,6 +66,19 @@ result3 = api.post_ipam_dhcp_server_test_unsaved(
 check("a DhcpUnavailable comes back as {ok: False, error: ...}, not a 500",
       result3 == {"ok": False, "error": "no PowerShell on this host"}, result3)
 
+ipam_dhcp.test_connection = fake_test_connection
+for field, body in (
+    ("username", {"address": "dhcp01.example.net", "username": ["svc"], "password": "x"}),
+    ("password", {"address": "dhcp01.example.net", "username": "svc", "password": 12345}),
+):
+    try:
+        api.post_ipam_dhcp_server_test_unsaved(service, {}, body)
+        check(f"a non-string {field} raises ValueError, not a 500 from "
+              "os.environ rejecting it", False)
+    except ValueError as exc:
+        check(f"a non-string {field} raises ValueError, not a 500 from "
+              "os.environ rejecting it", field in str(exc), str(exc))
+
 print()
 print("FAILURES:", FAILS if FAILS else "none")
 raise SystemExit(1 if FAILS else 0)
