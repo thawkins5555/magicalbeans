@@ -200,10 +200,10 @@ together.
 **Security.** NetFlow's custom port names and interface names are operator
 typed and shown in every viewer's flow table; they are now escaped there,
 and a name containing `<` or `>` is refused on save rather than accepted
-and stored. The frontend contract test that pins the JS now scans the body
-of every table cell, not just the ones it already knew to check, so a
-future cell that prints a row field unescaped fails the test instead of
-shipping.
+and stored. The frontend contract test that pins the JS now scans every
+table cell that returns a bare row field or a tag-less template, not just
+the ones it already knew to check, so a future cell that prints a row
+field unescaped fails the test instead of shipping.
 
 **Every IP address gets an actions button.** NetFlow, Syslog, SNMP Trap,
 IPAM hosts and leases, and a device's ARP/Addresses tables now show a small
@@ -239,8 +239,9 @@ with a Settings button, matching every other module. Four confirmation
 dialogs and the Nodes bulk-action button were re-worded to keep **Remove**
 and **Delete** distinct: Remove takes something out of monitoring or
 configuration, Delete destroys data that was stored. Byte counts are now
-decimal (base 1000: KB/MB/GB) on both the browser and the server, matching
-how a switch or a service quotes its own throughput. Rate labels (bps/
+decimal (base 1000: KB/MB/GB) in both the browser and server formatters,
+including the console window and ConfigRX backup sizes, matching how a
+switch or a service quotes its own throughput. Rate labels (bps/
 Kbps/Mbps) now go through the one shared formatter instead of a
 second copy that had drifted slightly from it. Alerts, Syslog and SNMP
 Trap's help panels gained a severity colour key, and a note on time zones
