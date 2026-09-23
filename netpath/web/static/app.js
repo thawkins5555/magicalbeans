@@ -1551,10 +1551,10 @@ const App = (() => {
   function bytes(value) {
     let n = Number(value) || 0;
     for (const unit of ['B', 'KB', 'MB', 'GB', 'TB']) {
-      if (n < 1024 || unit === 'TB') {
+      if (n < 1000 || unit === 'TB') {
         return unit === 'B' ? `${Math.round(n)} B` : `${n.toFixed(1)} ${unit}`;
       }
-      n /= 1024;
+      n /= 1000;
     }
     return `${n} TB`;
   }

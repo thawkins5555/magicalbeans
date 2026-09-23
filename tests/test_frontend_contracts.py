@@ -5252,6 +5252,13 @@ check("Dialog buttons: a form dialog" in read("app.css")
 check("'shell.dialogs'" in APP and "Remove takes something out of monitoring" in APP,
       "app.js registers shell.dialogs with the Remove/Delete distinction too")
 
+
+# ---------------------------------------------------------------------------
+# 117. App.bytes divides by 1000, not 1024, with the same unit labels.
+BYTES117 = js_function(APP, "bytes")
+check("n < 1000 || unit === 'TB'" in BYTES117 and "n /= 1000;" in BYTES117,
+      "App.bytes uses 1000 as its base, not 1024")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:
