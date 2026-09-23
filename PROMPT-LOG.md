@@ -44,11 +44,17 @@ script, an alarm-sound option, and a kiosk-mode session-limit exemption
 escaping and settings-validation fix was committed, and Thing1 and
 Thing2 started building the rest in separate worktrees.
 
-**Outcome.** The fix pass landed as 5.57.0 — the two worktree lanes were
-merged, the byte-unit and dialog-button-rule mechanical passes were done
-across every touched module, and the docs (this file, `CHANGELOG.md`,
-`FEATURES.md`, `INTERNALS.md`, `README.md`) are written. Testy's run and
-Javariius's whole-diff review are next, before the push to main.
+**Outcome.** The fix pass shipped as 5.57.0. The first full suite ran
+215 of 215 and the browser walk 98 of 98 after one router fix.
+Javariius's review found no security holes but did flag two major and
+several moderate defects — NetFlow cells blanking for unresolved names,
+the Problems-only filter's select-all sweeping up hidden devices,
+popover and live-table interaction, filter links not round-tripping on
+reload, a deliberate sign-out carrying the page hash along, and comment
+density — all closed in a second lane pass. The final full suite ran
+213 of 215, with the two failures resolved: a test pin updated for the
+storage meter's decimal cap text, and an SSH terminal socket reset under
+load confirmed to pass standalone. Pushed to main.
 
 ## 5.56.0 — Every reboot emails; silent email drops say why; DAC badge grey; Send test email
 
