@@ -5357,6 +5357,16 @@ START124 = js_function(APP, "start")
 check("event.target.closest('.module-refresh')" in START124 and "refreshNow();" in START124,
       "start() delegates .module-refresh clicks to App.refreshNow()")
 
+
+# ---------------------------------------------------------------------------
+# 125. Every .card.strip in index.html carries role="toolbar" and its own
+#      aria-label.
+check(INDEX.count('class="card strip"') == INDEX.count('class="card strip" role="toolbar" aria-label='),
+      "every .card.strip carries role=toolbar and an aria-label")
+check(INDEX.count('class="card strip" role="toolbar" aria-label=') == 11,
+      "eleven .card.strip elements are labelled (found %d)"
+      % INDEX.count('class="card strip" role="toolbar" aria-label='))
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

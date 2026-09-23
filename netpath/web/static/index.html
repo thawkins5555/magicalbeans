@@ -96,7 +96,7 @@
 
 <!-- ============================= NODES ============================== -->
 <section id="page-nodes" class="page">
-  <div class="card strip">
+  <div class="card strip" role="toolbar" aria-label="Nodes controls">
     <span id="nd-dot" class="dot"></span>
     <span id="nd-status" class="stat">Poller stopped</span>
     <span id="nd-counters" class="hint"></span>
@@ -501,7 +501,7 @@
 
 <!-- ============================= ALERTS ============================== -->
 <section id="page-alerts" class="page">
-  <div class="card strip">
+  <div class="card strip" role="toolbar" aria-label="Alerts controls">
     <span id="alerts-dot" class="dot"></span>
     <span id="alerts-status" class="stat">Alert engine stopped</span>
     <span id="alerts-counters" class="hint"></span>
@@ -674,7 +674,7 @@
 
 <!-- ============================ NETFLOW ============================ -->
 <section id="page-netflow" class="page">
-  <div class="card strip">
+  <div class="card strip" role="toolbar" aria-label="NetFlow controls">
     <span id="nf-dot" class="dot"></span>
     <span id="nf-status" class="stat">Collector stopped</span>
     <span id="nf-counters" class="hint"></span>
@@ -742,7 +742,7 @@
 
 <!-- ============================== SNMP TRAP =========================== -->
 <section id="page-snmp" class="page">
-  <div class="card strip">
+  <div class="card strip" role="toolbar" aria-label="SNMP Trap controls">
     <span id="sn-dot" class="dot"></span>
     <span id="sn-status" class="stat">Receiver stopped</span>
     <span id="sn-counters" class="hint"></span>
@@ -805,7 +805,7 @@
 
 <!-- ============================= SYSLOG ============================= -->
 <section id="page-syslog" class="page">
-  <div class="card strip">
+  <div class="card strip" role="toolbar" aria-label="Syslog controls">
     <span id="sl-dot" class="dot"></span>
     <span id="sl-status" class="stat">Collector stopped</span>
     <span id="sl-counters" class="hint"></span>
@@ -868,7 +868,7 @@
 
 <!-- ============================== IPAM ================================ -->
 <section id="page-ipam" class="page">
-  <div class="card strip">
+  <div class="card strip" role="toolbar" aria-label="IPAM controls">
     <span id="ipam-dot" class="dot"></span>
     <span id="ipam-status" class="stat">Worker stopped</span>
     <span id="ipam-counters" class="hint"></span>
@@ -977,7 +977,7 @@
 
 <!-- ============================ WIRELESS ============================ -->
 <section id="page-wireless" class="page">
-  <div class="card strip">
+  <div class="card strip" role="toolbar" aria-label="Forti-AP controls">
     <span id="wl-dot" class="dot"></span>
     <span id="wl-status" class="stat">Poller stopped</span>
     <span id="wl-counters" class="hint"></span>
@@ -1048,7 +1048,7 @@
 
 <!-- ============================ CONFIGRX ============================= -->
 <section id="page-configrx" class="page">
-  <div class="card strip">
+  <div class="card strip" role="toolbar" aria-label="ConfigRX controls">
     <span id="cx-dot" class="dot"></span>
     <span id="cx-status" class="stat">Worker stopped</span>
     <span id="cx-counters" class="hint"></span>
@@ -1216,7 +1216,7 @@
      tab button joins the strip right after CONFIGRX (see #tabs above), and
      this section follows that same, already-established convention. -->
 <section id="page-mapper" class="page">
-  <div class="card strip">
+  <div class="card strip" role="toolbar" aria-label="Mapper controls">
     <span id="mp-dot" class="dot"></span>
     <span id="mp-status" class="stat">No map selected</span>
     <span id="mp-counters" class="hint"></span>
@@ -1282,7 +1282,7 @@
 
 <!-- ============================= DEBUG ============================= -->
 <section id="page-debug" class="page">
-  <div class="card strip"><span id="dbg-summary" class="stat"></span></div>
+  <div class="card strip" role="toolbar" aria-label="Debug controls"><span id="dbg-summary" class="stat"></span></div>
   <div class="rows" data-splitter="debug-body">
    <div class="pane" data-grow="65">
     <header class="bar"><span class="section">TRACE WORKERS</span></header>
