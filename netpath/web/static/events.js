@@ -278,6 +278,10 @@
         apply: `${spec.prefix}-apply`, clear: `${spec.prefix}-clear`,
         clears: spec.bar.clears.map((suffix) => `${spec.prefix}-${suffix}`),
       });
+      const syncRoute = () => App.syncFilterRoute(spec.tab,
+        Object.fromEntries(spec.queryKeys.map((key) => [key, `${spec.prefix}-${key}`])));
+      el('apply').addEventListener('click', syncRoute);
+      el('clear').addEventListener('click', syncRoute);
       // Replaces filterBar's plain-refresh handler so "Custom…" opens the range dialog.
       const rangeSelect = el('range');
       rangeSelect.onchange = async () => {
@@ -328,6 +332,20 @@
       if (!opts) return;
       const query = opts.query || {};
       let filtered = false;
+      // t0/t1 pin the window rather than sliding under it, the same as
+      // clicking a histogram bucket (pinWindow) — a link naming a window
+      // means that window, not "the last N seconds as of whenever it is
+      // opened".
+      const t0 = query.t0 !== undefined ? Number(query.t0) : undefined;
+      const t1 = query.t1 !== undefined ? Number(query.t1) : undefined;
+      if (Number.isFinite(t0) && Number.isFinite(t1)) {
+        view.follow = false;
+        el('follow').checked = false;
+        view.t0 = t0;
+        view.t1 = t1;
+        el('live').hidden = false;
+        filtered = true;
+      }
       for (const key of spec.queryKeys) {
         if (query[key] === undefined) continue;
         const field = el(key);
@@ -371,7 +389,7 @@
       selects: ['range', 'limit', 'severity', 'facility'],
       clears: ['q', 'source', 'host', 'app', 'severity', 'facility'],
     },
-    queryKeys: ['source', 'host'],
+    queryKeys: ['source', 'host', 'severity', 'facility', 'q'],
 
     columns: (shared) => [
       shared.time,
@@ -551,7 +569,7 @@
       selects: ['range', 'limit', 'severity', 'kind', 'version'],
       clears: ['q', 'source', 'oid', 'severity', 'kind', 'version'],
     },
-    queryKeys: ['source'],
+    queryKeys: ['source', 'severity', 'q'],
 
     columns: (shared) => [
       shared.time,

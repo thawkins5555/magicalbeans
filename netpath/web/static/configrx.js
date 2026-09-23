@@ -1609,6 +1609,9 @@
       text: ['cx-q'], selects: ['cx-filter-vendor'],
       apply: 'cx-apply', clear: 'cx-clear', clears: ['cx-q', 'cx-filter-vendor', 'cx-enabled-only'],
     });
+    const syncConfigrxRoute = () => App.syncFilterRoute('configrx', { q: 'cx-q' });
+    App.el('cx-apply').addEventListener('click', syncConfigrxRoute);
+    App.el('cx-clear').addEventListener('click', syncConfigrxRoute);
     App.el('cx-bulk-clear').onclick = bulkClearSelection;
     App.el('cx-backup-delete').onclick = () => deleteBackups([...view.backupsChecked]);
     App.el('cx-backup-clear').onclick = () => {
@@ -1706,7 +1709,13 @@
      id>. Runs after refresh(), so the device list is populated; selectDevice
      fetches that device's backups before the backup half is applied. */
   async function activate(opts) {
-    if (!opts || !opts.parts) return;
+    if (!opts) return;
+    const query = opts.query || {};
+    if (query.q !== undefined) {
+      App.el('cx-q').value = query.q;
+      await App.refreshNow('configrx');
+    }
+    if (!opts.parts) return;
     if (opts.parts[0] === 'device') {
       // 'device' (singular) names no subtab of its own, so
       // applySubtabFromRoute (app.js) never switches here on its own —

@@ -7024,6 +7024,12 @@
       // every five seconds is unusable.
       onEnter: () => { view.macSearchPending = true; },
     });
+    const syncNodesRoute = () => App.syncFilterRoute('nodes', {
+      q: 'nd-q', group: 'nd-filter-group', devgroup: 'nd-filter-devgroup',
+      status: 'nd-filter-status',
+    });
+    App.el('nd-apply').addEventListener('click', syncNodesRoute);
+    App.el('nd-clear').addEventListener('click', syncNodesRoute);
     // A revealed row's highlight is a "you asked to find this one" cue; it
     // has nothing to say once the operator starts a different search.
     App.el('nd-q').oninput = () => {

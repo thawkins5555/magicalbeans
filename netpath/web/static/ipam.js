@@ -1236,6 +1236,7 @@
         [{ label: 'OK', primary: true, onClick: App.closeModal }]);
       return;
     }
+    App.syncFilterRoute('ipam', { q: 'ipam-search-q' });
     let payload;
     try {
       payload = await App.get('/api/ipam/search', { q: query });
@@ -1333,5 +1334,18 @@
     selectSub(startSub);
   }
 
-  App.pages.ipam = { init, refresh, fastTick: drawStatus };
+  /* #/ipam?ip=& or ?q=: a link in from App.ipCell or another tab's "view in
+     IPAM" action. Lands in the Find box, on the subnets-and-hosts subtab,
+     and runs the same search Enter/Search would. */
+  function activate(opts) {
+    if (!opts) return;
+    const query = opts.query || {};
+    const value = query.ip !== undefined ? query.ip : query.q;
+    if (value === undefined) return;
+    App.el('ipam-search-q').value = value;
+    selectSub('subnets');
+    searchHosts();
+  }
+
+  App.pages.ipam = { init, refresh, activate, fastTick: drawStatus };
 })();

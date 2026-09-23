@@ -737,6 +737,9 @@
       text: ['wl-q'], selects: ['wl-controller', 'wl-state'],
       apply: 'wl-apply', clear: 'wl-clear', clears: ['wl-q', 'wl-controller', 'wl-state'],
     });
+    const syncWirelessRoute = () => App.syncFilterRoute('wireless', { q: 'wl-q' });
+    App.el('wl-apply').addEventListener('click', syncWirelessRoute);
+    App.el('wl-clear').addEventListener('click', syncWirelessRoute);
     App.el('wl-export-csv').onclick = exportApsCsv;
     App.el('wl-state').onchange = () => App.refreshNow('wireless');
     App.fillRanges(App.el('wl-hist-range'), 'Last 24 hours', undefined, { custom: true });
@@ -792,7 +795,13 @@
      tails, and silently widening the window to find one row would
      change what the operator asked to see. */
   function activate(opts) {
-    if (!opts || !opts.parts || opts.parts[0] === undefined) return;
+    if (!opts) return;
+    const query = opts.query || {};
+    if (query.q !== undefined) {
+      App.el('wl-q').value = query.q;
+      App.refreshNow('wireless');
+    }
+    if (!opts.parts || opts.parts[0] === undefined) return;
     const id = Number(opts.parts[0]);
     if (!Number.isFinite(id)) return;
     const row = (view.aps || []).find((r) => r.id === id);

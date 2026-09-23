@@ -1283,6 +1283,16 @@
       apply: 'nf-apply', clear: 'nf-clear',
       clears: ['nf-src', 'nf-dst', 'nf-port', 'nf-protocol', 'nf-exporter'],
     });
+    // Mirrors the filters into the hash after filterBar's own refresh, so a
+    // link into this view can be shared. nf-src is the round trip for
+    // App.ipCell's "view in NetFlow" action (see activate() below) — there
+    // is no single combined address box, so the Source filter is it.
+    const syncNetflowRoute = () => App.syncFilterRoute('netflow', {
+      ip: 'nf-src', dst: 'nf-dst', port: 'nf-port', protocol: 'nf-protocol',
+      exporter: 'nf-exporter',
+    });
+    App.el('nf-apply').addEventListener('click', syncNetflowRoute);
+    App.el('nf-clear').addEventListener('click', syncNetflowRoute);
     App.el('nf-export-csv').onclick = exportFlowsCsv;
     // "Resolve names" used to sit here, in the filter bar beside per-view
     // controls (source/dest/port), silently writing a server-wide setting
@@ -1302,5 +1312,32 @@
     applyWindow(...rangeWindow(), true);
   }
 
-  App.pages.netflow = { init, refresh, fastTick: drawStatus };
+  /* #/netflow?ip=&t0=&t1=&window=: a link in from App.ipCell or another
+     tab's "view in NetFlow" action. ip lands in the Source filter (see
+     syncNetflowRoute above); t0/t1 pin a custom window, window (seconds)
+     picks a range-select entry — t0/t1 wins when both are given. Either
+     one's own fetch (setWindow/resetWindow, debounced through
+     requestFetch) carries the filter along once it lands. */
+  function activate(opts) {
+    if (!opts) return;
+    const query = opts.query || {};
+    let filtered = false;
+    if (query.ip !== undefined) {
+      App.el('nf-src').value = query.ip;
+      filtered = true;
+    }
+    const t0 = query.t0 !== undefined ? Number(query.t0) : undefined;
+    const t1 = query.t1 !== undefined ? Number(query.t1) : undefined;
+    if (Number.isFinite(t0) && Number.isFinite(t1)) {
+      App.el('nf-range').value = 'custom';
+      setWindow(t0, t1, false);
+    } else if (query.window !== undefined) {
+      App.el('nf-range').value = query.window;
+      resetWindow();
+    } else if (filtered) {
+      App.refreshNow('netflow');
+    }
+  }
+
+  App.pages.netflow = { init, refresh, activate, fastTick: drawStatus };
 })();

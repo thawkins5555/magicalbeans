@@ -5398,6 +5398,48 @@ check(INDEX.index('id="dash-get-started"') < INDEX.index('id="dash-grid"'),
 DRAW127 = js_function(DASHBOARD101, "draw")
 check("drawGetStarted();" in DRAW127, "draw() calls drawGetStarted() every time")
 
+# ---------------------------------------------------------------------------
+# 107. Filters in the address bar: NetFlow, IPAM, wireless and ConfigRX each
+#      grew (or extended) an activate(opts) that reads its filters back out
+#      of the route's query string, and every module's Search/Apply and
+#      Clear also write the hash so the view can be shared as a link.
+NETFLOW107 = read("netflow.js")
+check("function activate(opts)" in NETFLOW107
+      and "App.pages.netflow = { init, refresh, activate, fastTick: drawStatus };" in NETFLOW107,
+      "netflow.js exports an activate() reading opts.query")
+check("App.syncFilterRoute('netflow'," in NETFLOW107,
+      "NetFlow's Apply/Clear mirror the filters into the hash")
+IPAM107 = read("ipam.js")
+check("function activate(opts)" in IPAM107
+      and "App.pages.ipam = { init, refresh, activate, fastTick: drawStatus };" in IPAM107,
+      "ipam.js exports an activate() reading opts.query")
+check("App.syncFilterRoute('ipam'," in IPAM107,
+      "IPAM's search mirrors the query into the hash")
+WIRELESS107 = read("wireless.js")
+check("query.q !== undefined" in js_function(WIRELESS107, "activate"),
+      "wireless.js's activate() also reads opts.query.q")
+check("App.syncFilterRoute('wireless'," in WIRELESS107,
+      "wireless's Apply/Clear mirror the filter into the hash")
+CONFIGRX107 = read("configrx.js")
+check("query.q !== undefined" in js_function(CONFIGRX107, "activate"),
+      "configrx.js's activate() also reads opts.query.q")
+check("App.syncFilterRoute('configrx'," in CONFIGRX107,
+      "ConfigRX's Apply/Clear mirror the filter into the hash")
+EVENTS107 = read("events.js")
+check("queryKeys: ['source', 'host', 'severity', 'facility', 'q']" in EVENTS107,
+      "syslog's queryKeys grew severity, facility and q")
+check("queryKeys: ['source', 'severity', 'q']" in EVENTS107,
+      "snmp's queryKeys grew severity and q")
+check("Number.isFinite(t0) && Number.isFinite(t1)" in js_function(EVENTS107, "activate")
+      and "view.follow = false;" in js_function(EVENTS107, "activate"),
+      "a route naming t0/t1 pins the window instead of sliding it")
+check("App.syncFilterRoute(spec.tab," in EVENTS107,
+      "Syslog/SNMP's shared Apply/Clear mirror the filters into the hash")
+NODES107 = read("nodes.js")
+check("App.syncFilterRoute('nodes'," in NODES107,
+      "the device list's Apply/Clear mirror the filters into the hash")
+
+# ---------------------------------------------------------------------------
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:
