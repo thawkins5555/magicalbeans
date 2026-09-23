@@ -20,7 +20,8 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _source import js_function, js_functions, js_const, css_rule, python_text, static_text
+from _source import (js_function, js_functions, js_const, css_rule, python_text,
+                     python_function, static_text)
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATIC = os.path.join(REPO_ROOT, "netpath", "web", "static")
@@ -5562,6 +5563,34 @@ check('subnet["scan_started"] = worker_state["scan_started"].get(subnet["id"])'
       "the worker's own job-start tracking")
 
 
+# 115. Test a DHCP server before it is saved: the Add dialog gets the same
+#      Test connection button, disabled-while-testing text and result <pre>
+#      as Edit, posting to the new address-only route.
+IPAM115 = read("ipam.js")
+_ADD_DHCP115 = js_function(IPAM115, "addDhcpServer")
+check("'/api/ipam/dhcp/servers/test'" in _ADD_DHCP115,
+      "Add's Test connection posts to the unsaved-server route")
+check("button.textContent = 'Testing…';" in _ADD_DHCP115
+      and "button.disabled = true;" in _ADD_DHCP115,
+      "...disables the button and says so while it runs")
+check("<pre class=\"err\">${escape(result.error)}</pre>" in _ADD_DHCP115,
+      "...and a failure's detail renders the same as Edit's")
+_IPAM_PY115 = python_text("web.api.ipam")
+check("def _test_dhcp_connection(service, address, username, password)" in _IPAM_PY115,
+      "the PowerShell round trip is factored out of the id-based handler")
+check("def post_ipam_dhcp_server_test_unsaved(service, params, body)" in _IPAM_PY115,
+      "...and reused by the new address-only route")
+_TEST_UNSAVED115 = python_function("web.api.ipam", "post_ipam_dhcp_server_test_unsaved")
+check('raise ValueError("A hostname or address is required")' in _TEST_UNSAVED115,
+      "a missing address is refused before any round trip is attempted")
+_SERVER_PY115 = python_text("web.server")
+check(r'("POST", r"^/api/ipam/dhcp/servers/test$", api.post_ipam_dhcp_server_test_unsaved, ("ipam", W)),'
+      in _SERVER_PY115,
+      "the new route carries the same ('ipam', W) permission as the "
+      "id-based Test route")
+
+
+# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 if failures:
     print("FAILED %d contract(s):" % len(failures))

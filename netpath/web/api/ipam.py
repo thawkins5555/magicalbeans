@@ -330,8 +330,25 @@ def post_ipam_dhcp_server_poll(service, params, body, server_id) -> dict:
     return {"ok": True}
 
 
-def post_ipam_dhcp_server_test(service, params, body, server_id) -> dict:
+def _test_dhcp_connection(service, address, username, password) -> dict:
+    """The PowerShell round trip itself, shared by the id-based Test button
+    (an already-saved server) and the Add dialog's Test connection (nothing
+    saved yet, so only whatever the form currently holds)."""
     from ...ipam_dhcp import DhcpUnavailable, test_connection
+
+    try:
+        result = test_connection(
+            address,
+            timeout_s=float(service.ipam_settings.get("dhcp_timeout_s", 30)),
+            username=username or None, password=password or None)
+    except (DhcpUnavailable, ValueError) as exc:
+        return {"ok": False, "error": str(exc)}
+    finally:
+        username = password = None
+    return result
+
+
+def post_ipam_dhcp_server_test(service, params, body, server_id) -> dict:
     from ...ipam_worker import credential_for_server
 
     server = _require(service.ipam_db.dhcp_server(server_id), "DHCP server")
@@ -342,17 +359,17 @@ def post_ipam_dhcp_server_test(service, params, body, server_id) -> dict:
     password = body.get("password")
     if username is None:
         username, password = credential_for_server(server)
+    return _test_dhcp_connection(service, server["address"], username, password)
 
-    try:
-        result = test_connection(
-            server["address"],
-            timeout_s=float(service.ipam_settings.get("dhcp_timeout_s", 30)),
-            username=username or None, password=password or None)
-    except (DhcpUnavailable, ValueError) as exc:
-        return {"ok": False, "error": str(exc)}
-    finally:
-        username = password = None
-    return result
+
+def post_ipam_dhcp_server_test_unsaved(service, params, body) -> dict:
+    """The Add DHCP server dialog's own Test connection: the same round
+    trip, before there is a row (or a stored credential) to fall back to --
+    exactly the address/username/password the form currently holds."""
+    address = str(body.get("address", "")).strip()
+    if not address:
+        raise ValueError("A hostname or address is required")
+    return _test_dhcp_connection(service, address, body.get("username"), body.get("password"))
 
 
 def post_ipam_dhcp_server_credential(service, params, body, server_id) -> dict:

@@ -283,6 +283,7 @@ ROUTES = [
     ("POST", r"^/api/ipam/conflicts/(\d+)/reopen$", api.post_ipam_conflict_reopen, ("ipam", W)),
     ("GET", r"^/api/ipam/dhcp/servers$", api.get_ipam_dhcp_servers, ("ipam", R)),
     ("POST", r"^/api/ipam/dhcp/servers$", api.post_ipam_dhcp_server, ("ipam", W)),
+    ("POST", r"^/api/ipam/dhcp/servers/test$", api.post_ipam_dhcp_server_test_unsaved, ("ipam", W)),
     ("PUT", r"^/api/ipam/dhcp/servers/(\d+)$", api.put_ipam_dhcp_server, ("ipam", W)),
     ("DELETE", r"^/api/ipam/dhcp/servers/(\d+)$", api.delete_ipam_dhcp_server, ("ipam", W)),
     ("POST", r"^/api/ipam/dhcp/servers/(\d+)/poll$", api.post_ipam_dhcp_server_poll, ("ipam", W)),

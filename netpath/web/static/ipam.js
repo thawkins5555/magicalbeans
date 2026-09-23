@@ -636,6 +636,31 @@
   async function addDhcpServer() {
     App.modal('Add DHCP server', dhcpServerForm(null), [
       { label: 'Cancel', onClick: App.closeModal },
+      // Same round trip as the Edit dialog's Test connection, before there
+      // is a server row or a stored credential to fall back to -- whatever
+      // is currently typed, and nothing else.
+      { label: 'Test connection', onClick: async (b, button) => {
+        const fields = readDhcpForm(b);
+        const errorBox = b.querySelector('#dh-error');
+        const label = button.textContent;
+        button.disabled = true;
+        button.textContent = 'Testing…';
+        errorBox.innerHTML = '<span class="hint">Testing connection — this can take up to '
+          + 'thirty seconds…</span>';
+        try {
+          const result = await App.post('/api/ipam/dhcp/servers/test', {
+            address: fields.address, username: fields.username, password: fields.password,
+          });
+          errorBox.innerHTML = result.ok
+            ? `<span style="color:var(--ok)">Reachable — DHCP Server ${escape(result.version)}, ${result.scope_count} scope(s)</span>`
+            : `<pre class="err">${escape(result.error)}</pre>`;
+        } catch (error) {
+          errorBox.innerHTML = `<span class="err">${escape(error.message)}</span>`;
+        } finally {
+          button.disabled = false;
+          button.textContent = label;
+        }
+      } },
       { label: 'Add', primary: true, onClick: async (b) => {
         const fields = readDhcpForm(b);
         try {
