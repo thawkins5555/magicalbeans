@@ -15,7 +15,7 @@
 </head>
 <body>
 
-<!-- Skips the twelve-item tab bar. It targets #view, the <main> around
+<!-- Skips the thirteen-item tab bar. It targets #view, the <main> around
      the page sections below, not #tabs — the nav the link exists to skip.
      app.js moves focus to the active page, since <main> is display:
      contents and has no box of its own to focus. -->
@@ -24,7 +24,7 @@
 <!-- #tabs is the ONLY thing here that scrolls; the utility group sits
      outside it so narrowing the window can never scroll it out of reach.
      The two must stay adjacent siblings: app.css draws the overflow fade on
-     the utility group with a `+` selector against #tabs. The twelve tabs
+     the utility group with a `+` selector against #tabs. The thirteen tabs
      are flat, direct children of #tabs; the attribute on three of them
      marks where a hairline stands in for a group label. -->
 <div class="topbar">
@@ -75,7 +75,7 @@
   <span id="kiosk-session" class="kiosk-session"></span>
 </div>
 
-<!-- The one main landmark, around all twelve views; exactly one is shown
+<!-- The one main landmark, around all thirteen views; exactly one is shown
      at a time. -->
 <main id="view" class="views">
 <!-- =========================== DASHBOARD ============================ -->
@@ -1323,7 +1323,7 @@
 
 <!-- =========================== SETTINGS ============================ -->
 <section id="page-settings" class="page">
-  <!-- Seven subtabs, the same nav/subpage/recallSub grammar as every other
+  <!-- Eight subtabs, the same nav/subpage/recallSub grammar as every other
        multi-section page, so #/settings/users is addressable. -->
   <nav class="subtabs">
     <button class="subtab active" data-subtab="general">GENERAL</button>

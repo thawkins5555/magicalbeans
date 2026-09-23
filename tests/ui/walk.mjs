@@ -7,7 +7,7 @@
  *
  * Everything here needs a real browser: that a table carries `scope` and
  * `aria-sort`, that focus returns to the control that opened a dialog, that a
- * hash route survives a reload, that twelve tabs throw no page error, that a
+ * hash route survives a reload, that thirteen tabs throw no page error, that a
  * read-only account is never shown a control whose route would refuse it.
  * None of it can be asserted from Python, which is why this is the one part
  * of `tests/` that is neither a plain script nor standard-library-only, and

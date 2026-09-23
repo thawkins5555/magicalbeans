@@ -90,7 +90,7 @@ const App = (() => {
     // choice, not a server setting, so it lives here rather than on the
     // Settings page every OTHER account on this install also sees — and is
     // skipped entirely on the forced must-change-password prompt, which has
-    // nothing to do with either. The tab list mirrors the twelve-tab strip
+    // nothing to do with either. The tab list mirrors the thirteen-tab strip
     // so a display can rotate through exactly the views its account can
     // actually read.
     const appearanceHtml = forced ? '' : `
@@ -415,7 +415,7 @@ const App = (() => {
       const pageEl = el.closest('.page');
       if (!pageEl) continue;
       // The subpage the control is actually on, where there is one. Settings
-      // is seven subtabs now, only one of them visible at a time, so a note
+      // is eight subtabs now, only one of them visible at a time, so a note
       // written to the page's first scroll container explained the Users
       // subtab's disabled controls from inside a hidden General subtab.
       const host = el.closest('.subpage') || writeDeniedHost(pageEl);
@@ -487,7 +487,7 @@ const App = (() => {
   /* ---------------------------------------------------- lazy modules
 
      One script per tab, all loaded unconditionally, cost 1.17 MB on every
-     visit whether or not the operator opened eleven of the twelve tabs.
+     visit whether or not the operator opened twelve of the thirteen tabs.
      dashboard.js stays eager (it is the tab everyone lands on, and what
      start() initialises); every other module is fetched the first time its
      tab becomes current, through ensureModuleReady. */
@@ -4538,7 +4538,7 @@ const App = (() => {
   }
 
   /* Roving-tabindex arrow-key contract for a tablist-shaped group: shared
-     by the twelve-tab strip and the .subtabs groups below rather than
+     by the thirteen-tab strip and the .subtabs groups below rather than
      written twice. ArrowRight/Left wrap through the tabs `tabsFn` returns,
      Home/End jump to the ends; `activate` both moves focus and performs
      the selection (selectTab for the main strip, a real click for a
@@ -4568,7 +4568,7 @@ const App = (() => {
      pane, Alerts, IPAM) are genuinely nested tablists — a second level of
      tabs inside a page the top strip already switched to — and get the
      full tablist/tab/tabpanel semantics and the same keyboard contract as
-     the twelve-tab strip, wired once here rather than by each module: a
+     the thirteen-tab strip, wired once here rather than by each module: a
      module's own selectSub only ever toggles the `active` class, so a
      MutationObserver on that class is what keeps aria-selected/tabindex
      and the paired subpage in step however the selection happened — a
