@@ -225,7 +225,7 @@
       cell: (r) => `<input type="checkbox" class="alerts-check" aria-label="Select alert on ${
         escape(r.entity_label || r.object || 'this object')}"${
         view.checked.has(r.id) ? ' checked' : ''}>` },
-    { key: 'severity', label: 'Sev', width: 60, numeric: true, mono: false, on: true,
+    { key: 'severity', label: 'Sev', width: 90, numeric: true, mono: false, on: true,
       // The name, not the digit. Syslog and SNMP Trap both show the word in
       // this column; Alerts showed "2" and kept the word in a column that is
       // off by default, so the one page an operator triages from was the one

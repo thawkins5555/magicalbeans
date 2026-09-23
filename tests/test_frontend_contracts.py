@@ -5330,6 +5330,13 @@ check("wirePrintToggle('netpath-print', 'route-canvas');" in APP
 check('<input type="checkbox" id="nd-problems"> Problems only' in INDEX,
       "the Nodes strip carries an unwired #nd-problems checkbox")
 
+
+# ---------------------------------------------------------------------------
+# 123. Alerts' Sev column is 90px wide (was 60), wide enough for the
+#      severity word rather than just the digit.
+check("{ key: 'severity', label: 'Sev', width: 90," in read("alerts.js"),
+      "alerts.js's Sev column is 90px wide")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:
