@@ -5207,6 +5207,17 @@ CSS113 = read("app.css")
 check(".conn.conn-updated { color: var(--dim); }" in CSS113,
       "app.css dims the updated-clock text")
 
+
+# ---------------------------------------------------------------------------
+# 114. Network-error wording: call()'s own TypeError (Chromium/Firefox/
+#      Safari each word it differently) becomes "No answer from the server".
+CALL114 = js_function(APP, "call")
+check("error.name === 'TypeError'" in CALL114
+      and "Failed to fetch|NetworkError|Load failed" in CALL114,
+      "call() recognises every browser's own network-failure wording")
+check("throw new Error('No answer from the server');" in CALL114,
+      "call() rewrites it to operator language")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

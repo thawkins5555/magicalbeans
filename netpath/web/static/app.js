@@ -722,6 +722,14 @@ const App = (() => {
         throw new Error(`No answer within ${Math.round(
           (options.timeoutMs || REQUEST_TIMEOUT_MS) / 1000)} seconds`);
       }
+      // fetch's own network-failure TypeError, worded differently by every
+      // browser (Chromium's "Failed to fetch", Firefox's "NetworkError when
+      // attempting to fetch resource", Safari's "Load failed") — none of
+      // them operator language either.
+      if (error && error.name === 'TypeError'
+          && /Failed to fetch|NetworkError|Load failed/.test(error.message || '')) {
+        throw new Error('No answer from the server');
+      }
       // We cancelled this one ourselves — either because a newer request for
       // the same URL started, or because the caller's own signal fired (a
       // NetFlow window change abandoning the window before it, whose URL
