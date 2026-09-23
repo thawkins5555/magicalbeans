@@ -5608,6 +5608,23 @@ check(_EDIT_DHCP116.count("const snap = App.modalFormSnapshot();") == 2
       "editDhcpServer's Remove server and Clear credential confirms both "
       "snapshot and restore the form")
 
+
+# ---------------------------------------------------------------------------
+# 117. "Problems only" on the device list: a client-side filter (the
+#      server's status param is single-valued and cannot OR three
+#      statuses together), coded defensively for an index.html that does
+#      not carry #nd-problems yet, and persisted like the other filters.
+NODES117 = read("nodes.js")
+check("'nd-filter-overrides', 'nd-problems', 'disc-target'" in NODES117,
+      "nd-problems is remembered/restored like the other device filters")
+_DRAWTABLE117 = js_function(NODES117, "drawTable")
+check("problemsEl && problemsEl.checked" in _DRAWTABLE117
+      and "STATUS_TONE[d.status] === 'warn' || STATUS_TONE[d.status] === 'fail'" in _DRAWTABLE117,
+      "checking it shows only warn/fail-toned devices, off the module's own "
+      "status vocabulary")
+check("if (App.el('nd-problems')) App.el('nd-problems').onchange = drawTable;" in NODES117,
+      "wiring is defensive against a missing element")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

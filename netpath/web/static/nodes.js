@@ -429,7 +429,11 @@
       row._groupName = groupsById[row.group_id] || '';
       row._devGroupName = devGroupsById[row.device_group_id] || '';
     }
-    const rows = App.sortRows(view.devices, view.deviceSort.key,
+    const problemsEl = App.el('nd-problems');
+    const deviceRows = problemsEl && problemsEl.checked
+      ? view.devices.filter((d) => STATUS_TONE[d.status] === 'warn' || STATUS_TONE[d.status] === 'fail')
+      : view.devices;
+    const rows = App.sortRows(deviceRows, view.deviceSort.key,
                               view.deviceSort.descending, columns);
 
     // App.drawRows keys its cache by column set; mono is pinned off so the
@@ -6940,7 +6944,7 @@
        event, so these listeners do not fight it. */
     const CONTROLS = ['nd-q', 'nd-filter-group', 'nd-filter-devgroup',
       'nd-filter-status', 'nd-filter-offline', 'nd-filter-maintenance',
-      'nd-filter-overrides', 'disc-target', 'disc-pingonly'];
+      'nd-filter-overrides', 'nd-problems', 'disc-target', 'disc-pingonly'];
     App.rememberControls('nodes', CONTROLS);
     for (const btn of document.querySelectorAll('#page-nodes > .subtabs > .subtab')) {
       btn.onclick = () => {
@@ -7031,6 +7035,11 @@
     });
     App.el('nd-apply').addEventListener('click', syncNodesRoute);
     App.el('nd-clear').addEventListener('click', syncNodesRoute);
+    // Client-side, unlike the filters above: "problems" spans three of this
+    // module's own statuses (see STATUS_TONE), and the server's `status`
+    // param only ever matches one at a time. No element yet on an older
+    // index.html is a no-op, not an error.
+    if (App.el('nd-problems')) App.el('nd-problems').onchange = drawTable;
     // A revealed row's highlight is a "you asked to find this one" cue; it
     // has nothing to say once the operator starts a different search.
     App.el('nd-q').oninput = () => {
