@@ -443,10 +443,16 @@ check("function auditIsRoutine(" in SETTINGS and ".audit-row-routine" in read("a
 # once that call has actually run.
 check("pages.settings" not in APP.split("must_change")[1].split("return payload;")[0],
       "the forced prompt no longer reaches through pages.settings at all")
-must_change_block = APP.split("if (payload.session.must_change")[1].split("\n      }")[0]
-check("accountModal({ forced: true })" in must_change_block,
+# promptForcedPasswordChange (5.57.0): the one opener both the state poll's
+# must_change and login.js's first-paint sessionStorage flag share now, so
+# the same "call it directly, set the sentinel only after" contract lives in
+# one place instead of being duplicated at both call sites.
+check("if (payload.session.must_change && !state.promptedChange) promptForcedPasswordChange();" in APP,
+      "the state poll's forced prompt calls the shared opener directly")
+must_change_opener = js_function(APP, "promptForcedPasswordChange")
+check("accountModal({ forced: true })" in must_change_opener,
       "the forced prompt calls App.accountModal directly")
-check("state.promptedChange = true" in must_change_block.split("accountModal({ forced: true })")[1],
+check("state.promptedChange = true" in must_change_opener.split("accountModal({ forced: true })")[1],
       "the sentinel is set AFTER the call that must actually run, not before it")
 check("function forcePasswordChange(" not in SETTINGS and "forcePasswordChange," not in SETTINGS,
       "the now-dead one-line delegate is gone from settings.js, not left orphaned")
@@ -5166,6 +5172,23 @@ LOGIN111 = static_text("login.js")
 check("if (!wanted) {" in LOGIN111
       and "localStorage.setItem('sappiwhere.tab', 'dashboard')" in LOGIN111,
       "login.js only forces the stored tab to dashboard when there is no hash")
+
+
+# ---------------------------------------------------------------------------
+# 112. Forced password change on first paint: login.js flags must_change in
+#      sessionStorage, app.js's start() reads it before the first state
+#      poll, and both paths open the dialog through one opener.
+LOGIN112 = static_text("login.js")
+check("payload.must_change" in LOGIN112
+      and "sessionStorage.setItem('sappiwhere.mustChange', '1')" in LOGIN112,
+      "login.js flags a forced password change in sessionStorage")
+START112 = js_function(APP, "start")
+check("sessionStorage.getItem('sappiwhere.mustChange')" in START112
+      and "sessionStorage.removeItem('sappiwhere.mustChange')" in START112
+      and "promptForcedPasswordChange();" in START112,
+      "app.js's start() consumes the flag and opens the forced prompt")
+check("if (payload.session.must_change && !state.promptedChange) promptForcedPasswordChange();" in APP,
+      "the state poll's own must_change path shares the same opener")
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))

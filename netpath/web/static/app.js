@@ -314,6 +314,19 @@ const App = (() => {
     return box;
   }
 
+  /* One opener for the two paths that force the change-password prompt: the
+     state poll (session.must_change, above app.js's start of day) and a
+     sessionStorage flag login.js sets right after a login response says the
+     same thing, read at first paint before that poll has even run once. The
+     sentinel is set only once the call has actually run, so a genuine
+     failure here gets retried on the next poll rather than never again. */
+  function promptForcedPasswordChange() {
+    try {
+      accountModal({ forced: true });
+      state.promptedChange = true;
+    } catch (error) { /* retry on the next poll rather than never again */ }
+  }
+
   /* The module names as an operator would say them, for the sentence
      below. A key missing here is a bug in the markup rather than a reason
      to say nothing, so the raw key is the fallback. */
@@ -6211,12 +6224,7 @@ const App = (() => {
       // merely attempted), so a genuine failure here — the #modal element
       // gone from the DOM, say — gets retried on the next poll instead of
       // never prompting again.
-      if (payload.session.must_change && !state.promptedChange) {
-        try {
-          accountModal({ forced: true });
-          state.promptedChange = true;
-        } catch (error) { /* retry on the next poll rather than never again */ }
-      }
+      if (payload.session.must_change && !state.promptedChange) promptForcedPasswordChange();
     }
     return payload;
   }
@@ -6425,6 +6433,16 @@ const App = (() => {
       html: '<p>Every IP address has an actions button beside it: jump to '
         + 'that address in IPAM, Syslog, SNMP Trap or NetFlow, or to its '
         + 'device in Nodes when the fleet has one at that address.</p>' } });
+    // login.js set this the moment /api/login's own response said the
+    // account must change its password — first paint, rather than waiting
+    // on the first /api/state poll (loadState, below) to say the same
+    // thing a cycle later.
+    try {
+      if (sessionStorage.getItem('sappiwhere.mustChange')) {
+        sessionStorage.removeItem('sappiwhere.mustChange');
+        promptForcedPasswordChange();
+      }
+    } catch (error) { /* private browsing, or storage full — the state poll still catches it */ }
     const bar = tabBar();
     if (bar) bar.setAttribute('role', 'tablist');
     for (const tab of stripTabs()) {

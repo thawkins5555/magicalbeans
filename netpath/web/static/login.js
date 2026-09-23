@@ -38,6 +38,13 @@
         document.getElementById('password').focus();
         return;
       }
+      // Read at first paint (app.js's start()), before the first /api/state
+      // poll would otherwise be the one to say the account must change its
+      // password — sessionStorage, not localStorage, so it never outlives
+      // this tab's own sign-in.
+      if (payload.must_change) {
+        try { sessionStorage.setItem('sappiwhere.mustChange', '1'); } catch (e) { /* private browsing, or storage full */ }
+      }
       // ...unless a redirect (e.g. a 401 on #/alerts/998) preserved a hash to finish the journey to.
       const wanted = String(window.location.hash || '');
       // A fresh sign-in with nowhere named lands on Dashboard; app.js's
