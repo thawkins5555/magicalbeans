@@ -135,9 +135,9 @@ def client_rows(clients: dict, limit: int = CLIENT_ROWS) -> tuple[int, list[tupl
 
 def _size(total: float) -> str:
     for unit in ("B", "KB", "MB", "GB", "TB"):
-        if total < 1024 or unit == "TB":
+        if total < 1000 or unit == "TB":
             return f"{total:.0f} B" if unit == "B" else f"{total:.1f} {unit}"
-        total /= 1024
+        total /= 1000
     return f"{total:.1f} TB"
 
 

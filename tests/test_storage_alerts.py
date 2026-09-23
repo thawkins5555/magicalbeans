@@ -136,6 +136,10 @@ check("...and promising only what the trim actually does: at 86% no pass is "
       near and "deleted once it reaches that cap" in near[0]["message"]
       and "Every maintenance pass" not in near[0]["message"],
       near[0]["message"] if near else None)
+check("...and the cap reads through format_bytes too, decimal like the used "
+      "figure beside it, not a binary MB that would disagree with it",
+      near and "536.9 MB cap" in near[0]["message"],
+      near[0]["message"] if near else None)
 check("...and the stores still in room are cleared in the same pass",
       "trace" not in [entity for rule, entity in warned.cleared
                       if rule == "db_near_cap"]

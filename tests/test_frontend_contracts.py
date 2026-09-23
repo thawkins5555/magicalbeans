@@ -5823,6 +5823,21 @@ check("Alive ${u.alive || 0}" in _DRAWDETAIL123
       and "never seen ${u.never_seen || 0}" in _DRAWDETAIL123,
       "the alive/seen-down/never-seen breakdown is plain text")
 
+# ---------------------------------------------------------------------------
+# 124. Byte units are decimal (1000-based) everywhere a size is formatted,
+#      so a cap and a used figure printed side by side always agree.
+_BYTESTEXT124 = js_function(read("configrx.js"), "bytesText")
+check("if (n < 1000) return" in _BYTESTEXT124 and "if (n < 1000000) return" in _BYTESTEXT124
+      and "n / 1000" in _BYTESTEXT124 and "n / 1000000" in _BYTESTEXT124,
+      "configrx.js's bytesText divides by 1000, not 1024")
+_SIZE124 = python_function("console", "_size")
+check("if total < 1000 or unit == \"TB\":" in _SIZE124 and "total /= 1000" in _SIZE124,
+      "console.py's _size divides by 1000, not 1024")
+_SERVICE124 = python_text("web.service")
+check("f\"{format_bytes(cap)} cap \"" in _SERVICE124,
+      "the db_near_cap alert formats its cap through format_bytes, decimal "
+      "like the used figure beside it")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

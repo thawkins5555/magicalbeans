@@ -61,9 +61,9 @@
   const escape = App.escapeHtml;
 
   function bytesText(n) {
-    if (n < 1024) return `${n} B`;
-    if (n < 1048576) return `${(n / 1024).toFixed(1)} KB`;
-    return `${(n / 1048576).toFixed(1)} MB`;
+    if (n < 1000) return `${n} B`;
+    if (n < 1000000) return `${(n / 1000).toFixed(1)} KB`;
+    return `${(n / 1000000).toFixed(1)} MB`;
   }
 
   /* "changed" is information, not ill health — a config differing from the

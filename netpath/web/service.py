@@ -1997,7 +1997,7 @@ class Service:
                        "used_pct": round(share * 100, 1),
                        "setting": store.cap_key},
                 message=(f"{store.label} is at {share * 100:.0f}% of its "
-                         f"{cap // 1048576} MB cap "
+                         f"{format_bytes(cap)} cap "
                          f"({format_bytes(used)} in {db.path}). Its oldest "
                          f"records are deleted once it reaches that cap. "
                          f"Raise {store.cap_key} in Settings → Data & "
