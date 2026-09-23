@@ -5218,6 +5218,24 @@ check("error.name === 'TypeError'" in CALL114
 check("throw new Error('No answer from the server');" in CALL114,
       "call() rewrites it to operator language")
 
+
+# ---------------------------------------------------------------------------
+# 115. Read-only accounts: a gated control's title reads "Read-only: your
+#      account can read <Module> but not change it" when it had none, and
+#      an inert (non-native-disabled) gated control gets a visible cue.
+GATE115 = js_function(APP, "applyWriteGate")
+check("if (!el.title) el.title = title;" in GATE115,
+      "applyWriteGate sets a title only when the control has none")
+TITLE115 = js_function(APP, "writeDeniedTitle")
+check("Read-only: your account can read ${name} but not change it" in TITLE115,
+      "writeDeniedTitle carries the Read-only: wording")
+CSS115 = read("app.css")
+check("[inert].write-denied { opacity: .55; cursor: not-allowed; }" in CSS115,
+      "app.css gives an inert gated control a visible cue")
+check(read("app.js").count("function explainDeniedGroups") == 1
+      and "byPage.get(host).add(el.dataset.requiresWrite)" in APP,
+      "explainDeniedGroups still dedupes by host via a Set, one line per module")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

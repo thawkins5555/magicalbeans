@@ -593,6 +593,12 @@ button.danger:disabled:hover { background: var(--grid); filter: none; }
    padding of its own — hence the .bar-matching gutter here. */
 .write-denied-why { margin: 6px 0 0; padding: 0 var(--space-md); }
 #page-settings .scroll > .write-denied-why { padding: 0; }
+/* [inert] only: a disabled BUTTON/INPUT/SELECT/TEXTAREA/FIELDSET already
+   carries its own button:disabled tone (above) and the "no opacity"
+   reasoning right above applies to it — stacking opacity on top would push
+   it below the contrast floor. An inert <div>/<span> has no native disabled
+   styling at all, so without this it looks identical to a live one. */
+[inert].write-denied { opacity: .55; cursor: not-allowed; }
 button.icon { width: 32px; padding: var(--space-xs) 0; text-align: center; }
 /* A module's Settings button is an ordinary secondary button. It used to
    be an accent outline that inverted to a solid accent fill on hover — the

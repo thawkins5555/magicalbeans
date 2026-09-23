@@ -351,19 +351,28 @@ const App = (() => {
      page and still readable, which is the whole point. */
   const GATEABLE = new Set(['BUTTON', 'INPUT', 'SELECT', 'TEXTAREA', 'FIELDSET']);
 
+  // The hover title a gated control gets when it has none of its own —
+  // shorter than writeDeniedReason's own sentence (that one opens a
+  // paragraph below the page; this one is a tooltip) but the same fact.
+  function writeDeniedTitle(module) {
+    if (module === 'admin') return 'Read-only: administrator access is needed to change this';
+    const name = MODULE_NAMES[module] || module;
+    return `Read-only: your account can read ${name} but not change it`;
+  }
+
   function applyWriteGate(el, allowed) {
-    const reason = writeDeniedReason(el.dataset.requiresWrite);
+    const title = writeDeniedTitle(el.dataset.requiresWrite);
     if (GATEABLE.has(el.tagName)) {
       // Only ever touched when this function is the one that turned it off,
       // so a button held down for an in-flight request is left alone.
       if (!allowed) {
         el.disabled = true;
         el.dataset.writeDenied = '1';
-        if (!el.title) el.title = reason;
+        if (!el.title) el.title = title;
       } else if (el.dataset.writeDenied) {
         el.disabled = false;
         delete el.dataset.writeDenied;
-        if (el.title === reason) el.removeAttribute('title');
+        if (el.title === title) el.removeAttribute('title');
       }
     } else if (!allowed) {
       el.inert = true;
