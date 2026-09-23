@@ -226,7 +226,7 @@ else:
     check("a database at 150% of its cap says 150%, not 100% -- the "
           "Dashboard's headroom tile has always said the true figure and "
           "the two disagreed",
-          "150% of cap" in over["use-trace"]["innerHTML"],
+          "150% of 512 MB cap" in over["use-trace"]["innerHTML"],
           over["use-trace"]["innerHTML"])
     check("...while its BAR stops at the end of the track",
           "width:100%" in over["use-trace"]["innerHTML"],
@@ -235,7 +235,7 @@ else:
           over["use-trace"]["className"] == "usage full",
           over["use-trace"]["className"])
     check("a database at half its cap reads 50% and is not coloured",
-          "50% of cap" in over["use-alerts"]["innerHTML"]
+          "50% of 512 MB cap" in over["use-alerts"]["innerHTML"]
           and over["use-alerts"]["className"] == "usage",
           (over["use-alerts"]["innerHTML"], over["use-alerts"]["className"]))
     check("an uncapped store shows its size on its file row",
