@@ -28,6 +28,16 @@
           App.buildRoute('nodes', [], { add: ip })}">Add as a device</a>`;
   }
 
+  App.registerHelp({
+    'events.severity': { title: 'Severity colours', html: `
+      <p>The Severity column's colour is the same scale everywhere it is
+      shown, RFC 5424's 0 (Emergency) through 7 (Debug), most severe first:</p>
+      <p><span class="sev sev-0">0-2 Emergency/Alert/Critical</span> — red</p>
+      <p><span class="sev sev-3">3 Error</span> — orange</p>
+      <p><span class="sev sev-4">4 Warning</span> — amber</p>
+      <p><span class="sev sev-5">5-7 Notice/Info/Debug</span> — neutral</p>` },
+  });
+
   /* ------------------------------------------------------------ the page */
 
   function eventsPage(spec) {
@@ -501,7 +511,7 @@
           TCP can sit on different ports; 601 is the registered one for TCP syslog.</p>
       </fieldset>
       <fieldset><legend>VOLUME</legend>
-        <label>Keep severity <select id="s-minsev"></select> and worse</label>
+        <label>Keep severity <select id="s-minsev"></select> and worse</label>${App.helpLink('events.severity')}
         ${form.number('s-maxchars', 'Truncate messages at (characters)', s.max_message_chars, 'min=80 max=65535')}
         <p class="hint">Both are applied as messages arrive, before anything is written, so a
           device stuck in a debug loop costs nothing beyond the parse. Filtered messages are
@@ -744,7 +754,7 @@
           not decoded.</p>
       </fieldset>
       <fieldset><legend>VOLUME</legend>
-        <label>Keep severity <select id="sp-minsev"></select> and worse</label>
+        <label>Keep severity <select id="sp-minsev"></select> and worse</label>${App.helpLink('events.severity')}
         ${form.number('sp-maxvb', 'Max varbinds per trap', s.max_varbinds, 'min=1 max=1000')}
         ${form.number('sp-maxval', 'Truncate varbind text at (characters)', s.max_value_chars, 'min=32 max=65535')}
         ${form.check('sp-storeraw', 'Store the original datagram (for debugging)', s.store_raw)}

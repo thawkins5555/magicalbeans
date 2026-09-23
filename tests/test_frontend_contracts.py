@@ -5502,6 +5502,18 @@ check("view.selected = null;" in _RETURNTOLIVE111 and "App.setRoute([]);" in _RE
       "Return to live clears the selection and the route id, not just follow")
 
 # ---------------------------------------------------------------------------
+# 112. Severity colour key: registered as help, linked from both Syslog and
+#      SNMP trap settings, using the same .sev sev-N classes the table does.
+check("'events.severity': { title: 'Severity colours'" in EVENTS107,
+      "events.js registers the severity colour key as help")
+check(EVENTS107.count("App.helpLink('events.severity')") == 2,
+      "both Syslog and SNMP trap settings link to it")
+check("sev sev-0" in EVENTS107 and "sev sev-3" in EVENTS107
+      and "sev sev-4" in EVENTS107 and "sev sev-5" in EVENTS107,
+      "the key is rendered with the same .sev sev-N classes as the column")
+
+
+# ---------------------------------------------------------------------------
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:
