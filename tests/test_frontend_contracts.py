@@ -5423,6 +5423,14 @@ check("App.el('nd-add-device')" in GS127 and "App.whenModuleReady('nodes')" in G
 check('id="dash-gs-add" data-requires-write="nodes"' in GS127,
       "the Add a device button is gated for read-only accounts, like every "
       "other write control")
+
+# ---------------------------------------------------------------------------
+# 132. The severity legend in help does not wrap: .sev's 62px table-column
+#      width is overridden to auto inside .help-body.
+HELPCSS132 = css_rule(read("app.css"), ".help-body .sev")
+check("width: auto;" in HELPCSS132 and "display: inline-block;" in HELPCSS132
+      and "padding: 0 .4em;" in HELPCSS132,
+      ".help-body .sev widens to fit its text instead of wrapping")
 check(INDEX.index('id="dash-get-started"') < INDEX.index('id="dash-grid"'),
       "#dash-get-started sits above #dash-grid in index.html")
 DRAW127 = js_function(DASHBOARD101, "draw")

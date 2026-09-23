@@ -1622,6 +1622,9 @@ body.login-page {
 .help-body p { margin: 0 0 10px; line-height: 1.45; }
 .help-body ul { margin: 0 0 10px var(--space-lg); padding: 0; }
 .help-body li { margin: var(--space-xs) 0; line-height: 1.4; }
+/* .sev's 62px table-column width wraps the severity legend, whose text
+   ("0 Emergency") runs longer than a column ever needs to. */
+.help-body .sev { width: auto; display: inline-block; padding: 0 .4em; }
 /* The body of every dialog is wrapped in <form class="modal-form"> so that
    Enter submits it (see App.modal), which put one element between
    .modal-box and the labels this rule reaches. Same shared control column
