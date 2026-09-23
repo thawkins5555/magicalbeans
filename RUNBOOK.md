@@ -14,6 +14,7 @@ backup, `INTERNALS.md` is why any of this works the way it does.
 - [The poller has stopped](#the-poller-has-stopped)
 - [A collector says "stopped unexpectedly"](#a-collector-says-stopped-unexpectedly)
 - [A collector is losing messages (`kernel_dropped`)](#a-collector-is-losing-messages-kernel_dropped)
+- [NetFlow has holes and the strip says awaiting template](#netflow-has-holes-and-the-strip-says-awaiting-template)
 - [The trap receiver answers informs from anywhere](#the-trap-receiver-answers-informs-from-anywhere)
 - [The alert engine is behind (`backlog`)](#the-alert-engine-is-behind-backlog)
 - [Charts are empty, or history has vanished](#charts-are-empty-or-history-has-vanished)
@@ -158,6 +159,66 @@ reported zero dropped.
 5. **Check the writer is not the bottleneck.** If `queue` in the Debug counters
    is also high, the receive thread is fine and the database write path is
    behind — see the disk section.
+
+---
+
+## NetFlow has holes and the strip says awaiting template
+
+**Symptom.** A NetFlow chart is missing a stretch of time from one exporter,
+or the status strip's *awaiting template* count is consistently large,
+while the collector itself shows green and the packet counter is still
+climbing.
+
+**What it usually is.** A v9 or IPFIX data set arrived before its record
+layout (the *template*) was cached, so the whole set was dropped — every
+byte and packet in it, not partial data. Before 5.58.0 this was only a
+single running total on the status strip, with no way to tell which
+exporter it was, which template, or why the template was never cached;
+from 5.58.0 the strip and the Events log name all three.
+
+**Checks, in order.**
+
+1. **The line under the NetFlow status strip.** It names the exporter,
+   the observation domain, the template id, how many record sets have
+   been dropped and when the first was seen, and the reason in parentheses — e.g.
+   `Records dropped for lack of a template: 10.1.1.1 domain 0 template
+   260 — 12,345 sets, first seen 2h ago (never received since the collector
+   started)`.
+2. **Debug tab, filtered to NetFlow.** Look for "Dropping records from
+   `<exporter>`" (at most one line every 10 minutes, naming the latest template and
+   counting the rest, while the gap continues) and, once the exporter's own resend cycle
+   comes round, a "Template `<id>` from `<exporter>`
+   (domain `<n>`) arrived: N record set(s) were dropped over `<duration>`
+   while it was missing (`<reason>`)" — that line gives you the hole's
+   actual length, so you know whether this was a blip or something worth
+   escalating.
+3. **Act on the reason in parentheses:**
+   - **"never received since the collector started"** — the router is not
+     refreshing its template to *this* collector. On Cisco Flexible
+     NetFlow, `flow exporter <name>` → `template data timeout 60`; on
+     classic NetFlow, `ip flow-export template timeout-rate 1` and `ip
+     flow-export template refresh-rate 20`. Then pin the export source —
+     `ip flow-export source Loopback0` (Flexible NetFlow: `source
+     Loopback0` under the flow exporter) — because the template cache is
+     keyed by the source address on the datagram, not by the router's
+     identity: a routing change that shifts which interface originates
+     the export makes the same router look like a brand-new exporter with
+     no templates cached at all. Check the Exporters dropdown for two
+     addresses that are really one router — that is the tell.
+   - **"evicted: the exporter sent more than 512 templates"** — a single
+     refresh burst from that exporter outgrew the per-exporter cache.
+     Split its monitored interfaces or flow monitors across two
+     exporters (two source addresses) so no one burst is that large.
+   - **"rejected: <reason>"** — the template itself is malformed (a zero
+     field count, more fields than any real device sends, or a
+     zero-length field). Find the export record or flow monitor that
+     produces it and remove it; this is a device-side configuration
+     problem, not something this application can decode around.
+
+**Confirm it recovered:** the exporter's line disappears from under the
+status strip, and the Events log shows its "Template … arrived" line with
+the hole's length. A chart drawn over the affected window still shows the
+gap — the flows genuinely were never decoded — but new data resumes.
 
 ---
 

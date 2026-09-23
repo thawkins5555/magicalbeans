@@ -434,7 +434,7 @@ A collector that listens for exported flow records, stores them, and charts them
 
 ### Protocol support
 
-NetFlow v5, NetFlow v9 and IPFIX (v10), all on one UDP socket — the version is read from each packet, so a mixed fleet needs no extra configuration. v9 and IPFIX are template-driven: an exporter sends a template describing its record layout, and records arriving before that template can't be decoded. The status strip counts those as *awaiting template*; they stop appearing once the exporter's template refresh comes round, usually within a minute or two.
+NetFlow v5, NetFlow v9 and IPFIX (v10), all on one UDP socket — the version is read from each packet, so a mixed fleet needs no extra configuration. v9 and IPFIX are template-driven: an exporter sends a template describing its record layout, and records arriving before that template can't be decoded. The status strip counts those as *awaiting template*; they stop appearing once the exporter's template refresh comes round, usually within a minute or two. From 5.58.0, a line under the strip names which exporter, template and reason is behind an ongoing gap, and the Events log records the moment a missing template finally arrives, including how long the gap lasted.
 
 sFlow is a different protocol (packet sampling rather than flow export) and is not supported.
 

@@ -5852,6 +5852,19 @@ check("f\"{format_bytes(cap)} cap \"" in _SERVICE124,
       "the db_near_cap alert formats its cap through format_bytes, decimal "
       "like the used figure beside it")
 
+# ---------------------------------------------------------------------------
+# 125. 5.58.0: missing-template accounting on the NetFlow status strip.
+INDEX125 = read("index.html")
+check('<p id="nf-missing" class="hint" hidden></p>' in INDEX125,
+      "index.html carries the nf-missing readout below the collector strip")
+NETFLOW125 = read("netflow.js")
+check("App.el('nf-missing')" in NETFLOW125,
+      "netflow.js reads the nf-missing element")
+check("collector.missing_templates" in NETFLOW125,
+      "drawStatus reads missing_templates off the /api/state collector payload")
+check("Records dropped for lack of a template" in NETFLOW125,
+      "the readout leads with the literal operators were told to expect")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

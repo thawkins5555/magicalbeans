@@ -39,7 +39,7 @@ RECOVER_TAG = "[RECOVER]"
 BUILTIN_TEMPLATES = {
     "device_down": {
         "name": "Device not responding",
-        "subject": "{{severity_tag}} SappiWhere: {{device_name}} is not responding",
+        "subject": "{{severity_tag}} {{device_name}} is not responding",
         "body": (
             "{{device_name}} ({{device_ip}}) stopped responding at {{opened_time}}.\n\n"
             "{{message}}\n\n"
@@ -50,7 +50,7 @@ BUILTIN_TEMPLATES = {
     },
     "device_up": {
         "name": "Device recovered",
-        "subject": "{{severity_tag}} SappiWhere: {{device_name}} has recovered",
+        "subject": "{{severity_tag}} {{device_name}} has recovered",
         # "has recovered" rather than "is responding again": _notify_clear
         # renders this one template for every kind of resolution, including a
         # port coming back and a threshold dropping below its clear value, and
@@ -70,7 +70,7 @@ BUILTIN_TEMPLATES = {
     },
     "device_rebooted": {
         "name": "Device rebooted",
-        "subject": "{{severity_tag}} SappiWhere: {{device_name}} rebooted",
+        "subject": "{{severity_tag}} {{device_name}} rebooted",
         "body": (
             "{{device_name}} ({{device_ip}}) appears to have rebooted at {{last_time}}.\n\n"
             "Previous reported uptime: {{previous_uptime}}\n"
@@ -81,7 +81,7 @@ BUILTIN_TEMPLATES = {
     },
     "threshold_breach": {
         "name": "Threshold breach",
-        "subject": "{{severity_tag}} SappiWhere: {{entity_label}} — {{metric_label}} is {{value}}",
+        "subject": "{{severity_tag}} {{entity_label}} — {{metric_label}} is {{value}}",
         "body": (
             "{{entity_label}} crossed a threshold at {{last_time}}.\n\n"
             "Metric: {{metric_label}}\n"
@@ -105,7 +105,7 @@ BUILTIN_TEMPLATES = {
     # rather than a short one.
     "event_notice": {
         "name": "Event notice",
-        "subject": "{{severity_tag}} SappiWhere: {{rule_name}} — {{entity_label}}",
+        "subject": "{{severity_tag}} {{rule_name}} — {{entity_label}}",
         "body": (
             "{{rule_name}} — {{entity_label}}\n\n"
             "{{message}}\n\n"
@@ -117,7 +117,7 @@ BUILTIN_TEMPLATES = {
     },
     "trap_forwarded": {
         "name": "Forwarded event",
-        "subject": "{{severity_tag}} SappiWhere: {{rule_name}} — {{entity_label}}",
+        "subject": "{{severity_tag}} {{rule_name}} — {{entity_label}}",
         "body": (
             "{{rule_name}} matched at {{last_time}}.\n\n"
             "Source: {{entity_label}}\n"

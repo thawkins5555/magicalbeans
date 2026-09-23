@@ -408,11 +408,20 @@ class UdpReceiver:
         now = time.time()
         if now - self._log_times.get(key, 0.0) < interval_s:
             return False
-        self._log_times[key] = now
+        self._stamp_log_time(key, now)
         if callable(detail):
             detail = detail()
         self.log.add(ERROR, message, target=target, detail=detail)
         return True
+
+    # Capped so a future per-source key cannot grow this dict without bound.
+    MAX_LOG_KEYS = 4096
+
+    def _stamp_log_time(self, key: str, now: float) -> None:
+        self._log_times.pop(key, None)
+        self._log_times[key] = now
+        while len(self._log_times) > self.MAX_LOG_KEYS:
+            del self._log_times[next(iter(self._log_times))]
 
     def _sync_error_counter(self) -> None:
         """Republish counters["errors"] after _loop_errors changed. Overridden

@@ -383,6 +383,13 @@ class FlowDatabase(SqliteStore):
             self._conn.commit()
         return len(rows)
 
+    def save_template_cache(self, payload) -> None:
+        """Persist the decoder's learned v9/IPFIX templates across a restart."""
+        self._set_private_setting("template_cache", payload)
+
+    def load_template_cache(self) -> list:
+        return self._private_setting("template_cache", []) or []
+
     def record_sampling_rates(self, rates, since_ts: float = 0.0) -> int:
         """Store announced sampling rates, and correct the flows that arrived
         before the announcement.

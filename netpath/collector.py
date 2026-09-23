@@ -38,6 +38,23 @@ FLUSH_ROWS = 5000
 # rate still rewrites its own window, one flush later at worst.
 MAX_RESAMPLE_PER_FLUSH = 64
 
+# How often the template cache is persisted, so a process restart does not
+# empty it and rediscover every v9/IPFIX exporter's layout from scratch.
+TEMPLATE_SAVE_INTERVAL_S = 300
+
+
+def _span_text(seconds: float) -> str:
+    """A duration as "2h 13m", for the "template arrived" recovery line."""
+    total = max(0, int(seconds))
+    minutes, _ = divmod(total, 60)
+    hours, minutes = divmod(minutes, 60)
+    days, hours = divmod(hours, 24)
+    if days:
+        return f"{days}d {hours:02d}h"
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    return f"{minutes}m"
+
 
 class Collector(udpsock.UdpReceiver):
     NOUN = "Collector"
@@ -64,6 +81,7 @@ class Collector(udpsock.UdpReceiver):
         # Counted since each throttle's last line, for that line to report.
         self._templates_pending = 0
         self._first_seen_pending = 0
+        self._recovered_pending = 0
 
     # --------------------------------------------------------------- lifecycle
 
@@ -73,6 +91,7 @@ class Collector(udpsock.UdpReceiver):
         self._reset_for_start()
         self._templates_pending = 0
         self._first_seen_pending = 0
+        self._recovered_pending = 0
 
         self._versions = set()
         if settings.get("accept_v5", True):
@@ -85,6 +104,17 @@ class Collector(udpsock.UdpReceiver):
         allow = str(settings.get("allowed_exporters", "") or "")
         self._allowed = {item.strip() for item in allow.replace(",", "\n").split("\n")
                          if item.strip()}
+
+        # A cold start (no templates carried over from a settings restart)
+        # tries the ones saved before the process last stopped, so an
+        # operator restart does not blind every v9/IPFIX exporter until it
+        # resends its templates on its own schedule.
+        if len(self.decoder.templates) == 0:
+            restored = self.decoder.import_templates(self.db.load_template_cache())
+            if restored:
+                self.log.add(NETFLOW,
+                             f"Restored {restored} template(s) saved before "
+                             f"the last stop")
 
         # Carry the previous decoder's learned templates/sampling through the restart, so a v9/IPFIX exporter stays decodable.
         self.decoder = Decoder(
@@ -154,7 +184,41 @@ class Collector(udpsock.UdpReceiver):
         self.counters["last_packet"] = time.time()
         templates_before = self.decoder.stats["templates"]
         errors_before = self.decoder.stats["errors"]
+        no_template_before = self.decoder.stats["no_template"]
         flows = self.decoder.decode(data, exporter)
+
+        # One line per interval for the whole collector, not per key: the key
+        # is wire data, so per-key lines were a log flood any sender could drive.
+        # The NetFlow tab lists every missing template regardless.
+        if (self.decoder.stats["no_template"] > no_template_before
+                and self.decoder.last_missing_key):
+            miss_exporter, domain, template_id = self.decoder.last_missing_key
+            entry = self.decoder.missing.get(self.decoder.last_missing_key) or {}
+            others = len(self.decoder.missing) - 1
+            self._log_netflow_throttled(
+                "missing",
+                f"Dropping records from {miss_exporter} (domain {domain}, "
+                f"template {template_id}): no template cached — "
+                f"{entry.get('reason', '')}"
+                + (f"; {others} other template(s) are also missing, see the "
+                   f"NetFlow tab" if others > 0 else ""),
+                target=miss_exporter, interval_s=600)
+        if self.decoder.recovered:
+            recovered, self.decoder.recovered = self.decoder.recovered, []
+            self._recovered_pending += len(recovered)
+            (rec_exporter, rec_domain, rec_template_id), entry, recovered_at = recovered[-1]
+            span = _span_text(recovered_at - entry["first_ts"])
+            more = self._recovered_pending - 1
+            if self._log_netflow_throttled(
+                    "recovered",
+                    f"Template {rec_template_id} from {rec_exporter} "
+                    f"(domain {rec_domain}) arrived: {entry['count']} "
+                    f"record set(s) were dropped over {span} while it "
+                    f"was missing ({entry['reason']})"
+                    + (f"; {more} other template(s) also arrived since the "
+                       f"last such line" if more > 0 else ""),
+                    target=rec_exporter):
+                self._recovered_pending = 0
 
         if self._first_from(exporter):
             self._log_first_seen(exporter, data)
@@ -193,7 +257,7 @@ class Collector(udpsock.UdpReceiver):
         now = time.time()
         if now - self._log_times.get(key, 0.0) < interval_s:
             return False
-        self._log_times[key] = now
+        self._stamp_log_time(key, now)
         if callable(detail):
             detail = detail()
         self.log.add(NETFLOW, message, target=target, detail=detail)
@@ -220,6 +284,7 @@ class Collector(udpsock.UdpReceiver):
         # exporter -> [packets, flows, sampling, version]
         per_exporter: dict[str, list[int]] = {}
         last_flush = time.time()
+        last_template_save = time.time()
 
         def take(exporter: str, flows: list) -> None:
             pending.extend(flows)
@@ -266,6 +331,9 @@ class Collector(udpsock.UdpReceiver):
                 per_exporter.clear()
                 last_flush = time.time()
                 self._apply_learned_rates()
+                if last_flush - last_template_save >= TEMPLATE_SAVE_INTERVAL_S:
+                    self._save_templates()
+                    last_template_save = last_flush
                 if self.on_batch:
                     self.on_batch()
 
@@ -291,6 +359,22 @@ class Collector(udpsock.UdpReceiver):
             return
         if corrected:
             self.counters["resampled"] += corrected
+
+    def _save_templates(self) -> None:
+        """Persist the learned template cache, so a process restart does not
+        blind every v9/IPFIX exporter until it resends on its own schedule."""
+        try:
+            self.db.save_template_cache(self.decoder.export_templates())
+        except Exception as exc:
+            self._log_throttled("template_save",
+                                f"Could not save the template cache: {exc}")
+
+    def begin_stop(self) -> None:
+        # Not on the stop() start() issues before binding: that would overwrite
+        # the saved cache with an empty one before start() restores it.
+        if self.bound is not None:
+            self._save_templates()
+        super().begin_stop()
 
     # ------------------------------------------------------------------ status
 

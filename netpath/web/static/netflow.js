@@ -1076,6 +1076,16 @@
     if (historyLine) parts.push(historyLine);
     App.strip('nf', collector, { stopped: 'Collector stopped', start: 'Start collector',
       stop: 'Stop collector', parts, tooltip: true });
+
+    const missing = collector.missing_templates || [];
+    const missingEl = App.el('nf-missing');
+    missingEl.hidden = missing.length === 0;
+    if (missing.length) {
+      const items = missing.map((m) =>
+        `${m.exporter} domain ${m.domain} template ${m.template_id} — ` +
+        `${m.count.toLocaleString()} sets, first seen ${ago(m.first_ts)} (${m.reason})`);
+      missingEl.textContent = 'Records dropped for lack of a template: ' + items.join(' · ');
+    }
   }
 
   async function refresh() {

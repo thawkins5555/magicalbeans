@@ -88,6 +88,63 @@ check("the marker being set stops the reset from running again",
       still["subject"] == "Edited again, after the marker", still["subject"])
 alerts.close()
 
+print("3. the one-time SappiWhere-in-subject strip")
+alerts = AlertsDatabase(os.path.join(TMPDIR, "strip.db"))
+alerts._conn.execute(
+    "UPDATE templates SET subject = ? WHERE key = ? AND is_builtin = 1",
+    ("[CRITICAL] SappiWhere: my wording", builtin_key))
+alerts._conn.execute(
+    "INSERT INTO templates(key, name, subject, body, is_html, is_builtin,"
+    " updated_ts) VALUES ('custom2', 'Custom', 'SappiWhere: custom', 'body', 0, 0, ?)",
+    (time.time(),))
+alerts._conn.commit()
+alerts._clear_private_setting("template_subjects_strip_5_58")
+alerts._migrate()
+
+after = alerts._conn.execute(
+    "SELECT subject FROM templates WHERE key = ? AND is_builtin = 1",
+    (builtin_key,)).fetchone()
+check("SappiWhere is stripped out of the edited built-in subject",
+      after["subject"] == "[CRITICAL] my wording", after["subject"])
+custom = alerts._conn.execute(
+    "SELECT subject FROM templates WHERE key = 'custom2'").fetchone()
+check("a non-builtin template's subject is never touched by the strip",
+      custom["subject"] == "SappiWhere: custom", custom["subject"])
+check("the strip marker is set",
+      alerts._private_setting("template_subjects_strip_5_58") is True)
+
+alerts._conn.execute(
+    "UPDATE templates SET subject = ? WHERE key = ? AND is_builtin = 1",
+    ("SappiWhere: edited again, after the marker", builtin_key))
+alerts._conn.commit()
+alerts._migrate()
+still = alerts._conn.execute(
+    "SELECT subject FROM templates WHERE key = ? AND is_builtin = 1",
+    (builtin_key,)).fetchone()
+check("the strip marker being set stops it from running again",
+      still["subject"] == "SappiWhere: edited again, after the marker", still["subject"])
+alerts.close()
+
+print("3b. an unedited 5.57 subject migrates through the strip release too")
+alerts = AlertsDatabase(os.path.join(TMPDIR, "strip57.db"))
+alerts._conn.execute(
+    "UPDATE templates SET subject = ?, body = ?, updated_ts = 1.0"
+    " WHERE key = ? AND is_builtin = 1",
+    ("{{severity_tag}} SappiWhere: {{device_name}} is not responding",
+     alertmail.BUILTIN_TEMPLATES["device_down"]["body"], builtin_key))
+alerts._conn.commit()
+alerts.close()
+
+alerts = AlertsDatabase(os.path.join(TMPDIR, "strip57.db"))
+migrated = alerts.template_by_key("device_down")
+check("the 5.57 subject is migrated to the current wording on reopen",
+      migrated["subject"] == alertmail.BUILTIN_TEMPLATES["device_down"]["subject"],
+      migrated["subject"])
+check("...and builtin_subject agrees",
+      migrated["builtin_subject"] == alertmail.BUILTIN_TEMPLATES["device_down"]["subject"],
+      migrated["builtin_subject"])
+alerts.close()
+
 
 # ------------------------------------------------------- the three digests
 _SEQ = [0]
@@ -124,7 +181,7 @@ SENDABLE = [
     (alert(103, "sw3", 3), rule(), None),
 ]
 
-print("3. the email digest subject")
+print("4. the email digest subject")
 engine = build_engine()
 captured = []
 engine._mail.submit = lambda job: (captured.append(job) or True)
@@ -134,9 +191,11 @@ engine._send_digest(SENDABLE, {"email_enabled": True, "smtp_host": "mail.example
 check("one email digest was built", len(captured) == 1, captured)
 if captured:
     check("its subject leads with the worst severity's tag",
-          captured[0].subject.startswith("[CRITICAL] SappiWhere:"), captured[0].subject)
+          captured[0].subject.startswith("[CRITICAL] "), captured[0].subject)
+    check("its subject no longer names SappiWhere",
+          "SappiWhere" not in captured[0].subject, captured[0].subject)
 
-print("4. the webhook digest subject")
+print("5. the webhook digest subject")
 engine = build_engine()
 captured = []
 engine._webhook.submit = lambda job: (captured.append(job) or True)
@@ -145,11 +204,13 @@ engine._webhook_digest(SENDABLE, {"webhook_enabled": True,
 check("one webhook digest was built", len(captured) == 1, captured)
 if captured:
     check("its subject leads with the worst severity's tag",
-          captured[0].subject.startswith("[CRITICAL] SappiWhere:"), captured[0].subject)
+          captured[0].subject.startswith("[CRITICAL] "), captured[0].subject)
+    check("its subject no longer names SappiWhere",
+          "SappiWhere" not in captured[0].subject, captured[0].subject)
     check("the payload's own subject agrees",
           captured[0].payload["subject"] == captured[0].subject, captured[0].payload)
 
-print("5. the SMS digest text")
+print("6. the SMS digest text")
 engine = build_engine()
 captured = []
 engine._sms.submit = lambda job: (captured.append(job) or True)

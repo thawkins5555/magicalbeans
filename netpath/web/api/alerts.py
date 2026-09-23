@@ -971,7 +971,7 @@ def post_alerts_smtp_test(service, params, body) -> dict:
             "Sending a password to a server whose certificate is not "
             "verified defeats the point of the encryption. Turn certificate "
             "verification back on, or leave the password blank.")
-    subject = "SappiWhere test email"
+    subject = "Alerts test email"
     body_text = "This is a test email from SappiWhere's Alerts module."
     try:
         alertmail.send(settings, password, [to_addr], subject, body_text)

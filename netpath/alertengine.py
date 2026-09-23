@@ -3727,7 +3727,7 @@ class AlertEngine(Worker):
         minutes = max(1, round(delay_s / 60.0))
         tag = alertmail.severity_tag(
             min(row["severity"] for row, _rule_row, _occurrence in sendable))
-        subject = (f"{tag} SappiWhere: {len(sendable)} alerts opened in the last "
+        subject = (f"{tag} {len(sendable)} alerts opened in the last "
                   f"{minutes} minute{'s' if minutes != 1 else ''}")
         lines = [f"{row['entity_label']}: {row['message']}"
                 for row, _rule_row, _occurrence in sendable]
@@ -3794,7 +3794,7 @@ class AlertEngine(Worker):
         minutes = max(1, round(delay_s / 60.0))
         tag = alertmail.severity_tag(
             min(row["severity"] for row, _rule_row, _occurrence in sendable))
-        subject = (f"{tag} SappiWhere: {len(sendable)} alerts opened in the last "
+        subject = (f"{tag} {len(sendable)} alerts opened in the last "
                   f"{minutes} minute{'s' if minutes != 1 else ''}")
         alerts = [{"alert_id": row["id"], "rule": rule_row["key"] or "",
                    "rule_name": rule_row["name"], "entity_label": row["entity_label"],

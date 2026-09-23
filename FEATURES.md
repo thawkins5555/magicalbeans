@@ -3040,6 +3040,17 @@ hard to trip — a path monitor that cries wolf gets turned off.
   hourly budget and the recipient list; if the alert's own first notice is
   still waiting on the roll-up hold, the repeat is folded into that one
   notice instead of sending twice.
+- **Subjects no longer repeat the product name, from 5.58.0.** A subject
+  already opens with a severity tag and the From line already says who
+  sent it, so every built-in template's subject — and the roll-up
+  digest's — carried "SappiWhere" a second time: `[CRITICAL] SappiWhere:
+  core-sw-b is not responding`. The name is now gone from every built-in
+  subject and from the digest's; the body's `-- SappiWhere` sign-off and
+  the From display name are unchanged, and the SMS text (never emailed,
+  so it never carried the name) is unaffected. Upgrading strips the word
+  from every built-in template's subject, edited or not, the same
+  one-time correction 5.30.0 used to add the severity tag that had been
+  missing; a custom (non-built-in) template is never touched.
 - **Email over the standard library's `smtplib`** — none, STARTTLS or
   SSL/TLS, with or without certificate verification (turning verification
   off is a deliberate, explicit opt-out, never a silent downgrade). A
@@ -3071,7 +3082,7 @@ hard to trip — a path monitor that cries wolf gets turned off.
   problem began. More than three alerts still due when the window closes
   arrive as one digest email (or webhook) rather than one each, counted
   once against the hourly budget. **From 5.30.0 that digest's subject leads
-  with the worst severity in the batch** — `[CRITICAL] SappiWhere: 7 alerts
+  with the worst severity in the batch** — `[CRITICAL] 7 alerts
   opened in the last 5 minutes` — the same severity tag a single alert's
   subject already carried, so a digest is no longer the one notification
   type an inbox preview can't triage at a glance. A restart mid-window
@@ -3094,7 +3105,7 @@ hard to trip — a path monitor that cries wolf gets turned off.
   `interface_flapping` were bound to the outage template, so a missing
   vendor MIB arrived in the inbox with the subject "acc-sw-070 is not
   responding". They now use a generic `event_notice` template —
-  "SappiWhere: <rule> — <what>" — and an operator's own template choice is
+  "<rule> — <what>" — and an operator's own template choice is
   never overwritten by the change.
 - **An open alert emails once by default**; a re-notify interval can be
   set to repeat while it stays open. An alert that clears — resolved
@@ -3110,7 +3121,7 @@ hard to trip — a path monitor that cries wolf gets turned off.
   on a resolution is when the *problem* last recurred, a moment before it
   cleared.
 - **A recovery's subject leads with `[RECOVER]`, from 5.10.0**, in place of
-  the severity tag every opening alert carries — `[RECOVER] SappiWhere:
+  the severity tag every opening alert carries — `[RECOVER]
   core-sw-b has recovered`, not `[WARNING]`, since a resolution is not a
   fresh problem at the severity the outage was. A new token, `recover_tag`,
   renders to `[RECOVER]` on a resolution and to nothing on an opening
@@ -3422,6 +3433,39 @@ Listens for exported flow records, stores them, and charts them.
 - **Templates** for v9 and IPFIX are cached per exporter and observation
   domain. Records arriving before their template are counted as *awaiting
   template* rather than silently dropped.
+- **A missing template is now named, from 5.58.0.** The NetFlow tab shows
+  a line under the status strip for each exporter, domain and template
+  currently missing — `Records dropped for lack of a template: 10.1.1.1
+  domain 0 template 260 — 12,345 sets, first seen 2h ago (never received since
+  the collector started)` — instead of only the *awaiting template* count
+  on the strip itself. The reason is one of three: never received since
+  the collector started, evicted (the exporter sent more templates in
+  one burst than the cache below now holds), or rejected (a malformed
+  field count or a zero-length field). The Events log records a
+  throttled "Dropping records" line, at most one every 10 minutes for the
+  whole collector, naming the latest and counting the rest, not per
+  template, and — once the template finally arrives — a line (at most one
+  a minute, counting any others) giving how long the hole lasted, the first place that
+  is recorded anywhere: "Template 260 from 10.1.1.1 (domain 0) arrived:
+  12,345 record set(s) were dropped over 2h 13m while it was missing
+  (never received since the collector started)."
+- **The per-exporter template cache holds 512 templates, up from 64,
+  from 5.58.0.** A Cisco AVC/ezPM profile, or a stacked switch reporting
+  one observation domain per member, can send several hundred templates
+  in a single refresh burst; the old cap let a burst that size evict the
+  exporter's own live data template regardless of how recently it had
+  been used — the likely explanation where a collector reads healthy but
+  hours of flows are missing. The cap is still applied per exporter, so
+  one exporter's flood cannot evict another exporter's cache.
+- **Templates now survive a restart of the application, from 5.58.0**,
+  not only a settings save (which restarted the collector in place and
+  already carried templates through, from 5.23.0). The learned cache is
+  written to disk every 300 seconds while flows are being written and
+  again on a clean stop, and read
+  back the moment the collector starts — "Restored N template(s) saved
+  before the last stop" in the log — so stopping and starting the whole
+  application no longer puts every v9/IPFIX exporter back to *awaiting
+  template* until its own next scheduled resend.
 - **Template age** is reported beside the packet age in the collector status,
   because v9 and IPFIX records cannot be decoded until a template arrives and
   exporters resend them only every few minutes. It reads `no template yet` when

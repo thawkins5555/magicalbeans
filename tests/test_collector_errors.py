@@ -540,6 +540,282 @@ def test_r7_templates_survive_a_settings_restart() -> None:
         flow_db.close()
 
 
+# ----------------------------------------------------------------------- R8
+
+def test_r8_missing_template_accounting() -> None:
+    """Nothing used to record which exporter/template/why/how-long a v9 data
+    set was dropped for lack of a cached template -- only the aggregate
+    no_template counter moved. Decoder.missing tracks each key, and the
+    collector logs both the drop and the recovery once the template lands."""
+    print("R8: missing-template accounting, and the collector's log lines")
+
+    decoder = nfdecode.Decoder()
+    exporter = "10.9.9.9"
+    data = struct.pack("!I", 100) + struct.pack("!I", 5)
+    key = (exporter, 0, 700)
+
+    decoder.decode(v9_packet(ipfix_set(700, data)), exporter)
+    check(key in decoder.missing, "the missing data set is tracked")
+    check(decoder.missing[key]["count"] == 1, "count starts at 1")
+    check(decoder.missing[key]["reason"].startswith("never received"),
+          f"reason names never having received the template (got "
+          f"{decoder.missing[key]['reason']!r})")
+    check(decoder.last_missing_key == key,
+          "last_missing_key names the key that just went missing")
+
+    decoder.decode(v9_packet(ipfix_set(700, data)), exporter)
+    check(decoder.missing[key]["count"] == 2, "a second drop bumps the count")
+
+    fields = [(nfdecode.OCTETS, 4), (nfdecode.PACKETS, 4)]
+    template = struct.pack("!HH", 700, len(fields))
+    for field_id, size in fields:
+        template += struct.pack("!HH", field_id, size)
+    decoder.decode(v9_packet(ipfix_set(0, template)), exporter)
+    check(key not in decoder.missing,
+          "the entry is gone once the template arrives")
+    check(len(decoder.recovered) == 1 and decoder.recovered[0][0] == key
+          and decoder.recovered[0][1]["count"] == 2,
+          "recovered carries the key and the count it left with")
+
+    flow_db = FlowDatabase(db_path("r8-flows.db"))
+    log = eventlog.EventLog()
+    collector = Collector(flow_db, log=log)
+    port = free_udp_port()
+    try:
+        assert collector.start({"port": port, "bind_address": "127.0.0.1"})
+        send_udp(port, v9_packet(ipfix_set(700, data)))
+        check(wait_for(lambda: any(
+            "Dropping records from" in e.message and "template 700" in e.message
+            for e in log.all())),
+              "a live collector logs the drop, naming the exporter and "
+              "template")
+
+        send_udp(port, v9_packet(ipfix_set(0, template)))
+        check(wait_for(lambda: any(
+            "Template 700 from" in e.message and "arrived" in e.message
+            for e in log.all())),
+              "...and logs the recovery once the template arrives")
+    finally:
+        collector.stop()
+        flow_db.close()
+
+
+# ----------------------------------------------------------------------- R9
+
+def test_r9_cap_and_rejection_reasons() -> None:
+    """The raised per-exporter cap (512, up from 64, so a Cisco AVC burst
+    fits) still evicts on overflow, and a template rejected as malformed is
+    told apart from one merely evicted -- Decoder.missing's reason says
+    which. Reading a template's data moves it to the LRU's most-recently-used
+    end, same as any cache read, so the template evicted by the 513th is
+    whichever was second-oldest once the oldest had been read."""
+    print("R9: cap eviction and template rejection carry distinct reasons")
+
+    decoder = nfdecode.Decoder()
+    exporter = "10.0.0.6"
+    fields = [(nfdecode.OCTETS, 4), (nfdecode.PACKETS, 4)]
+
+    def template_bytes(template_id: int) -> bytes:
+        body = struct.pack("!HH", template_id, len(fields))
+        for field_id, size in fields:
+            body += struct.pack("!HH", field_id, size)
+        return body
+
+    for template_id in range(256, 768):
+        decoder.decode(v9_packet(ipfix_set(0, template_bytes(template_id))),
+                       exporter)
+    check(len(decoder.templates) == 512,
+          f"all 512 templates from one burst are cached under the raised "
+          f"cap (got {len(decoder.templates)})")
+
+    data = struct.pack("!I", 100) + struct.pack("!I", 5)
+    flows = decoder.decode(v9_packet(ipfix_set(256, data)), exporter)
+    check(len(flows) == 1, "the first template in the burst still decodes")
+
+    decoder.decode(v9_packet(ipfix_set(0, template_bytes(768))), exporter)
+    check(len(decoder.templates) == 512,
+          "a 513th template holds the cache at the cap, not past it")
+    # 256 was just read above, so it is the most-recently-used entry and
+    # survives; 257 is now the oldest and is what the 513th insert evicts.
+    victim = 257
+    check((exporter, 0, victim) not in decoder.templates,
+          f"template {victim} -- the actual least-recently-used once 256 "
+          f"had been read -- was evicted to make room")
+    flows = decoder.decode(v9_packet(ipfix_set(victim, data)), exporter)
+    check(flows == [], "its data set no longer decodes")
+    entry = decoder.missing.get((exporter, 0, victim))
+    reason = entry["reason"] if entry else None
+    check(entry is not None and reason.startswith("evicted"),
+          f"...and is recorded as evicted (got {reason!r})")
+
+    decoder.decode(v9_packet(ipfix_set(0, struct.pack("!HH", 300, 0))), exporter)
+    check((exporter, 0, 300) not in decoder.templates,
+          "a template declaring 0 fields is rejected, forgetting the "
+          "earlier one cached under the same id")
+    flows = decoder.decode(v9_packet(ipfix_set(300, data)), exporter)
+    check(flows == [], "its data set is undecodable")
+    entry = decoder.missing.get((exporter, 0, 300))
+    reason = entry["reason"] if entry else None
+    check(entry is not None and reason.startswith("rejected"),
+          f"...and recorded as rejected, not evicted (got {reason!r})")
+
+
+# ---------------------------------------------------------------------- R10
+
+def test_r10_templates_restored_after_process_restart() -> None:
+    """R7 covers a settings restart, which carries the outgoing Decoder's
+    own cache into the replacement -- a full process restart has no outgoing
+    Decoder to carry from. The cache is now saved to the database on stop
+    and loaded back on a cold start, closing that gap too."""
+    print("R10: a v9 template survives a full process restart")
+
+    flow_db = FlowDatabase(db_path("r10-flows.db"))
+    log = eventlog.EventLog()
+    collector_a = Collector(flow_db, log=log)
+    port = free_udp_port()
+    exporter = "127.0.0.1"
+    fields = [(nfdecode.OCTETS, 4), (nfdecode.PACKETS, 4)]
+    template = struct.pack("!HH", 600, len(fields))
+    for field_id, size in fields:
+        template += struct.pack("!HH", field_id, size)
+    record = struct.pack("!I", 4000) + struct.pack("!I", 40)
+
+    try:
+        assert collector_a.start({"port": port, "bind_address": "127.0.0.1"})
+        send_udp(port, v9_packet(ipfix_set(0, template)))
+        check(wait_for(lambda: (exporter, 0, 600) in collector_a.decoder.templates),
+              "the template is learned on collector A")
+        collector_a.stop()
+
+        collector_b = Collector(flow_db, log=log)
+        try:
+            assert collector_b.start({"port": port, "bind_address": "127.0.0.1"})
+            check(any("Restored 1 template(s)" in e.message for e in log.all()),
+                  "the new process's start logs that one template was "
+                  "restored")
+            send_udp(port, v9_packet(ipfix_set(600, record)))
+            check(wait_for(lambda: collector_b.counters["flows"] >= 1),
+                  "the data record decodes on the new process's decoder "
+                  "without waiting for the exporter's own resend")
+            check(collector_b.decoder.stats["no_template"] == 0,
+                  "stats['no_template'] never rose")
+        finally:
+            collector_b.stop()
+    finally:
+        flow_db.close()
+
+
+# ---------------------------------------------------------------------- R11
+
+def test_r11_missing_template_log_lines_are_bounded() -> None:
+    """The source address, domain and template id are all wire data, so a
+    per-key throttle let one sender file a log line per novel key and grow
+    the throttle dict for ever. Both lines are one per interval for the whole
+    collector, and the throttle dict itself is capped."""
+    print("R11: a flood of spoofed missing/arrived keys cannot flood the log")
+
+    flow_db = FlowDatabase(db_path("r11-flows.db"))
+    log = eventlog.EventLog()
+    collector = Collector(flow_db, log=log)
+    port = free_udp_port()
+    data = struct.pack("!I", 100) + struct.pack("!I", 5)
+    fields = [(nfdecode.OCTETS, 4), (nfdecode.PACKETS, 4)]
+    template = struct.pack("!HH", 700, len(fields))
+    for field_id, size in fields:
+        template += struct.pack("!HH", field_id, size)
+    try:
+        assert collector.start({"port": port, "bind_address": "127.0.0.1"})
+        for index in range(3000):
+            source = f"10.{(index >> 16) & 255}.{(index >> 8) & 255}.{index & 255}"
+            collector._handle_datagram(v9_packet(ipfix_set(700, data)), (source, 1))
+        dropping = [e for e in log.all() if "Dropping records from" in e.message]
+        check(len(dropping) == 1,
+              f"3000 spoofed sources produce one Dropping line, not {len(dropping)}")
+        collector._log_times["missing"] = 0.0
+        collector._handle_datagram(v9_packet(ipfix_set(700, data)), ("10.99.0.2", 1))
+        dropping = [e for e in log.all() if "Dropping records from" in e.message]
+        check(len(dropping) == 2
+              and "other template(s) are also missing" in dropping[-1].message,
+              "...and the next interval's line counts the rest")
+        check(len(collector._log_times) <= collector.MAX_LOG_KEYS,
+              f"the throttle dict stays capped ({len(collector._log_times)})")
+        collector.MAX_LOG_KEYS = 4
+        for index in range(6):
+            collector._stamp_log_time(f"k{index}", float(index))
+        check(len(collector._log_times) == 4 and "k5" in collector._log_times
+              and "k0" not in collector._log_times,
+              "the cap forgets the oldest key and keeps the newest")
+        del collector.MAX_LOG_KEYS
+        for index in range(3000):
+            source = f"10.{(index >> 16) & 255}.{(index >> 8) & 255}.{index & 255}"
+            collector._handle_datagram(v9_packet(ipfix_set(0, template)), (source, 1))
+        arrived = [e for e in log.all() if "arrived" in e.message]
+        check(len(arrived) == 1,
+              f"3000 templates arriving produce one arrival line, not {len(arrived)}")
+        for key in list(collector._log_times):
+            collector._log_times[key] = 0.0
+        collector._handle_datagram(v9_packet(ipfix_set(0, template)), ("10.0.0.1", 1))
+        collector._handle_datagram(v9_packet(ipfix_set(700, data)), ("10.99.0.1", 1))
+        collector._handle_datagram(v9_packet(ipfix_set(0, template)), ("10.99.0.1", 1))
+        arrived = [e for e in log.all() if "arrived" in e.message]
+        check(len(arrived) == 2 and "other template(s) also arrived" in arrived[-1].message,
+              "the next interval's arrival line counts the ones suppressed since")
+    finally:
+        collector.stop()
+        flow_db.close()
+
+
+# ---------------------------------------------------------------------- R12
+
+def test_r12_snapshots_survive_a_concurrent_receive_thread() -> None:
+    """export_templates() runs on the writer thread and missing_templates()
+    on the HTTP thread while netflow-rx keeps inserting; a live iteration
+    raised "mutated during iteration" and lost the save."""
+    print("R12: export/missing snapshots while another thread churns the cache")
+    import threading
+
+    decoder = nfdecode.Decoder()
+    data = struct.pack("!I", 100) + struct.pack("!I", 5)
+    stop = threading.Event()
+    errors: list = []
+
+    def churn() -> None:
+        index = 0
+        while not stop.is_set():
+            source = f"10.1.{(index >> 8) & 255}.{index & 255}"
+            template = (struct.pack("!HH", 256 + index % 300, 1)
+                        + struct.pack("!HH", nfdecode.OCTETS, 4))
+            decoder.decode(v9_packet(ipfix_set(0, template)), source)
+            decoder.decode(v9_packet(ipfix_set(900, data)), source)
+            index += 1
+
+    thread = threading.Thread(target=churn, daemon=True)
+    thread.start()
+    deadline = time.time() + 1.5
+    exported = 0
+    try:
+        while time.time() < deadline:
+            exported += len(decoder.export_templates())
+            decoder.missing_templates()
+    except RuntimeError as exc:
+        errors.append(exc)
+    finally:
+        stop.set()
+        thread.join(2.0)
+    check(not errors, f"no iteration error while the cache churns ({errors[:1]})")
+    check(exported > 0, "the snapshots were not empty")
+    check(len(decoder.export_templates()) <= nfdecode.MAX_TEMPLATES,
+          "the persisted snapshot is bounded")
+
+    full = nfdecode.Decoder()
+    for template_id in range(256, 256 + nfdecode.MAX_TEMPLATES_PER_EXPORTER):
+        template = (struct.pack("!HH", template_id, 1)
+                    + struct.pack("!HH", nfdecode.OCTETS, 4))
+        full.decode(v9_packet(ipfix_set(0, template)), "10.5.5.5")
+    check(full.export_templates() == [],
+          "an exporter sitting at its cap is left out of the snapshot")
+
+
 TESTS = [
     test_r1_options_sampling_rate_is_clamped,
     test_r2_writer_thread_survives_and_running_reflects_death,
@@ -548,6 +824,11 @@ TESTS = [
     test_r5_v1_oversized_integer_clamped_and_batch_survives,
     test_r6_syslog_strips_control_and_ansi_bytes,
     test_r7_templates_survive_a_settings_restart,
+    test_r8_missing_template_accounting,
+    test_r9_cap_and_rejection_reasons,
+    test_r10_templates_restored_after_process_restart,
+    test_r11_missing_template_log_lines_are_bounded,
+    test_r12_snapshots_survive_a_concurrent_receive_thread,
 ]
 
 

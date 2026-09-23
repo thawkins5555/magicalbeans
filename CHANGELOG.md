@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.58.0 — Email subjects drop "SappiWhere"; NetFlow names what's missing, raises the per-exporter template cap to 512, and keeps templates across a restart](#5580--email-subjects-drop-sappiwhere-netflow-names-whats-missing-raises-the-per-exporter-template-cap-to-512-and-keeps-templates-across-a-restart)
 - [5.57.0 — IP addresses everywhere get an actions button; filters and nested tabs are links; sign-in returns you to where you were](#5570--ip-addresses-everywhere-get-an-actions-button-filters-and-nested-tabs-are-links-sign-in-returns-you-to-where-you-were)
 - [5.56.0 — Every reboot emails; silent email drops say why; DAC badge grey; Send test email](#5560--every-reboot-emails-silent-email-drops-say-why-dac-badge-grey-send-test-email)
 - [5.55.0 — Priority star on the device list; DAC transceiver badge](#5550--priority-star-on-the-device-list-dac-transceiver-badge)
@@ -191,6 +192,66 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.58.0 — Email subjects drop "SappiWhere"; NetFlow names what's missing, raises the per-exporter template cap to 512, and keeps templates across a restart
+
+Two operator reports, unrelated to each other, closed together.
+
+**Alert email subjects no longer repeat the product name.** A subject
+already opens with a severity tag and the From line already says who
+it's from, so `[CRITICAL] SappiWhere: core-sw-b is not responding`
+carried the name twice. The six built-in templates (Device not
+responding, Device recovered, Device rebooted, Threshold breach, Event
+notice, Forwarded event) now read `[CRITICAL] core-sw-b is not
+responding`, the roll-up digest reads `[CRITICAL] 7 alerts opened in the
+last 5 minutes`, and the Alerts → Settings test email now reads `Alerts
+test email`. Bodies keep the `-- SappiWhere` sign-off, the From display
+name is still SappiWhere, and the SMS digest text is unchanged — this is
+a subject-line change only. Upgrading strips the word from every
+built-in subject, whether or not an operator had edited it, the same
+one-time correction 5.30.0 used to add the missing severity tag; a
+custom (non-built-in) template is never touched.
+
+**NetFlow now names a missing template instead of just counting it.** A
+v9/IPFIX exporter that has not yet sent its record layout used to be
+counted only as "awaiting template" on the status strip, with the whole
+data set dropped and nothing said about which exporter, which template,
+or why — on a busy fleet, hours of flows could go missing while the
+collector showed green throughout. The NetFlow tab now shows a line
+under the status strip for each one currently missing — `Records
+dropped for lack of a template: 10.1.1.1 domain 0 template 260 — 12,345
+sets, first seen 2h ago (never received since the collector started)` — and the
+Events log records a "Dropping records" line (at most one every 10
+minutes, naming the latest and counting the rest) plus, once the template
+finally arrives, a line giving how long the hole lasted (at most one a
+minute, likewise counting any others): "Template
+260 from 10.1.1.1 (domain 0) arrived: 12,345 record set(s) were dropped
+over 2h 13m while it was missing (never received since the collector
+started)." A template can also go missing because it was evicted (the
+exporter sent more templates in one burst than the cache holds) or
+rejected (a malformed field count or a zero-length field); both reasons
+are named the same way.
+
+**The per-exporter template cap is raised 64 → 512.** A Cisco AVC/ezPM
+profile, or a stacked switch reporting one observation domain per
+member, can legitimately send several hundred templates in one refresh
+burst; the old cap of 64 let that single burst evict the exporter's own
+live data template regardless of how recently it had been used — one
+way the reported gaps could open; the new line under the strip now
+names whichever reason actually applies on the live box. The higher
+cap is still bounded per exporter, so one exporter flooding templates
+still cannot push out another exporter's cache.
+
+**Templates now survive a process restart, not only a settings save.**
+The collector already carried its template cache across a NetFlow
+settings save (5.23.0); it did not survive the process itself stopping
+and starting, which put every v9/IPFIX exporter back to "awaiting
+template" until its next scheduled resend. The cache is now written to
+`flows.db` every 300 seconds while flows are being written, and again on a
+clean stop, and read back
+the moment the collector starts — "Restored N template(s) saved before
+the last stop" in the log — so a restart of the application, not just a
+settings change, no longer blacks out flows.
 
 ### 5.57.0 — IP addresses everywhere get an actions button; filters and nested tabs are links; sign-in returns you to where you were
 

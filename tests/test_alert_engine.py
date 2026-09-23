@@ -815,7 +815,7 @@ event_tpl = alerts.template_by_key("event_notice")
 # message — the rule-name/entity-label part this assertion is actually about
 # is unchanged.
 assert event_tpl["subject"] == \
-    "{{severity_tag}} SappiWhere: {{rule_name}} — {{entity_label}}", \
+    "{{severity_tag}} {{rule_name}} — {{entity_label}}", \
     event_tpl["subject"]
 ok("the generic template's subject names the rule, not the device's health")
 

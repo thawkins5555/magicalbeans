@@ -1146,6 +1146,14 @@ _PREVIOUS_BUILTIN_TEMPLATES = {
                      "automatically once the device responds again.\n\n"
                      "-- SappiWhere, {{severity_name}}"),
         },
+        {   # as shipped 5.30 through 5.57, before SappiWhere left the subject
+            "subject": "{{severity_tag}} SappiWhere: {{device_name}} is not responding",
+            "body": ("{{device_name}} ({{device_ip}}) stopped responding at "
+                     "{{opened_time}}.\n\n{{message}}\n\n"
+                     "This alert has occurred {{count}} time(s). It will clear "
+                     "automatically once the device responds again.\n\n"
+                     "-- SappiWhere"),
+        },
     ],
     "device_up": [
         {   # as shipped before 4.32.0
@@ -1160,6 +1168,12 @@ _PREVIOUS_BUILTIN_TEMPLATES = {
                      "{{recovered_time}}.\n\n{{downtime_line}}{{message}}\n\n"
                      "-- SappiWhere, {{severity_name}}"),
         },
+        {   # as shipped 5.30 through 5.57, before SappiWhere left the subject
+            "subject": "{{severity_tag}} SappiWhere: {{device_name}} has recovered",
+            "body": ("{{device_name}} ({{device_ip}}) has recovered as of "
+                     "{{recovered_time}}.\n\n{{downtime_line}}{{message}}\n\n"
+                     "-- SappiWhere"),
+        },
     ],
     "device_rebooted": [
         {
@@ -1168,6 +1182,13 @@ _PREVIOUS_BUILTIN_TEMPLATES = {
                      "{{last_time}}.\n\nPrevious reported uptime: {{previous_uptime}}\n"
                      "Current reported uptime: {{current_uptime}}\n\n{{message}}\n\n"
                      "-- SappiWhere, {{severity_name}}"),
+        },
+        {   # as shipped 5.30 through 5.57, before SappiWhere left the subject
+            "subject": "{{severity_tag}} SappiWhere: {{device_name}} rebooted",
+            "body": ("{{device_name}} ({{device_ip}}) appears to have rebooted at "
+                     "{{last_time}}.\n\nPrevious reported uptime: {{previous_uptime}}\n"
+                     "Current reported uptime: {{current_uptime}}\n\n{{message}}\n\n"
+                     "-- SappiWhere"),
         },
     ],
     "threshold_breach": [
@@ -1189,6 +1210,17 @@ _PREVIOUS_BUILTIN_TEMPLATES = {
                      "automatically once the value drops back below the clear "
                      "threshold.\n\n-- SappiWhere"),
         },
+        {   # as shipped 5.30 through 5.57, before SappiWhere left the subject
+            "subject": "{{severity_tag}} SappiWhere: {{entity_label}} — {{metric_label}} is {{value}}",
+            "body": ("{{entity_label}} crossed a threshold at {{last_time}}.\n\n"
+                     "Metric: {{metric_label}}\n"
+                     "Current value: {{value}}\n"
+                     "Threshold: {{threshold}}{{threshold_source}}\n\n"
+                     "{{message}}\n\n"
+                     "This alert has occurred {{count}} time(s). It will clear "
+                     "automatically once the value drops back below the clear threshold.\n\n"
+                     "-- SappiWhere"),
+        },
     ],
     "event_notice": [
         {
@@ -1197,6 +1229,15 @@ _PREVIOUS_BUILTIN_TEMPLATES = {
                      "First seen {{opened_time}}; most recently {{last_time}}.\n"
                      "This alert has occurred {{count}} time(s).\n\n"
                      "-- SappiWhere, {{severity_name}}"),
+        },
+        {   # as shipped 5.30 through 5.57, before SappiWhere left the subject
+            "subject": "{{severity_tag}} SappiWhere: {{rule_name}} — {{entity_label}}",
+            "body": ("{{rule_name}} — {{entity_label}}\n\n"
+                     "{{message}}\n\n"
+                     "{{detail}}\n"
+                     "First seen {{opened_time}}; most recently {{last_time}}.\n"
+                     "This alert has occurred {{count}} time(s).\n\n"
+                     "-- SappiWhere"),
         },
     ],
     "trap_forwarded": [
@@ -1208,6 +1249,17 @@ _PREVIOUS_BUILTIN_TEMPLATES = {
                      "Varbinds: {{varbinds}}\n\n"
                      "This alert has occurred {{count}} time(s).\n\n"
                      "-- SappiWhere, {{severity_name}}"),
+        },
+        {   # as shipped 5.30 through 5.57, before SappiWhere left the subject
+            "subject": "{{severity_tag}} SappiWhere: {{rule_name}} — {{entity_label}}",
+            "body": ("{{rule_name}} matched at {{last_time}}.\n\n"
+                     "Source: {{entity_label}}\n"
+                     "{{message}}\n\n"
+                     "Trap name: {{trap_name}}\n"
+                     "Trap OID: {{trap_oid}}\n"
+                     "Varbinds: {{varbinds}}\n\n"
+                     "This alert has occurred {{count}} time(s).\n\n"
+                     "-- SappiWhere"),
         },
     ],
 }
@@ -1223,6 +1275,8 @@ class AlertsDatabase(SqliteStore):
     last_prune_incomplete = False
     # Marker for the one-time built-in subject reset (see _migrate).
     _TEMPLATE_SUBJECTS_RESET_5_30 = "template_subjects_reset_5_30"
+    # Marker for the one-time SappiWhere-in-subject strip (see _migrate).
+    _TEMPLATE_SUBJECTS_STRIP_5_58 = "template_subjects_strip_5_58"
 
     def _after_open(self) -> None:
         # AlertEngine's per-tick change signals: see take_dirty_devices and
@@ -1259,6 +1313,14 @@ class AlertsDatabase(SqliteStore):
                 "UPDATE templates SET subject = builtin_subject, updated_ts = ?"
                 " WHERE is_builtin = 1 AND subject <> builtin_subject", (time.time(),))
             self._set_private_setting(self._TEMPLATE_SUBJECTS_RESET_5_30, True, commit=False)
+        # One-time: drop "SappiWhere" out of edited built-in subjects (5.58).
+        if not self._private_setting(self._TEMPLATE_SUBJECTS_STRIP_5_58):
+            self._conn.execute(
+                "UPDATE templates SET subject = TRIM(REPLACE(REPLACE(REPLACE("
+                "subject, 'SappiWhere: ', ''), 'SappiWhere', ''), '  ', ' ')),"
+                " updated_ts = ? WHERE is_builtin = 1 AND subject LIKE '%SappiWhere%'",
+                (time.time(),))
+            self._set_private_setting(self._TEMPLATE_SUBJECTS_STRIP_5_58, True, commit=False)
         self.ensure_columns("sms_credential", {
             "account_sid": "TEXT NOT NULL DEFAULT ''",
             "auth_mode": "TEXT NOT NULL DEFAULT 'auth_token'",

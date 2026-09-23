@@ -9330,6 +9330,34 @@ immediately after `_migrate_templates()` in `_migrate()` (so
 never again — a template subject an operator edits after the reset stays
 exactly as edited.
 
+**5.58.0: the same one-time, unconditional shape, this time to drop
+"SappiWhere" out of every built-in subject.** `BUILTIN_TEMPLATES`
+(`alertmail.py`) had the word removed from all six subjects — the
+severity tag and the From line already say what mail this is, so the
+name was redundant in the one place a mail client's preview actually
+shows — and `_PREVIOUS_BUILTIN_TEMPLATES` gained a further entry per key
+carrying the exact 5.30–5.57 wording, so `_migrate_templates()`'s
+character-exact match still moves an untouched template onto the new
+subject. That alone would leave any subject an operator had edited still reading
+"SappiWhere" indefinitely — the digest subject is a separate case, built
+at send time in `_send_digest`/`_webhook_digest`/`_sms_digest` rather
+than stored as one of the six templates, so it needed the literal string
+removed from its own format rather than a database migration — so
+`_migrate` also runs a second one-time
+statement, gated on `_TEMPLATE_SUBJECTS_STRIP_5_58` — the same marker
+mechanism as `_TEMPLATE_SUBJECTS_RESET_5_30` above: `UPDATE templates
+SET subject = TRIM(REPLACE(REPLACE(REPLACE(subject, 'SappiWhere: ',
+''), 'SappiWhere', ''), '  ', ' ')) WHERE is_builtin = 1 AND subject
+LIKE '%SappiWhere%'`. Like the 5.30.0 reset, this touches **every**
+built-in subject that still carries the word, edited or not, because
+there is no way to tell "an old shipped wording" from "an operator's
+own rewording that happens to include the app's name" apart for this
+one field, and the goal is that no built-in subject reads "SappiWhere"
+after the upgrade, full stop. Bodies (which keep their `-- SappiWhere`
+sign-off) and every custom, non-built-in template are never touched by
+either statement. It runs once per database, after the 5.30.0 reset in
+`_migrate()`, and never again.
+
 A resolution email (`_notify_clear()`, kind `"clear"` — the
 `notifications.kind` enum value the schema already reserved for this)
 fires when the CLEARS map (or a threshold dropping back below its clear
@@ -10450,6 +10478,54 @@ silently skipped rather than erroring — the exporter will resend the
 template within a minute or two, and every record before that is
 genuinely undecodable, not a bug.
 
+**A missing template is named, not just counted, from 5.58.0.** Before
+this the whole outcome of the paragraph above was one number — how many
+data sets `no_template` had swallowed — with no way to say which
+exporter, which template, or why the template was never cached in the
+first place; on a busy fleet that can mean hours of flows vanish while
+the collector's own status strip stays green. `self.templates` is now
+`_TemplateCache`, an outer LRU of exporter addresses (bounded by
+`MAX_TEMPLATE_EXPORTERS`) each holding its own inner LRU of that
+exporter's `(domain, template_id)` templates, capped by
+`MAX_TEMPLATES_PER_EXPORTER` — raised 64 → 512 in this release, because
+a Cisco AVC/ezPM profile, or a stacked platform reporting one
+observation domain per member, sends well over 64 templates in a single
+refresh burst, and a burst bigger than the old cap evicted the
+exporter's own live data template regardless of how recently it had
+been used. Splitting the cap this way also means one exporter varying
+its own domain field can only push out its own earlier templates, never
+another exporter's. `_TemplateCache.evicted` and `.rejected` are two
+more bounded LRUs (1024 entries each) that remember, respectively, an
+`on_evict` hook firing on an exporter's inner LRU and a `reject()` call
+from `_read_templates()`/`_read_options_template()` (a template with 0
+fields, more than `MAX_FIELDS_PER_TEMPLATE`, or a zero-length field).
+`Decoder.missing` is a third LRU (256 entries), keyed the same way as
+the template cache, each entry holding `count`, `first_ts`, `last_ts`
+and a `reason` string resolved once, on first sight of the key, by
+`_note_missing()`: `rejected` is checked first, then `evicted` (worded
+as "evicted: the exporter sent more than 512 templates"), and only if
+neither has an answer does it fall back to "never received since the
+collector started" — both diagnostic caches are themselves LRUs, so the
+explanation has to be captured the moment it is first seen or it can
+age out before anyone looks. The moment a template arrives for a key
+sitting in `self.missing`, `_read_templates()`/`_read_options_template()`
+pop it out and append `(key, entry, recovered_at)` to `Decoder.recovered`,
+a plain list `collector.py` drains on every packet to log the
+"Template … arrived" line, giving the hole's length as
+`recovered_at - entry["first_ts"]` — the first place that duration is
+recorded anywhere. `collector.py` also logs a "Dropping records" line
+when `no_template` rises. Both lines are throttled for the whole
+collector (600 s and 60 s, one key each, the message naming the latest
+template and counting the rest), not per key: the key is wire data, so a
+per-key throttle let one sender file a line per spoofed source and grow
+`_log_times` for ever — that dict is now capped at `MAX_LOG_KEYS` (4096)
+in `udpsock.py`. `missing_templates()` and `_TemplateCache.items()`
+iterate `list()` snapshots, since they run on the HTTP and writer threads
+while netflow-rx mutates the dicts. `Decoder.missing_templates(limit=20)` flattens
+`self.missing` into plain dicts, worst (highest `count`) first, for
+`/api/state`'s collector payload (`_shared.py`) and the NetFlow tab's
+status-strip line.
+
 Fields with `size == 0xFFFF` in their template are IPFIX variable-length
 fields; `_read_variable()` reads a length-prefix byte (or, if that byte
 is `255`, a following 2-byte length) before each such field rather than
@@ -10892,6 +10968,42 @@ one replaces it — so a settings save carries every exporter's learned
 templates straight through the restart. A genuinely fresh process still
 starts with an empty cache, since there is no prior decoder to read one
 from.
+
+### Templates now also survive a process restart, not only a settings save (`collector.py`, `flowdb.py`, `nfdecode.py`) — 5.58.0
+
+The carry-over above only ever moved templates from one `Decoder` to the
+next *inside the same running process* — a `templates=` keyword passed
+straight from the old decoder to the new one. Stopping and starting the
+process itself (a service restart, an update) still lost every learned
+template, exactly as a settings save used to before 5.23.0. `Decoder`
+gains `export_templates()`, returning every cached template as plain
+data (`exporter`, `domain`, `template_id`, `fields`, `is_options`,
+`scope_count`, `ipfix` — nothing but built-in types, so it round-trips
+through JSON), and `import_templates(payload)`, which rebuilds `Template`
+objects from that shape and skips any entry that fails to parse rather
+than raising, since it is reading back whatever the database happened to
+hold. `FlowDatabase.save_template_cache()`/`load_template_cache()` store
+that payload under the `template_cache` key via the existing
+`_private_setting`/`_set_private_setting` mechanism (flowdb.py's private
+settings table, the same one the row-cap watermarks above use) —
+no schema change. `Collector._write()`'s flush loop calls
+`_save_templates()` every `TEMPLATE_SAVE_INTERVAL_S` (300 s) once a batch
+has actually been written, and `begin_stop()` calls it once more before
+the base class's own shutdown, so a clean stop never loses the last few
+minutes' templates to the timer's own cadence. `Collector.start()` calls
+`import_templates()` only when `len(self.decoder.templates) == 0` — a
+settings-save restart already carried templates in memory and must not
+have them overwritten by a possibly older on-disk snapshot — and logs
+"Restored N template(s) saved before the last stop" when it finds any.
+An unclean stop (a crash, a killed process) loses only whatever arrived
+since the last 300-second save, never the whole cache as before. The
+snapshot is bounded (`_TemplateCache.snapshot`): most recently heard-from
+exporters first, any bucket sitting at its cap skipped, at most
+`MAX_TEMPLATES` entries, so a spoofing flood cannot grow the settings row
+without limit; a save failure logs one throttled line and leaves the
+error counter alone. A restored template can be stale: an exporter
+reconfigured while the process was down has its old layout applied to new
+data until its next template refresh replaces it.
 
 ### The row cap stops at the minute watermark, and the rollup catches up (`flowdb.py`, `web/service.py`) — 5.23.0
 

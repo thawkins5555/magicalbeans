@@ -24,9 +24,11 @@ MAX_SAMPLING = 4096
 # template_id are both wire data the sending source controls, so one flooding
 # source varying the domain field could mint unlimited keys in a shared cache
 # and evict every OTHER exporter's templates. Per-exporter bounding means a
-# flood can only push out its own earlier templates. 64 is generous headroom
-# above what any real exporter's template set needs.
-MAX_TEMPLATES_PER_EXPORTER = 64
+# flood can only push out its own earlier templates. A Cisco AVC profile, or a
+# stacked platform with one observation domain per member, sends well over 64
+# templates in one refresh burst, and a burst bigger than the cap evicts the
+# live data template regardless of recency.
+MAX_TEMPLATES_PER_EXPORTER = 512
 # How many distinct exporter addresses the template cache remembers at all,
 # matching collector.py's MAX_SEEN_SOURCES: the address is the datagram's
 # source, which is spoofable, so this outer bound is an LRU too rather than
@@ -151,18 +153,21 @@ class _Lru(collections.OrderedDict):
     an unbounded dict is a memory leak that any sender can drive.
     """
 
-    def __init__(self, limit: int):
+    def __init__(self, limit: int, on_evict=None):
         super().__init__()
         self.limit = limit
         self.evictions = 0
+        self._on_evict = on_evict
 
     def __setitem__(self, key, value) -> None:
         if key in self:
             self.move_to_end(key)
         super().__setitem__(key, value)
         while len(self) > self.limit:
-            self.popitem(last=False)
+            dropped_key, dropped_value = self.popitem(last=False)
             self.evictions += 1
+            if self._on_evict is not None:
+                self._on_evict(dropped_key, dropped_value)
 
     def get(self, key, default=None):
         if key in self:
@@ -199,12 +204,19 @@ class _TemplateCache:
         self._max_exporters = max_exporters
         self._exporters: collections.OrderedDict = collections.OrderedDict()
         self.evictions = 0
+        # Why a template is currently uncached: LRU-evicted or rejected as
+        # malformed. Flat-keyed; diagnostics only.
+        self.evicted: _Lru = _Lru(1024)
+        self.rejected: _Lru = _Lru(1024)
 
     def __setitem__(self, key, value) -> None:
         exporter, domain, template_id = key
         bucket = self._exporters.get(exporter)
         if bucket is None:
-            bucket = _Lru(self._per_exporter)
+            def _on_evict(inner_key, _value, exporter=exporter):
+                domain, template_id = inner_key
+                self.evicted[(exporter, domain, template_id)] = time.time()
+            bucket = _Lru(self._per_exporter, on_evict=_on_evict)
             self._exporters[exporter] = bucket
             while len(self._exporters) > self._max_exporters:
                 # An exporter evicted wholesale here (rather than one
@@ -241,6 +253,33 @@ class _TemplateCache:
 
     def __len__(self) -> int:
         return sum(len(bucket) for bucket in self._exporters.values())
+
+    def items(self):
+        """Every cached (exporter, domain, template_id) key with its Template.
+        list() over each level is atomic under the GIL, so the receive thread
+        inserting mid-walk cannot raise "mutated during iteration" here."""
+        for exporter, bucket in list(self._exporters.items()):
+            for (domain, template_id), value in list(bucket.items()):
+                yield (exporter, domain, template_id), value
+
+    def snapshot(self, limit: int):
+        """items(), most recently heard-from exporter first, skipping any
+        bucket at its cap, at most `limit` entries."""
+        taken = 0
+        for exporter, bucket in reversed(list(self._exporters.items())):
+            if len(bucket) >= self._per_exporter:
+                continue
+            for (domain, template_id), value in list(bucket.items()):
+                if taken >= limit:
+                    return
+                taken += 1
+                yield (exporter, domain, template_id), value
+
+    def reject(self, key, reason: str) -> None:
+        """Refuse a malformed template: forget any earlier one under this key
+        (a stale layout is worse than none) and record why, for missing_templates()."""
+        self.pop(key, None)
+        self.rejected[key] = reason
 
 
 @dataclass
@@ -329,6 +368,12 @@ class Decoder:
         self.stats = {"packets": 0, "flows": 0, "templates": 0, "errors": 0,
                       "no_template": 0, "bad_template": 0,
                       "implausible_sampling": 0, "truncated_flows": 0}
+        # (exporter, domain, template_id) -> {count, first_ts, last_ts, reason}
+        # for data sets dropped since no template was cached for that key.
+        self.missing: _Lru = _Lru(256)
+        # Keys that left self.missing because their template arrived.
+        self.recovered: list = []
+        self.last_missing_key: tuple[str, int, int] | None = None
 
     def sampling_for(self, exporter: str, domain: int = 0,
                      sampler_id: int = 0) -> int:
@@ -524,6 +569,8 @@ class Decoder:
             # cached-or-not Template never allocates a fields list sized by
             # an attacker rather than by a real device.
             broken = count == 0 or count > MAX_FIELDS_PER_TEMPLATE
+            reason = ("0 fields" if count == 0 else
+                      f"{count} fields" if count > MAX_FIELDS_PER_TEMPLATE else "")
             for _ in range(count):
                 if offset + 4 > len(body):
                     return
@@ -538,6 +585,7 @@ class Decoder:
                     offset += 4
                 if size <= 0:
                     broken = True
+                    reason = reason or "zero-length field"
                 if not broken:
                     template.fields.append((field_id, size, enterprise))
             if broken:
@@ -550,10 +598,14 @@ class Decoder:
                 # stale layouts cannot be decoded either.
                 self.stats["bad_template"] += 1
                 self.stats["errors"] += 1
-                self.templates.pop((exporter, domain, template_id), None)
+                self.templates.reject((exporter, domain, template_id), reason)
                 continue
-            self.templates[(exporter, domain, template_id)] = template
+            key = (exporter, domain, template_id)
+            self.templates[key] = template
             self.stats["templates"] += 1
+            entry = self.missing.pop(key, None)
+            if entry:
+                self.recovered.append((key, entry, time.time()))
 
     def _read_options_template(self, body: bytes, exporter: str, domain: int,
                                ipfix: bool) -> None:
@@ -581,6 +633,8 @@ class Decoder:
         # appended, so a template claiming an absurd field_count never grows
         # the fields list to match.
         broken = field_count == 0 or field_count > MAX_FIELDS_PER_TEMPLATE
+        reason = ("0 fields" if field_count == 0 else
+                  f"{field_count} fields" if field_count > MAX_FIELDS_PER_TEMPLATE else "")
         for _ in range(field_count):
             if offset + 4 > len(body):
                 break
@@ -595,24 +649,97 @@ class Decoder:
                 offset += 4
             if size <= 0:
                 broken = True
+                reason = reason or "zero-length field"
             if not broken:
                 template.fields.append((field_id, size, enterprise))
         if broken:
             self.stats["bad_template"] += 1
             self.stats["errors"] += 1
-            self.templates.pop((exporter, domain, template_id), None)
+            self.templates.reject((exporter, domain, template_id), reason)
             return
-        self.templates[(exporter, domain, template_id)] = template
+        key = (exporter, domain, template_id)
+        self.templates[key] = template
         self.stats["templates"] += 1
+        entry = self.missing.pop(key, None)
+        if entry:
+            self.recovered.append((key, entry, time.time()))
 
     # ------------------------------------------------------------- data
+
+    def _note_missing(self, key: tuple[str, int, int]) -> None:
+        """Track a dropped data set. The reason is resolved at first sight of
+        `key`, since rejected/evicted are LRUs and may forget it later."""
+        now = time.time()
+        entry = self.missing.get(key)
+        if entry is None:
+            reason = self.templates.rejected.get(key)
+            if reason is not None:
+                reason = f"rejected: {reason}"
+            elif key in self.templates.evicted:
+                reason = (f"evicted: the exporter sent more than "
+                         f"{MAX_TEMPLATES_PER_EXPORTER} templates")
+            else:
+                reason = "never received since the collector started"
+            entry = {"count": 0, "first_ts": now, "last_ts": now, "reason": reason}
+        entry["count"] += 1
+        entry["last_ts"] = now
+        self.missing[key] = entry
+        self.last_missing_key = key
+
+    def missing_templates(self, limit: int = 20) -> list[dict]:
+        """The templates most often missing, worst first, for the NetFlow
+        status strip and /api/state."""
+        entries = [
+            {"exporter": exporter, "domain": domain, "template_id": template_id,
+             **data}
+            for (exporter, domain, template_id), data in list(self.missing.items())
+        ]
+        entries.sort(key=lambda e: e["count"], reverse=True)
+        return entries[:limit]
+
+    def export_templates(self) -> list[dict]:
+        """Every cached template, plain-data, for FlowDatabase to persist
+        across a process restart."""
+        return [
+            {"exporter": exporter, "domain": domain, "template_id": template_id,
+             "fields": [list(f) for f in template.fields],
+             "is_options": template.is_options, "scope_count": template.scope_count,
+             "ipfix": template.ipfix}
+            for (exporter, domain, template_id), template
+            in self.templates.snapshot(MAX_TEMPLATES)
+        ]
+
+    def import_templates(self, payload) -> int:
+        """Rebuild templates saved by export_templates(). Any malformed entry
+        is skipped rather than raised, since this reads back whatever the
+        database happened to hold. Returns how many were restored."""
+        restored = 0
+        for entry in payload or []:
+            try:
+                exporter = str(entry["exporter"])
+                domain = int(entry["domain"])
+                template_id = int(entry["template_id"])
+                fields = [(int(fid), int(size), int(ent))
+                         for fid, size, ent in entry["fields"]]
+                template = Template(
+                    template_id=template_id, fields=fields,
+                    is_options=bool(entry.get("is_options", False)),
+                    scope_count=int(entry.get("scope_count", 0)),
+                    ipfix=bool(entry.get("ipfix", False)))
+            except (KeyError, TypeError, ValueError):
+                continue
+            self.templates[(exporter, domain, template_id)] = template
+            restored += 1
+        return restored
 
     def _read_data(self, body: bytes, exporter: str, domain: int, template_id: int,
                    version: int, boot: float, export_time: float,
                    budget: int = MAX_FLOWS_PER_PACKET) -> list[Flow]:
-        template = self.templates.get((exporter, domain, template_id))
+        key = (exporter, domain, template_id)
+        template = self.templates.get(key)
         if template is None:
             self.stats["no_template"] += 1
+            self._note_missing(key)
             return []
 
         flows: list[Flow] = []
@@ -625,7 +752,7 @@ class Decoder:
             # two yields a record per byte of the set (see MIN_RECORD_BYTES).
             self.stats["bad_template"] += 1
             self.stats["errors"] += 1
-            self.templates.pop((exporter, domain, template_id), None)
+            self.templates.reject(key, "record shorter than 4 bytes")
             return []
 
         while offset < len(body):

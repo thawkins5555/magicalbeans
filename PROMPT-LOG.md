@@ -5,6 +5,54 @@ grouped by the version that carries it. This is a working record for the
 operator — the full story of each change is in `CHANGELOG.md`, and this file
 does not replace it.
 
+## 5.58.0 — Email subjects drop "SappiWhere"; NetFlow names missing templates, raises the cap to 512, and survives a restart
+
+**"Remove 'SappiWhere' from the subject line of all email templates."**
+Confirmed this meant every subject an email can carry — the six
+built-in templates, the roll-up digest, and the Alerts → Settings test
+email — not only the ones an operator had left at their shipped
+wording. Bodies keep their `-- SappiWhere` sign-off and the From display
+name is unchanged; only subjects change, and the SMS text was never
+affected since it has no subject line to strip. Upgrading strips the
+word out of every built-in subject, edited or not, the same one-time,
+deliberately unconditional correction 5.30.0 used when it added the
+missing severity tag; a custom (non-built-in) template is left exactly
+as written.
+
+**"Netflow is consistently missing HOURS of data that is confirmed being
+sent to the SappiWhere application."** A round of questions narrowed
+this down before anything was changed: the holes sit inside a single
+day's traffic chart and inside the raw flow Records table too, so this
+is not a display artifact; the collector has been running steadily, no
+crashes or restarts lining up with the gaps; the exporter speaks
+NetFlow v9; NTP is in order on both ends; and the status strip's
+*awaiting template* count is consistently large rather than an
+occasional spike. That combination pointed at the template cache
+quietly dropping v9 data sets rather than a real gap in what the router
+exports, and the fix shipped in three parts: name what's missing
+(exporter, template id and why) instead of only counting it, raise the
+per-exporter template cache from 64 to 512 (a stacked switch or a Cisco
+AVC/ezPM profile can send more templates in one refresh burst than the
+old cap held, evicting the exporter's own live template in the
+process), and write the learned template cache to disk so a process
+restart — not just a settings save, which 5.23.0 already covered — no
+longer blanks every v9/IPFIX exporter until its own next scheduled
+resend.
+
+**Outcome.** Shipping as 5.58.0. Thing1 and Thing2 built the two lanes
+in parallel — alert-subject wording and the NetFlow template work — and
+Stephen_King wrote the docs and bumped the version. Testy passed the
+targeted suites, the full suite (only the known environmental failures)
+and the NetFlow/Alerts walk. Javariius's review found the two new log
+lines could be flooded by spoofed sources, the template snapshot raced
+the receive thread, and the saved snapshot had no size bound; all three
+were fixed (per-collector throttles, list() snapshots, a bounded
+snapshot) with tests R11 and R12 before the push to main.
+
+**Files changed for 5.58.0's documentation:** `netpath/__init__.py`
+(version), `CHANGELOG.md`, `FEATURES.md`, `INTERNALS.md`, `README.md`,
+`RUNBOOK.md`, and this file.
+
 ## UI/UX review of SappiWhere — no version bump
 
 **"UI-Review."** A bare word with no matching command or skill on this

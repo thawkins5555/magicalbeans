@@ -91,7 +91,7 @@ check("...and documents recover_tag itself",
 check("no built-in template text changed for any of this "
       "(_PREVIOUS_BUILTIN_TEMPLATES stays untouched)",
       alertmail.BUILTIN_TEMPLATES["device_up"]["subject"]
-      == "{{severity_tag}} SappiWhere: {{device_name}} has recovered",
+      == "{{severity_tag}} {{device_name}} has recovered",
       alertmail.BUILTIN_TEMPLATES["device_up"]["subject"])
 
 # --------------------------------------------------- every built-in template
@@ -99,6 +99,8 @@ check("no built-in template text changed for any of this "
 for key, spec in alertmail.BUILTIN_TEMPLATES.items():
     check(f"{key}'s subject leads with {{{{severity_tag}}}}",
           spec["subject"].startswith("{{severity_tag}} "), spec["subject"])
+    check(f"{key}'s subject no longer names SappiWhere",
+          "SappiWhere" not in spec["subject"], spec["subject"])
     check(f"{key}'s body no longer signs off with the now-redundant "
           f"{{{{severity_name}}}}",
           spec["body"].rstrip().endswith("-- SappiWhere")

@@ -766,6 +766,7 @@ def get_state(service, params, body) -> dict:
             "status": service.collector.status_text(),
             "counters": service.collector.counters,
             "decoder": service.collector.decoder.stats,
+            "missing_templates": service.collector.decoder.missing_templates(),
             # A5: how far back each tier reaches, cached — this is polled
             # every 2s by every open tab and coverage() reads the raw table.
             "coverage": service.cached_poll(
