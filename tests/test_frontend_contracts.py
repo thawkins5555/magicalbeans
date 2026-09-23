@@ -5259,6 +5259,21 @@ BYTES117 = js_function(APP, "bytes")
 check("n < 1000 || unit === 'TB'" in BYTES117 and "n /= 1000;" in BYTES117,
       "App.bytes uses 1000 as its base, not 1024")
 
+
+# ---------------------------------------------------------------------------
+# 118. Help text: alerts.severity's colour-keyed legend (alerts.js), and
+#      shell.time/shell.browsers (app.js), reachable and registered.
+ALERTS118 = read("alerts.js")
+check("'alerts.severity'" in ALERTS118 and "class=\"sev sev-${n}\"" in ALERTS118,
+      "alerts.js registers alerts.severity using the existing .sev sev-N classes")
+check('data-help="alerts.severity"' in INDEX,
+      "the Severity filter carries a help link to it")
+check("Edge or Chrome 111 or newer" in APP
+      and "Firefox 113 or newer, Safari 16.2 or newer" in APP,
+      "app.js registers shell.browsers with the exact supported-browser sentence")
+check("'shell.time'" in APP and "a UTC offset" in APP,
+      "app.js registers shell.time noting the CSV UTC-offset/local-time split")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

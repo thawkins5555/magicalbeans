@@ -1610,6 +1610,12 @@
       is not somebody's inbox, and it has its own on/off switch and its own
       hourly budget. Nor is it the per-rule <b>Send email for this rule</b>
       checkbox, which silences one rule at every severity.</p>` },
+    'alerts.severity': { title: 'Severity colours', html: `
+      <p>The syslog scale, counting down — 0 is worst.</p>
+      <p>${[0, 1, 2, 3, 4, 5, 6, 7].map((n) =>
+        `<span class="sev sev-${n}">${n} ${escape((App.state.severities || [])[n] || '')}</span>`)
+        .join('<br>')}</p>
+      <p>0-2 read red, 3 orange, 4 amber; 5-7 are routine and stay neutral.</p>` },
   });
 
   function normalizeRecipients(raw) {

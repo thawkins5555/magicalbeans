@@ -129,7 +129,8 @@ const App = (() => {
       <fieldset id="am-sms"><legend>Text alerts (SMS)</legend>
         <div id="am-sms-body"><p class="hint">Loading…</p></div>
       </fieldset>`}
-      ${forced ? '' : `<p class="hint">Conventions ${helpLink('shell.dialogs')}</p>`}
+      ${forced ? '' : `<p class="hint">Conventions ${helpLink('shell.dialogs')}
+        · Time zones ${helpLink('shell.time')} · Browsers ${helpLink('shell.browsers')}</p>`}
       ${version ? `<p class="hint">SappiWhere v${escapeHtml(version)}</p>` : ''}`,
       [
         // Forced, this dialog is the only thing the account can do — the
@@ -6461,6 +6462,13 @@ const App = (() => {
         + '<p>Remove takes something out of monitoring or configuration; '
         + 'Delete destroys stored data (backups, maps, rule sets, the '
         + 'event log).</p>' } });
+    registerHelp({ 'shell.time': { title: 'Time zones',
+      html: '<p>The screen always shows local time — this browser\'s. A CSV '
+        + 'export instead carries its timestamps with a UTC offset, so a '
+        + 'file opened somewhere else still reads correctly.</p>' } });
+    registerHelp({ 'shell.browsers': { title: 'Supported browsers',
+      html: '<p>Supported browsers: Edge or Chrome 111 or newer, '
+        + 'Firefox 113 or newer, Safari 16.2 or newer.</p>' } });
     // login.js set this the moment /api/login's own response said the
     // account must change its password — first paint, rather than waiting
     // on the first /api/state poll (loadState, below) to say the same
