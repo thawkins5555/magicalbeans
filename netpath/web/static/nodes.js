@@ -728,6 +728,8 @@
     const query = opts.query || {};
     let filtered = false;
     for (const [id, key] of [['nd-filter-status', 'status'],
+                             ['nd-filter-group', 'group'],
+                             ['nd-filter-devgroup', 'devgroup'],
                              ['nd-q', 'q'],
                              ['nd-q', 'name']]) {
       if (query[key] === undefined) continue;
@@ -7038,7 +7040,7 @@
       onEnter: () => { view.macSearchPending = true; },
     });
     const syncNodesRoute = () => App.syncFilterRoute('nodes', {
-      q: 'nd-q', group: 'nd-filter-group', devgroup: 'nd-filter-devgroup',
+      name: 'nd-q', group: 'nd-filter-group', devgroup: 'nd-filter-devgroup',
       status: 'nd-filter-status',
     });
     App.el('nd-apply').addEventListener('click', syncNodesRoute);

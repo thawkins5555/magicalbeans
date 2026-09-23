@@ -5110,8 +5110,10 @@ check('data-t0' not in IPCELL107 and 'data-t1' not in IPCELL107,
 check("opts.label === '' ? ''" in IPCELL107,
       "an empty label renders the actions button alone, for cells that "
       "already print the address")
-check("[['src', 'nf-src'], ['dst', 'nf-dst']]" in read("netflow.js"),
-      "NetFlow's activate() reads src and dst query keys into its two filters")
+check("[['src', 'nf-src'], ['dst', 'nf-dst'], ['port', 'nf-port'],\n"
+      "      ['protocol', 'nf-protocol'], ['exporter', 'nf-exporter']]" in read("netflow.js"),
+      "NetFlow's activate() reads src, dst, port, protocol and exporter "
+      "query keys into their filters")
 OPEN107 = js_function(APP, "openIpPopover")
 check("el.setAttribute('role', 'menu')" in OPEN107,
       "openIpPopover's popover carries role=menu")
@@ -5782,6 +5784,28 @@ check("App.ipCell(r.src_ip, { label: r.src_name || undefined })" in NETFLOW121
       and "App.ipCell(r.src_ip, {})" in NETFLOW121
       and "App.ipCell(r.dst_ip, {})" in NETFLOW121,
       "none of NetFlow's four ipCell calls pass t0/t1 any more")
+
+# ---------------------------------------------------------------------------
+# 122. Filter links round-trip. NetFlow's activate() also reads port,
+#      protocol, exporter and window back out of the query string, and
+#      syncNetflowRoute mirrors the window select into the hash too. Nodes'
+#      activate() reads group/devgroup, and its typed-search key is
+#      'name' — the same key that skips the MAC-search prompt on replay.
+NETFLOW122 = read("netflow.js")
+check("src: 'nf-src', dst: 'nf-dst', port: 'nf-port', protocol: 'nf-protocol',\n"
+      "      exporter: 'nf-exporter', window: 'nf-range'," in NETFLOW122,
+      "syncNetflowRoute mirrors window (nf-range) into the hash alongside "
+      "the other filters")
+NODES122 = read("nodes.js")
+_ACTIVATE122 = js_function(NODES122, "activate")
+check("['nd-filter-group', 'group']" in _ACTIVATE122
+      and "['nd-filter-devgroup', 'devgroup']" in _ACTIVATE122,
+      "nodes.js's activate() reads group and devgroup back into their "
+      "filter-bar selects")
+check("name: 'nd-q', group: 'nd-filter-group', devgroup: 'nd-filter-devgroup',"
+      in NODES122,
+      "syncNodesRoute writes the typed search under 'name', not 'q' — 'q' "
+      "arms the MAC search on replay, 'name' does not")
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))

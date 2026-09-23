@@ -1280,7 +1280,7 @@
     // App.ipCell's "NetFlow from" / "NetFlow to" actions (see activate()).
     const syncNetflowRoute = () => App.syncFilterRoute('netflow', {
       src: 'nf-src', dst: 'nf-dst', port: 'nf-port', protocol: 'nf-protocol',
-      exporter: 'nf-exporter',
+      exporter: 'nf-exporter', window: 'nf-range',
     });
     App.el('nf-apply').addEventListener('click', syncNetflowRoute);
     App.el('nf-clear').addEventListener('click', syncNetflowRoute);
@@ -1313,7 +1313,8 @@
     if (!opts) return;
     const query = opts.query || {};
     let filtered = false;
-    for (const [key, id] of [['src', 'nf-src'], ['dst', 'nf-dst']]) {
+    for (const [key, id] of [['src', 'nf-src'], ['dst', 'nf-dst'], ['port', 'nf-port'],
+      ['protocol', 'nf-protocol'], ['exporter', 'nf-exporter']]) {
       if (query[key] !== undefined) {
         App.el(id).value = query[key];
         filtered = true;
