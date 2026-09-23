@@ -1276,11 +1276,10 @@
       clears: ['nf-src', 'nf-dst', 'nf-port', 'nf-protocol', 'nf-exporter'],
     });
     // Mirrors the filters into the hash after filterBar's own refresh, so a
-    // link into this view can be shared. nf-src is the round trip for
-    // App.ipCell's "view in NetFlow" action (see activate() below) — there
-    // is no single combined address box, so the Source filter is it.
+    // link into this view can be shared. src/dst are the round trip for
+    // App.ipCell's "NetFlow from" / "NetFlow to" actions (see activate()).
     const syncNetflowRoute = () => App.syncFilterRoute('netflow', {
-      ip: 'nf-src', dst: 'nf-dst', port: 'nf-port', protocol: 'nf-protocol',
+      src: 'nf-src', dst: 'nf-dst', port: 'nf-port', protocol: 'nf-protocol',
       exporter: 'nf-exporter',
     });
     App.el('nf-apply').addEventListener('click', syncNetflowRoute);
@@ -1314,9 +1313,11 @@
     if (!opts) return;
     const query = opts.query || {};
     let filtered = false;
-    if (query.ip !== undefined) {
-      App.el('nf-src').value = query.ip;
-      filtered = true;
+    for (const [key, id] of [['src', 'nf-src'], ['dst', 'nf-dst']]) {
+      if (query[key] !== undefined) {
+        App.el(id).value = query[key];
+        filtered = true;
+      }
     }
     const t0 = query.t0 !== undefined ? Number(query.t0) : undefined;
     const t1 = query.t1 !== undefined ? Number(query.t1) : undefined;

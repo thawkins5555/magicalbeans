@@ -954,7 +954,8 @@ const App = (() => {
       { label: 'IPAM', href: buildRoute('ipam', [], { ip }) },
       { label: 'Syslog', href: buildRoute('syslog', [], { source: ip, t0, t1 }) },
       { label: 'SNMP Trap', href: buildRoute('snmp', [], { source: ip, t0, t1 }) },
-      { label: 'NetFlow', href: buildRoute('netflow', [], { ip, t0, t1 }) },
+      { label: 'NetFlow from', href: buildRoute('netflow', [], { src: ip, t0, t1 }) },
+      { label: 'NetFlow to', href: buildRoute('netflow', [], { dst: ip, t0, t1 }) },
     ];
   }
 
@@ -1017,11 +1018,12 @@ const App = (() => {
   function ipCell(ip, opts = {}) {
     const addr = String(ip ?? '');
     if (!addr) return '';
-    const shownText = opts.label ? String(opts.label) : addr;
+    // label '' means the caller already printed the address: button only.
+    const shownText = opts.label === '' ? '' : (opts.label ? String(opts.label) : addr);
     if (state.kiosk) return escapeHtml(shownText);
     const t0 = opts.t0 || '';
     const t1 = opts.t1 || '';
-    return `<span class="ip-cell"><span class="mono">${escapeHtml(shownText)}</span>` +
+    return `<span class="ip-cell">${shownText ? `<span class="mono">${escapeHtml(shownText)}</span>` : ''}` +
       `<button type="button" class="ip-menu" aria-label="Actions for ${escapeHtml(addr)}" ` +
       `aria-haspopup="menu" aria-expanded="false" data-ip="${escapeHtml(addr)}" ` +
       `data-t0="${escapeHtml(t0)}" data-t1="${escapeHtml(t1)}">⋯</button></span>`;

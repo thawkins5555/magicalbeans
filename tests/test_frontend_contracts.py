@@ -5098,6 +5098,14 @@ check("if (state.kiosk) return escapeHtml(shownText);" in IPCELL107,
 ITEMS107 = js_function(APP, "ipPopoverItems")
 for route in ("'ipam'", "'syslog'", "'snmp'", "'netflow'"):
     check(route in ITEMS107, "ipPopoverItems links %s" % route)
+check("{ src: ip, t0, t1 }" in ITEMS107 and "{ dst: ip, t0, t1 }" in ITEMS107,
+      "the popover offers NetFlow both from and to the address (the flow "
+      "filter has no either-side match)")
+check("opts.label === '' ? ''" in IPCELL107,
+      "an empty label renders the actions button alone, for cells that "
+      "already print the address")
+check("[['src', 'nf-src'], ['dst', 'nf-dst']]" in read("netflow.js"),
+      "NetFlow's activate() reads src and dst query keys into its two filters")
 OPEN107 = js_function(APP, "openIpPopover")
 check("el.setAttribute('role', 'menu')" in OPEN107,
       "openIpPopover's popover carries role=menu")
