@@ -1547,8 +1547,9 @@ ALLOWED_BARE_FIELDS = {
                   "t.id", "w.id"},
     # list.id: App.comboBox's own dropdown element id, built here as
     # `${input.id}-list` a few lines above the template that reads it back —
-    # never a server-supplied row field.
-    "app.js": {"c.key", "entry.html", "entry.title", "list.id"},
+    # never a server-supplied row field. item.href: ipPopoverItems' own
+    # buildRoute() output, not a row field either.
+    "app.js": {"c.key", "entry.html", "entry.title", "list.id", "item.href"},
     "configrx.js": {"device.ssh_port", "g.id", "ids.length", "r.rule_set_id",
                     "s.backup_interval_hours", "s.capture_timeout_s", "s.configrx_workers",
                     "s.retention_count_per_device", "s.retention_days"},
@@ -5073,6 +5074,33 @@ check("dac_count" in _REPORT106,
 _NODEPOLL106 = python_text("nodepoll")
 check("_DAC_TEXT" in _NODEPOLL106,
       "nodepoll's _decode.py defines the twinax/direct-attach regex")
+
+
+# ---------------------------------------------------------------------------
+# 107. IP actions popover: App.ipCell renders the address, the menu button
+#      and the four cross-module routes, escapes what it interpolates, and
+#      degrades to plain text in kiosk mode.
+IPCELL107 = js_function(APP, "ipCell")
+check('class="ip-menu"' in IPCELL107 and 'aria-haspopup="menu"' in IPCELL107,
+      "ipCell's button carries the ip-menu class and menu role")
+check("escapeHtml(shownText)" in IPCELL107 and "escapeHtml(addr)" in IPCELL107,
+      "ipCell escapes both the shown text and the raw address")
+check("if (state.kiosk) return escapeHtml(shownText);" in IPCELL107,
+      "ipCell degrades to escaped plain text in kiosk mode")
+ITEMS107 = js_function(APP, "ipPopoverItems")
+for route in ("'ipam'", "'syslog'", "'snmp'", "'netflow'"):
+    check(route in ITEMS107, "ipPopoverItems links %s" % route)
+OPEN107 = js_function(APP, "openIpPopover")
+check("el.setAttribute('role', 'menu')" in OPEN107,
+      "openIpPopover's popover carries role=menu")
+check("byIp.get(ip)" in OPEN107 and "'Device'" in OPEN107,
+      "openIpPopover appends a Device item once the index resolves")
+check("ArrowDown" in OPEN107 and "ArrowUp" in OPEN107 and "Escape" in OPEN107,
+      "openIpPopover's menu handles arrow-key roving and Escape")
+CSS107 = read("app.css")
+check(".ip-cell" in CSS107 and ".ip-actions" in CSS107,
+      "app.css styles the ip-cell button and its popover")
+check("'shell.ip'" in APP, "app.js registers the shell.ip help entry")
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))

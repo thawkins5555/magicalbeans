@@ -2877,6 +2877,20 @@ async function checkMisc(page, watcher) {
     return '';
   });
 
+  // App.ipCell's actions button: an empty table on a fresh demo run is not
+  // a failure, so this skips rather than asserts when Syslog has no rows.
+  await check('the IP actions popover opens and Escape closes it (Syslog)', async () => {
+    await selectTab(page, 'syslog');
+    await settle(page, 900);
+    const button = await page.$('.ip-menu');
+    if (!button) return 'skipped: no IP address rows on screen';
+    await button.click();
+    await page.waitForSelector('.ip-actions[role="menu"]', { timeout: 5000 });
+    await page.keyboard.press('Escape');
+    await page.waitForSelector('.ip-actions[role="menu"]', { state: 'detached', timeout: 5000 });
+    return '';
+  });
+
   // Two tables can share a column set — the interface list is drawn in the
   // Nodes pane and again inside the device dialog — and a reused <tr> is
   // MOVED when it is appended, not copied. A row cache keyed on the columns

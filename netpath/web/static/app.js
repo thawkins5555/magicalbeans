@@ -884,6 +884,117 @@ const App = (() => {
     return `<a class="linkish inline" href="${href}">${escapeHtml(text)}</a>`;
   }
 
+  /* An IP address with a jump-to-anywhere menu behind it: IPAM, Syslog,
+     SNMP Trap and NetFlow all key on the address itself, and Nodes does
+     when the address happens to be a known device. One button replaces the
+     ad hoc "open this in another tab" links each table used to grow on its
+     own. Kiosk drops straight to plain text — nobody is at the keyboard to
+     answer a popover. */
+  let ipPopover = null;
+  let ipPopoverButton = null;
+
+  function closeIpPopover(returnFocus = false) {
+    const button = ipPopoverButton;
+    if (ipPopover) { ipPopover.remove(); ipPopover = null; }
+    if (button) {
+      button.setAttribute('aria-expanded', 'false');
+      ipPopoverButton = null;
+      if (returnFocus) button.focus();
+    }
+  }
+
+  function positionIpPopover(el, button) {
+    const rect = button.getBoundingClientRect();
+    const box = el.getBoundingClientRect();
+    let x = rect.left;
+    let y = rect.bottom + 4;
+    if (x + box.width > window.innerWidth - 8) x = window.innerWidth - box.width - 8;
+    if (y + box.height > window.innerHeight - 8) y = rect.top - box.height - 4;
+    el.style.left = `${Math.max(x, 8)}px`;
+    el.style.top = `${Math.max(y, 8)}px`;
+  }
+
+  function ipPopoverItems(button) {
+    const ip = button.dataset.ip || '';
+    const t0 = button.dataset.t0 || '';
+    const t1 = button.dataset.t1 || '';
+    return [
+      { label: 'IPAM', href: buildRoute('ipam', [], { ip }) },
+      { label: 'Syslog', href: buildRoute('syslog', [], { source: ip, t0, t1 }) },
+      { label: 'SNMP Trap', href: buildRoute('snmp', [], { source: ip, t0, t1 }) },
+      { label: 'NetFlow', href: buildRoute('netflow', [], { ip, t0, t1 }) },
+    ];
+  }
+
+  async function openIpPopover(button) {
+    closeIpPopover();
+    const el = document.createElement('div');
+    el.className = 'ip-actions';
+    el.setAttribute('role', 'menu');
+    el.innerHTML = helpLink('shell.ip') + ipPopoverItems(button).map((item) =>
+      `<a role="menuitem" tabindex="-1" href="${item.href}">${escapeHtml(item.label)}</a>`).join('');
+    document.body.appendChild(el);
+    ipPopover = el;
+    ipPopoverButton = button;
+    button.setAttribute('aria-expanded', 'true');
+    positionIpPopover(el, button);
+    el.addEventListener('keydown', (event) => {
+      const items = [...el.querySelectorAll('[role="menuitem"]')];
+      const idx = items.indexOf(document.activeElement);
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeIpPopover(true);
+      } else if (event.key === 'ArrowDown') {
+        event.preventDefault();
+        items[(idx + 1) % items.length].focus();
+      } else if (event.key === 'ArrowUp') {
+        event.preventDefault();
+        items[(idx - 1 + items.length) % items.length].focus();
+      }
+    });
+    const first = el.querySelector('[role="menuitem"]');
+    if (first) first.focus();
+    const ip = button.dataset.ip || '';
+    const { byIp } = await deviceIndex();
+    const device = byIp.get(ip);
+    if (device && ipPopoverButton === button) {
+      const a = document.createElement('a');
+      a.setAttribute('role', 'menuitem');
+      a.tabIndex = -1;
+      a.href = buildRoute('nodes', ['device', device.id]);
+      a.textContent = 'Device';
+      el.appendChild(a);
+      positionIpPopover(el, button);
+    }
+  }
+
+  function wireIpPopover() {
+    document.addEventListener('click', (event) => {
+      const menuButton = event.target.closest('.ip-menu');
+      if (menuButton) {
+        event.stopPropagation();
+        if (ipPopoverButton === menuButton) closeIpPopover();
+        else openIpPopover(menuButton);
+        return;
+      }
+      if (event.target.closest('.ip-actions')) { closeIpPopover(); return; }
+      if (ipPopover) closeIpPopover();
+    });
+  }
+
+  function ipCell(ip, opts = {}) {
+    const addr = String(ip ?? '');
+    if (!addr) return '';
+    const shownText = opts.label ? String(opts.label) : addr;
+    if (state.kiosk) return escapeHtml(shownText);
+    const t0 = opts.t0 || '';
+    const t1 = opts.t1 || '';
+    return `<span class="ip-cell"><span class="mono">${escapeHtml(shownText)}</span>` +
+      `<button type="button" class="ip-menu" aria-label="Actions for ${escapeHtml(addr)}" ` +
+      `aria-haspopup="menu" aria-expanded="false" data-ip="${escapeHtml(addr)}" ` +
+      `data-t0="${escapeHtml(t0)}" data-t1="${escapeHtml(t1)}">⋯</button></span>`;
+  }
+
   /* The dangerous failure this replaces: a wall display that has lost its
      server looked exactly like a healthy fleet, distinguished only by the
      raw Chromium string "Failed to fetch" in low-contrast grey while two
@@ -6198,6 +6309,10 @@ const App = (() => {
   }
 
   async function start() {
+    registerHelp({ 'shell.ip': { title: 'IP address actions',
+      html: '<p>Every IP address has an actions button beside it: jump to '
+        + 'that address in IPAM, Syslog, SNMP Trap or NetFlow, or to its '
+        + 'device in Nodes when the fleet has one at that address.</p>' } });
     const bar = tabBar();
     if (bar) bar.setAttribute('role', 'tablist');
     for (const tab of stripTabs()) {
@@ -6234,6 +6349,7 @@ const App = (() => {
     }
     wireSubtabGroups();
     wireSubtabRouting();
+    wireIpPopover();
     const signout = document.getElementById('signout');
     if (signout) {
       signout.onclick = async () => {
@@ -6459,7 +6575,7 @@ const App = (() => {
     state, pages, selectTab, whenModuleReady, loadState, refreshNow,
     buildRoute, setRoute, currentRoute: parseRoute,
     get, post, put, del, saveCsv, exportCsv, download, deviceIndex, deviceLink,
-    deviceNameLink,
+    deviceNameLink, ipCell,
     clock, stamp, span, duration, ago, when, timeCell, agoCell, isoLocal,
     localInputValue,
     emptyText, stackedHistogram, plottedRange, filterBar, filterValues, clearFilters,

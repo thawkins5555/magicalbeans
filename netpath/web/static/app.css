@@ -1457,6 +1457,42 @@ body.resizing-h, body.resizing-h * { cursor: col-resize !important; user-select:
   max-width: 460px;
 }
 
+/* App.ipCell: an address plus its actions button (IPAM/Syslog/SNMP
+   Trap/NetFlow/Device), and the popover the button opens. */
+.ip-cell { display: inline-flex; align-items: center; gap: 4px; }
+.ip-menu {
+  border: none;
+  background: none;
+  color: var(--muted);
+  padding: 0 2px;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+}
+.ip-menu:hover, .ip-menu[aria-expanded="true"] { color: var(--text); background: var(--raised); }
+.ip-actions {
+  position: fixed;
+  z-index: var(--z-tooltip);
+  display: flex;
+  flex-direction: column;
+  min-width: 140px;
+  padding: 4px;
+  background: var(--raised);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-pop);
+}
+.ip-actions a[role="menuitem"] {
+  padding: var(--space-xs) var(--space-sm);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  text-decoration: none;
+}
+.ip-actions a[role="menuitem"]:hover, .ip-actions a[role="menuitem"]:focus {
+  background: var(--selected);
+  outline: none;
+}
+
 /* --------------------------------------------------------------- density */
 /* Everything below keeps a laptop usable: the panes are resizable, but the
    defaults should already fit rather than needing to be dragged first. */
