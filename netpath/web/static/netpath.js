@@ -445,7 +445,12 @@
     return (topo.silent_runs || []).map(([a, b]) => [a, b]);
   }
 
-  function drawRoute() {
+  /* Async so a hop whose address matches a Nodes device can be made to open
+     it: resolved once per draw, before anything is drawn, rather than once
+     per hop — the index itself is cached 30s by App.deviceIndex, so this is
+     a fast, usually-synchronous await after the first draw. */
+  async function drawRoute() {
+    const { byIp } = await App.deviceIndex();
     const svg = App.el('route-svg');
     svg.innerHTML = '';
     const topo = view.topology;
@@ -494,7 +499,7 @@
     nodeLayer.appendChild(nodeBox(0, -NODE_H / 2, {
       label: 'this host', hostname: '', rtt: null, share: 1,
       is_destination: false, is_timeout: false, refusal: null, eyebrow: 'Source',
-    }));
+    }, byIp));
     anchors.origin = { left: 0, right: NODE_W, y: 0 };
 
     slots.forEach((slot, index) => {
@@ -523,7 +528,7 @@
       }, `HOP ${slot.ttl}`));
       for (const key of keys) {
         const node = byKey[key];
-        nodeLayer.appendChild(nodeBox(x, y, node));
+        nodeLayer.appendChild(nodeBox(x, y, node, byIp));
         anchors[key] = { left: x, right: x + NODE_W, y: y + NODE_H / 2 };
         keyToId[key] = key;
         y += NODE_H + ROW_GAP;
@@ -625,7 +630,7 @@
     element.addEventListener('blur', App.hideTooltip);
   }
 
-  function nodeBox(x, y, node) {
+  function nodeBox(x, y, node, byIp) {
     const g = App.svgNode('g', { transform: `translate(${x},${y})` });
     const mtr = mtrSeverity(node, currentTarget());
     let border = 'var(--canvas-hairline)', accent = 'var(--canvas-accent)';
@@ -716,7 +721,22 @@
       if (mtr === 'fail') tip.push('Continuous probing: HIGH LOSS');
       else if (mtr === 'warn') tip.push('Continuous probing: degraded (over the warn threshold)');
     }
+    const device = byIp && node.label ? byIp.get(node.label) : undefined;
+    if (device) tip.push('Click to open device');
     attachTip(g, tip.join('\n'));
+    if (device) {
+      g.style.cursor = 'pointer';
+      g.setAttribute('role', 'link');
+      g.setAttribute('tabindex', '0');
+      g.setAttribute('aria-label', `Open device ${device.name || device.sys_name || node.label}`);
+      const open = () => { window.location.hash = App.buildRoute('nodes', ['device', device.id]); };
+      g.addEventListener('click', () => { if (!view.dragMoved) open(); });
+      g.addEventListener('keydown', (event) => {
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        event.preventDefault();
+        open();
+      });
+    }
     return g;
   }
 

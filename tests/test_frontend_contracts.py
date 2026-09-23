@@ -5458,6 +5458,28 @@ check(NODES107.count("App.ipCell(r.ip, {})") >= 2,
 
 
 # ---------------------------------------------------------------------------
+# 109. Route hops open the device: drawRoute resolves App.deviceIndex once
+#      per draw and nodeBox makes a hop whose address matches a device a
+#      real link into it.
+NETPATH109 = read("netpath.js")
+check("async function drawRoute()" in NETPATH109
+      and "const { byIp } = await App.deviceIndex();" in NETPATH109,
+      "drawRoute resolves the device index once, before drawing")
+_NODEBOX109 = js_function(NETPATH109, "nodeBox")
+check("function nodeBox(x, y, node, byIp)" in NETPATH109,
+      "nodeBox takes the resolved index")
+check("g.setAttribute('role', 'link');" in _NODEBOX109
+      and "g.setAttribute('tabindex', '0');" in _NODEBOX109
+      and "Open device ${device.name" in _NODEBOX109,
+      "a hop that matches a device gets a link role, a tab stop and a named "
+      "accessible label")
+check("Click to open device" in _NODEBOX109,
+      "...and its tooltip says so")
+check("App.buildRoute('nodes', ['device', device.id])" in _NODEBOX109,
+      "...opening the same #/nodes/device/<id> route every other cross-tab "
+      "device link uses")
+
+# ---------------------------------------------------------------------------
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:
