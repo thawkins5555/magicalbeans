@@ -887,10 +887,10 @@
     for (const btn of box.querySelectorAll('.aw-delete')) {
       btn.onclick = () => {
         const w = (windows || []).find((x) => String(x.id) === btn.dataset.id);
-        App.confirmDestructive('Delete maintenance window',
-          `<p>Delete <b>${escape(w ? w.name : 'this window')}</b>?</p>` +
+        App.confirmDestructive('Remove maintenance window',
+          `<p>Remove <b>${escape(w ? w.name : 'this window')}</b>?</p>` +
           '<p class="hint">Alerts for its covered devices resume the moment ' +
-          'this is deleted, if the window is currently active.</p>', 'Delete',
+          'this is removed, if the window is currently active.</p>', 'Remove',
           () => App.del(`/api/alerts/windows/${btn.dataset.id}`, {}),
           () => windowsDialog());
       };

@@ -1469,9 +1469,9 @@
   }
 
   function deleteRuleConfirm(ruleId, description) {
-    App.confirmDestructive('Delete rule',
-      `<p>Delete the rule <b>${escape(description)}</b>?</p>`,
-      'Delete',
+    App.confirmDestructive('Remove rule',
+      `<p>Remove the rule <b>${escape(description)}</b>?</p>`,
+      'Remove',
       async () => {
         await App.del(`/api/configrx/rule-sets/${view.selectedRuleSetId}/rules/${ruleId}`, {});
         await loadRuleSetDetail(view.selectedRuleSetId);

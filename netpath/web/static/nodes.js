@@ -634,10 +634,10 @@
     // confirmDestructive is the shape that cannot do that: it closes only
     // after the request has come back, and leaves the dialog open saying
     // why when it does not.
-    App.confirmDestructive('Delete devices',
+    App.confirmDestructive('Remove devices',
       `<p>Remove <b>${ids.length}</b> device(s)? This deletes their interfaces, ` +
       `metric history and events.</p>${list}`,
-      'Delete',
+      'Remove',
       () => App.post('/api/nodes/devices/bulk-delete', { device_ids: ids }),
       (confirmed) => {
         if (!confirmed) return;
@@ -4777,9 +4777,9 @@
   }
 
   function removeSchedule(id, name) {
-    App.confirmDestructive('Delete scheduled report',
-      `<p>Delete <b>${escape(name)}</b>? This does not affect reports already sent.</p>`,
-      'Delete', async () => {
+    App.confirmDestructive('Remove scheduled report',
+      `<p>Remove <b>${escape(name)}</b>? This does not affect reports already sent.</p>`,
+      'Remove', async () => {
         await App.del(`/api/nodes/reports/schedules/${id}`);
         loadReportSchedules().catch(() => {});
       });

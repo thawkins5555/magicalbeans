@@ -5633,6 +5633,23 @@ check("problemsEl && problemsEl.checked" in _DRAWTABLE117
 check("if (App.el('nd-problems')) App.el('nd-problems').onchange = drawTable;" in NODES117,
       "wiring is defensive against a missing element")
 
+# ---------------------------------------------------------------------------
+# 108. Verb rule: Remove takes something out of monitoring or configuration,
+#      Delete destroys stored data. The four confirms that used the wrong
+#      verb, and the two that rightly keep Delete.
+NODES108 = read("nodes.js")
+check("App.confirmDestructive('Remove devices'," in NODES108
+      and "App.confirmDestructive('Remove scheduled report'," in NODES108,
+      "bulk device removal and scheduled-report removal say Remove")
+check("App.confirmDestructive('Remove maintenance window'," in read("alerts.js"),
+      "maintenance-window removal says Remove")
+CONFIGRX108 = read("configrx.js")
+check("App.confirmDestructive('Remove rule'," in CONFIGRX108
+      and "App.confirmDestructive('Delete rule set'," in CONFIGRX108,
+      "a compliance rule is removed; a rule set (stored data) is deleted")
+check('id="nd-bulk-delete" data-requires-write="nodes">Remove</button>' in read("index.html"),
+      "the Nodes bulk button says Remove")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:
