@@ -106,6 +106,7 @@
     <button id="nd-manage-devgroups" data-requires-write="nodes">Manage groups</button>
     <button id="nd-duplicates">Duplicates</button>
     <button id="nd-toggle" data-requires-write="nodes">Start poller</button>
+    <button type="button" class="module-refresh" aria-label="Refresh Nodes">Refresh</button>
     <button id="nd-settings" class="module-settings" data-requires-write="nodes">Settings</button>
   </div>
   <!-- Offers the discovery approval dialog rather than forcing it open on
@@ -507,6 +508,7 @@
     <span class="grow"></span>
     <button id="alerts-ack-all" data-requires-write="alerts">Acknowledge all</button>
     <button id="alerts-toggle" data-requires-write="alerts">Start alert engine</button>
+    <button type="button" class="module-refresh" aria-label="Refresh Alerts">Refresh</button>
     <button id="alerts-settings" class="module-settings" data-requires-write="alerts">Settings</button>
   </div>
 
@@ -597,6 +599,7 @@
  <div class="card strip" role="toolbar" aria-label="Routes controls">
    <span class="grow"></span>
    <button type="button" id="netpath-print" aria-pressed="false">Print</button>
+   <button type="button" class="module-refresh" aria-label="Refresh Routes">Refresh</button>
    <button id="netpath-settings" class="module-settings" data-requires-write="netpath">Settings</button>
  </div>
  <div class="cols" data-splitter="netpath-main">
@@ -678,6 +681,7 @@
     <span class="grow"></span>
     <button id="nf-test" data-requires-write="netflow">Send test packet</button>
     <button id="nf-toggle" data-requires-write="netflow">Start collector</button>
+    <button type="button" class="module-refresh" aria-label="Refresh NetFlow">Refresh</button>
     <button id="nf-settings" class="module-settings" data-requires-write="netflow">Settings</button>
   </div>
 
@@ -745,6 +749,7 @@
     <span class="grow"></span>
     <button id="sn-test" data-requires-write="snmp">Send test trap</button>
     <button id="sn-toggle" data-requires-write="snmp">Start receiver</button>
+    <button type="button" class="module-refresh" aria-label="Refresh SNMP Trap">Refresh</button>
     <button id="sn-settings" class="module-settings" data-requires-write="snmp">Settings</button>
   </div>
 
@@ -807,6 +812,7 @@
     <span class="grow"></span>
     <button id="sl-test" data-requires-write="syslog">Send test message</button>
     <button id="sl-toggle" data-requires-write="syslog">Start collector</button>
+    <button type="button" class="module-refresh" aria-label="Refresh Syslog">Refresh</button>
     <button id="sl-settings" class="module-settings" data-requires-write="syslog">Settings</button>
   </div>
 
@@ -870,6 +876,7 @@
     <button id="ipam-search-btn">Search</button>
     <span class="grow"></span>
     <button id="ipam-toggle" data-requires-write="ipam">Start worker</button>
+    <button type="button" class="module-refresh" aria-label="Refresh IPAM">Refresh</button>
     <button id="ipam-settings" class="module-settings" data-requires-write="ipam">Settings</button>
   </div>
 
@@ -977,6 +984,7 @@
     <span class="grow"></span>
     <button id="wl-controllers" data-requires-write="wireless">Controllers</button>
     <button id="wl-toggle" data-requires-write="wireless">Start poller</button>
+    <button type="button" class="module-refresh" aria-label="Refresh Forti-AP">Refresh</button>
     <button id="wl-settings" class="module-settings" data-requires-write="wireless">Settings</button>
   </div>
 
@@ -1046,6 +1054,7 @@
     <span id="cx-counters" class="hint"></span>
     <span class="grow"></span>
     <button id="cx-toggle" data-requires-write="configrx">Start worker</button>
+    <button type="button" class="module-refresh" aria-label="Refresh ConfigRX">Refresh</button>
     <button id="cx-settings" class="module-settings" data-requires-write="configrx">Settings</button>
   </div>
 

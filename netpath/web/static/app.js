@@ -6540,6 +6540,13 @@ const App = (() => {
     wireIpPopover();
     wirePrintToggle('netpath-print', 'route-canvas');
     wirePrintToggle('mp-print', 'mp-canvas');
+    // Every module strip's manual refresh, one delegated handler: refreshes
+    // whichever tab is current, which is always the one the click came
+    // from. Dashboard and Mapper keep their own refresh buttons, wired by
+    // their own modules, not this class.
+    document.addEventListener('click', (event) => {
+      if (event.target.closest('.module-refresh')) refreshNow();
+    });
     const signout = document.getElementById('signout');
     if (signout) {
       signout.onclick = async () => {

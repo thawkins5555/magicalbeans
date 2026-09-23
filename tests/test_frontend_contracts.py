@@ -5337,6 +5337,26 @@ check('<input type="checkbox" id="nd-problems"> Problems only' in INDEX,
 check("{ key: 'severity', label: 'Sev', width: 90," in read("alerts.js"),
       "alerts.js's Sev column is 90px wide")
 
+
+# ---------------------------------------------------------------------------
+# 124. Manual refresh: every module strip that lacked one (Alerts, Nodes,
+#      IPAM, Forti-AP, ConfigRX, Routes, NetFlow, Syslog, SNMP Trap) gets a
+#      .module-refresh button immediately before its Settings button, and
+#      one delegated handler calls App.refreshNow(). Dashboard and Mapper
+#      keep their own.
+check(INDEX.count('class="module-refresh"') == 9,
+      "nine module strips carry a .module-refresh button")
+for module in ("Nodes", "Alerts", "Routes", "NetFlow", "SNMP Trap", "Syslog",
+               "IPAM", "Forti-AP", "ConfigRX"):
+    marker = 'aria-label="Refresh %s">Refresh</button>' % module
+    check(marker in INDEX, "the %s strip's refresh button reads %r" % (module, marker))
+    _after = INDEX[INDEX.index(marker):INDEX.index(marker) + 200]
+    check('class="module-settings"' in _after,
+          "%s's refresh button sits immediately before its Settings button" % module)
+START124 = js_function(APP, "start")
+check("event.target.closest('.module-refresh')" in START124 and "refreshNow();" in START124,
+      "start() delegates .module-refresh clicks to App.refreshNow()")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

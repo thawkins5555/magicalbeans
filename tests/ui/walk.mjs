@@ -2891,6 +2891,22 @@ async function checkMisc(page, watcher) {
     return '';
   });
 
+  await check('every module strip that should have a manual refresh has one',
+    async () => {
+      const counts = await page.evaluate(() => {
+        const modules = ['nodes', 'alerts', 'netpath', 'netflow', 'snmp',
+          'syslog', 'ipam', 'wireless', 'configrx'];
+        return modules.map((tab) => ({
+          tab,
+          n: document.querySelectorAll(`#page-${tab} .module-refresh`).length,
+        }));
+      });
+      const wrong = counts.filter((c) => c.n !== 1);
+      assert(wrong.length === 0,
+             `strips without exactly one .module-refresh: ${JSON.stringify(wrong)}`);
+      return `${counts.length} strips checked`;
+    });
+
   await check('the Print toggle exists on both Routes and Mapper', async () => {
     await selectTab(page, 'netpath');
     await settle(page, 500);
