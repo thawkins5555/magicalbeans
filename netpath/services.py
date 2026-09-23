@@ -138,9 +138,9 @@ def port_name(port: int, resolve: bool = True) -> str:
 def format_bytes(value: float) -> str:
     value = float(value or 0)
     for unit in ("B", "KB", "MB", "GB", "TB"):
-        if value < 1024 or unit == "TB":
+        if value < 1000 or unit == "TB":
             return f"{value:.1f} {unit}" if unit != "B" else f"{value:.0f} B"
-        value /= 1024
+        value /= 1000
     return f"{value:.1f} TB"
 
 
