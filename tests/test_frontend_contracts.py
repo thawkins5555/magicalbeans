@@ -5101,6 +5101,12 @@ for route in ("'ipam'", "'syslog'", "'snmp'", "'netflow'"):
 check("{ src: ip, t0, t1 }" in ITEMS107 and "{ dst: ip, t0, t1 }" in ITEMS107,
       "the popover offers NetFlow both from and to the address (the flow "
       "filter has no either-side match)")
+check("typeof pages[state.tab].ipWindow === 'function'" in ITEMS107,
+      "ipPopoverItems reads the time window live from the active page at "
+      "open time, not from a baked-in cell attribute")
+check('data-t0' not in IPCELL107 and 'data-t1' not in IPCELL107,
+      "ipCell no longer bakes the time window into the cell, so a live "
+      "table's re-render cannot detach an open popover")
 check("opts.label === '' ? ''" in IPCELL107,
       "an empty label renders the actions button alone, for cells that "
       "already print the address")

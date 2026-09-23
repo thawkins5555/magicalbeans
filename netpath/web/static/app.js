@@ -948,8 +948,10 @@ const App = (() => {
 
   function ipPopoverItems(button) {
     const ip = button.dataset.ip || '';
-    const t0 = button.dataset.t0 || '';
-    const t1 = button.dataset.t1 || '';
+    const win = pages[state.tab] && typeof pages[state.tab].ipWindow === 'function'
+      ? pages[state.tab].ipWindow() || {} : {};
+    const t0 = win.t0 || '';
+    const t1 = win.t1 || '';
     return [
       { label: 'IPAM', href: buildRoute('ipam', [], { ip }) },
       { label: 'Syslog', href: buildRoute('syslog', [], { source: ip, t0, t1 }) },
@@ -1021,12 +1023,10 @@ const App = (() => {
     // label '' means the caller already printed the address: button only.
     const shownText = opts.label === '' ? '' : (opts.label ? String(opts.label) : addr);
     if (state.kiosk) return escapeHtml(shownText);
-    const t0 = opts.t0 || '';
-    const t1 = opts.t1 || '';
+    // opts.t0/t1 accepted but unused: the window is read live from the page at open time (see ipPopoverItems).
     return `<span class="ip-cell">${shownText ? `<span class="mono">${escapeHtml(shownText)}</span>` : ''}` +
       `<button type="button" class="ip-menu" aria-label="Actions for ${escapeHtml(addr)}" ` +
-      `aria-haspopup="menu" aria-expanded="false" data-ip="${escapeHtml(addr)}" ` +
-      `data-t0="${escapeHtml(t0)}" data-t1="${escapeHtml(t1)}">⋯</button></span>`;
+      `aria-haspopup="menu" aria-expanded="false" data-ip="${escapeHtml(addr)}">⋯</button></span>`;
   }
 
   /* The dangerous failure this replaces: a wall display that has lost its
