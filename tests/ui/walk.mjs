@@ -2853,9 +2853,9 @@ async function checkOfflineBanner(context, page) {
       null, { timeout: 25000 });
     const conn = await page.evaluate(
       () => document.getElementById('conn').textContent);
-    assert(/reconnected/i.test(conn) || conn === '',
+    assert(/reconnected/i.test(conn) || /^updated \d{2}:\d{2}:\d{2}$/.test(conn),
            `the indicator reads "${conn}"`);
-    return conn || '(cleared)';
+    return conn;
   });
 
   await check('a hidden tab stops polling', async () => {

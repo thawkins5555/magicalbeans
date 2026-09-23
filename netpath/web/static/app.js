@@ -1067,19 +1067,21 @@ const App = (() => {
         announce('Reconnected to the SappiWhere server — data is current');
       }
       if (Date.now() < reconnectedUntil) {
+        // The 5s "reconnected" message keeps priority over the plain clock.
         el.textContent = 'reconnected — data is current';
-        el.classList.remove('bad');
+        el.classList.remove('bad', 'conn-updated');
         el.classList.add('good');
       } else {
-        el.textContent = '';
+        el.textContent = `updated ${clock(lastGoodTs)}`;
         el.classList.remove('bad', 'good');
+        el.classList.add('conn-updated');
       }
       return;
     }
 
     missedCycles += 1;
     reconnectedUntil = 0;
-    el.classList.remove('good');
+    el.classList.remove('good', 'conn-updated');
     el.classList.add('bad');
     // Operator language, not the browser's. `message` still reaches the
     // title so the underlying failure is one hover away.

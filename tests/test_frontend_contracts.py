@@ -5190,6 +5190,23 @@ check("sessionStorage.getItem('sappiwhere.mustChange')" in START112
 check("if (payload.session.must_change && !state.promptedChange) promptForcedPasswordChange();" in APP,
       "the state poll's own must_change path shares the same opener")
 
+
+# ---------------------------------------------------------------------------
+# 113. An always-visible "updated HH:MM:SS": connected()'s healthy branch
+#      leaves a dim clock behind instead of going blank, except during the
+#      5s "reconnected" message, which keeps priority.
+CONNECTED113 = js_function(APP, "connected")
+check("el.textContent = `updated ${clock(lastGoodTs)}`;" in CONNECTED113,
+      "connected() leaves a dim clock behind on a healthy poll")
+check("el.classList.add('conn-updated');" in CONNECTED113,
+      "connected() marks the clock text with conn-updated")
+check(CONNECTED113.index("reconnected — data is current")
+      < CONNECTED113.index("updated ${clock(lastGoodTs)}"),
+      "the reconnected message is checked before the plain clock, so it keeps priority")
+CSS113 = read("app.css")
+check(".conn.conn-updated { color: var(--dim); }" in CSS113,
+      "app.css dims the updated-clock text")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

@@ -485,6 +485,9 @@ button.linkish:hover, a.linkish:hover { color: var(--accent); }
 button.linkish.inline { padding: 0; font-size: inherit; text-decoration: underline; }
 .conn.bad { color: var(--fail); }
 .conn.good { color: var(--ok); }
+/* The plain "updated HH:MM:SS" a healthy poll leaves behind — dim, so it
+   reads as ambient rather than competing with .bad/.good for attention. */
+.conn.conn-updated { color: var(--dim); }
 
 /* Stale content is dimmed rather than hidden: the operator may still want to
    read the last known state, but must never mistake it for the current one.
