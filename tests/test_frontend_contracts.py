@@ -5656,6 +5656,14 @@ check("App.confirmDestructive('Remove rule'," in CONFIGRX108
 check('id="nd-bulk-delete" data-requires-write="nodes">Remove</button>' in read("index.html"),
       "the Nodes bulk button says Remove")
 
+# ---------------------------------------------------------------------------
+# 128. Row keydown yields to a focusable control inside the row (the IP
+#      popover's ⋯ button) instead of intercepting its Enter/Space first.
+WRK128 = js_function(APP, "wireRowKeyboard")
+check("if (event.target !== tr) return;" in WRK128,
+      "wireRowKeyboard's row keydown only acts when the row itself has "
+      "focus, so a button inside the row gets its own Enter/Space")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

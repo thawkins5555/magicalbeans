@@ -5478,6 +5478,9 @@ const App = (() => {
       if (tr.dataset.keyboardWired) continue;
       tr.dataset.keyboardWired = '1';
       tr.addEventListener('keydown', (event) => {
+        // Let a focusable control inside the row (e.g. its ⋯ button) handle
+        // its own Enter/Space instead of the row intercepting it first.
+        if (event.target !== tr) return;
         if (event.key === 'Enter') {
           event.preventDefault();     // Space would scroll the pane instead
           tr.click();
