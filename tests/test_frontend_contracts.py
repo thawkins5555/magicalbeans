@@ -5420,6 +5420,9 @@ check("href=\"#/nodes\"" in GS127 and "href=\"#/netpath\"" in GS127,
       "drawGetStarted links Start poller (#/nodes) and Add destination (#/netpath)")
 check("App.el('nd-add-device')" in GS127 and "App.whenModuleReady('nodes')" in GS127,
       "the Add a device button waits for Nodes then opens #nd-add-device")
+check('id="dash-gs-add" data-requires-write="nodes"' in GS127,
+      "the Add a device button is gated for read-only accounts, like every "
+      "other write control")
 check(INDEX.index('id="dash-get-started"') < INDEX.index('id="dash-grid"'),
       "#dash-get-started sits above #dash-grid in index.html")
 DRAW127 = js_function(DASHBOARD101, "draw")

@@ -1170,7 +1170,7 @@
       return;
     }
     root.innerHTML = `<div class="card get-started"><p>No devices yet.
-      <button type="button" class="linkish inline" id="dash-gs-add">Add a device</button>,
+      <button type="button" class="linkish inline" id="dash-gs-add" data-requires-write="nodes">Add a device</button>,
       then <a class="linkish inline" href="#/nodes">start the poller</a> to begin monitoring
       — or <a class="linkish inline" href="#/netpath">add a destination</a> to trace a route.</p></div>`;
     App.el('dash-gs-add').onclick = async () => {
