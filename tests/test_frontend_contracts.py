@@ -5664,6 +5664,15 @@ check("if (event.target !== tr) return;" in WRK128,
       "wireRowKeyboard's row keydown only acts when the row itself has "
       "focus, so a button inside the row gets its own Enter/Space")
 
+# ---------------------------------------------------------------------------
+# 129. setRoute keeps the address bar's current query when called without
+#      one (a row selection), so it cannot wipe filters syncFilterRoute
+#      wrote; an explicit {} still clears it.
+SETROUTE129 = js_function(APP, "setRoute")
+check("query === undefined ? parseRoute().query : query" in SETROUTE129,
+      "setRoute falls back to parseRoute().query only when query is "
+      "undefined, not when it is an explicit {}")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

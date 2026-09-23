@@ -5890,7 +5890,10 @@ const App = (() => {
   /* Called by a module when its own selection changes. Always a replace:
      only a tab change is worth a history entry. */
   function setRoute(parts, query, options = {}) {
-    writeRoute(buildRoute(state.tab, parts, query), options);
+    // undefined keeps whatever filters are already in the address bar (a
+    // row selection should not wipe what syncFilterRoute wrote); {} clears.
+    const q = query === undefined ? parseRoute().query : query;
+    writeRoute(buildRoute(state.tab, parts, q), options);
   }
 
   /* Keeps a tab's filters in the address bar, so the current search is a
