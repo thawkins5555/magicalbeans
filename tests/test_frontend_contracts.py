@@ -5323,6 +5323,13 @@ check("wirePrintToggle('netpath-print', 'route-canvas');" in APP
       and "wirePrintToggle('mp-print', 'mp-canvas');" in APP,
       "both Print toggles are wired at start()")
 
+
+# ---------------------------------------------------------------------------
+# 122. Nodes "Problems only" checkbox markup (index.html), beside the Status
+#      filter -- unwired here; nodes.js wires it.
+check('<input type="checkbox" id="nd-problems"> Problems only' in INDEX,
+      "the Nodes strip carries an unwired #nd-problems checkbox")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:
