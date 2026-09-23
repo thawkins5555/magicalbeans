@@ -5730,6 +5730,15 @@ check("'button, input, select, a[href]'" in TOOLBAR131,
 START125 = js_function(APP, "start")
 check("wireToolbarKeyboard();" in START125,
       "start() wires the toolbar keyboard handler once")
+# ---------------------------------------------------------------------------
+# 118. NetFlow Source/Destination cells: an unresolved name is '' from the
+#      collector, not a caller-chosen "button only" — falling back to
+#      undefined lets ipCell show the address instead of hiding it.
+NETFLOW118 = read("netflow.js")
+check("label: r.src_name || undefined }" in NETFLOW118
+      and "label: r.dst_name || undefined }" in NETFLOW118,
+      "an empty/unresolved src_name or dst_name falls back to the address, "
+      "not to a button-only cell")
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))
