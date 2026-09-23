@@ -1840,6 +1840,36 @@ const App = (() => {
     return Boolean(wrap) && !wrap.hidden && modalToken() === token;
   }
 
+  /* A plain {key: value} snapshot of every field in the open dialog —
+     checkbox/radio by their `checked` state, everything else by `.value` —
+     keyed on id where a field has one, else its name. modalFormRestore
+     writes one back by the same keys, skipping any field the snapshot
+     names that is no longer there. */
+  function modalFormSnapshot() {
+    const box = document.getElementById('modal-box');
+    const out = {};
+    if (!box) return out;
+    for (const field of box.querySelectorAll('input, select, textarea')) {
+      const key = field.id || field.name;
+      if (!key) continue;
+      out[key] = (field.type === 'checkbox' || field.type === 'radio')
+        ? field.checked : field.value;
+    }
+    return out;
+  }
+
+  function modalFormRestore(snapshot) {
+    const box = document.getElementById('modal-box');
+    if (!box || !snapshot) return;
+    for (const [key, value] of Object.entries(snapshot)) {
+      const field = box.querySelector(`#${CSS.escape(key)}`)
+        || box.querySelector(`[name="${CSS.escape(key)}"]`);
+      if (!field) continue;
+      if (field.type === 'checkbox' || field.type === 'radio') field.checked = !!value;
+      else field.value = value;
+    }
+  }
+
   const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]),' +
     ' select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
@@ -6601,7 +6631,7 @@ const App = (() => {
     emptyText, stackedHistogram, plottedRange, filterBar, filterValues, clearFilters,
     timeZoneLabel, timeZoneTitle, countLabel,
     bytes, rate, formatMac, fillRanges, wheelWindow, extraCounterParts,
-    modal, modalToken, modalIsCurrent, pollWhileModal,
+    modal, modalToken, modalIsCurrent, pollWhileModal, modalFormSnapshot, modalFormRestore,
     closeModal, requestCloseModal, confirmDestructive, el, svgNode,
     setText, setHtml, setBg, setHidden, strip, wireToggle,
     tooltip, hideTooltip, toast, showModalError, clearModalError, requireFields,

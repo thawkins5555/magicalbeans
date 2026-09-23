@@ -5119,6 +5119,22 @@ check("'alerts-apply'" in ALERTS_INIT108 and "'alerts-clear'" in ALERTS_INIT108
       and "syncFilterRoute" in ALERTS_INIT108[ALERTS_INIT108.index("'alerts-apply'"):],
       "alerts.js reports its route back from both Apply and Clear")
 
+
+# ---------------------------------------------------------------------------
+# 109. Form snapshot helpers: App.modalFormSnapshot/modalFormRestore read
+#      and write every #modal-box field by id or name, checkboxes/radios by
+#      their checked state.
+SNAP109 = js_function(APP, "modalFormSnapshot")
+check("field.type === 'checkbox' || field.type === 'radio'" in SNAP109,
+      "modalFormSnapshot reads a checkbox/radio's checked state")
+check("field.id || field.name" in SNAP109,
+      "modalFormSnapshot keys a field on its id, falling back to its name")
+RESTORE109 = js_function(APP, "modalFormRestore")
+check("if (!field) continue;" in RESTORE109,
+      "modalFormRestore skips a key with no matching field")
+check("modalFormSnapshot, modalFormRestore" in APP,
+      "modalFormSnapshot/modalFormRestore are exported on App")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:
