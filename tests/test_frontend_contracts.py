@@ -5102,6 +5102,23 @@ check(".ip-cell" in CSS107 and ".ip-actions" in CSS107,
       "app.css styles the ip-cell button and its popover")
 check("'shell.ip'" in APP, "app.js registers the shell.ip help entry")
 
+
+# ---------------------------------------------------------------------------
+# 108. Filters in the address bar: App.syncFilterRoute reads named inputs
+#      into a replaceState query, and Alerts' Apply/Clear buttons report
+#      back to it.
+SYNCROUTE108 = js_function(APP, "syncFilterRoute")
+check("document.getElementById(id)" in SYNCROUTE108,
+      "syncFilterRoute reads each input by its id")
+check("setRoute(parts !== undefined ? parts : parseRoute().parts, query)" in SYNCROUTE108,
+      "syncFilterRoute defaults to the current route's parts and replaces, not pushes")
+ALERTS_INIT108 = js_function(read("alerts.js"), "init")
+check("App.syncFilterRoute('alerts'" in ALERTS_INIT108,
+      "alerts.js's init wires syncFilterRoute")
+check("'alerts-apply'" in ALERTS_INIT108 and "'alerts-clear'" in ALERTS_INIT108
+      and "syncFilterRoute" in ALERTS_INIT108[ALERTS_INIT108.index("'alerts-apply'"):],
+      "alerts.js reports its route back from both Apply and Clear")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

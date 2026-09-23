@@ -2214,6 +2214,18 @@
       clears: ['alerts-filter-device', 'alerts-filter-text', 'alerts-filter-sev',
                'alerts-filter-state', 'alerts-filter-rule'],
     });
+    // The address bar carries the same four filters activate() reads back
+    // (above), so a link into a search is exact. Added rather than assigned:
+    // filterBar's own onclick (refresh, or clear-then-refresh) still has to
+    // run first — Clear must empty the fields before this reads them.
+    const syncFilterRoute = () => App.syncFilterRoute('alerts', {
+      state: 'alerts-filter-state', severity: 'alerts-filter-sev',
+      device: 'alerts-filter-device', q: 'alerts-filter-text',
+    });
+    for (const id of ['alerts-apply', 'alerts-clear']) {
+      const btn = App.el(id);
+      if (btn) btn.addEventListener('click', syncFilterRoute);
+    }
     // filterBar wired a plain refresh to alerts-range's change above; this
     // replaces that handler (same element, last assignment wins) so
     // "Custom…" opens the range dialog instead of asking window_() to parse

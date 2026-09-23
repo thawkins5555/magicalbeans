@@ -5754,7 +5754,10 @@ const App = (() => {
      inside a tab is a replaceState, so clicking down a list does not cost
      forty presses of Back. Modules take a route through `activate(opts)` and
      report a selection back with App.setRoute(); one that implements neither
-     still works, with no routes deeper than its own tab. */
+     still works, with no routes deeper than its own tab. A filter bar
+     reports back with App.syncFilterRoute(tab, keysToIds) instead — same
+     replaceState, built from the named inputs rather than a caller-built
+     parts/query pair. */
 
   const ROUTE_TABS = ['dashboard', 'nodes', 'alerts', 'netpath', 'netflow',
                       'snmp', 'syslog', 'ipam', 'wireless', 'configrx',
@@ -5795,6 +5798,23 @@ const App = (() => {
      only a tab change is worth a history entry. */
   function setRoute(parts, query, options = {}) {
     writeRoute(buildRoute(state.tab, parts, query), options);
+  }
+
+  /* Keeps a tab's filters in the address bar, so the current search is a
+     link rather than something only this browser's localStorage knows. A
+     filter change is a replace, same as setRoute above — Back should not
+     have to walk through every intermediate severity a search was
+     narrowed by. `keysToIds` is a `{queryKey: inputId}` map; `parts`
+     defaults to whatever the address bar already names past the tab, so a
+     filter applied on a subtab or a selection does not throw that away. */
+  function syncFilterRoute(tab, keysToIds, parts) {
+    const query = {};
+    for (const [key, id] of Object.entries(keysToIds)) {
+      const field = document.getElementById(id);
+      if (!field || !field.value) continue;
+      query[key] = field.value;
+    }
+    setRoute(parts !== undefined ? parts : parseRoute().parts, query);
   }
 
   function writeRoute(hash, options = {}) {
@@ -6573,7 +6593,7 @@ const App = (() => {
      inside this file is not listed here — it stays where it is, private. */
   const api = {
     state, pages, selectTab, whenModuleReady, loadState, refreshNow,
-    buildRoute, setRoute, currentRoute: parseRoute,
+    buildRoute, setRoute, syncFilterRoute, currentRoute: parseRoute,
     get, post, put, del, saveCsv, exportCsv, download, deviceIndex, deviceLink,
     deviceNameLink, ipCell,
     clock, stamp, span, duration, ago, when, timeCell, agoCell, isoLocal,
