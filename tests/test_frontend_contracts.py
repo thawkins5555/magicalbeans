@@ -5292,6 +5292,17 @@ check("scrollbar-color: var(--line) var(--panel)"
       in re.search(r"^#page-settings \.scroll \{([^}]*)\}", CSS119, re.M).group(1),
       "the folded #page-settings .scroll block still carries its scrollbar colours")
 
+
+# ---------------------------------------------------------------------------
+# 120. Ticked rows keep readable status text: .sev/.status-mark/.status-text
+#      go back to --text inside a tr.bulk-checked row, the class app.js,
+#      alerts.js, configrx.js and nodes.js all draw a ticked row with.
+CSS120 = read("app.css")
+check("tr.bulk-checked .sev, tr.bulk-checked .status-mark, tr.bulk-checked .status-text {"
+      in CSS120 and "color: var(--text);" in CSS120.split(
+        "tr.bulk-checked .sev, tr.bulk-checked .status-mark, tr.bulk-checked .status-text {")[1][:40],
+      "app.css restores --text for .sev/.status-mark/.status-text in a bulk-checked row")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

@@ -1056,6 +1056,12 @@ tr.selected td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
    Nodes, Alerts and ConfigRX, which all use the same class. */
 tr.bulk-checked td { background: var(--checked); }
 tr.bulk-checked.selected td { background: var(--checked-strong); }
+/* Same tinted-text problem tr.alert-severe solves below, for the ticked
+   state: --checked/--checked-strong can sit close enough to a severity or
+   status colour to wash it out. All three go back to --text here. */
+tr.bulk-checked .sev, tr.bulk-checked .status-mark, tr.bulk-checked .status-text {
+  color: var(--text);
+}
 /* Outranks .selected/.bulk-checked on specificity so a revealDevice() target still stands out. */
 table.grid tr.revealed td { background: var(--reveal); }
 /* Priority port: faint accent wash, mixed against --panel so the zebra stripe does not show through. */
