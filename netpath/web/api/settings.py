@@ -274,6 +274,15 @@ def _check_configrx_settings(values: dict) -> None:
             raise ValueError(f"Line ignore pattern {line!r} is invalid: {exc}") from exc
 
 
+def _check_netflow_settings(values: dict) -> None:
+    """A port or interface name is shown in every viewer's flow table, so
+    the markup characters are refused here as well as escaped there."""
+    for key in ("custom_ports", "interface_names"):
+        text = str(values.get(key, ""))
+        if "<" in text or ">" in text:
+            raise ValueError(f"{key}: a name cannot contain < or >")
+
+
 def _check_tacacs_settings(values: dict) -> None:
     """`tacacs_servers` parses (a clear error naming the bad entry rather
     than a client-side surprise on first sign-in) and `tacacs_default_role`
@@ -356,6 +365,8 @@ def post_settings(service, params, body) -> dict:
         _check_mapper_settings(service, values)
     if scope == "configrx":
         _check_configrx_settings(values)
+    if scope == "netflow":
+        _check_netflow_settings(values)
     if scope == "global":
         _check_tacacs_settings(values)
         if raw_tacacs_secret:

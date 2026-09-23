@@ -1650,6 +1650,40 @@ check(sum(len(v) for v in ALLOWED_BARE_FIELDS.values()) >= 70,
       "the escaping allow-list still lists the fields it was written against "
       "(an emptied list would pass vacuously)")
 
+# drawRows inserts a column's cell() result into innerHTML as-is, so a
+# `cell: (r) => r.name` body is as much a sink as a template with tags in it,
+# and the scan above never sees it: there is no backtick, or the template
+# carries no "<". Every bare-field cell body is server-formatted numbers.
+ALLOWED_BARE_CELLS = {
+    "netflow.js": {"r.bytes_text", "r.packets_text"},
+    "nodes.js": {"r.if_index"},
+}
+_CELL_BARE = re.compile(r"cell:\s*\((\w*)\)\s*=>\s*([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+)\s*[,}]")
+_CELL_TPL = re.compile(r"cell:\s*\((\w*)\)\s*=>\s*`([^`]*)`")
+bare_cells = []
+for _name in MODULES:
+    if _name.startswith("vendor"):
+        continue
+    _body = read(_name)
+    for _m in _CELL_BARE.finditer(_body):
+        if _m.group(2) not in ALLOWED_BARE_CELLS.get(_name, set()):
+            bare_cells.append("%s:%d %s" % (_name, _body.count("\n", 0, _m.start()) + 1,
+                                            _m.group(2)))
+    for _m in _CELL_TPL.finditer(_body):
+        if "<" in _m.group(2):
+            continue
+        for _expr in _interpolations(_m.group(2)):
+            if _DOTTED.match(_expr) and _expr not in ALLOWED_BARE_CELLS.get(_name, set()):
+                bare_cells.append("%s:%d ${%s}" % (_name, _body.count("\n", 0, _m.start()) + 1,
+                                                   _expr))
+check(not bare_cells,
+      "no table cell() returns a row field bare — wrap it in escape() or add it to "
+      "ALLOWED_BARE_CELLS with a reason (found: %s)" % (", ".join(bare_cells[:8]) or "none"))
+_nf = read("netflow.js")
+check("escape(r.src_port)" in _nf and "escape(r.dst_port)" in _nf
+      and "${escape(r.in_if)} / ${escape(r.out_if)}" in _nf,
+      "NetFlow port and interface names (operator-typed settings) are escaped in the flow table")
+
 print()
 # ---------------------------------------------------------------------------
 # 45a. NetFlow: "graphs are not showing all data from the timeline window".
