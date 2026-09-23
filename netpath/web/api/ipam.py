@@ -365,8 +365,8 @@ def post_ipam_dhcp_server_test(service, params, body, server_id) -> dict:
 
     # Testing an in-progress edit checks whatever is currently typed, before
     # it is saved; otherwise fall back to whatever credential already exists.
-    username = body.get("username")
-    password = body.get("password")
+    username = _text_or_none(body.get("username"), "username")
+    password = _text_or_none(body.get("password"), "password")
     if username is None:
         username, password = credential_for_server(server)
     return _test_dhcp_connection(service, server["address"], username, password)
