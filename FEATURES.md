@@ -264,8 +264,9 @@ rather than staying a fixed white regardless of what theme the rest of the
 interface is in; Light keeps a white canvas, since that's still the theme
 meant to print or screenshot the way the route canvas always has. A
 **Print** toggle on each module's controls strip forces that module's
-canvas white with dark text and hairlines for the length of one print or
-screenshot, whatever the active theme, then reverts.
+canvas white with dark text and hairlines for print or screenshot,
+whatever the active theme, and stays on — remembered in this browser —
+until switched off again.
 
 ### Any width
 
