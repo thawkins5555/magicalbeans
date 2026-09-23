@@ -3022,7 +3022,7 @@
     const body = document.createElement('tbody');
     for (const r of rows) {
       const tr = document.createElement('tr');
-      tr.innerHTML = `<td>${escape(r.ip)}</td>` +
+      tr.innerHTML = `<td>${App.ipCell(r.ip, {})}</td>` +
         `<td><button class="linkish nd-arp-mac" data-mac="${escape(r.mac)}" ` +
         'title="Find the switch port this MAC address was learned on">' +
         `${escape(formatMac(r.mac))}</button></td>` +
@@ -3081,7 +3081,7 @@
         : (r.if_index == null ? '\u2014'
             : `<span title="ifIndex ${escape(String(r.if_index))}">#${
                 escape(String(r.if_index))}</span>`);
-      tr.innerHTML = `<td>${escape(r.ip)}${r.primary
+      tr.innerHTML = `<td>${App.ipCell(r.ip, {})}${r.primary
           ? ' <span class="hint">(primary)</span>' : ''}</td>` +
         `<td>${iface}</td>` +
         `<td>${escape(r.netmask || '\u2014')}</td>` +

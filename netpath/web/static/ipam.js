@@ -326,7 +326,7 @@
      rather than a recent-looking timestamp left by the last sweep. */
   const HOST_COLUMNS = [
     { key: 'ip', label: 'IP address', width: 130, on: true, value: (r) => r.ip,
-      cell: (r) => escape(r.ip) },
+      cell: (r) => App.ipCell(r.ip, {}) },
     { key: 'mac', label: 'MAC', width: 150, on: true, value: (r) => r.mac || '',
       cell: (r) => escape(r.mac || '\u2014') },
     { key: 'alive', label: 'Alive', width: 70, on: true,
@@ -1020,7 +1020,7 @@
 
   const LEASE_COLUMNS = [
     { key: 'ip', label: 'IP address', width: 130, on: true, value: (r) => r.ip,
-      cell: (r) => escape(r.ip) },
+      cell: (r) => App.ipCell(r.ip, {}) },
     { key: 'mac', label: 'MAC', width: 150, on: true, value: (r) => r.mac || '',
       cell: (r) => escape(r.mac || '') },
     { key: 'hostname', label: 'Hostname', width: 200, on: true,

@@ -5440,6 +5440,24 @@ check("App.syncFilterRoute('nodes'," in NODES107,
       "the device list's Apply/Clear mirror the filters into the hash")
 
 # ---------------------------------------------------------------------------
+# 108. IP actions everywhere: an address cell in NetFlow, Syslog/SNMP, IPAM
+#      and the device detail's ARP/Addresses tables goes through App.ipCell
+#      rather than a bare escaped string, so every one of them carries the
+#      same actions button.
+check(NETFLOW107.count("App.ipCell(") >= 4,
+      "NetFlow's source/destination name cells and the raw Source/"
+      "Destination IP columns all go through App.ipCell")
+check(EVENTS107.count("App.ipCell(") >= 1,
+      "the shared Source column appends App.ipCell to deviceNameLink")
+check(IPAM107.count("App.ipCell(") >= 2,
+      "the host and lease address columns go through App.ipCell")
+check("App.ipCell(r.ip, {})" in NODES107,
+      "the ARP and Addresses tables' IP cells go through App.ipCell")
+check(NODES107.count("App.ipCell(r.ip, {})") >= 2,
+      "...both the ARP cache and the Addresses table")
+
+
+# ---------------------------------------------------------------------------
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

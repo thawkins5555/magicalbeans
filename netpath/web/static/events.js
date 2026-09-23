@@ -67,7 +67,8 @@
       source: { key: 'source', label: 'Source', width: 160, on: true,
         value: (r) => (view.showHostname && r.source_name) || r.source || '',
         cell: (r) => App.deviceNameLink((view.showHostname && r.source_name)
-                                        || r.source) },
+                                        || r.source)
+          + App.ipCell(r.source, { t0: view.t0, t1: view.t1, label: '' }) },
       sourceName: { key: 'source_name', label: 'Source name', width: 160,
         cell: (r) => App.deviceNameLink(r.source_name) || '—' },
     };
