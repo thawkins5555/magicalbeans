@@ -94,7 +94,13 @@ open tab and the selected thing — `#/nodes`, `#/nodes?status=down`,
 map, and `#/snmp/5512`, `#/syslog/8801` and `#/wireless/3` for a trap, a
 message and an access point. From 4.48.0 a tab's own subtabs carry the same URL — `#/nodes/discovery`,
 `#/settings/users` — so a pasted link lands a colleague on the pane that was
-actually open, not just the tab. Back walks the selections, a reload lands where you were,
+actually open, not just the tab. From 5.57.0 a nested subtab one level
+further in — `#/nodes/reports/firmware`, a device's own ARP tab — is a link
+too, and a filtered view on Alerts, NetFlow, Syslog, SNMP Trap, IPAM,
+Forti-AP, ConfigRX or Nodes is mirrored into the address bar as it's
+searched, so the filtered view itself — not just the tab — is what gets
+copied into a ticket; NetFlow and IPAM also accept a link built this way.
+Back walks the selections, a reload lands where you were,
 and a link pasted into a ticket or an email opens what it names for
 anybody who can sign in and read that module. A route naming something the
 account cannot read, or that no longer exists, falls back to the tab.
@@ -122,7 +128,11 @@ than inheriting the last operator's searches. **Reset panel sizes** on the
 Settings tab resets panel sizes and nothing else. **Signing in always opens
 on Dashboard**, though: a fresh login is a new visit, not a reload, so it
 starts from the same place every time rather than wherever a previous
-session happened to leave off.
+session happened to leave off. From 5.57.0 that's true only of a fresh
+visit — signing out, or being signed out by idle timeout or session expiry
+mid-view, now carries the view you were on through to the sign-in page and
+back, so re-authenticating returns you to the same alert, device or
+filtered list rather than to Dashboard.
 
 ## How it runs
 
@@ -247,6 +257,15 @@ text/muted/dim/line hierarchy, the same minimum contrast pairs, and, from
 4.54.0, the same sixteen-colour VLAN palette MAPPER's trunk strands use,
 each theme's sixteen hues checked pairwise so two VLANs on the same trunk
 are never confusable in any of the eight.
+
+**The ROUTES and MAPPER canvases now follow the active theme**, from
+5.57.0 — Dark's canvas is dark, Neon's is Neon's own palette, and so on —
+rather than staying a fixed white regardless of what theme the rest of the
+interface is in; Light keeps a white canvas, since that's still the theme
+meant to print or screenshot the way the route canvas always has. A
+**Print** toggle on each module's controls strip forces that module's
+canvas white with dark text and hairlines for the length of one print or
+screenshot, whatever the active theme, then reverts.
 
 ### Any width
 
@@ -395,6 +414,13 @@ every operator saw. It now answers "what should I look at first" from data
 the application already had, refreshed on the interval in
 `dashboard_refresh_s` (five seconds by default).
 
+**From 5.57.0, a fleet with no devices yet shows a "Get started" card**
+above the tile grid instead of a page of empty tiles — a short line with
+**Add a device** and links to start the poller or add a Routes
+destination. It shows only while the fleet count is genuinely zero, for an
+account that can read Nodes, and disappears the moment a first device is
+added.
+
 **From 5.21.0 the tile grid is a per-account layout, not a fixed list.**
 Every account starts on the same shipped default — the ten tiles below,
 in this order — but can rearrange, resize, add and remove tiles from a
@@ -539,6 +565,14 @@ A filterable device table with at-a-glance status, and a per-device
 drill-down: a zoomable metric chart, an interface table and an event
 history. Discovery, polling profiles and vendor MIB upload live on their
 own subtabs.
+
+**From 5.57.0, a "Problems only" checkbox on the device list** filters to
+the devices whose status reads as a warning or a failure — down, unknown,
+auth-failed — in one click, without having to build the same result out of
+the Status dropdown. Every address on a device's ARP and Addresses tables
+also gained the actions button described under NetFlow, below, so an
+address found there can be jumped straight to its IPAM record or into
+NetFlow filtered to it.
 
 ### Devices and polling
 
@@ -3532,6 +3566,18 @@ in the last hour are queried — a busy exporter sees tens of thousands of
 distinct addresses and naming all of them would be wasted work. Nothing is
 looked up at all while the checkbox is off.
 
+**Every IP address in the table carries its own actions button**, from
+5.57.0 — a small `⋯` beside the address that opens IPAM, Syslog, SNMP
+Trap, or NetFlow itself filtered from that address or to it (offered both
+ways, since a flow row has both a source and a destination), and that
+address's own device when it belongs to one being monitored. The same
+button appears on Syslog, SNMP Trap and IPAM's own tables, and on a
+device's ARP and Addresses tabs, so any address anywhere in the product is
+a jumping-off point to every other place it shows up. Custom port and
+interface names entered under Settings are operator-typed text shown in
+this table; a name containing `<` or `>` is refused when the setting is
+saved, and whatever is stored is escaped everywhere it's displayed.
+
 ### Zoom without a wheel
 
 Drag across the chart to zoom into a range, scroll to zoom about the cursor,
@@ -3671,6 +3717,10 @@ been wrong for several releases: **Nodes** polls with GET and GETBULK, and
 **Alerts** is a rule engine over device events, traps, syslog, IPAM conflicts
 and thresholds. Traps reaching this receiver are evaluated by it.)
 
+**From 5.57.0, selecting a row on the live table pauses it**, the same
+**Return to live** behaviour as Syslog, and its own severity colour key is
+one click away from the volume setting.
+
 From 4.39.0 a trap whose SNMPv3 authentication **fails** is dropped rather than
 stored. The digest was always computed and counted; it was never enforced, so a
 forged v3 trap was stored and could open an alert. The `reject_failed_auth`
@@ -3785,6 +3835,12 @@ A collector, a search, and an hourly histogram.
   IPAM's DHCP polling knows the address as.
 - **Send test message** sends one to the collector over loopback and shows the
   PowerShell equivalent, the same as the NetFlow test packet.
+- **From 5.57.0, selecting a row on the live table pauses it** rather than
+  letting new messages scroll the selection out from under you; a
+  **Return to live** control brings it back to streaming. The severity
+  column's colours are explained in a help panel reachable from the
+  volume setting, the same RFC 5424 scale used everywhere severity is
+  shown.
 - **Hostname**, next to the message count above the table, switches the
   Source column between the resolved name and the raw address — on by
   default. The detail panel for a selected message always shows both.
@@ -3928,14 +3984,19 @@ works anywhere — but without a MAC there is nothing to compare across scans,
 so conflict detection is only possible on a directly-attached subnet. This is
 a property of ARP, not a limitation of the code.
 
-**Every subnet shows a utilization donut** in the sidebar list — a glance at
-alive, previously-seen-but-down, and never-seen, without opening it — and
-selecting a subnet shows a larger version of the same chart above its host
-table, with the counts and percentages spelled out beside it. An address only
-counts as "seen before, now down" if it has genuinely answered at some point
-in the past; an address that has been probed on every sweep and never once
-replied is "never seen," however many times it's been swept. Hovering a
-subnet's sidebar row gives the exact numbers as a tooltip.
+**Every subnet shows a utilization donut** in the sidebar list — from
+5.57.0, used address space against free, matching the "N% free" figure
+already printed underneath the larger version of the same chart shown
+above a subnet's own host table when you open it; the alive / previously-
+seen-but-down / never-seen breakdown that used to be the ring's three
+colours is still there, as the tooltip and the detail page's legend rows.
+An address only counts as "seen before, now down" if it has genuinely
+answered at some point in the past; an address that has been probed on
+every sweep and never once replied is "never seen," however many times
+it's been swept. Hovering a subnet's sidebar row gives the exact numbers
+as a tooltip. **A subnet mid-scan now also states when that scan
+started** — "Scanning now… started 4 min ago" — instead of only saying a
+scan is in progress.
 
 The host table sorts and resizes the same way NetFlow's flow record table
 does: click a heading to order by it, drag an edge to resize, both remembered
@@ -3982,7 +4043,9 @@ polled DHCP server's own lease record most recently said for that address.
 Both need a person to look at them — nothing here auto-resolves, because only
 a person knows whether it was a NIC swap, a slow-to-expire lease, or something
 worth chasing. **Mark resolved** dismisses one; **Show resolved** brings the
-history back.
+history back, and, from 5.57.0, **Reopen** puts a resolved conflict straight
+back onto the open list, for the case where "resolved" turns out to have
+been premature.
 
 The DHCP cross-check only fires against reasonably fresh lease data — three
 times the DHCP poll interval, or an hour, whichever is longer — so a DHCP
@@ -4069,8 +4132,11 @@ server regardless of what SappiWhere itself is running on.
 Server version and scope count without walking every scope's leases, useful
 for confirming a new server before waiting on the first full poll — including
 an unsaved username and password, to check a credential works before
-committing to it. **Poll now** forces an immediate one. **Clear credential**
-removes a stored one and reverts that server to ambient identity.
+committing to it. **From 5.57.0 the same Test connection is available in
+the Add DHCP server dialog itself**, so a new server's address and
+credential can be checked before it is ever saved, not only after. **Poll
+now** forces an immediate one. **Clear credential** removes a stored one
+and reverts that server to ambient identity.
 
 A reservation with no client having claimed it yet has no lease of its own on
 the DHCP server, and would otherwise be invisible; SappiWhere synthesizes a
@@ -5195,6 +5261,45 @@ takes every open alert on the server rather than the rows you ticked. Buttons th
 a filter or a selection, which destroy nothing, are deliberately left
 unconfirmed.
 
+### Interface conventions, written down from 5.57.0
+
+A handful of cross-module rules that were already mostly followed and are
+now a stated standard, so a new dialog or page keeps following them
+rather than each one being reinvented:
+
+- **A form dialog's action buttons sit at the top** (Save, Add, Test
+  connection); **a confirmation dialog's buttons sit at the bottom**
+  (Cancel, then the action). A form is something you fill in and act on
+  when ready; a confirmation is something you read and then decide.
+- **Remove and Delete are not the same verb.** Remove takes something out
+  of monitoring or configuration — a device, a maintenance window, a
+  DHCP server — without touching data already collected about it. Delete
+  destroys data that was stored — a backup, a history of samples. Four
+  confirmation dialogs and the Nodes bulk-action button were reworded to
+  match, where the verb they used didn't.
+- **Byte counts are decimal**, base 1000 (1 KB = 1000 B), matching how a
+  switch or a network service quotes its own throughput — not base 1024,
+  which this application used before 5.57.0. Both the browser and the
+  server changed together, so a figure read off a table and one read off
+  an exported CSV always agree.
+- **Every module's controls strip is a labelled toolbar** for a screen
+  reader, and has its own **Refresh** button, even the handful of pages
+  that didn't have one before.
+- **Time is shown in this browser's own time zone**, and a note to that
+  effect is in the relevant help panels — worth knowing when comparing a
+  timestamp here against a device's own log, which may be logging in UTC
+  or its own local time.
+- **Supported browsers**: Edge or Chrome 111 or newer, Firefox 113 or
+  newer, Safari 16.2 or newer. Nothing checks this at sign-in; an older
+  browser is more likely to hit a rendering or a JavaScript-feature gap
+  than an outright failure.
+- **The connection indicator now always shows something** — "updated
+  HH:MM:SS" while healthy, rather than going blank the moment the
+  "reconnected" banner clears — and a dropped connection reads "No
+  answer from the server" instead of the browser's own raw fetch error
+  text, which used to read as a cryptic "Failed to fetch" to anyone not
+  already familiar with browser internals.
+
 ### Software update
 
 One button — **Check for update & restart** — checks
@@ -5229,7 +5334,11 @@ add/edit/delete button, a module's Settings gear — is **disabled and says
 why**, in the control's tooltip and in one line under the bar it sits in.
 It is not hidden: a control that is silently absent reads as a feature the
 install does not have, which turned permission questions into support
-calls about missing features. Both are purely client-side conveniences,
+calls about missing features. From 5.57.0 the tooltip reads plainly —
+"Read-only: your account can read Nodes but not change it" — and a gated
+control that isn't a native button or field (so nothing dims it on its
+own) gets a visible dimmed, not-allowed cue as well, so a read-only
+account can tell an inert control apart from a live one at a glance. Both are purely client-side conveniences,
 since the server enforces the identical check on every route regardless of
 what the browser shows. Because it is a disable rather than a hide, it is
 re-evaluated on every poll, so a grant given or taken away mid-session

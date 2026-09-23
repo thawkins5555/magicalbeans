@@ -14913,19 +14913,38 @@ Verified with real screenshots (not computed-style polling, which can
 report styles that never actually get painted) captured every 50ms
 through an artificially throttled reload — none of them show NetPath.
 
-**A fresh sign-in always opens on Dashboard.** `login.js` writes
-`'dashboard'` under the same `'sappiwhere.tab'` key immediately before its
-`window.location.href = '/'` on a successful credential check — the two
-files share nothing else (login.html "shares the stylesheet and nothing
-else" with the rest of the app, so this key name is duplicated as a
-literal rather than imported), but agreeing on the key is enough for
-`app.js`'s existing restore-on-load logic to pick it up with no
-special-casing on that side: a login looks exactly like a reload that
-happens to find `'dashboard'` already stored. The "already signed in,
-bounce back to /" redirect on the login page itself (`fetch('/api/session')`
-finding an existing session) does *not* set this key — that path isn't a
-login, just a page that immediately sends an already-authenticated visitor
-onward, so whatever tab they had open stays open.
+**A fresh sign-in opens on Dashboard, unless the trip through `/login` was
+carrying somewhere to go back to — 5.57.0.** `login.js` writes `'dashboard'`
+under the same `'sappiwhere.tab'` key immediately before its
+`window.location.href` on a successful credential check — the two files
+share nothing else (login.html "shares the stylesheet and nothing else"
+with the rest of the app, so this key name is duplicated as a literal
+rather than imported), but agreeing on the key is enough for `app.js`'s
+existing restore-on-load logic to pick it up with no special-casing on
+that side: a login looks exactly like a reload that happens to find
+`'dashboard'` already stored. That write is now conditional on
+`window.location.hash` being empty: a session expiring mid-view (the 401
+handler in `app.js`'s `post`/`get`), the idle-timeout redirect, and the
+account's own **Sign out** button all now navigate to `'/login' +
+window.location.hash` instead of a bare `/login`, so the view the operator
+was on rides along as the hash; `login.js` reads that same `wanted` hash
+back off `window.location.hash` after a successful credential check and, if
+it is non-empty, sends the browser there instead of overwriting the
+remembered tab with `'dashboard'` — a named hash is the whole reason it was
+carried this far, and must not lose to whatever tab this browser last had
+open. The "already signed in, bounce back to /" redirect on the login page
+itself (`fetch('/api/session')` finding an existing session) does *not* set
+the `'dashboard'` key — that path isn't a login, just a page that
+immediately sends an already-authenticated visitor onward, so whatever tab
+they had open stays open. A forced password change reads similarly:
+`login.js` now stamps `sessionStorage['sappiwhere.mustChange']` the moment
+`/api/login`'s own response says the account must change its password, and
+`app.js`'s `start()` checks and clears that sentinel at first paint — before
+the first `/api/state` poll would otherwise be the one to notice — so the
+prompt opens on the very first frame rather than a cycle later.
+`promptForcedPasswordChange()` is now the one opener both that first-paint
+path and the state poll's own `must_change` check call, in place of the
+duplicated inline block each used to carry.
 
 **Dashboard** (`dashboard.js`) is registered the same way every other
 page is (`App.pages.dashboard = { init, refresh, activate,
@@ -14936,6 +14955,153 @@ throw or silently never refresh. From 5.21.0 `page-dashboard` is a
 per-account grid of up to 24 kinds of tile, several of them charts of
 their own — see *A modular Dashboard* under **Web layer** for the
 catalogue, the storage and the routes.
+
+### `App.ipCell`: one actions popover behind every address (`app.js`) — 5.57.0
+
+Every table that prints an IP address — NetFlow, Syslog, SNMP Trap, IPAM
+hosts and leases, a device's ARP and Addresses tables — built its own
+`escape(r.ip)` cell with nothing to click. `App.ipCell(ip, opts)` replaces
+each of those: it renders the address (or, with `opts.label: ''`, the
+button alone, for a cell whose caller already printed the address as part
+of a name) beside a `⋯` button carrying the address and, where relevant, a
+time window (`opts.t0`/`opts.t1`) in its `data-*` attributes. One delegated
+document-level click listener (`wireIpPopover`, wired once in `boot()`)
+opens `ipPopoverItems(ip, t0, t1)`'s menu beside whichever button was
+clicked — IPAM, Syslog, SNMP Trap, **NetFlow from**/**NetFlow to** (both
+directions, since a flow row has two addresses), and, where the address
+matches a monitored device's own address table, that device's own page.
+Every item is a plain link built from `App.buildRoute`, so `item.href` is
+the one bare field the frontend-contracts escaping scan allowlists for
+`app.js` (see `ALLOWED_BARE_FIELDS` in `tests/test_frontend_contracts.py`)
+— it is `buildRoute`'s own output, never a server-supplied row field. In
+kiosk mode `ipCell` renders plain text with no button, since there is
+nobody there to click it and no write access to gate on either.
+
+### Address-bar filters and nested-subtab deep links (`app.js`) — 5.57.0
+
+**`App.syncFilterRoute(tab, keysToIds, parts)`** is the filter-bar half of
+`App.setRoute`: given a `{queryKey: inputId}` map, it reads each named
+input's current value and writes a `replaceState` with those as the query
+string, defaulting `parts` to whatever the address bar already names past
+the tab so a filter applied on a subtab or with a selection open doesn't
+clobber it. Alerts, NetFlow, Nodes, Syslog and SNMP Trap wire it to their
+own Apply/Clear buttons (`alerts.js`, `netflow.js`, `nodes.js`,
+`events.js`); each page's own `activate(opts)` reads `opts.query` back on
+the way in and re-populates the matching filter fields before its own
+first fetch. NetFlow's `activate` additionally takes `ip`/`t0`/`t1`/
+`window` — the shape `App.ipCell`'s NetFlow links build — landing the
+address in the Source filter and pinning or presetting the chart window
+from whichever of `t0`/`t1` or `window` (seconds) was given.
+
+**Nested subtabs are now walked one level deeper.** `applySubtabFromRoute`
+already matched a route's first part against a tab's own `.subtabs > .subtab`
+buttons; it now also looks for a `.subtabs.nested` list inside whichever
+`.subpage` that click just revealed and clicks the route's second part
+there (`applyNestedSubtabFromRoute`) — `#/nodes/reports/firmware` opens
+REPORTS, then FIRMWARE, in one navigation. An entity route
+(`#/nodes/device/1234/arp`) has no top-level subtab named `device`, so
+nothing here can find the nested nav synchronously; `waitForNestedSubtab`
+polls briefly instead of giving up, since the module (`nodes.js`) still has
+to open the device asynchronously before its own nested tabs exist in the
+DOM. A purely numeric last part (`port/7`) is never treated as a nested
+subtab name.
+
+**Route hops open their own device.** The ROUTES canvas's hop boxes now
+carry a click handler that looks the hop's address up against the Nodes
+device-address index (the same one `App.ipCell`'s "Device" item uses) and
+routes to it when the address belongs to a monitored device; a hop with no
+match is unaffected.
+
+### `App.modalFormSnapshot()` / `App.modalFormRestore(snapshot)` (`app.js`) — 5.57.0
+
+A nested confirmation opened from inside a form dialog (Clear credential,
+Remove server) used to redraw the parent form from scratch once the
+confirmation closed, which discarded whatever the operator had typed into
+it before opening the confirmation. `modalFormSnapshot()` walks every
+`input`/`select`/`textarea` under `#modal-box`, keyed by `id` or, failing
+that, `name`, recording `.checked` for a checkbox/radio and `.value`
+otherwise; `modalFormRestore(snapshot)` writes it back the same way,
+skipping any key the snapshot names that the redrawn form no longer has.
+The two call sites (`ipam.js`'s Clear credential and Remove server
+confirmations) snapshot immediately before opening the nested confirm and
+restore immediately after redrawing the parent form.
+
+### NetFlow custom names: escaped on display, refused on save (`web/api/settings.py`, `netflow.js`) — 5.57.0
+
+NetFlow's `custom_ports` and `interface_names` settings are operator-typed
+`key = label` text, rendered into every viewer's flow table as the
+Interfaces column and the exporter/port labels. `_check_netflow_settings`
+(`web/api/settings.py`), wired into `post_settings` for `scope ==
+"netflow"`, refuses a save where either field's raw text contains `<` or
+`>` — a `ValueError` the settings dialog surfaces the same way every other
+per-scope validator does. `netflow.js`'s flow table now runs `escape()`
+over `r.in_if`/`r.out_if` (previously interpolated bare), so a name already
+on file before this validation existed is still rendered safely rather than
+only newly-saved ones. `tests/test_netflow_settings_names.py` (plain
+script, not pytest) exercises the validator directly: a tag is refused, a
+plain `22609 = NVR` line is accepted, and a settings request that doesn't
+touch either key is a no-op.
+
+### `test_frontend_contracts.py`'s cell-body scan (`_CELL_BARE`, `_CELL_TPL`, `ALLOWED_BARE_CELLS`) — 5.57.0
+
+The existing escaping scan checked template literals for a bare
+`${r.field}` interpolation, but `drawRows` (every module's table renderer)
+inserts a column's `cell(r)` return value into `innerHTML` exactly as
+returned — so a `cell: (r) => r.name` body with no backticks at all was as
+much a sink as an unescaped template, and the scan never looked at it. Two
+new regexes walk every `cell:` arrow function in each table-column
+definition: `_CELL_BARE` catches a body that is nothing but a bare
+dotted-property read (`cell: (r) => r.name`); `_CELL_TPL` catches a
+template body and re-runs the existing interpolation check against it,
+skipping any template containing a literal `<` (already presumed to carry
+its own markup deliberately, e.g. a button). `ALLOWED_BARE_CELLS` is the
+same shape as `ALLOWED_BARE_FIELDS` — a `{file: {expr, …}}` allowlist for
+the handful of cells that are always server-formatted numbers or strings
+with nothing user-controlled in them (`r.bytes_text`, `r.packets_text`,
+`r.if_index`) — so the check fails loudly, naming the file, line and
+expression, for any future cell that prints a row field bare.
+
+### The two new IPAM endpoints (`web/api/ipam.py`, `ipamdb.py`) — 5.57.0
+
+**`POST /api/ipam/conflicts/<id>/reopen`** (`post_ipam_conflict_reopen`,
+`IpamDatabase.reopen_conflict`) is `resolve_conflict`'s mirror: it clears
+`resolved_ts` back to `NULL` rather than stamping it. Both routes now go
+through `_require(service.ipam_db.conflict(conflict_id), "conflict")`
+first — a new `IpamDatabase.conflict(id)` single-row lookup — so an id that
+doesn't exist answers 404 rather than a silent no-op `UPDATE` matching zero
+rows.
+
+**`POST /api/ipam/dhcp/servers/test`** (`post_ipam_dhcp_server_test_unsaved`)
+is the Add DHCP server dialog's own Test connection: the existing
+`post_ipam_dhcp_server_test(service, params, body, server_id)` needed a
+saved row to fall back to for its address and stored credential when the
+request body omitted `username`. The round trip itself — build a
+`test_connection()` call, catch `DhcpUnavailable`/`ValueError` into an
+`{"ok": False, "error": …}` reply — is now `_test_dhcp_connection(service,
+address, username, password)`, called by both the existing id-based route
+(server's own address, `credential_for_server` fallback) and the new
+id-less one (whatever `address`/`username`/`password` the Add dialog's
+form currently holds, with a plain `ValueError` if `address` is blank).
+`tests/test_ipam_dhcp_test_unsaved.py` and
+`tests/test_ipam_conflict_reopen.py` cover the two new routes.
+
+### Decimal bytes: `format_bytes` and `App.bytes` move to base 1000 (`services.py`, `app.js`) — 5.57.0
+
+Both the server's `format_bytes(value)` (`services.py`, used in exported
+CSVs and report text) and the browser's `App.bytes(value)` (`app.js`, used
+everywhere a byte count is drawn on screen) divided by 1024 per unit step;
+both now divide by 1000, matching how a switch or a network service quotes
+its own throughput and keeping the two in agreement with each other. The
+unit labels (B/KB/MB/GB/TB) and the rounding (`.0f` for B, `.1f` above it)
+are unchanged — only the divisor moved — so `tests/test_format_bytes.py`
+(new) pins `format_bytes`'s boundaries at the new 1000/1,000,000/…
+thresholds rather than 1024's. `App.rate`, the shared bits-per-second
+formatter, already divided by 1000 per step (bps/Kbps/Mbps/…, the networking
+convention) and is unchanged; NetFlow's chart axis label used to carry its
+own duplicate `rateLabel()` doing the identical division and has been
+deleted in favour of calling `App.rate` directly, so there is exactly one
+rate formatter left in the codebase rather than two that happened to agree
+today.
 
 ## Tests (`tests/`)
 

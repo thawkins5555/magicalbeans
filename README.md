@@ -141,6 +141,11 @@ Requires Python 3.10+ and the system `traceroute` (macOS/Linux) or `tracert`
 (Windows, built in). On Debian/Ubuntu: `sudo apt install traceroute`. Shelling
 out to the OS tool means no raw sockets and no root.
 
+The browser interface itself needs Edge or Chrome 111 or newer, Firefox 113
+or newer, or Safari 16.2 or newer — nothing checks this at sign-in, but an
+older browser is more likely to hit a rendering or JavaScript-feature gap
+than an outright failure.
+
 The databases live beside each other; override any of them:
 
 ```bash

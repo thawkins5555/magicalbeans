@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.57.0 — IP addresses everywhere get an actions button; filters and nested tabs are links; sign-in returns you to where you were](#5570--ip-addresses-everywhere-get-an-actions-button-filters-and-nested-tabs-are-links-sign-in-returns-you-to-where-you-were)
 - [5.56.0 — Every reboot emails; silent email drops say why; DAC badge grey; Send test email](#5560--every-reboot-emails-silent-email-drops-say-why-dac-badge-grey-send-test-email)
 - [5.55.0 — Priority star on the device list; DAC transceiver badge](#5550--priority-star-on-the-device-list-dac-transceiver-badge)
 - [5.54.0 — Opt-in form: separate terms and consent checkboxes](#5540--opt-in-form-separate-terms-and-consent-checkboxes)
@@ -190,6 +191,92 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.57.0 — IP addresses everywhere get an actions button; filters and nested tabs are links; sign-in returns you to where you were
+
+A round of small fixes and consistency work from live use, all shipped
+together.
+
+**Security.** NetFlow's custom port names and interface names are operator
+typed and shown in every viewer's flow table; they are now escaped there,
+and a name containing `<` or `>` is refused on save rather than accepted
+and stored. The frontend contract test that pins the JS now scans the body
+of every table cell, not just the ones it already knew to check, so a
+future cell that prints a row field unescaped fails the test instead of
+shipping.
+
+**Every IP address gets an actions button.** NetFlow, Syslog, SNMP Trap,
+IPAM hosts and leases, and a device's ARP/Addresses tables now show a small
+`⋯` button beside every address. It opens IPAM, Syslog, SNMP Trap, NetFlow
+(filtered from that address, or to it, offered both ways in NetFlow's own
+table), and — where the address belongs to a monitored device — that
+device's own page. A cell that already prints the address text shows the
+button alone rather than the address twice.
+
+**Filtered views are now links.** The filter fields on Alerts, NetFlow,
+Syslog, SNMP Trap, IPAM, Forti-AP, ConfigRX and Nodes are mirrored into the
+address bar as you search, so a filtered view — "down devices in the core
+group," "flows from this address in the last hour" — can be copied out of
+the address bar and pasted into a ticket or a chat exactly as it stands.
+NetFlow and IPAM now also accept a link built this way, including the new
+IP-actions button's own NetFlow links. Nested subtabs are deep-linkable
+too — a firmware report under Nodes → Reports, a device's own detail tab —
+and a route hop on the ROUTES canvas now opens the device it belongs to
+when that device is monitored.
+
+**Sign-in remembers where you were.** Signing out, or being signed out by
+session expiry, now returns you to the same view once you sign back in,
+instead of dropping you back at Dashboard. A forced password change (a new
+account's first login, or one an administrator reset) opens the moment the
+page paints rather than waiting for the first state poll to notice.
+
+**Consistency pass.** Dialog button placement is now a written-down rule —
+a form's action buttons sit at the top, a confirmation's buttons sit at the
+bottom — and it's applied throughout. ROUTES gets its own controls strip
+with a Settings button, matching every other module. Four confirmation
+dialogs and the Nodes bulk-action button were re-worded to keep **Remove**
+and **Delete** distinct: Remove takes something out of monitoring or
+configuration, Delete destroys data that was stored. Byte counts are now
+decimal (base 1000: KB/MB/GB) on both the browser and the server, matching
+how a switch or a service quotes its own throughput. Rate labels (bps/
+Kbps/Mbps) now go through the one shared formatter instead of a
+second copy that had drifted slightly from it. Alerts, Syslog and SNMP
+Trap's help panels gained a severity colour key, and a note on time zones
+and supported browsers. A few stale tab-count comments in the code were
+corrected.
+
+**Visual fixes.** The ROUTES and MAPPER canvases now follow the active
+theme instead of staying permanently white, with a Print toggle on each to
+force a white, screenshot-safe canvas back on for a ticket or a printed
+copy — Light theme still prints white by default. A ticked row in a table
+keeps its status text readable instead of the tint washing it out. The
+Alerts severity column is wide enough that the severity name no longer
+truncates. IPAM's subnet donut now shows used versus free space, matching
+the "N% free" label already printed under it.
+
+**Workflow fixes.** The Add DHCP server dialog gained its own Test
+connection button, so a server's reachability can be checked before it is
+saved, not only after. A resolved IPAM conflict can now be reopened if it
+turns out not to have been resolved after all. A subnet's scan card now
+shows when the current scan started, not just that one is running. Nested
+confirmation dialogs (Clear credential, Remove server) no longer discard
+unsaved edits sitting in the parent form behind them.
+
+**Status and read-only account clarity.** The connection status now always
+shows "updated HH:MM:SS" rather than going blank while healthy. A dropped
+connection reads "No answer from the server" instead of surfacing the
+browser's own raw fetch error text. Read-only accounts get one plain
+explanation of why per page, plus a tooltip on each control they can't use.
+Dashboard shows a "Get started" card when the fleet has no devices yet
+instead of an empty grid. Nodes gained a "Problems only" filter on the
+device list. Every module's controls strip now has a Refresh button, even
+the ones that lacked one. The live Syslog and SNMP Trap tables now pause
+when a row is selected, with a "Return to live" control, instead of the
+selection scrolling out from under you.
+
+**Accessibility and responsiveness.** Every module's controls strip is now
+a labelled toolbar for a screen reader. A table inside a scrolling pane now
+shows a visible, themed scrollbar instead of an invisible one.
 
 ### 5.56.0 — Every reboot emails; silent email drops say why; DAC badge grey; Send test email
 

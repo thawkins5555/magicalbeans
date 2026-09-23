@@ -5,6 +5,51 @@ grouped by the version that carries it. This is a working record for the
 operator — the full story of each change is in `CHANGELOG.md`, and this file
 does not replace it.
 
+## UI/UX review of SappiWhere — no version bump
+
+**"UI-Review."** A bare word with no matching command or skill on this
+team — the session asked what was meant before doing anything.
+
+**Full UI/UX review brief.** Review only, no source changes. Map every
+page, tab, sub-view and modal first; cite every finding to its file and
+line; take screenshots with Playwright if the app can be run locally.
+Nine review areas: navigation, cross-module consistency, visual
+hierarchy, interaction flows, states, real-time behaviour, accessibility
+(WCAG 2.1 AA), responsiveness, and frontend code health (including
+`innerHTML`/XSS exposure). Deliverable: `UI_UX_REVIEW.md` at the repo
+root, with an executive summary, a page inventory, findings, a
+consistency matrix, quick wins and a roadmap. Decided: the review file
+stays untracked since this is a public repo, and a one-off screenshot
+pass stands in for the standard browser walk for this review.
+
+**"git pull" (twice).** The session branch (`refactor/5.43-structure`)
+had no upstream tracking branch, so the first pull only fetched and did
+not merge. Fast-forwarded the branch to `origin/main` at commit
+`c925b62` (5.56.0).
+
+**"git pull."** A later session branch again had no upstream tracking
+branch. `origin/main` was one commit ahead — a CLAUDE.md model-name edit
+identical to what was already sitting uncommitted locally — and
+fast-forwarded cleanly.
+
+**"Using the new CLAUDE.md agent rules, propose a plan to resolve every
+item in the review file."** Dora verified twenty code seams from the
+review first, then four open questions went to the operator: form
+dialogs keep action buttons at the top and confirmations at the bottom
+as a written-down standing rule, byte units move to base-1000 while
+keeping the KB/MB/GB labels, everything ships as one release (5.57.0),
+and four items — the tab-strip reorder, splitting the nodes module
+script, an alarm-sound option, and a kiosk-mode session-limit exemption
+— are left out of this pass. With the plan approved, the NetFlow
+escaping and settings-validation fix was committed, and Thing1 and
+Thing2 started building the rest in separate worktrees.
+
+**Outcome.** The fix pass landed as 5.57.0 — the two worktree lanes were
+merged, the byte-unit and dialog-button-rule mechanical passes were done
+across every touched module, and the docs (this file, `CHANGELOG.md`,
+`FEATURES.md`, `INTERNALS.md`, `README.md`) are written. Testy's run and
+Javariius's whole-diff review are next, before the push to main.
+
 ## 5.56.0 — Every reboot emails; silent email drops say why; DAC badge grey; Send test email
 
 **"Make the 'DAC' interface tag the same color gray as the DOM, SFP, and
