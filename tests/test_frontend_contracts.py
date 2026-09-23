@@ -5179,11 +5179,19 @@ check("MutationObserver" in WAIT110 and "setTimeout(() => observer.disconnect(),
 
 
 # ---------------------------------------------------------------------------
-# 111. Session expiry keeps the operator's place: every /login redirect in
-#      app.js carries the current hash, and login.js only forces the
-#      stored tab to Dashboard when there is none to finish the journey to.
-check(APP.count("window.location.href = '/login' + window.location.hash;") == 4,
-      "app.js's four /login redirects all carry the current hash")
+# 111. Session expiry (and a forced password change) keep the operator's
+#      place: those /login redirects in app.js carry the current hash. A
+#      deliberate sign-out (the Sign out button and the forced-dialog's own
+#      Sign out) does not, so the next operator on a shared machine starts
+#      at Dashboard rather than inheriting a filtered, scrolled-in view.
+#      login.js only forces the stored tab to Dashboard when there is no
+#      hash to finish the journey to.
+check(APP.count("window.location.href = '/login' + window.location.hash;") == 2,
+      "app.js's two forced re-auth /login redirects (401, forced password "
+      "change) carry the current hash")
+check(APP.count("window.location.href = '/login';") == 2,
+      "app.js's two deliberate sign-out /login redirects (the Sign out "
+      "button and the forced-dialog's Sign out) do not carry the hash")
 LOGIN111 = static_text("login.js")
 check("if (!wanted) {" in LOGIN111
       and "localStorage.setItem('sappiwhere.tab', 'dashboard')" in LOGIN111,

@@ -141,7 +141,9 @@ const App = (() => {
           ? [{ label: 'Sign out', onClick: async () => {
               state.modalLocked = false;
               try { await post('/api/logout', {}); } catch (error) { /* going anyway */ }
-              window.location.href = '/login' + window.location.hash;
+              // Deliberate sign-out: the next operator on a shared machine
+              // should not inherit this one's filters, search or selection.
+              window.location.href = '/login';
             } }]
           : [{ label: 'Cancel', onClick: closeModal },
              { label: 'Save theme', onClick: async () => {
@@ -6564,7 +6566,8 @@ const App = (() => {
         // this browser must not find this operator's filters waiting.
         forgetView();
         try { await post('/api/logout', {}); } catch (error) { /* going anyway */ }
-        window.location.href = '/login' + window.location.hash;
+        // Deliberate sign-out: land back at Dashboard, not the view forgetView just dropped.
+        window.location.href = '/login';
       };
     }
     const accountBtn = document.getElementById('account-btn');

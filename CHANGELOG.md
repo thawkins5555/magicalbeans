@@ -224,11 +224,13 @@ too — a firmware report under Nodes → Reports, a device's own detail tab —
 and a route hop on the ROUTES canvas now opens the device it belongs to
 when that device is monitored.
 
-**Sign-in remembers where you were.** Signing out, or being signed out by
-session expiry, now returns you to the same view once you sign back in,
-instead of dropping you back at Dashboard. A forced password change (a new
-account's first login, or one an administrator reset) opens the moment the
-page paints rather than waiting for the first state poll to notice.
+**Sign-in remembers where you were.** Session expiry, and a forced password
+change (a new account's first login, or one an administrator reset), now
+return you to the same view once you sign back in, instead of dropping you
+back at Dashboard. A deliberate sign-out still starts at Dashboard, so the
+next operator on a shared machine does not inherit your filters, search
+text and selected row. The forced password change dialog opens the moment
+the page paints rather than waiting for the first state poll to notice.
 
 **Consistency pass.** Dialog button placement is now a written-down rule —
 a form's action buttons sit at the top, a confirmation's buttons sit at the
