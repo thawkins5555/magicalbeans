@@ -141,8 +141,7 @@ const App = (() => {
           ? [{ label: 'Sign out', onClick: async () => {
               state.modalLocked = false;
               try { await post('/api/logout', {}); } catch (error) { /* going anyway */ }
-              // Deliberate sign-out: the next operator on a shared machine
-              // should not inherit this one's filters, search or selection.
+              // Deliberate sign-out: the next operator here must not inherit this one's filters or selection.
               window.location.href = '/login';
             } }]
           : [{ label: 'Cancel', onClick: closeModal },
@@ -318,12 +317,8 @@ const App = (() => {
     return box;
   }
 
-  /* One opener for the two paths that force the change-password prompt: the
-     state poll (session.must_change, above app.js's start of day) and a
-     sessionStorage flag login.js sets right after a login response says the
-     same thing, read at first paint before that poll has even run once. The
-     sentinel is set only once the call has actually run, so a genuine
-     failure here gets retried on the next poll rather than never again. */
+  // Shared by the state poll (session.must_change) and login.js's
+  // sessionStorage flag, read at first paint before that poll has run.
   function promptForcedPasswordChange() {
     try {
       accountModal({ forced: true });
@@ -355,9 +350,7 @@ const App = (() => {
      page and still readable, which is the whole point. */
   const GATEABLE = new Set(['BUTTON', 'INPUT', 'SELECT', 'TEXTAREA', 'FIELDSET']);
 
-  // The hover title a gated control gets when it has none of its own —
-  // shorter than writeDeniedReason's own sentence (that one opens a
-  // paragraph below the page; this one is a tooltip) but the same fact.
+  // The tooltip form of writeDeniedReason's own sentence, for a control with no title of its own.
   function writeDeniedTitle(module) {
     if (module === 'admin') return 'Read-only: administrator access is needed to change this';
     const name = MODULE_NAMES[module] || module;
@@ -735,10 +728,7 @@ const App = (() => {
         throw new Error(`No answer within ${Math.round(
           (options.timeoutMs || REQUEST_TIMEOUT_MS) / 1000)} seconds`);
       }
-      // fetch's own network-failure TypeError, worded differently by every
-      // browser (Chromium's "Failed to fetch", Firefox's "NetworkError when
-      // attempting to fetch resource", Safari's "Load failed") — none of
-      // them operator language either.
+      // fetch's own network-failure TypeError, worded differently by every browser — none of it operator language.
       if (error && error.name === 'TypeError'
           && /Failed to fetch|NetworkError|Load failed/.test(error.message || '')) {
         throw new Error('No answer from the server');
@@ -852,8 +842,7 @@ const App = (() => {
   let deviceIndexInFlight = null;
   async function deviceIndex() {
     if (deviceIndexCache && Date.now() - deviceIndexAt < 30000) return deviceIndexCache;
-    // Held and handed to every caller until the fetch settles, so a burst
-    // (netpath redraws on each pan move) makes one request, not one per call.
+    // Held and handed to every caller until it settles, so a burst (netpath's pan) makes one request, not one per call.
     if (deviceIndexInFlight) return deviceIndexInFlight;
     deviceIndexInFlight = (async () => {
       const byIp = new Map();
@@ -870,9 +859,7 @@ const App = (() => {
           byId.set(d.id, d);
         }
       } catch (error) {
-        // An abort (a newer deviceIndex() call superseded this fetch) must
-        // not cache an empty index; Nodes unreadable to this account (403)
-        // is the one failure that legitimately means "no links".
+        // A superseding abort must not cache an empty index; 403 (Nodes unreadable) legitimately means "no links".
         if (error && error.superseded) return deviceIndexCache || { byIp, byId };
       }
       deviceIndexCache = { byIp, byId };
@@ -1894,11 +1881,7 @@ const App = (() => {
     return Boolean(wrap) && !wrap.hidden && modalToken() === token;
   }
 
-  /* A plain {key: value} snapshot of every field in the open dialog —
-     checkbox/radio by their `checked` state, everything else by `.value` —
-     keyed on id where a field has one, else its name. modalFormRestore
-     writes one back by the same keys, skipping any field the snapshot
-     names that is no longer there. */
+  // {key: value} for every field in the open dialog, keyed on id or else name; modalFormRestore writes it back.
   function modalFormSnapshot() {
     const box = document.getElementById('modal-box');
     const out = {};
@@ -3901,10 +3884,7 @@ const App = (() => {
     };
   }
 
-  /* Routes and Mapper's Print toggle: forces their canvas white with dark
-     ink (app.css's [data-print="1"]) regardless of theme, for a printout or
-     a screenshot bound for a document. One shared localStorage preference —
-     turning it on for one canvas is meant to carry to the other. */
+  // Forces a canvas white with dark ink (app.css's [data-print="1"]) regardless of theme; one shared preference.
   function wirePrintToggle(buttonId, canvasId) {
     const button = el(buttonId);
     const canvas = el(canvasId);
@@ -4582,12 +4562,8 @@ const App = (() => {
     });
   }
 
-  /* One delegated keydown handler for every [role="toolbar"] strip, instead
-     of wiring each of the eleven module strips separately. ArrowLeft/Right
-     and Home/End move focus among the strip's own enabled controls — a
-     button, input, select or a[href] — but only when focus is already on
-     one of them, and not while a text input is taking the keys for cursor
-     movement instead. */
+  // Delegated: ArrowLeft/Right/Home/End rove among a [role="toolbar"] strip's own controls when
+  // focus is already on one of them, but not while a text input is taking the keys for its cursor.
   function wireToolbarKeyboard() {
     const TOOLBAR_CONTROLS = 'button, input, select, a[href]';
     const TEXT_INPUT_TYPES = new Set(['text', 'search', 'number', 'email', 'password', 'url', 'tel', 'date', 'time']);
@@ -5525,8 +5501,7 @@ const App = (() => {
       if (tr.dataset.keyboardWired) continue;
       tr.dataset.keyboardWired = '1';
       tr.addEventListener('keydown', (event) => {
-        // Let a focusable control inside the row (e.g. its ⋯ button) handle
-        // its own Enter/Space instead of the row intercepting it first.
+        // A focusable control inside the row (e.g. its ⋯ button) handles its own Enter/Space.
         if (event.target !== tr) return;
         if (event.key === 'Enter') {
           event.preventDefault();     // Space would scroll the pane instead
@@ -5937,19 +5912,12 @@ const App = (() => {
   /* Called by a module when its own selection changes. Always a replace:
      only a tab change is worth a history entry. */
   function setRoute(parts, query, options = {}) {
-    // undefined keeps whatever filters are already in the address bar (a
-    // row selection should not wipe what syncFilterRoute wrote); {} clears.
+    // undefined keeps the filters syncFilterRoute already wrote; {} clears them.
     const q = query === undefined ? parseRoute().query : query;
     writeRoute(buildRoute(state.tab, parts, q), options);
   }
 
-  /* Keeps a tab's filters in the address bar, so the current search is a
-     link rather than something only this browser's localStorage knows. A
-     filter change is a replace, same as setRoute above — Back should not
-     have to walk through every intermediate severity a search was
-     narrowed by. `keysToIds` is a `{queryKey: inputId}` map; `parts`
-     defaults to whatever the address bar already names past the tab, so a
-     filter applied on a subtab or a selection does not throw that away. */
+  // Keeps a tab's filters in the address bar as a replace (same as setRoute); `parts` defaults to what is already there.
   function syncFilterRoute(tab, keysToIds, parts) {
     const query = {};
     for (const [key, id] of Object.entries(keysToIds)) {

@@ -1155,12 +1155,7 @@
     App.el('dash-done').hidden = !view.editing;
   }
 
-  /* A fresh install's dashboard is 24 tile types over an empty fleet — not
-     wrong, just nothing to point at yet. Shown above the grid (not a tile
-     itself, so the grid's own layout is untouched) only once the fleet
-     count is confirmed at zero; gone the moment a device exists. Gated on
-     Nodes read: an account that cannot read Nodes has nothing here to act
-     on either. */
+  // Shown above the grid only once the fleet is confirmed empty and Nodes is readable; gone once a device exists.
   function drawGetStarted() {
     const root = App.el('dash-get-started');
     if (!root) return;

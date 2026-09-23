@@ -5271,7 +5271,7 @@ check('<div class="card strip" role="toolbar" aria-label="Routes controls">' in 
 check(NETPATH_SECTION116.count('id="netpath-settings"') == 1,
       "#netpath-settings is defined exactly once, in the new strip")
 check("Dialog buttons: a form dialog" in read("app.css")
-      and "Confirmations (App.confirmDestructive) and the Settings Apply/Revert bar" in read("app.css"),
+      and "confirmation or the Settings Apply/Revert bar" in read("app.css"),
       "app.css's strip comment carries the dialog-button placement rule")
 check("'shell.dialogs'" in APP and "Remove takes something out of monitoring" in APP,
       "app.js registers shell.dialogs with the Remove/Delete distinction too")

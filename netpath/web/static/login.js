@@ -38,20 +38,12 @@
         document.getElementById('password').focus();
         return;
       }
-      // Read at first paint (app.js's start()), before the first /api/state
-      // poll would otherwise be the one to say the account must change its
-      // password — sessionStorage, not localStorage, so it never outlives
-      // this tab's own sign-in.
+      // sessionStorage, not localStorage: app.js's start() reads this at first paint, before the first /api/state poll would otherwise say so.
       if (payload.must_change) {
         try { sessionStorage.setItem('sappiwhere.mustChange', '1'); } catch (e) { /* private browsing, or storage full */ }
       }
       // ...unless a redirect (e.g. a 401 on #/alerts/998) preserved a hash to finish the journey to.
       const wanted = String(window.location.hash || '');
-      // A fresh sign-in with nowhere named lands on Dashboard; app.js's
-      // reload-preserves-tab logic takes over for every reload after this
-      // one. A named hash is itself the destination — the whole point of
-      // carrying it here — so it must not be overridden by whatever tab
-      // this browser last had open.
       if (!wanted) {
         try { localStorage.setItem('sappiwhere.tab', 'dashboard'); } catch (e) { /* private browsing, or storage full */ }
       }

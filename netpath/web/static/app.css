@@ -485,8 +485,7 @@ button.linkish:hover, a.linkish:hover { color: var(--accent); }
 button.linkish.inline { padding: 0; font-size: inherit; text-decoration: underline; }
 .conn.bad { color: var(--fail); }
 .conn.good { color: var(--ok); }
-/* The plain "updated HH:MM:SS" a healthy poll leaves behind — dim, so it
-   reads as ambient rather than competing with .bad/.good for attention. */
+/* Dim: ambient, not competing with .bad/.good for attention. */
 .conn.conn-updated { color: var(--dim); }
 
 /* Stale content is dimmed rather than hidden: the operator may still want to
@@ -593,11 +592,7 @@ button.danger:disabled:hover { background: var(--grid); filter: none; }
    padding of its own — hence the .bar-matching gutter here. */
 .write-denied-why { margin: 6px 0 0; padding: 0 var(--space-md); }
 #page-settings .scroll > .write-denied-why { padding: 0; }
-/* [inert] only: a disabled BUTTON/INPUT/SELECT/TEXTAREA/FIELDSET already
-   carries its own button:disabled tone (above) and the "no opacity"
-   reasoning right above applies to it — stacking opacity on top would push
-   it below the contrast floor. An inert <div>/<span> has no native disabled
-   styling at all, so without this it looks identical to a live one. */
+/* [inert] only: a disabled BUTTON/etc already has button:disabled's tone; an inert <div>/<span> has none of its own. */
 [inert].write-denied { opacity: .55; cursor: not-allowed; }
 button.icon { width: 32px; padding: var(--space-xs) 0; text-align: center; }
 /* A module's Settings button is an ordinary secondary button. It used to
@@ -607,11 +602,8 @@ button.icon { width: 32px; padding: var(--space-xs) 0; text-align: center; }
    emphatic controls for actions of very different weight, and on the two
    strips with no primary at all it read as the one.
 
-   Dialog buttons: a form dialog (App.modal's default) puts them at the top,
-   sticky, so Save is reachable without scrolling a long form first.
-   Confirmations (App.confirmDestructive) and the Settings Apply/Revert bar
-   are short enough that there is no fold to be above, so both stay
-   bottom-anchored instead ({buttonsTop: false}). */
+   Dialog buttons: a form dialog puts them at the top, sticky, so Save stays reachable; a
+   confirmation or the Settings Apply/Revert bar is short enough to stay bottom-anchored instead. */
 
 input, select, textarea {
   background: var(--raised);
@@ -961,10 +953,7 @@ body.tiny .terms { display: none; }
 .timeline svg { user-select: none; -webkit-user-select: none; width: 100%; height: 100%; display: block; }
 /* The route/map canvas is the exception (tokens.css); every other chart
    is a panel and takes the panel surface from the list above. It follows
-   the theme (dark on dark, since a predecessor of this comment kept it
-   white in every theme but Contrast) except under [data-print="1"] (also
-   tokens.css, beside the theme blocks it works the same way as), which
-   forces it back to white with dark ink regardless of theme. */
+   the theme except under [data-print="1"] (also tokens.css), forced back to white with dark ink. */
 /* A compact "at a glance" strip rather than a primary resizable panel —
    the Alerts histogram sits above its own splitter, not inside one. */
 .canvas.small { flex: none; height: 120px; min-height: 120px; }
@@ -1069,9 +1058,7 @@ tr.selected td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
    Nodes, Alerts and ConfigRX, which all use the same class. */
 tr.bulk-checked td { background: var(--checked); }
 tr.bulk-checked.selected td { background: var(--checked-strong); }
-/* Same tinted-text problem tr.alert-severe solves below, for the ticked
-   state: --checked/--checked-strong can sit close enough to a severity or
-   status colour to wash it out. All three go back to --text here. */
+/* Same tinted-text problem tr.alert-severe solves below, for the ticked state. */
 tr.bulk-checked .sev, tr.bulk-checked .status-mark, tr.bulk-checked .status-text {
   color: var(--text);
 }
@@ -1491,8 +1478,7 @@ body.resizing-h, body.resizing-h * { cursor: col-resize !important; user-select:
   max-width: 460px;
 }
 
-/* App.ipCell: an address plus its actions button (IPAM/Syslog/SNMP
-   Trap/NetFlow/Device), and the popover the button opens. */
+/* App.ipCell: an address plus its actions button, and the popover it opens. */
 .ip-cell { display: inline-flex; align-items: center; gap: 4px; }
 .ip-menu {
   border: none;
@@ -1622,8 +1608,7 @@ body.login-page {
 .help-body p { margin: 0 0 10px; line-height: 1.45; }
 .help-body ul { margin: 0 0 10px var(--space-lg); padding: 0; }
 .help-body li { margin: var(--space-xs) 0; line-height: 1.4; }
-/* .sev's 62px table-column width wraps the severity legend, whose text
-   ("0 Emergency") runs longer than a column ever needs to. */
+/* .sev's 62px table-column width wraps the severity legend's longer text. */
 .help-body .sev { width: auto; display: inline-block; padding: 0 .4em; }
 /* The body of every dialog is wrapped in <form class="modal-form"> so that
    Enter submits it (see App.modal), which put one element between
