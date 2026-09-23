@@ -162,7 +162,8 @@
                                 view.sort.descending, columns);
       App.drawRows(body, rows, columns, (tr, row) => {
         tr.className = 'clickable' + (view.selected === row.id ? ' selected' : '');
-        tr.onclick = () => {
+        tr.onclick = (event) => {
+          if (event.target.closest('.ip-menu')) return;
           view.selected = row.id;
           App.setRoute([row.id]);
           // A selected row is a snapshot an operator is reading; Live

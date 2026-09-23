@@ -5753,6 +5753,13 @@ check("checked: deviceRows.length > 0" in _DRAWTABLE119
 check("if (!deviceRowIds.has(id)) checked.delete(id);" in _DRAWTABLE119,
       "ticking select-all drops any hidden device a prior selection left checked")
 
+# ---------------------------------------------------------------------------
+# 120. Syslog/SNMP row click: a click on the ⋯ actions button inside a row
+#      must not also select the row and pause Live.
+_DRAWTABLE120 = js_function(read("events.js"), "drawTable")
+check("if (event.target.closest('.ip-menu')) return;" in _DRAWTABLE120,
+      "the row's onclick bails out early for a click on .ip-menu")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:
