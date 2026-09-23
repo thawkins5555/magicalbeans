@@ -753,7 +753,24 @@ class IpamDatabase(SqliteStore):
             self._conn.commit()
 
     def reopen_conflict(self, conflict_id: int) -> None:
+        """Refuses to reopen a resolved conflict a scan has already
+        re-detected: record_conflict opens a fresh row rather than touch a
+        resolved one, so reopening this one too would leave two open rows
+        for the same ip/MAC pair."""
         with self._lock:
+            row = self._conn.execute(
+                "SELECT ip, mac_a, mac_b FROM conflicts WHERE id=?",
+                (conflict_id,)).fetchone()
+            if row is None:
+                return
+            dup = self._conn.execute(
+                "SELECT id FROM conflicts WHERE id!=? AND ip=? AND resolved_ts IS NULL"
+                " AND ((mac_a=? AND mac_b=?) OR (mac_a=? AND mac_b=?))",
+                (conflict_id, row["ip"], row["mac_a"], row["mac_b"],
+                 row["mac_b"], row["mac_a"])).fetchone()
+            if dup:
+                raise ValueError(
+                    "A scan already re-detected this conflict; see the open row instead")
             self._conn.execute(
                 "UPDATE conflicts SET resolved_ts=NULL WHERE id=?",
                 (conflict_id,))
