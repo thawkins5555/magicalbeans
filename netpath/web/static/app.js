@@ -5779,6 +5779,8 @@ const App = (() => {
          #/netpath/12                       a destination
          #/configrx/device/4/backup/91      a stored configuration
          #/snmp/5512  #/syslog/8801  #/wireless/3
+         #/nodes/reports/firmware           a top-level subtab, then a nested one
+         #/nodes/device/1234/arp            a device, then its own nested tab
 
      A tab change is a pushState, so Back walks the tabs; selecting a row
      inside a tab is a replaceState, so clicking down a list does not cost
@@ -5892,18 +5894,78 @@ const App = (() => {
      person's own click would run (nodes.js's selectSub, for one). A route
      whose first part is not a known subtab name for this tab (an entity id,
      "device", a numeric alert id) simply matches nothing here and falls
-     through unchanged to the module below. */
+     through unchanged to the module below.
+
+     A second route part is walked the same way, one level down: a nested
+     `.subtabs.nested` nav inside whichever `.subpage` the first part just
+     activated (Nodes' REPORTS children, Settings' groups) — clicked the
+     instant the top-level match makes it visible, since that switch is
+     synchronous. An entity route (`#/nodes/device/1234/arp`) has no such
+     match at the top level — "device" is not a subtab name — so nothing
+     here can find its nested nav yet; the module still has to open the
+     device first, asynchronously in Nodes' case. waitForNestedSubtab below
+     watches for that instead of running once and giving up, so the link
+     still lands on the right nested tab without this file waiting on
+     nodes.js itself. */
   function applySubtabFromRoute(route) {
     const name = route.parts[0];
     if (!name || !/^[a-z0-9_-]+$/i.test(name)) return;
     const nav = document.querySelector(`#page-${route.tab} > .subtabs`);
-    if (!nav) return;
+    if (nav) {
+      for (const button of nav.querySelectorAll(':scope > .subtab')) {
+        if (button.dataset.subtab === name) {
+          if (!button.classList.contains('active')) button.click();
+          applyNestedSubtabFromRoute(route);
+          return;
+        }
+      }
+    }
+    // A purely numeric last part is an id (`device/1234`, `port/7`), never
+    // a nested subtab name, so there is nothing worth watching for.
+    const last = route.parts[route.parts.length - 1];
+    if (route.parts.length > 1 && !/^\d+$/.test(last)) waitForNestedSubtab(route);
+  }
+
+  function clickNestedSubtab(nav, name) {
     for (const button of nav.querySelectorAll(':scope > .subtab')) {
       if (button.dataset.subtab === name) {
         if (!button.classList.contains('active')) button.click();
-        return;
+        return true;
       }
     }
+    return false;
+  }
+
+  function applyNestedSubtabFromRoute(route) {
+    const name = route.parts[1];
+    if (!name || !/^[a-z0-9_-]+$/i.test(name)) return;
+    const activeSubpage = document.querySelector(`#page-${route.tab} .subpage.active`);
+    const nav = activeSubpage && activeSubpage.querySelector(':scope > .subtabs.nested');
+    if (nav) clickNestedSubtab(nav, name);
+  }
+
+  /* A nested nav that is not there yet — a Nodes device's own INTERFACES/
+     ARP/… strip, drawn only once nodes.js opens the device the route's
+     first part named. The entity descriptor itself varies in length
+     (`device/1234` is two parts), so the LAST part is the candidate nested
+     name here, not the second — `#/nodes/device/1234/arp` wants "arp", not
+     "1234". Watches #page-<tab> rather than polling nodes.js's own state,
+     and gives up after 5s so a route naming a device that no longer exists
+     does not leave an observer running for the rest of the session. */
+  function waitForNestedSubtab(route) {
+    const name = route.parts[route.parts.length - 1];
+    if (!name || !/^[a-z0-9_-]+$/i.test(name)) return;
+    const page = document.getElementById(`page-${route.tab}`);
+    if (!page) return;
+    const tryNow = () => {
+      const nav = [...page.querySelectorAll('.subtabs.nested')]
+        .find((candidate) => candidate.offsetParent !== null);
+      return nav ? clickNestedSubtab(nav, name) : false;
+    };
+    if (tryNow()) return;
+    const observer = new MutationObserver(() => { if (tryNow()) observer.disconnect(); });
+    observer.observe(page, { attributes: true, childList: true, subtree: true });
+    setTimeout(() => observer.disconnect(), 5000);
   }
 
   /* Hands the route to the module. The selection half runs after the

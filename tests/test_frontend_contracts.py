@@ -5135,6 +5135,26 @@ check("if (!field) continue;" in RESTORE109,
 check("modalFormSnapshot, modalFormRestore" in APP,
       "modalFormSnapshot/modalFormRestore are exported on App")
 
+
+# ---------------------------------------------------------------------------
+# 110. Nested subtab deep links: a second (and, for a device, a last) route
+#      part is walked through a `.subtabs.nested` nav — synchronously for a
+#      subpage a top-level match just activated, or watched for once it is
+#      an entity (a Nodes device) the module still has to open.
+APPLYSUB110 = js_function(APP, "applySubtabFromRoute")
+check("applyNestedSubtabFromRoute(route)" in APPLYSUB110,
+      "applySubtabFromRoute applies a nested part right after a top-level match")
+check("waitForNestedSubtab(route)" in APPLYSUB110,
+      "applySubtabFromRoute falls back to waiting for a nested nav")
+NESTED110 = js_function(APP, "applyNestedSubtabFromRoute")
+check(".subpage.active" in NESTED110 and ".subtabs.nested" in NESTED110,
+      "applyNestedSubtabFromRoute reads the active subpage's own nested nav")
+WAIT110 = js_function(APP, "waitForNestedSubtab")
+check("route.parts[route.parts.length - 1]" in WAIT110,
+      "waitForNestedSubtab uses the route's last part, not its second")
+check("MutationObserver" in WAIT110 and "setTimeout(() => observer.disconnect(), 5000)" in WAIT110,
+      "waitForNestedSubtab watches for the nav and gives up after 5s")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

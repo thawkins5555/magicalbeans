@@ -2381,6 +2381,20 @@ async function checkRouting(page, base, dir, tag) {
     return `${state.hash} -> subtab ${state.active.subtab}`;
   });
 
+  await check('a nested subtab deep link opens the right nested tab (#/nodes/reports/firmware)',
+    async () => {
+      await page.evaluate(() => { window.location.hash = '#/nodes/reports/firmware'; });
+      await sleep(1200);
+      const active = await page.evaluate(() => (document.querySelector(
+        '#nodes-sub-reports > .subtabs.nested > .subtab.active') || {}).dataset);
+      assert(active && active.subtab === 'firmware',
+             `the active nested subtab is "${active && active.subtab}", not firmware`);
+      // Leave Nodes the way every other check here found it.
+      await page.click('#page-nodes > .subtabs > [data-subtab="devices"]').catch(() => {});
+      await sleep(400);
+      return active.subtab;
+    });
+
   let alertHash = null;
 
   await check('selecting an alert writes #/alerts/<id>', async () => {
