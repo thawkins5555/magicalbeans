@@ -5997,9 +5997,11 @@ const App = (() => {
   function applyNestedSubtabFromRoute(route) {
     const name = route.parts[1];
     if (!name || !/^[a-z0-9_-]+$/i.test(name)) return;
-    const activeSubpage = document.querySelector(`#page-${route.tab} .subpage.active`);
+    // Direct child only: a device's own detail panes are .subpage.active
+    // too, nested inside the DEVICES subpage, and would match first.
+    const activeSubpage = document.querySelector(`#page-${route.tab} > .subpage.active`);
     const nav = activeSubpage && activeSubpage.querySelector(':scope > .subtabs.nested');
-    if (nav) clickNestedSubtab(nav, name);
+    if (!nav || !clickNestedSubtab(nav, name)) waitForNestedSubtab(route);
   }
 
   /* A nested nav that is not there yet — a Nodes device's own INTERFACES/

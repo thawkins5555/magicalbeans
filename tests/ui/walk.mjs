@@ -2387,11 +2387,13 @@ async function checkRouting(page, base, dir, tag) {
       await sleep(1200);
       const active = await page.evaluate(() => (document.querySelector(
         '#nodes-sub-reports > .subtabs.nested > .subtab.active') || {}).dataset);
-      assert(active && active.subtab === 'firmware',
-             `the active nested subtab is "${active && active.subtab}", not firmware`);
-      // Leave Nodes the way every other check here found it.
+      // Leave Nodes the way every other check here found it — before the
+      // assertion, so a failure here cannot hide the device list from the
+      // checks that follow.
       await page.click('#page-nodes > .subtabs > [data-subtab="devices"]').catch(() => {});
       await sleep(400);
+      assert(active && active.subtab === 'firmware',
+             `the active nested subtab is "${active && active.subtab}", not firmware`);
       return active.subtab;
     });
 
@@ -2924,7 +2926,8 @@ async function checkMisc(page, watcher) {
   await check('the IP actions popover opens and Escape closes it (Syslog)', async () => {
     await selectTab(page, 'syslog');
     await settle(page, 900);
-    const button = await page.$('.ip-menu');
+    // Scoped: NetFlow's hidden table precedes Syslog in the DOM.
+    const button = await page.$('#page-syslog .ip-menu');
     if (!button) return 'skipped: no IP address rows on screen';
     await button.click();
     await page.waitForSelector('.ip-actions[role="menu"]', { timeout: 5000 });
