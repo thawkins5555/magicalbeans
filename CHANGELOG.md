@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.59.0 — VlanView glows the links carrying a picked VLAN; charts stop bridging gaps in the data; Mapper gets SSH/WEB buttons; SMS sign-up adds a Privacy Policy checkbox](#5590--vlanview-glows-the-links-carrying-a-picked-vlan-charts-stop-bridging-gaps-in-the-data-mapper-gets-sshweb-buttons-sms-sign-up-adds-a-privacy-policy-checkbox)
 - [5.58.0 — Email subjects drop "SappiWhere"; NetFlow names what's missing, raises the per-exporter template cap to 512, and keeps templates across a restart](#5580--email-subjects-drop-sappiwhere-netflow-names-whats-missing-raises-the-per-exporter-template-cap-to-512-and-keeps-templates-across-a-restart)
 - [5.57.0 — IP addresses everywhere get an actions button; filters and nested tabs are links; sign-in returns you to where you were](#5570--ip-addresses-everywhere-get-an-actions-button-filters-and-nested-tabs-are-links-sign-in-returns-you-to-where-you-were)
 - [5.56.0 — Every reboot emails; silent email drops say why; DAC badge grey; Send test email](#5560--every-reboot-emails-silent-email-drops-say-why-dac-badge-grey-send-test-email)
@@ -192,6 +193,55 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.59.0 — VlanView glows the links carrying a picked VLAN; charts stop bridging gaps in the data; Mapper gets SSH/WEB buttons; SMS sign-up adds a Privacy Policy checkbox
+
+Four operator asks from one working session.
+
+**VlanView: pick a VLAN on the map, and its links light up.** Clicking a
+row in MAPPER's "VLANs on this map" table already dimmed every link that
+does not carry that VLAN; the links that do carry it now also get a
+steady glow in that VLAN's own colour — the same colour its tile shows —
+so the path a VLAN actually takes is readable at a glance instead of
+read off the dimming alone. The glow works whether FiberView is on or
+off, is carried through in the PNG export, and the legend line above the
+canvas now spells out which VLAN is picked: "VlanView: links carrying
+VLAN 20 (Engineering) glow in its colour; the rest are dimmed."
+
+**Charts no longer draw a straight line across a gap in the data.** A
+device that goes quiet for a stretch — offline, or a run of missed
+polls — used to have its chart bridge straight over the missing samples,
+which reads as "the number ramped smoothly" when what actually happened
+is "nothing was heard from it." A gap of more than three missed samples
+(four times that series' own normal polling interval) now breaks the
+line, and the shaded min/max band, into separate pieces instead of
+joining across it; a poll or two lost to a busy device still connects
+normally, so this only catches a real outage, not ordinary jitter, and
+the one poll that answered in the middle of an outage shows as a dot
+rather than vanishing. This
+is the one chart engine behind the Nodes device and interface history
+charts, the Dashboard's graph tiles, and Wireless's history charts, so
+all of them stop bridging gaps the same way.
+
+**Mapper gets SSH and WEB buttons of its own.** The strip above the map
+now carries the same **SSH** and **WEB** buttons the Nodes device pane
+already has, beside **Print** and **Settings**. Select a single real
+device on the map — not a placeholder, an unmanaged peer, or a device
+since removed from Nodes — and **SSH** opens a terminal to it exactly the
+way Nodes does; **WEB** opens a tunnel to its web interface the same
+way, and additionally needs the device to have an IP address on file.
+Both buttons are gated on the same `ssh`/`web` permissions as their
+Nodes counterparts, so nothing is opened up to an account that could not
+already reach it from Nodes.
+
+**SMS sign-up now asks for the Terms of Service and the Privacy Policy
+separately.** The Account dialog's opt-in form used one checkbox to
+cover both documents, plus a separate consent checkbox; it is now three
+checkboxes — Terms of Service, Privacy Policy, and consent to receive the
+alert texts — and the server refuses to start a sign-up unless all three
+are ticked. The audit trail now reads "terms and privacy policy
+accepted, alert-text consent given" instead of folding the two documents
+into one line.
 
 ### 5.58.0 — Email subjects drop "SappiWhere"; NetFlow names what's missing, raises the per-exporter template cap to 512, and keeps templates across a restart
 

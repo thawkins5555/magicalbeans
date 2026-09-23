@@ -5,6 +5,39 @@ grouped by the version that carries it. This is a working record for the
 operator — the full story of each change is in `CHANGELOG.md`, and this file
 does not replace it.
 
+## 5.59.0 — VlanView glows the picked VLAN's links, charts stop bridging data gaps, Mapper gets SSH/WEB buttons, and SMS sign-up splits into three checkboxes
+
+**Operator prompt, four items in one message:**
+- SMS sign-up: split the single Terms-and-Privacy checkbox into two — one
+  for the Terms of Service, one for the Privacy Policy — alongside the
+  existing consent checkbox.
+- Mapper: when a VLAN is picked in "VLANS ON THIS MAP," the links
+  carrying it should stand out with a glow in that VLAN's own colour, not
+  just leave everything else dimmed the way it does today.
+- Charts (Nodes, Dashboard, Wireless): stop drawing a straight line
+  across a stretch where a device went quiet — a screenshot showed a full
+  day of downtime inside a 7-day window drawn as an unbroken line.
+- Mapper: add SSH and WEB buttons to the map's own toolbar strip, acting
+  on the one selected device, the same as Nodes' device pane already
+  offers.
+
+**Two planning answers, both the recommended option.** The chart gap
+rule: break the line after more than three missed samples (four times
+that series' own normal spacing). The glow: steady, not pulsing like
+FiberView.
+
+**Outcome.** Shipped as 5.59.0. Thing1 built the glow, the chart runs
+and the strip buttons; Thing2 the three SMS boxes; Stephen_King the
+docs. Testy: targeted suites green, full suite 205/208 with only the
+three known environmental failures (`test_prune_lock_hold` confirmed
+failing identically on unmodified main), the browser walk 98/98, and an
+ad-hoc Mapper check of the glow, legend and buttons. Javariius found one
+fix-first item: a lone sample between two gaps became a one-point run
+that painted nothing, so it now draws as a dot; short runs also lose
+their min/max the same way smoothed runs do. Files: `netpath/web/api/auth.py`,
+`netpath/web/static/{app.js,app.css,index.html,mapper.js,nodes.js,sms-terms.html}`,
+`tests/test_frontend_contracts.py`, `tests/test_account_sms.py`, the docs.
+
 ## 5.58.0 — Email subjects drop "SappiWhere"; NetFlow names missing templates, raises the cap to 512, and survives a restart
 
 **"Remove 'SappiWhere' from the subject line of all email templates."**

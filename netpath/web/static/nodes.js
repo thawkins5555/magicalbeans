@@ -5609,48 +5609,17 @@
       }, (confirmed) => { if (!confirmed) editDevice(); });
   }
 
-  /* The one window.open in the application: a shell is not a dialog, it is
-     kept open beside the product, resized and lived in. The name keys the
-     window to the device, so a second click raises the session it already
-     has. `noopener` cannot be in the feature string for that — a window
-     opened with it is treated as `_blank` and the name is discarded, so
-     every click would open a rival shell; clearing `opener` on the
-     same-origin handle does the same job. The display name rides in the URL
-     and is replaced by whatever /api/ssh/devices/<id> reports. */
   function sshDevice() {
     if (!view.detail || !App.canWrite('ssh')) return;
     const d = view.detail;
-    const w = window.open(
-      `/ssh.html?device=${d.id}&name=${encodeURIComponent(displayName(d))}`,
-      `ssh-${d.id}`, 'width=1000,height=640');
-    if (w) {
-      w.opener = null;
-      w.focus();
-    }
+    App.openSshWindow(d.id, displayName(d));
   }
 
-  /* The window is opened BEFORE the POST and its location set afterwards:
-     a `window.open` after an `await` is no longer inside the click that
-     caused it, and every browser's popup blocker eats it. */
   async function webDevice() {
     if (!view.detail || !App.canWrite('web')) return;
     const d = view.detail;
-    const w = window.open('', `web-${d.id}`, 'width=1200,height=800');
-    if (w) w.opener = null;
-    try {
-      const relay = await App.post(`/api/web/devices/${d.id}/relay`, {});
-      if (w) {
-        w.location = relay.url;
-        w.focus();
-      }
-      const minutes = Math.max(1, Math.round((relay.expires_s || 900) / 60));
-      App.toast(`Tunnel open on port ${relay.port} for ${minutes} minute(s) `
-                + 'of idle time', 'ok');
-      loadWebRelays();
-    } catch (error) {
-      if (w) w.close();
-      App.toast(`Could not open a tunnel: ${error.message}`, 'fail');
-    }
+    const relay = await App.openWebTunnel(d.id);
+    if (relay) loadWebRelays();
   }
 
   /* ------------------------------------------------------------ profiles */

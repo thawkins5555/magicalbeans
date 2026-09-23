@@ -281,7 +281,8 @@ const App = (() => {
             ${stoppedLine}
             <label>Mobile number <input id="am-sms-number" type="tel" autocomplete="tel" placeholder="+15551234567" value="${number}"></label>
             <p class="hint" id="am-sms-terms">SappiWhere sends automated network alert text messages (operational, not marketing) to this number: a text when an alert fires and one when it clears. Message frequency varies with network activity. Msg & data rates may apply. Reply STOP at any time to opt out, or HELP for help; you can also stop texts here. Your number is used only for these alerts and is not shared.</p>
-            <label class="check"><input type="checkbox" id="am-sms-terms-ok"> I have read and agree to the <a href="/sms-terms" target="_blank" rel="noopener">SMS Terms</a> and <a href="/sms-privacy" target="_blank" rel="noopener">SMS Privacy Policy</a></label>
+            <label class="check"><input type="checkbox" id="am-sms-terms-ok"> I have read and agree to the <a href="/sms-terms" target="_blank" rel="noopener">SMS Terms of Service</a></label>
+            <label class="check"><input type="checkbox" id="am-sms-privacy-ok"> I have read and agree to the <a href="/sms-privacy" target="_blank" rel="noopener">SMS Privacy Policy</a></label>
             <label class="check"><input type="checkbox" id="am-sms-consent"> Yes, I agree to receive automated network alert text messages from SappiWhere at this number</label>
             <div class="row"><button type="button" id="am-sms-start">Yes, sign me up</button></div>
             <p class="hint">We text a one-time code to this number to confirm it.</p>
@@ -289,12 +290,14 @@ const App = (() => {
           smsBody.querySelector('#am-sms-start').onclick = async () => {
             const numberValue = smsBody.querySelector('#am-sms-number').value.trim();
             const termsOk = smsBody.querySelector('#am-sms-terms-ok').checked;
+            const privacyOk = smsBody.querySelector('#am-sms-privacy-ok').checked;
             const consent = smsBody.querySelector('#am-sms-consent').checked;
             if (!numberValue) { showModalError(box, 'Enter your mobile number'); return; }
-            if (!termsOk) { showModalError(box, 'Tick the box to accept the SMS Terms and Privacy Policy'); return; }
+            if (!termsOk) { showModalError(box, 'Tick the box to accept the SMS Terms of Service'); return; }
+            if (!privacyOk) { showModalError(box, 'Tick the box to accept the SMS Privacy Policy'); return; }
             if (!consent) { showModalError(box, 'Tick the box to agree to receive alert texts'); return; }
             try {
-              const result = await post('/api/account/sms/start', { number: numberValue, consent: true, terms: true });
+              const result = await post('/api/account/sms/start', { number: numberValue, consent: true, terms: true, privacy: true });
               renderSms(result);
               announce('Verification code sent');
             } catch (error) { showModalError(box, error.message); }
@@ -648,6 +651,45 @@ const App = (() => {
       ' stored on this host: it needs either Windows DPAPI or a portable' +
       ' secret store configured with NETPATH_SECRET_PASSPHRASE_FILE (see' +
       ' CREDENTIAL-SECURITY.md), and neither is set up here.</p>';
+  }
+
+  /* A shell is not a dialog: it is kept open beside the product, resized
+     and lived in. The name keys the window to the device, so a second
+     click raises the session it already has. `noopener` cannot be in the feature string for that — a window
+     opened with it is treated as `_blank` and the name is discarded, so
+     every click would open a rival shell; clearing `opener` on the
+     same-origin handle does the same job. */
+  function openSshWindow(deviceId, name) {
+    const w = window.open(
+      `/ssh.html?device=${deviceId}&name=${encodeURIComponent(name)}`,
+      `ssh-${deviceId}`, 'width=1000,height=640');
+    if (w) {
+      w.opener = null;
+      w.focus();
+    }
+  }
+
+  /* The window is opened BEFORE the POST and its location set afterwards:
+     a `window.open` after an `await` is no longer inside the click that
+     caused it, and every browser's popup blocker eats it. */
+  async function openWebTunnel(deviceId) {
+    const w = window.open('', `web-${deviceId}`, 'width=1200,height=800');
+    if (w) w.opener = null;
+    try {
+      const relay = await post(`/api/web/devices/${deviceId}/relay`, {});
+      if (w) {
+        w.location = relay.url;
+        w.focus();
+      }
+      const minutes = Math.max(1, Math.round((relay.expires_s || 900) / 60));
+      toast(`Tunnel open on port ${relay.port} for ${minutes} minute(s) `
+            + 'of idle time', 'ok');
+      return relay;
+    } catch (error) {
+      if (w) w.close();
+      toast(`Could not open a tunnel: ${error.message}`, 'fail');
+      return null;
+    }
   }
 
   async function loadPlatform() {
@@ -3229,16 +3271,22 @@ const App = (() => {
      rather than reaching past the data. Only `avg`/`value` is smoothed;
      `min`/`max` are already a bucket's real extremes, and averaging them
      would blur out the spikes they exist to show. */
-  function movingAverage(points) {
-    const n = points.length;
-    if (n < 3) return points;
+  // Median positive gap between consecutive samples, 1 when there is none —
+  // shared by movingAverage's smoothing window and splitAtGaps' break test.
+  function medianSpacing(points) {
     const spacings = [];
-    for (let i = 1; i < n; i += 1) {
+    for (let i = 1; i < points.length; i += 1) {
       const dt = points[i].ts - points[i - 1].ts;
       if (dt > 0) spacings.push(dt);
     }
     spacings.sort((a, b) => a - b);
-    const median = spacings.length ? spacings[Math.floor(spacings.length / 2)] : 1;
+    return spacings.length ? spacings[Math.floor(spacings.length / 2)] : 1;
+  }
+
+  function movingAverage(points) {
+    const n = points.length;
+    if (n < 3) return points;
+    const median = medianSpacing(points);
     const window = Math.max(3, Math.min(25, Math.round(90 / median)));
     const half = Math.floor(window / 2);
     const isRollup = points[0].avg !== undefined;
@@ -3253,6 +3301,26 @@ const App = (() => {
       const smoothed = count ? sum / count : null;
       return isRollup ? { ...p, avg: smoothed } : { ts: p.ts, value: smoothed };
     });
+  }
+
+  const GAP_BREAK_FACTOR = 4;
+
+  // A gap longer than four normal sample spacings (more than three missed
+  // samples) is drawn as a break, not a line.
+  function splitAtGaps(points) {
+    if (points.length < 3) return [points];
+    const threshold = GAP_BREAK_FACTOR * medianSpacing(points);
+    const runs = [];
+    let run = [points[0]];
+    for (let i = 1; i < points.length; i += 1) {
+      if (points[i].ts - points[i - 1].ts > threshold) {
+        runs.push(run);
+        run = [];
+      }
+      run.push(points[i]);
+    }
+    runs.push(run);
+    return runs;
   }
 
   /* Axis-label formatting by metric unit — the raw number a metric
@@ -3305,12 +3373,15 @@ const App = (() => {
     const drawBand = (data.series || []).length === 1;
     const seriesList = (data.series || []).map((s) => {
       const points = s.points || [];
-      if (!opts.smooth || points.length < 3) return { ...s, points };
-      const smoothed = movingAverage(points);
-      const isRollupPts = points[0].avg !== undefined;
-      return { ...s, points: isRollupPts && !drawBand
-        ? smoothed.map((p) => ({ ts: p.ts, avg: p.avg }))
-        : smoothed };
+      const runs = splitAtGaps(points).map((run) => {
+        if (!opts.smooth) return run;
+        const smoothed = run.length < 3 ? run : movingAverage(run);
+        const isRollupPts = run.length > 0 && run[0].avg !== undefined;
+        return isRollupPts && !drawBand
+          ? smoothed.map((p) => ({ ts: p.ts, avg: p.avg }))
+          : smoothed;
+      });
+      return { ...s, runs, points: runs.flat() };
     });
     const value = (p) => p.avg !== undefined ? p.avg : p.value;
     // The ceiling comes from what is actually drawn: the avg/value line for
@@ -3365,20 +3436,28 @@ const App = (() => {
 
     for (const s of seriesList) {
       const isRollup = s.points[0] && s.points[0].avg !== undefined;
-      if (isRollup && drawBand) {
-        const banded = s.points.filter((p) => p.min != null && p.max != null);
-        const band = banded.map((p) => `${xFor(p.ts)},${yFor(p.max)}`).join(' ') +
-          ' ' + banded.slice().reverse()
-          .map((p) => `${xFor(p.ts)},${yFor(p.min)}`).join(' ');
-        svg.appendChild(svgNode('polygon', {
-          points: band, fill: s.color, 'fill-opacity': 0.15, stroke: 'none' }));
-      }
-      const line = s.points.filter((p) => value(p) != null)
-        .map((p) => `${xFor(p.ts)},${yFor(value(p))}`).join(' ');
-      if (line) {
-        svg.appendChild(svgNode('polyline', {
-          points: line, fill: 'none', stroke: s.color, 'stroke-width': 1.5,
-          'stroke-dasharray': s.dash || null }));
+      for (const run of s.runs) {
+        if (!run.length) continue;
+        if (isRollup && drawBand) {
+          const banded = run.filter((p) => p.min != null && p.max != null);
+          const band = banded.map((p) => `${xFor(p.ts)},${yFor(p.max)}`).join(' ') +
+            ' ' + banded.slice().reverse()
+            .map((p) => `${xFor(p.ts)},${yFor(p.min)}`).join(' ');
+          svg.appendChild(svgNode('polygon', {
+            points: band, fill: s.color, 'fill-opacity': 0.15, stroke: 'none' }));
+        }
+        const drawn = run.filter((p) => value(p) != null);
+        // The one poll that answered inside an outage is a run of one point:
+        // a polyline of one coordinate paints nothing, so it gets a dot.
+        if (drawn.length === 1) {
+          svg.appendChild(svgNode('circle', {
+            cx: xFor(drawn[0].ts), cy: yFor(value(drawn[0])), r: 2, fill: s.color }));
+        } else if (drawn.length) {
+          svg.appendChild(svgNode('polyline', {
+            points: drawn.map((p) => `${xFor(p.ts)},${yFor(value(p))}`).join(' '),
+            fill: 'none', stroke: s.color, 'stroke-width': 1.5,
+            'stroke-dasharray': s.dash || null }));
+        }
       }
     }
 
@@ -6813,6 +6892,7 @@ const App = (() => {
     bulkToggle, bulkClear,
     announce, desktopNotifyEnabled, setDesktopNotify, titleForAlerts,
     canStoreSecrets, credentialUnavailableHtml,
+    openSshWindow, openWebTunnel,
     registerHelp, helpLink,
     resetLayout, onRelayout, setTheme, currentTheme, tile, figure, figures, comboBox,
     drawSeriesChart, formatMetricValue, sparkline, RANGES, rangeDialog, rangeLabel,

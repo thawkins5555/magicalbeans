@@ -726,7 +726,9 @@ def post_account_sms_start(service, params, body) -> dict:
     if body.get("consent") is not True:
         raise ValueError("Accept the terms to receive alert texts")
     if body.get("terms") is not True:
-        raise ValueError("Accept the SMS Terms and Privacy Policy to receive alert texts")
+        raise ValueError("Accept the SMS Terms of Service to receive alert texts")
+    if body.get("privacy") is not True:
+        raise ValueError("Accept the SMS Privacy Policy to receive alert texts")
     number = str(body.get("number", "")).strip()
     if not alertmail.is_e164(number):
         raise ValueError("A mobile number in E.164 form (+15551234567) is required")
@@ -752,7 +754,7 @@ def post_account_sms_start(service, params, body) -> dict:
         service.app_db.sms_clear_code(me)
         raise ValueError(str(exc)) from exc
     _audit(service, params, "account.sms.start", target=me,
-          detail=f"terms accepted, alert-text consent given, code sent to {number}")
+          detail=f"terms and privacy policy accepted, alert-text consent given, code sent to {number}")
     return _account_sms(service, service.app_db.user_sms(me))
 
 

@@ -1386,12 +1386,14 @@ check("EMAIL SERVER" in _MINSEV_HELP,
 
 # 40. The WEB relay (5.1.0): must not regress — a URL in the markup, a
 #     missing permission gate, or a window.open placed after an await.
-_WEB_CLICK = js_function(NODES, "webDevice")
+#     The window mechanics moved into app.js's openWebTunnel (5.59.0), shared
+#     with the Mapper strip's own WEB button; nodes.js keeps the guard.
+_WEB_CLICK = js_function(APP, "openWebTunnel")
 check("dataset.url" not in NODES,
       "no device URL is stashed in the markup any more -- the destination "
       "comes from the device row, server-side, and the button carries a "
       "device selection and nothing else")
-check(_WEB_CLICK.index("window.open(") < _WEB_CLICK.index("await App.post("),
+check(_WEB_CLICK.index("window.open(") < _WEB_CLICK.index("await post("),
       "the tunnel window is opened synchronously inside the click and its "
       "location set once the POST answers; a window.open after an await is "
       "no longer user-initiated and every popup blocker eats it")
@@ -5009,12 +5011,12 @@ check("App.get('/api/nodes/devices', { ...query, fields: 'list' })" in _REFRESH1
       "nodes.js's device list refresh asks for the 'list' projection")
 
 # ---------------------------------------------------------------------------
-# 103. Account modal (5.54.0): the SMS opt-in fieldset carries its ids, the
-#      exact consent sentence, separate terms/consent checkboxes (neither
-#      pre-ticked), and the number interpolation is escaped.
+# 103. Account modal (5.59.0): the SMS opt-in fieldset carries its ids, the
+#      exact consent sentence, three separate terms/privacy/consent
+#      checkboxes (none pre-ticked), and the number interpolation is escaped.
 ACCOUNT_MODAL103 = js_function(APP, "accountModal")
-for sms_id in ("am-sms-number", "am-sms-terms-ok", "am-sms-consent", "am-sms-start",
-               "am-sms-code", "am-sms-confirm", "am-sms-stop"):
+for sms_id in ("am-sms-number", "am-sms-terms-ok", "am-sms-privacy-ok", "am-sms-consent",
+               "am-sms-start", "am-sms-code", "am-sms-confirm", "am-sms-stop"):
     check("id=\"%s\"" % sms_id in ACCOUNT_MODAL103,
           "accountModal renders #%s" % sms_id)
 check("Text alerts (SMS)" in ACCOUNT_MODAL103,
@@ -5031,7 +5033,7 @@ check('href="/sms-terms"' in ACCOUNT_MODAL103 and 'href="/sms-privacy"' in ACCOU
       "accountModal's SMS paragraph links the full terms and privacy pages")
 check(ACCOUNT_MODAL103.count('rel="noopener"') >= 2,
       "the SMS terms/privacy links open in a new tab without a window handle back")
-for _cb in ("am-sms-terms-ok", "am-sms-consent"):
+for _cb in ("am-sms-terms-ok", "am-sms-privacy-ok", "am-sms-consent"):
     _tag = ACCOUNT_MODAL103[ACCOUNT_MODAL103.rfind("<input", 0, ACCOUNT_MODAL103.index(f'id="{_cb}"')):ACCOUNT_MODAL103.index(">", ACCOUNT_MODAL103.index(f'id="{_cb}"'))]
     check(" checked" not in _tag, f"#{_cb} is not pre-ticked")
 check("Yes, sign me up" in ACCOUNT_MODAL103,
@@ -5042,8 +5044,14 @@ check("(operational, not marketing)" in ACCOUNT_MODAL103,
       "the SMS terms paragraph distinguishes alert texts from marketing")
 _termsOkLabel103 = ACCOUNT_MODAL103[ACCOUNT_MODAL103.index('id="am-sms-terms-ok"'):
                                     ACCOUNT_MODAL103.index("</label>", ACCOUNT_MODAL103.index('id="am-sms-terms-ok"'))]
-check('href="/sms-terms"' in _termsOkLabel103 and 'href="/sms-privacy"' in _termsOkLabel103,
-      "the SMS Terms and Privacy links sit inside the am-sms-terms-ok label")
+check('href="/sms-terms"' in _termsOkLabel103 and 'href="/sms-privacy"' not in _termsOkLabel103,
+      "the am-sms-terms-ok label links only the SMS Terms page")
+check("SMS Terms of Service" in _termsOkLabel103,
+      "the am-sms-terms-ok label carries the SMS Terms of Service wording")
+_privacyOkLabel103 = ACCOUNT_MODAL103[ACCOUNT_MODAL103.index('id="am-sms-privacy-ok"'):
+                                      ACCOUNT_MODAL103.index("</label>", ACCOUNT_MODAL103.index('id="am-sms-privacy-ok"'))]
+check('href="/sms-privacy"' in _privacyOkLabel103,
+      "the am-sms-privacy-ok label links the SMS Privacy page")
 
 # ---------------------------------------------------------------------------
 # 104. SMS Terms / SMS Privacy (Twilio 10DLC campaign): the public pages
@@ -5864,6 +5872,42 @@ check("collector.missing_templates" in NETFLOW125,
       "drawStatus reads missing_templates off the /api/state collector payload")
 check("Records dropped for lack of a template" in NETFLOW125,
       "the readout leads with the literal operators were told to expect")
+
+# ---------------------------------------------------------------------------
+# 126. Three Mapper/chart features (5.59.0): the VLAN table's picked VLAN
+#      glows its own links, a chart line breaks across a data gap instead of
+#      bridging it, and the Mapper strip gets SSH/WEB buttons that share
+#      app.js's window mechanics with the Nodes detail pane.
+_DRAWLINK126 = js_function(read("mapper.js"), "drawLink")
+check("mp-vlan-view" in _DRAWLINK126 and "'pointer-events': 'none'" in _DRAWLINK126,
+      "drawLink appends an unfocusable mp-vlan-view underlay for the glow")
+_APPCSS126 = read("app.css")
+check(".mp-link.mp-vlan-view" in _APPCSS126 and "--mp-vlan-glow" in _APPCSS126,
+      "app.css carries the VlanView glow rule and its colour custom property")
+_DRAWLEGEND126 = js_function(read("mapper.js"), "drawLegend")
+check("VlanView:" in _DRAWLEGEND126,
+      "the legend spells out the VlanView glow/dim behaviour when a VLAN is picked")
+_DRAWVLANTABLE126 = js_function(read("mapper.js"), "drawVlanTable")
+check("drawLegend()" in _DRAWVLANTABLE126,
+      "picking a VLAN in the table also redraws the legend, not just the canvas")
+_APP126 = read("app.js")
+check("GAP_BREAK_FACTOR = 4" in _APP126,
+      "the chart's gap-break factor is a named constant, not a magic number")
+_DRAWSERIES126 = js_function(_APP126, "drawSeriesChart")
+check("splitAtGaps(" in _DRAWSERIES126,
+      "drawSeriesChart splits each series into runs at data gaps before drawing")
+check("drawn.length === 1" in _DRAWSERIES126 and "svgNode('circle'" in _DRAWSERIES126,
+      "a run of one sample between two gaps draws as a dot, not an invisible one-point line")
+_INDEX126 = read("index.html")
+check('id="mp-ssh-device" data-requires-write="ssh"' in _INDEX126,
+      "the Mapper strip's SSH button is gated on the ssh permission in the markup")
+check('id="mp-web-device" data-requires-write="web"' in _INDEX126,
+      "the Mapper strip's WEB button is gated on the web permission in the markup")
+_MAPPER126 = read("mapper.js")
+check("App.openSshWindow(" in _MAPPER126 and "App.openWebTunnel(" in _MAPPER126,
+      "the Mapper strip's SSH/WEB buttons call app.js's shared window helpers")
+check("openSshWindow, openWebTunnel" in _APP126,
+      "and app.js exports both of them")
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))

@@ -1955,6 +1955,13 @@ body.kiosk .card.strip > .hint { overflow: visible; white-space: normal; }
    hiding them outright, so the rest of the topology stays legible while
    the chosen VLAN's path stands out from it. */
 .mp-link.dimmed { opacity: 0.22; }
+/* VlanView: a steady halo in the picked VLAN's own tile colour under every link that carries it, FiberView on or off. */
+.mp-link.mp-vlan-view {
+  stroke: var(--mp-vlan-glow);
+  stroke-width: var(--mp-vlan-w, 9px);
+  stroke-opacity: 0.5;
+  filter: drop-shadow(0 0 4px var(--mp-vlan-glow)) drop-shadow(0 0 10px var(--mp-vlan-glow));
+}
 /* FiberView (mp-fiberview): every link.fiber link, bold and glowing orange.
    The pulse animates stroke-opacity, not opacity, so .dimmed's own opacity
    (above) still dims a fiber link under an active VLAN filter instead of

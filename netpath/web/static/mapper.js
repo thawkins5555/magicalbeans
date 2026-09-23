@@ -1131,6 +1131,13 @@
     return name ? `${vlanId} (${name})` : `${vlanId}`;
   }
 
+  // The exact colour the VLAN table's own swatch uses (VLAN_COLUMNS below),
+  // so a link's VlanView glow always matches the tile the operator picked it from.
+  function vlanColorVar(vlan) {
+    const v = view.vlans.find((x) => x.vlan === vlan);
+    return `var(--canvas-vlan-${((v && v.color_index) || 0) + 1})`;
+  }
+
   function drawLink(layer, link, labelLayer = layer) {
     const a = linkNodeA(link), b = linkNodeB(link);
     if (!a || !b) return;   // an end not placed on THIS map: server already filters this out, belt-and-braces
@@ -1152,6 +1159,9 @@
     const selected = view.selectedLinkId === link.id;
     const dimmed = view.selectedVlan !== null
       && !(plan.vlans || []).includes(view.selectedVlan);
+    // A picked VLAN gets a steady halo under every link that carries it,
+    // FiberView on or off -- .dimmed already faded out the rest.
+    const glow = view.selectedVlan !== null && !dimmed && (plan.vlans || []).length > 0;
     // opts.focusable (default true) and opts.ariaLabel/opts.tooltip (default
     // the whole-link text) let the strands branch below give every strand
     // its OWN name and tooltip while keeping only one of them in the Tab
@@ -1203,9 +1213,21 @@
     // dots read solid. Below, a thin unglowed path carries them instead.
     const overlaidBlocking = link.blocking && link.fiber === true && view.fiberView;
     let bundleHalf = plan.width / 2;
-    if (plan.mode === 'strands' && plan.strands.length) {
+    const isStrandBundle = plan.mode === 'strands' && plan.strands.length;
+    if (isStrandBundle) {
       const offsets = plan.strands.map((strand) => strand.offset);
       bundleHalf = (Math.max(...offsets) - Math.min(...offsets) + plan.width) / 2;
+    }
+    const span = bundleHalf * 2; // shared by the strand-bundle underlays below and the VlanView glow
+    if (glow) {
+      const underlay = App.svgNode('path', {
+        d: `M ${from.x} ${from.y} L ${to.x} ${to.y}`,
+        class: 'mp-link mp-vlan-view', 'pointer-events': 'none', 'aria-hidden': 'true',
+      });
+      underlay.style.setProperty('--mp-vlan-glow', vlanColorVar(view.selectedVlan));
+      underlay.style.setProperty('--mp-vlan-w',
+        isStrandBundle ? `${span + 8}px` : `${Math.max(5, plan.width * 1.6) + 6}px`);
+      layer.appendChild(underlay);
     }
     // How much of each end a port label takes, so the VLAN numbers below stay off it.
     let reserve = 0;
@@ -1231,8 +1253,6 @@
       // discoverable by a screen reader's browse cursor even off the Tab
       // order) and its own mouse tooltip, so hovering a specific coloured
       // line — not just Tabbing to the link — names that one VLAN.
-      const offsets = plan.strands.map((strand) => strand.offset);
-      const span = (Math.max(...offsets) - Math.min(...offsets)) + plan.width;
       if (link.fiber === true) {
         // Underneath every strand, not one of them: the strands keep their
         // own VLAN colours, and this lone unfocusable path (no wireOne — no
@@ -2336,8 +2356,12 @@
     const hasFiber = view.links.some((l) => l.fiber);
     const hasLinks = view.links.length > 0;
     let text = '';
+    if (view.selectedVlan !== null) {
+      text = `VlanView: links carrying VLAN ${vlanDisplay(view.selectedVlan)} glow in its colour; ` +
+        'the rest are dimmed. ';
+    }
     if (view.fiberView && hasFiber) {
-      text = 'FiberView: dark orange = multimode, bright yellow = single-mode, ' +
+      text += 'FiberView: dark orange = multimode, bright yellow = single-mode, ' +
         'dotted red = single/multimode mismatch.';
     }
     if (view.nodes.length && !hasLinks) {
@@ -3499,9 +3523,20 @@
 
   /* --------------------------------------------------------- toolbar state */
 
+  // The one selected node, when it is a real device -- not a placeholder,
+  // an unmanaged peer, or one Nodes has since removed -- what the Mapper
+  // strip's SSH/WEB buttons act on.
+  function selectedDevice() {
+    if (view.selection.size !== 1) return null;
+    const node = nodeById([...view.selection][0]);
+    if (!node || node.placeholder || node.unmanaged || node.missing) return null;
+    return (node.device_id !== null && node.device_id !== undefined) ? node : null;
+  }
+
   function drawToolbarState() {
     const canWrite = App.canWrite('mapper');
     const hasMap = view.mapId !== null;
+    const device = selectedDevice();
     // Compared before assigning, for the reason App.setText/setHidden exist:
     // fastTick runs this ten times a second and an unconditional write
     // queues a real mutation even when the value is already there. There is
@@ -3517,6 +3552,8 @@
       ['mp-add-frame', !canWrite || !hasMap],
       ['mp-add-note', !canWrite || !hasMap],
       ['mp-snap', !canWrite || !hasMap],
+      ['mp-ssh-device', !App.canWrite('ssh') || !device],
+      ['mp-web-device', !App.canWrite('web') || !(device || {}).ip],
     ];
     for (const [id, disabled] of states) {
       const button = App.el(id);
@@ -3567,6 +3604,7 @@
         if (event.target.closest('[data-vlan-swatch]')) return;
         view.selectedVlan = view.selectedVlan === row.vlan ? null : row.vlan;
         requestDraw();
+        drawLegend();
         drawVlanTable();
       };
     }, 'No VLAN data has been seen on this map yet.');
@@ -3882,6 +3920,14 @@
       .then(() => App.extras.mapperUpstream.dialog())
       .catch((error) => App.toast(`Could not open upstream suggestions: ${error.message}`, 'fail'));
     App.el('mp-settings').onclick = settingsDialog;
+    App.el('mp-ssh-device').onclick = () => {
+      const n = selectedDevice();
+      if (n && App.canWrite('ssh')) App.openSshWindow(n.device_id, n.name);
+    };
+    App.el('mp-web-device').onclick = () => {
+      const n = selectedDevice();
+      if (n && App.canWrite('web')) App.openWebTunnel(n.device_id);
+    };
     App.el('mp-map').onchange = (event) => selectMap(Number(event.target.value));
     App.el('mp-add-device').onclick = openAddDevice;
     App.el('mp-add-neighbours').onclick = openAddNeighbours;

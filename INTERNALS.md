@@ -2607,6 +2607,28 @@ Bucketed and rollup points (`avg`/`min`/`max`) are smoothed on their
 drops them from a smoothed multi-series draw (no band) while keeping
 them for a single-series band.
 
+**A gap of more than three missed samples now breaks the line instead of
+smoothing over it** (`app.js`, `medianSpacing`/`splitAtGaps`, 5.59.0). The
+median-spacing calculation that `movingAverage` already ran to size its
+window is pulled out into its own `medianSpacing(points)`, so
+`splitAtGaps(points)` can use the same figure as its break test:
+`GAP_BREAK_FACTOR = 4`, so a gap longer than four times a series' own
+median sample spacing — more than three samples missed in a row — starts
+a new run. `drawSeriesChart` calls `splitAtGaps` on each series before
+anything else, smooths each run on its own when `opts.smooth` is set
+(so a run's edge sample is never averaged in with samples from across
+the gap it borders), and draws each run's polyline and min/max band
+separately — a run short of the existing 3-point floor is left
+unsmoothed exactly as a short series already was, and a run of one
+sample (the single poll that answered inside an outage) draws as a
+2px dot, since a one-coordinate polyline paints nothing. The Y-axis ceiling and
+the hover/tooltip's nearest-sample search both still read the series'
+flattened `points` (`runs.flat()`), so neither one needed to change: the
+gap is a drawing fact only, not a data fact. One shared renderer means
+one fix — the Nodes device/interface/history charts, the Dashboard graph
+tiles and Wireless's history charts all stop bridging a gap the same way
+without their own call sites changing.
+
 **Series buckets, the rate timestamp and axis hysteresis** (4.34.0).
 `NodesDatabase.series(device_id, metric_id, t0, t1, bucket_s=0)` groups
 raw samples into epoch-aligned windows (`CAST(ts / bucket_s AS INTEGER)
@@ -7622,6 +7644,108 @@ the CSS dash rule, and the detail-pane copy. `tests/ui/walk.mjs` gained a
 step that adds a placeholder, connects it to a visible device with
 Connect, and removes it.
 
+### VlanView's glow, and shared SSH/WEB window helpers (`mapper.js`, `app.js`, `app.css`) — 5.59.0
+
+**The glow is a second `<path>`, appended before the strands so it
+reads as a frame underneath them, not on top.** `drawLink` already
+appends, in order, the glowing fiber underlay (for a fiber trunk),
+then an invisible wide hit-path (5.39.0, `mp-link-hit`), then the strands
+or plain line themselves; a picked VLAN's `mp-vlan-view` underlay slots
+into that same drawn-first position, right after `bundleHalf`/`span` are
+computed and before the hit path and strand/fiber-underlay code runs.
+Appending it first means every later element — the hit path, the fiber
+glow, the strands, the plain line's own paint — lands on top of it in
+z-order, so the glow reads as a soft frame around the link rather than a
+haze sitting over the strand colours or blocking the hit path's own
+pointer target. `glow` itself gates on three things: a VLAN is picked
+(`view.selectedVlan !== null`), this link is not dimmed by that pick,
+and the link actually carries at least one VLAN — a manual **Connect**
+line or a link with no VLAN data draws no underlay at all, picked VLAN
+or not.
+
+**`vlanColorVar(vlan)` looks up the same `color_index` the VLANs-on-this-
+map table's own swatch reads** (`view.vlans.find(...).color_index`) and
+returns `` `var(--canvas-vlan-${index + 1})` `` — the identical CSS custom
+property `drawLink`'s own strand-colouring branch and the VLAN-colour
+picker dialog already read, so a strand followed onto a different VLAN's
+glow, or a glow followed back to its row in the table, is never a
+different shade by construction. The width is set as an inline custom
+property, `--mp-vlan-w`, rather than a class, because it depends on the
+link's own drawn geometry: `span + 8` for a strands-mode bundle (`span`
+being the same `bundleHalf * 2` the strand-offset math already computed,
+now hoisted out of the strand branch so both it and the glow can read
+it), or `max(5, plan.width * 1.6) + 6` for a plain/collapsed link — the
+same floor-plus-multiplier shape FiberView's own glow width uses (5.34.0),
+widened by a further 6px so the glow visibly frames a plain line's own
+width rather than merely matching it. `.mp-link.mp-vlan-view` in
+`app.css` reads both custom properties (`stroke: var(--mp-vlan-glow)`,
+`stroke-width: var(--mp-vlan-w, 9px)`) at a fixed `stroke-opacity: 0.5`
+with a two-layer `drop-shadow` — no animation, no `@media
+(prefers-reduced-motion)` guard, because the glow is deliberately steady
+rather than FiberView's pulse; the element itself carries `pointer-
+events: none` and `aria-hidden="true"`, so it changes nothing about
+which element a click or a screen reader lands on. `exportPng`'s
+existing `inlineComputedColors` (5.23.0) already copies computed
+`stroke`/`stroke-opacity`/`filter` onto a cloned element before
+serialising, the same mechanism that carries FiberView's own glow into
+the PNG, so the VlanView glow needed no export-path change of its own.
+
+**The legend and the VLAN table both redraw on a pick.** `drawLegend()`
+prepends a "VlanView: links carrying VLAN `<n>` (`<name>`) glow in its
+colour; the rest are dimmed." sentence whenever `view.selectedVlan !==
+null`, ahead of the existing FiberView colour-key sentence (both can show
+at once). `drawVlanTable`'s row-click handler, which already toggled
+`view.selectedVlan` and called `requestDraw()`, now also calls
+`drawLegend()` in the same handler — before 5.59.0 the legend only ever
+changed when the map's own data changed (5.0.0's `fastTick` fix), and a
+VLAN pick is a view choice, not new data, so nothing was redrawing it.
+
+**`App.openSshWindow(deviceId, name)` and `App.openWebTunnel(deviceId)`
+move the window mechanics `nodes.js`'s `sshDevice()`/`webDevice()` used to
+own into `app.js`, unchanged in behaviour, so the Mapper strip's new
+buttons and the Nodes detail pane call the same code instead of each
+carrying their own copy.** `openSshWindow` is exactly the prior
+`sshDevice()` body — a `window.open` named per
+device so a second click raises the session already open, `opener`
+cleared rather than `noopener` in the feature string because `noopener`
+would also discard the name and turn every click into a rival window.
+`openWebTunnel` is exactly the prior `webDevice()` body — the window
+opened before the `await post(...)`, its `location` set once the
+relay answers, closed again on a refused POST — except it now returns
+the relay object (or `null` on failure) instead of calling
+`loadWebRelays()` itself, since that refresh list is a `nodes.js` concern
+the Mapper strip has no equivalent of; `nodes.js`'s own `webDevice()`
+is now three lines calling `App.openWebTunnel` and refreshing its list
+on success, and `sshDevice()` is one line calling `App.openSshWindow`.
+Both are exported from `App`'s public object alongside the rest of its
+chart/tile helpers.
+
+**`selectedDevice()` (`mapper.js`) is what the strip's SSH/WEB buttons
+and their disabled state both read.** It returns the one selected map
+node only when `view.selection.size === 1` and that node is a real,
+still-managed device — `node.placeholder`, `node.unmanaged` and
+`node.missing` (a device Nodes has since removed) all return `null`
+instead, the same three cases "Open in Nodes" already treats as a
+no-op — and `null` for no selection or a multi-selection. `drawToolbarState()`
+(already called ten times a second by `fastTick`, hence the existing
+"compared before assigning" discipline the function's own comment
+explains) computes it once per call and disables `mp-ssh-device` on
+`!App.canWrite('ssh') || !device` and `mp-web-device` on
+`!App.canWrite('web') || !(device || {}).ip` — `WEB` additionally needs
+the device to carry an IP, since `openWebTunnel` has nothing to tunnel to
+without one. The click handlers re-check `selectedDevice()` and
+`App.canWrite` themselves before calling through, the same belt-and-
+braces reasoning `nodes.js`'s own SSH/WEB buttons already use.
+
+`tests/test_frontend_contracts.py` section 126 pins the `mp-vlan-view`
+underlay and its `pointer-events: none`, the `app.css` glow rule and its
+`--mp-vlan-glow` custom property, the legend's "VlanView:" sentence, the
+VLAN-table click handler's `drawLegend()` call, `GAP_BREAK_FACTOR = 4`
+and `drawSeriesChart`'s `splitAtGaps` call (chart internals, above), the
+markup's `data-requires-write="ssh"`/`"web"` on the two new buttons, and
+that `mapper.js` calls `App.openSshWindow`/`App.openWebTunnel` rather
+than carrying its own window code.
+
 ---
 
 ## Alerts
@@ -9586,7 +9710,11 @@ change another's opt-in, and no module-permission gate, the same as
 `alertmail.is_e164`, sends the code — from 5.54.0 it also requires a
 separate `terms: true` flag alongside `consent: true`, one per checkbox
 on the Account dialog's form, and the audit detail names both: "terms
-accepted, alert-text consent given"), `POST /api/account/sms/confirm`
+accepted, alert-text consent given"; from 5.59.0 a third flag, `privacy:
+true`, is required as well — the one checkbox covering both the Terms
+and the Privacy Policy became two, each gating its own field, and the
+audit detail reads "terms and privacy policy accepted, alert-text
+consent given"), `POST /api/account/sms/confirm`
 (checks the code, sends the opt-in text) and `DELETE /api/account/sms`
 (stops a live number, or just forgets a pending code / an already-stopped
 row via `sms_forget` — nothing to audit as a "stop" if texts were never

@@ -505,6 +505,19 @@ tile needs **Ctrl** (or **Cmd** on a Mac) held — a tile sits inside a
 scrolling Dashboard page, so a plain wheel over the chart scrolls the
 page like everywhere else, and only the modified scroll zooms it.
 
+**From 5.59.0, a chart no longer draws a line across a gap of more than
+three missed samples.** A device that went quiet for a stretch — offline,
+or a run of missed polls — used to have its chart bridge straight over
+the hole with a smooth-looking line, which reads as "nothing unusual
+happened" when the truth is "nothing was heard from it." A gap longer
+than four times that series' own normal polling interval — more than
+three missed samples in a row — now breaks the line, and the shaded
+min/max band, into separate pieces instead of joining across it; a poll
+or two lost to a busy device still connects normally, so ordinary jitter
+is unaffected. This is the one chart engine behind every graph tile here,
+the Nodes device and interface history charts, and Wireless's history
+charts, so all of them stop bridging gaps the same way.
+
 **The device field in every dashboard Configure dialog is a themed
 search-and-pick list**, matching the rest of the application, rather than
 the browser's own `<input list>` popup, which read enough like an
@@ -3210,10 +3223,11 @@ hard to trip — a path monitor that cries wolf gets turned off.
   page. A number opted in this way is texted alongside the Default
   numbers list above — merged in, de-duplicated — for every alert this
   section already covers, on the same timing and the same hourly cap.
-  From 5.54.0 that dialog has two required checkboxes, both unchecked
-  by default — one to accept the SMS Terms and Privacy Policy, one to
-  agree to receive the alert texts — and a **Yes, sign me up** button;
-  the server refuses to start the opt-in unless both boxes were ticked.
+  From 5.54.0 that dialog has required checkboxes, all unchecked by
+  default — from 5.59.0, three: one to accept the SMS Terms of Service,
+  one to accept the SMS Privacy Policy, one to agree to receive the
+  alert texts — and a **Yes, sign me up** button; the server refuses to
+  start the opt-in unless all boxes were ticked.
 - **From 5.53.0, two pages describing the program are public — no
   sign-in needed — at `/sms-terms` and `/sms-privacy`.** Twilio's
   campaign review wants a terms-of-service and privacy-policy URL it
@@ -4675,13 +4689,25 @@ like any other module.
   the strands, so hovering one strand precisely still names that strand's
   own VLAN — the wide target only catches the narrow gaps and margin
   between them that used to be impossible to land a cursor on.
+- **Clicking a row in the VLANs-on-this-map table picks that VLAN out on
+  the canvas — VlanView.** Every other link dims, and, from 5.59.0, every
+  link that actually carries the picked VLAN gets a steady glow in that
+  VLAN's own colour, the same colour its table row swatches — so the path
+  a VLAN takes across the map reads at a glance instead of being read off
+  the dimming alone. The glow works whether FiberView is ticked or not,
+  and is carried through in **Export PNG**. Click the same row again, or
+  any other VLAN row, to change or clear the pick.
 - **The legend above the canvas.** If two placed devices have no CDP/LLDP
   adjacency between them at all, it says so plainly rather than leaving an
   operator to wonder whether the link is missing by mistake or because
   nothing has been seen. With FiberView ticked and a fiber link on the
   map, it spells out FiberView's own colour key: dark orange for
   multimode, bright yellow for single-mode, dotted red for a single/
-  multimode mismatch. **From 5.39.0, the legend no longer explains what a
+  multimode mismatch. **From 5.59.0, a picked VLAN adds its own line** —
+  "VlanView: links carrying VLAN 20 (Engineering) glow in its colour; the
+  rest are dimmed." — naming the VLAN so a colour-blind viewer or a screen
+  reader gets the same fact a sighted viewer reads off the glow.
+  **From 5.39.0, the legend no longer explains what a
   dashed or dotted line means** — the "Trunks of N+ VLANs draw as one
   thick line… / a dashed line means no VLAN data… / a dotted line means
   spanning-tree blocked…" note that used to sit above the canvas is gone;
@@ -5074,6 +5100,16 @@ like any other module.
   instead of assuming a shallow line — so a label can no longer cross
   into its neighbour's — and a multi-VLAN link's VLAN numbers keep to
   whatever span the port labels leave free.
+- **From 5.59.0, the strip above the map carries SSH and WEB buttons of
+  its own**, beside Print and Settings — the same two buttons Nodes'
+  device pane already has, gated on the same `ssh`/`web` permissions.
+  They act on the one selected node, and only when it is a real device:
+  not a placeholder, an unmanaged peer, or a device since removed from
+  Nodes. **SSH** opens a terminal to it exactly as Nodes' own button does;
+  **WEB** opens the same short-lived tunnel to its web interface, and
+  additionally needs the device to have an IP address on file — either
+  button greys out otherwise. Nothing new is reachable this way that
+  Nodes did not already offer; this only saves switching tabs to open it.
 
 ---
 
