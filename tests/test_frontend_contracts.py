@@ -5303,6 +5303,26 @@ check("tr.bulk-checked .sev, tr.bulk-checked .status-mark, tr.bulk-checked .stat
         "tr.bulk-checked .sev, tr.bulk-checked .status-mark, tr.bulk-checked .status-text {")[1][:40],
       "app.css restores --text for .sev/.status-mark/.status-text in a bulk-checked row")
 
+
+# ---------------------------------------------------------------------------
+# 121. Dark route/map canvas plus a Print toggle: the button exists on both
+#      the Routes and Mapper strips, and App.wirePrintToggle wires both to
+#      the shared localStorage preference. (tokens.css's own per-theme
+#      --canvas values and [data-print="1"] override are checked by
+#      tests/test_design_tokens.py, not duplicated here.)
+check('id="netpath-print" aria-pressed="false"' in INDEX,
+      "the Routes strip carries the Print toggle, unpressed by default")
+check('id="mp-print" aria-pressed="false"' in INDEX,
+      "the Mapper toolbar carries the Print toggle, unpressed by default")
+PRINT121 = js_function(APP, "wirePrintToggle")
+check("canvas.dataset.print = '1'" in PRINT121 and "delete canvas.dataset.print;" in PRINT121,
+      "wirePrintToggle sets/clears data-print on the canvas wrapper")
+check("localStorage.setItem('sappiwhere.canvas.print'" in PRINT121,
+      "wirePrintToggle persists the choice in the documented localStorage key")
+check("wirePrintToggle('netpath-print', 'route-canvas');" in APP
+      and "wirePrintToggle('mp-print', 'mp-canvas');" in APP,
+      "both Print toggles are wired at start()")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

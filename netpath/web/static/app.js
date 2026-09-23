@@ -3881,6 +3881,28 @@ const App = (() => {
     };
   }
 
+  /* Routes and Mapper's Print toggle: forces their canvas white with dark
+     ink (app.css's [data-print="1"]) regardless of theme, for a printout or
+     a screenshot bound for a document. One shared localStorage preference —
+     turning it on for one canvas is meant to carry to the other. */
+  function wirePrintToggle(buttonId, canvasId) {
+    const button = el(buttonId);
+    const canvas = el(canvasId);
+    if (!button || !canvas) return;
+    const apply = (on) => {
+      if (on) canvas.dataset.print = '1'; else delete canvas.dataset.print;
+      button.setAttribute('aria-pressed', String(on));
+    };
+    let on = false;
+    try { on = localStorage.getItem('sappiwhere.canvas.print') === '1'; } catch (error) { /* private browsing */ }
+    apply(on);
+    button.onclick = () => {
+      on = !on;
+      apply(on);
+      try { localStorage.setItem('sappiwhere.canvas.print', on ? '1' : '0'); } catch (error) { /* private browsing, or storage full */ }
+    };
+  }
+
   /* ------------------------------------------------- status patterns
 
      Under a deuteranopia transform --ok #3FB950, --fail #F85149 and
@@ -6516,6 +6538,8 @@ const App = (() => {
     wireSubtabGroups();
     wireSubtabRouting();
     wireIpPopover();
+    wirePrintToggle('netpath-print', 'route-canvas');
+    wirePrintToggle('mp-print', 'mp-canvas');
     const signout = document.getElementById('signout');
     if (signout) {
       signout.onclick = async () => {

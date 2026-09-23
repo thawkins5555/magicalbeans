@@ -67,56 +67,53 @@
   --cat-7: #8F76E8;
   --cat-8: #DC5A5A;
 
-  /* Route canvas: NetPath draws its route on white on purpose (it prints); greys tuned for black have no
-     contrast there, so it keeps its own set. MAPPER's own canvas (#mp-canvas) is drawn on this same white
-     ground in every theme but Contrast -- see --canvas-vlan-* below for why the VLAN strand palette needed
-     its own counterpart here rather than reusing --vlan-1..16. */
-  --canvas: #FFFFFF;
-  --canvas-panel: #F4F6F9;
-  --canvas-hairline: #C9D2DD;
-  --canvas-grid: #E4E9F0;
-  --canvas-text: #161C24;
-  --canvas-muted: #55606E;
-  --canvas-faint: #66707E;
-  --canvas-accent: #2F5FC4;
-  --canvas-ok: #1B7F3B;
-  --canvas-warn: #9A6510;
-  --canvas-fail: #B3261E;
-  --canvas-blocked: #A63D10;
+  /* Route/map canvas: NetPath's route canvas and MAPPER's #mp-canvas now follow the theme like every
+     other panel — a white slab was the largest glare source on an otherwise dark screen. This base
+     block is Dark's own, so its canvas pairing is Dark's own surface/text/status tokens above, the
+     same pairing a zebra-striped table row already relies on. Light overrides all of this back to
+     white below, since it is the one theme still meant to print/screenshot the way NetPath's route
+     canvas always has; Contrast keeps its own dark override too, unchanged. */
+  --canvas: #151A21;
+  --canvas-panel: #1B222B;
+  --canvas-hairline: #2A323D;
+  --canvas-grid: #222933;
+  --canvas-text: #DCE3EA;
+  --canvas-muted: #8F9AA7;
+  --canvas-faint: #848F9C;
+  --canvas-accent: #7AA2F7;
+  --canvas-ok: #3FB950;
+  --canvas-warn: #E3B341;
+  --canvas-fail: #F8544C;
+  --canvas-blocked: #FF8A65;
 
   /* VLAN palette, second copy: --vlan-1..16 above is tuned against --panel, which is what a VLAN
      swatch in the colour-picker dialog actually draws on -- but a MAPPER strand itself is drawn on
-     #mp-canvas, whose background is --canvas (white in every theme except Contrast), not --panel. Nine
-     or ten of the sixteen --vlan-* hues fall under 3:1 measured on white (--vlan-4 lands near 1.5:1),
-     which a code review caught as strands that were nearly invisible in dark/midnight/nord/solarized.
-     Rather than re-theme #mp-canvas to a dark ground -- which would undo the same white-canvas-in-
-     every-theme idiom NetPath's route canvas already established, and MAPPER's own --canvas-panel/
-     --canvas-text/--canvas-grid chrome already fully commits to -- the strand palette gets a dedicated
-     counterpart, exactly the way the route canvas's own tones already work. These are the existing
-     Light-theme rotation (dark-on-white, chosen for that ground already) reused verbatim: same sixteen
-     hues, same 22.5-degree spacing, and since --canvas is the same #FFFFFF for dark/light/midnight/
-     nord/solarized/slate, one definition here covers all six -- only Contrast (whose --canvas goes
-     dark) needs its own override below, and reuses the ORIGINAL light-on-dark --vlan-1..16 rotation
-     for the same reason in reverse. tests/test_design_tokens.py checks this pairing (--canvas-vlan-*
-     against --canvas) at the 3:1 floor in all seven themes -- the pairing that is actually drawn --
-     while the original --vlan-1..16 section keeps checking against --panel, which is what the
-     swatches actually draw on. */
-  --canvas-vlan-1: #862727;
-  --canvas-vlan-2: #864B27;
-  --canvas-vlan-3: #866F27;
-  --canvas-vlan-4: #7A8627;
-  --canvas-vlan-5: #578627;
-  --canvas-vlan-6: #338627;
-  --canvas-vlan-7: #27863F;
-  --canvas-vlan-8: #278663;
-  --canvas-vlan-9: #278686;
-  --canvas-vlan-10: #276386;
-  --canvas-vlan-11: #273F86;
-  --canvas-vlan-12: #332786;
-  --canvas-vlan-13: #572786;
-  --canvas-vlan-14: #7A2786;
-  --canvas-vlan-15: #86276F;
-  --canvas-vlan-16: #86274B;
+     #mp-canvas, whose background is --canvas, not --panel. Nine or ten of the sixteen --vlan-* hues
+     fall under 3:1 measured on white (--vlan-4 lands near 1.5:1), which a code review caught as
+     strands that were nearly invisible in dark/midnight/nord/solarized when the canvas was still
+     white everywhere. The strand palette gets a dedicated counterpart instead, exactly the way the
+     route canvas's own tones already work. This base block reuses Contrast's own light-on-dark
+     rotation (below) verbatim, since Dark's canvas is now dark too; Light's own override (below)
+     carries the dark-on-white rotation back for its own white canvas. tests/test_design_tokens.py
+     checks this pairing (--canvas-vlan-* against --canvas) at the 3:1 floor in every theme -- the
+     pairing that is actually drawn -- while the original --vlan-1..16 section keeps checking against
+     --panel, which is what the swatches actually draw on. */
+  --canvas-vlan-1: #DA6C6C;
+  --canvas-vlan-2: #DA956C;
+  --canvas-vlan-3: #DABF6C;
+  --canvas-vlan-4: #CDDA6C;
+  --canvas-vlan-5: #A3DA6C;
+  --canvas-vlan-6: #7ADA6C;
+  --canvas-vlan-7: #6CDA88;
+  --canvas-vlan-8: #6CDAB1;
+  --canvas-vlan-9: #6CDADA;
+  --canvas-vlan-10: #6CB1DA;
+  --canvas-vlan-11: #6C88DA;
+  --canvas-vlan-12: #7A6CDA;
+  --canvas-vlan-13: #A36CDA;
+  --canvas-vlan-14: #CD6CDA;
+  --canvas-vlan-15: #DA6CBF;
+  --canvas-vlan-16: #DA6C95;
 
   /* Type: seven sizes in rem, so the browser's text-size setting and a wall-display density scale both work.
      --fs-glyph is not a text size: it sizes the status marks (●▲■◆○) and nothing else may use it. */
@@ -271,6 +268,38 @@
   --shadow-pop: 0 12px 40px rgba(20, 30, 45, 0.25);
   --shadow-float: 0 6px 20px rgba(20, 30, 45, 0.2);
   --scrim: rgba(20, 30, 45, 0.45);
+  /* Route/map canvas stays white here — the one theme still meant to
+     print/screenshot the way NetPath's route canvas always has (base
+     :root, above, is the one that went dark). Same dark-on-white VLAN
+     rotation the base block used to carry for every theme. */
+  --canvas: #FFFFFF;
+  --canvas-panel: #F4F6F9;
+  --canvas-hairline: #C9D2DD;
+  --canvas-grid: #E4E9F0;
+  --canvas-text: #161C24;
+  --canvas-muted: #55606E;
+  --canvas-faint: #66707E;
+  --canvas-accent: #2F5FC4;
+  --canvas-ok: #1B7F3B;
+  --canvas-warn: #9A6510;
+  --canvas-fail: #B3261E;
+  --canvas-blocked: #A63D10;
+  --canvas-vlan-1: #862727;
+  --canvas-vlan-2: #864B27;
+  --canvas-vlan-3: #866F27;
+  --canvas-vlan-4: #7A8627;
+  --canvas-vlan-5: #578627;
+  --canvas-vlan-6: #338627;
+  --canvas-vlan-7: #27863F;
+  --canvas-vlan-8: #278663;
+  --canvas-vlan-9: #278686;
+  --canvas-vlan-10: #276386;
+  --canvas-vlan-11: #273F86;
+  --canvas-vlan-12: #332786;
+  --canvas-vlan-13: #572786;
+  --canvas-vlan-14: #7A2786;
+  --canvas-vlan-15: #86276F;
+  --canvas-vlan-16: #86274B;
 }
 
 /* Midnight: deeper and cooler than Dark, for a NOC watched at 3am — every surface pushed further
@@ -317,6 +346,36 @@
   --cat-6: #4F9A3A;
   --cat-7: #8F76E8;
   --cat-8: #DC5A5A;
+  /* Route/map canvas: same dark-ground reasoning as Dark's own block above,
+     this theme's own surface/text/status pairing, Contrast's VLAN rotation. */
+  --canvas: #0C1119;
+  --canvas-panel: #121A24;
+  --canvas-hairline: #232E3C;
+  --canvas-grid: #1A2330;
+  --canvas-text: #D9E2EE;
+  --canvas-muted: #8996A8;
+  --canvas-faint: #7E8CA0;
+  --canvas-accent: #6C9BF5;
+  --canvas-ok: #3FC463;
+  --canvas-warn: #E7B84C;
+  --canvas-fail: #FF5D63;
+  --canvas-blocked: #FF9466;
+  --canvas-vlan-1: #DA6C6C;
+  --canvas-vlan-2: #DA956C;
+  --canvas-vlan-3: #DABF6C;
+  --canvas-vlan-4: #CDDA6C;
+  --canvas-vlan-5: #A3DA6C;
+  --canvas-vlan-6: #7ADA6C;
+  --canvas-vlan-7: #6CDA88;
+  --canvas-vlan-8: #6CDAB1;
+  --canvas-vlan-9: #6CDADA;
+  --canvas-vlan-10: #6CB1DA;
+  --canvas-vlan-11: #6C88DA;
+  --canvas-vlan-12: #7A6CDA;
+  --canvas-vlan-13: #A36CDA;
+  --canvas-vlan-14: #CD6CDA;
+  --canvas-vlan-15: #DA6CBF;
+  --canvas-vlan-16: #DA6C95;
 }
 
 /* Nord: the Nord community palette's desaturated arctic blues and greys (polar night surfaces,
@@ -364,6 +423,39 @@
   --cat-6: #88C0D0;
   --cat-7: #5E81AC;
   --cat-8: #BF616A;
+  /* Route/map canvas: same dark-ground reasoning as Dark's own block above,
+     this theme's own surface/text/status pairing, Contrast's VLAN rotation. */
+  --canvas: #333A47;
+  --canvas-panel: #3A4150;
+  --canvas-hairline: #4C566A;
+  --canvas-grid: #434C5E;
+  --canvas-text: #ECEFF4;
+  --canvas-muted: #C6CFE0;
+  --canvas-faint: #B0BBCE;
+  --canvas-accent: #9DCAC9;
+  --canvas-ok: #ACC99A;
+  --canvas-warn: #EBCB8B;
+  --canvas-fail: #F29CA6;
+  --canvas-blocked: #E9A188;
+  --canvas-vlan-1: #DA6C6C;
+  --canvas-vlan-2: #DA956C;
+  --canvas-vlan-3: #DABF6C;
+  --canvas-vlan-4: #CDDA6C;
+  --canvas-vlan-5: #A3DA6C;
+  --canvas-vlan-6: #7ADA6C;
+  --canvas-vlan-7: #6CDA88;
+  --canvas-vlan-8: #6CDAB1;
+  --canvas-vlan-9: #6CDADA;
+  --canvas-vlan-10: #6CB1DA;
+  --canvas-vlan-11: #6C88DA;
+  /* Lightened from Contrast's own #7A6CDA: Nord's --canvas (#333A47) is
+     lighter than Contrast's near-black one, and the unmodified violet
+     measured under the 3:1 floor here. */
+  --canvas-vlan-12: #877BDE;
+  --canvas-vlan-13: #A36CDA;
+  --canvas-vlan-14: #CD6CDA;
+  --canvas-vlan-15: #DA6CBF;
+  --canvas-vlan-16: #DA6C95;
 }
 
 /* Solarized: Solarized Dark's ochre-tinted base tones (base03/02 surfaces, the accent hues Ethan
@@ -412,6 +504,36 @@
   --cat-6: #859900;
   --cat-7: #6C71C4;
   --cat-8: #DC322F;
+  /* Route/map canvas: same dark-ground reasoning as Dark's own block above,
+     this theme's own surface/text/status pairing, Contrast's VLAN rotation. */
+  --canvas: #0A3540;
+  --canvas-panel: #0E3A46;
+  --canvas-hairline: #2E5661;
+  --canvas-grid: #123F4B;
+  --canvas-text: #BCCBCF;
+  --canvas-muted: #B7C8CC;
+  --canvas-faint: #93A8AD;
+  --canvas-accent: #6FB2EE;
+  --canvas-ok: #9FBF3B;
+  --canvas-warn: #E0A631;
+  --canvas-fail: #FF7A6E;
+  --canvas-blocked: #F5904F;
+  --canvas-vlan-1: #DA6C6C;
+  --canvas-vlan-2: #DA956C;
+  --canvas-vlan-3: #DABF6C;
+  --canvas-vlan-4: #CDDA6C;
+  --canvas-vlan-5: #A3DA6C;
+  --canvas-vlan-6: #7ADA6C;
+  --canvas-vlan-7: #6CDA88;
+  --canvas-vlan-8: #6CDAB1;
+  --canvas-vlan-9: #6CDADA;
+  --canvas-vlan-10: #6CB1DA;
+  --canvas-vlan-11: #6C88DA;
+  --canvas-vlan-12: #7A6CDA;
+  --canvas-vlan-13: #A36CDA;
+  --canvas-vlan-14: #CD6CDA;
+  --canvas-vlan-15: #DA6CBF;
+  --canvas-vlan-16: #DA6C95;
 }
 
 /* Slate: a warm neutral LIGHT theme, paper-grey rather than the existing Light theme's climb to a
@@ -457,6 +579,38 @@
   --cat-6: #3F7A2E;
   --cat-7: #74459E;
   --cat-8: #A6291F;
+  /* Route/map canvas: Slate is itself a light theme, so unlike every other
+     theme here it stays close to white — --raised is the darkest step it
+     has — and, like Light, needs the dark-on-white VLAN rotation back
+     rather than the dark-on-dark one the base block now carries. */
+  --canvas: #F4F1EA;
+  --canvas-panel: #FBF9F5;
+  --canvas-hairline: #D2CABC;
+  --canvas-grid: #DFD8CC;
+  --canvas-text: #2B2620;
+  --canvas-muted: #5A5347;
+  --canvas-faint: #6A6255;
+  --canvas-accent: #33629E;
+  --canvas-ok: #1B6B34;
+  --canvas-warn: #835613;
+  --canvas-fail: #AE2A20;
+  --canvas-blocked: #9C4113;
+  --canvas-vlan-1: #862727;
+  --canvas-vlan-2: #864B27;
+  --canvas-vlan-3: #866F27;
+  --canvas-vlan-4: #7A8627;
+  --canvas-vlan-5: #578627;
+  --canvas-vlan-6: #338627;
+  --canvas-vlan-7: #27863F;
+  --canvas-vlan-8: #278663;
+  --canvas-vlan-9: #278686;
+  --canvas-vlan-10: #276386;
+  --canvas-vlan-11: #273F86;
+  --canvas-vlan-12: #332786;
+  --canvas-vlan-13: #572786;
+  --canvas-vlan-14: #7A2786;
+  --canvas-vlan-15: #86276F;
+  --canvas-vlan-16: #86274B;
 }
 
 /* Neon: a neon-sign palette — cyan, magenta and lime tubes at the saturation a sign actually burns.
@@ -500,4 +654,73 @@
   --cat-6: #FF8C3A;
   --cat-7: #4D7CFF;
   --cat-8: #FF5E5E;
+  /* Route/map canvas: same dark-ground reasoning as Dark's own block above,
+     this theme's own surface/text/status pairing, Contrast's VLAN rotation. */
+  --canvas: #0E0B18;
+  --canvas-panel: #161228;
+  --canvas-hairline: #2C2450;
+  --canvas-grid: #1E183A;
+  --canvas-text: #F2F0FF;
+  --canvas-muted: #B9B0E6;
+  --canvas-faint: #A69CD9;
+  --canvas-accent: #39F0FF;
+  --canvas-ok: #39FF88;
+  --canvas-warn: #FFE43A;
+  --canvas-fail: #FF4D8D;
+  --canvas-blocked: #FF8C3A;
+  --canvas-vlan-1: #DA6C6C;
+  --canvas-vlan-2: #DA956C;
+  --canvas-vlan-3: #DABF6C;
+  --canvas-vlan-4: #CDDA6C;
+  --canvas-vlan-5: #A3DA6C;
+  --canvas-vlan-6: #7ADA6C;
+  --canvas-vlan-7: #6CDA88;
+  --canvas-vlan-8: #6CDAB1;
+  --canvas-vlan-9: #6CDADA;
+  --canvas-vlan-10: #6CB1DA;
+  --canvas-vlan-11: #6C88DA;
+  --canvas-vlan-12: #7A6CDA;
+  --canvas-vlan-13: #A36CDA;
+  --canvas-vlan-14: #CD6CDA;
+  --canvas-vlan-15: #DA6CBF;
+  --canvas-vlan-16: #DA6C95;
+}
+
+/* Print toggle (Routes and Mapper): set on the canvas wrapper itself
+   (#route-canvas, #mp-canvas — app.js's wirePrintToggle), so every
+   --canvas-* token an ancestor theme block set is overridden for it and
+   everything drawn inside it. Not a theme block — this key is not read by
+   test_design_tokens.py's :root[data-theme="…"] parsing — but the exact
+   light-on-white pairing Light carries by default, so a route or a map
+   printed or screenshotted reads the same regardless of the theme it was
+   viewed in on screen. */
+[data-print="1"] {
+  --canvas: #FFFFFF;
+  --canvas-panel: #F4F6F9;
+  --canvas-hairline: #C9D2DD;
+  --canvas-grid: #E4E9F0;
+  --canvas-text: #161C24;
+  --canvas-muted: #55606E;
+  --canvas-faint: #66707E;
+  --canvas-accent: #2F5FC4;
+  --canvas-ok: #1B7F3B;
+  --canvas-warn: #9A6510;
+  --canvas-fail: #B3261E;
+  --canvas-blocked: #A63D10;
+  --canvas-vlan-1: #862727;
+  --canvas-vlan-2: #864B27;
+  --canvas-vlan-3: #866F27;
+  --canvas-vlan-4: #7A8627;
+  --canvas-vlan-5: #578627;
+  --canvas-vlan-6: #338627;
+  --canvas-vlan-7: #27863F;
+  --canvas-vlan-8: #278663;
+  --canvas-vlan-9: #278686;
+  --canvas-vlan-10: #276386;
+  --canvas-vlan-11: #273F86;
+  --canvas-vlan-12: #332786;
+  --canvas-vlan-13: #572786;
+  --canvas-vlan-14: #7A2786;
+  --canvas-vlan-15: #86276F;
+  --canvas-vlan-16: #86274B;
 }

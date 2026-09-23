@@ -2891,6 +2891,18 @@ async function checkMisc(page, watcher) {
     return '';
   });
 
+  await check('the Print toggle exists on both Routes and Mapper', async () => {
+    await selectTab(page, 'netpath');
+    await settle(page, 500);
+    const netpath = await page.getAttribute('#netpath-print', 'aria-pressed');
+    await selectTab(page, 'mapper');
+    await settle(page, 500);
+    const mapper = await page.getAttribute('#mp-print', 'aria-pressed');
+    assert(netpath === 'false' || netpath === 'true', `#netpath-print aria-pressed is "${netpath}"`);
+    assert(mapper === 'false' || mapper === 'true', `#mp-print aria-pressed is "${mapper}"`);
+    return `netpath=${netpath} mapper=${mapper}`;
+  });
+
   // App.ipCell's actions button: an empty table on a fresh demo run is not
   // a failure, so this skips rather than asserts when Syslog has no rows.
   await check('the IP actions popover opens and Escape closes it (Syslog)', async () => {
