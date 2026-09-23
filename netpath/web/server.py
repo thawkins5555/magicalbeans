@@ -280,6 +280,7 @@ ROUTES = [
     ("GET", r"^/api/ipam/hosts/export\.csv$", api.get_ipam_hosts_export, ("ipam", R)),
     ("GET", r"^/api/ipam/conflicts$", api.get_ipam_conflicts, ("ipam", R)),
     ("POST", r"^/api/ipam/conflicts/(\d+)/resolve$", api.post_ipam_conflict_resolve, ("ipam", W)),
+    ("POST", r"^/api/ipam/conflicts/(\d+)/reopen$", api.post_ipam_conflict_reopen, ("ipam", W)),
     ("GET", r"^/api/ipam/dhcp/servers$", api.get_ipam_dhcp_servers, ("ipam", R)),
     ("POST", r"^/api/ipam/dhcp/servers$", api.post_ipam_dhcp_server, ("ipam", W)),
     ("PUT", r"^/api/ipam/dhcp/servers/(\d+)$", api.put_ipam_dhcp_server, ("ipam", W)),

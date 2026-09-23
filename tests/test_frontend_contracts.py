@@ -5531,6 +5531,38 @@ check("% free — ${free} of ${total} address(es)" in IPAM113,
 
 
 # ---------------------------------------------------------------------------
+# 114. Conflict reopen and scan-started: a resolved conflict row gets a
+#      Reopen button gated the same as any other write, and a running
+#      scan's card says how long ago it started.
+check("/api/ipam/conflicts/${c.id}/reopen" in IPAM113,
+      "the conflicts table posts to the reopen route")
+check("reopen.dataset.requiresWrite = 'ipam';" in IPAM113,
+      "the Reopen button is gated behind IPAM write, same as Mark resolved")
+check("started ${ago(subnet.scan_started)}" in IPAM113,
+      "the subnet card's 'Scanning now...' names how long ago it started")
+_IPAM_PY114 = python_text("web.api.ipam")
+check("def post_ipam_conflict_reopen(" in _IPAM_PY114
+      and 'service.ipam_db.reopen_conflict(conflict_id)' in _IPAM_PY114,
+      "api.py's reopen handler clears the resolved marker")
+check('_require(service.ipam_db.conflict(conflict_id), "conflict")' in _IPAM_PY114,
+      "both resolve and reopen 404 for an unknown conflict id")
+_IPAMDB_PY114 = python_text("ipamdb")
+check("def reopen_conflict(self, conflict_id: int) -> None:" in _IPAMDB_PY114
+      and "SET resolved_ts=NULL" in _IPAMDB_PY114,
+      "ipamdb carries the inverse of resolve_conflict")
+_SERVER_PY114 = python_text("web.server")
+check(r'("POST", r"^/api/ipam/conflicts/(\d+)/reopen$", api.post_ipam_conflict_reopen, ("ipam", W)),'
+      in _SERVER_PY114,
+      "the reopen route is wired to its handler with the same ('ipam', W) "
+      "permission as resolve")
+_API_IPAM_PY114 = python_text("web.api.ipam")
+check('subnet["scan_started"] = worker_state["scan_started"].get(subnet["id"])'
+      in _API_IPAM_PY114,
+      "the subnet status payload carries when a running scan started, off "
+      "the worker's own job-start tracking")
+
+
+# ---------------------------------------------------------------------------
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

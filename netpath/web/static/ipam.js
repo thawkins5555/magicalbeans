@@ -140,7 +140,9 @@
     const total = u.total || 0;
     const pct = (n) => total ? `${Math.round((n / total) * 100)}%` : '0%';
     const scan = subnet.last_scan;
-    const scanLine = subnet.scanning ? 'Scanning now\u2026'
+    const scanLine = subnet.scanning
+      ? (subnet.scan_started
+          ? `Scanning now\u2026 started ${ago(subnet.scan_started)}` : 'Scanning now\u2026')
       : scan ? `Last scan ${ago(scan.finished)} \u00b7 ${scan.alive}/${scan.addresses} answered` +
                (scan.conflicts ? `, ${scan.conflicts} new conflict(s)` : '')
       : 'Never scanned yet';
@@ -474,7 +476,15 @@
         };
         tr.lastElementChild.appendChild(button);
       } else {
-        tr.lastElementChild.textContent = `resolved ${ago(c.resolved)}`;
+        tr.lastElementChild.textContent = `resolved ${ago(c.resolved)} `;
+        const reopen = document.createElement('button');
+        reopen.textContent = 'Reopen';
+        reopen.dataset.requiresWrite = 'ipam';
+        reopen.onclick = async () => {
+          await App.post(`/api/ipam/conflicts/${c.id}/reopen`, {});
+          await loadConflicts();
+        };
+        tr.lastElementChild.appendChild(reopen);
       }
       body.appendChild(tr);
     }

@@ -690,6 +690,11 @@ class IpamDatabase(SqliteStore):
             self._conn.commit()
             return True
 
+    def conflict(self, conflict_id: int) -> sqlite3.Row | None:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM conflicts WHERE id=?", (conflict_id,)).fetchone()
+
     def conflicts(self, include_resolved: bool = False) -> list[sqlite3.Row]:
         # `, id DESC` is the tie-break, not decoration: one scan stamps every
         # conflict it opens with the same last_seen_ts, so on a tie SQLite is
@@ -745,6 +750,13 @@ class IpamDatabase(SqliteStore):
             self._conn.execute(
                 "UPDATE conflicts SET resolved_ts=? WHERE id=?",
                 (time.time(), conflict_id))
+            self._conn.commit()
+
+    def reopen_conflict(self, conflict_id: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE conflicts SET resolved_ts=NULL WHERE id=?",
+                (conflict_id,))
             self._conn.commit()
 
     def prune_conflicts(self, older_than_days: float) -> int:

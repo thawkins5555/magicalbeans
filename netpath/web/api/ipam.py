@@ -90,6 +90,10 @@ def get_ipam_subnets(service, params, body) -> dict:
         latest.setdefault(row["subnet_id"], dict(row))
     for subnet in subnets:
         subnet["scanning"] = subnet["id"] in worker_state["scanning"]
+        # When the currently-running scan started, for "Scanning now... "
+        # started N min ago" — the worker already tracks this for its own
+        # debug page (IpamWorker.state()'s scan_started).
+        subnet["scan_started"] = worker_state["scan_started"].get(subnet["id"])
         last = latest.get(subnet["id"])
         subnet["last_scan"] = {
             "started": last["started_ts"], "finished": last["finished_ts"],
@@ -254,7 +258,14 @@ def get_ipam_conflicts(service, params, body) -> dict:
 
 
 def post_ipam_conflict_resolve(service, params, body, conflict_id) -> dict:
+    _require(service.ipam_db.conflict(conflict_id), "conflict")
     service.ipam_db.resolve_conflict(conflict_id)
+    return {"ok": True}
+
+
+def post_ipam_conflict_reopen(service, params, body, conflict_id) -> dict:
+    _require(service.ipam_db.conflict(conflict_id), "conflict")
+    service.ipam_db.reopen_conflict(conflict_id)
     return {"ok": True}
 
 
