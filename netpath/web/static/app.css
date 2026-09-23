@@ -510,7 +510,7 @@ body.stale .page { opacity: 0.42; filter: grayscale(0.4); }
   box-shadow: var(--shadow-float);
 }
 
-.page { display: none; flex: 1; min-height: 0; }
+.page { display: none; flex: 1; min-height: 0; position: relative; }
 /* Column by default, so a new module cannot be forgotten here and end up
    laying its panels out side by side. NetPath is the one that wants a row,
    because its destination list sits beside the content. */
@@ -958,7 +958,7 @@ body.tiny .terms { display: none; }
   -webkit-user-select: none;
 }
 .canvas svg.dragging { cursor: grabbing; }
-.timeline svg { user-select: none; -webkit-user-select: none; }
+.timeline svg { user-select: none; -webkit-user-select: none; width: 100%; height: 100%; display: block; }
 /* The white route canvas is the exception (tokens.css); every other chart
    is a panel and takes the panel surface from the list above. */
 /* A compact "at a glance" strip rather than a primary resizable panel —
@@ -973,7 +973,6 @@ body.compact .canvas.small, body.tiny .canvas.small { min-height: 120px; }
    reading as a chart panel. Used by the Nodes device up/down timeline. */
 .canvas.strip { flex: none; height: 28px; min-height: 28px; margin-bottom: var(--space-sm); }
 .timeline { flex: 1; min-height: 130px; }
-.timeline svg { width: 100%; height: 100%; display: block; }
 
 /* -------------------------------------------------------------- netflow */
 #page-netflow .canvas.chart { flex: 1; min-height: 120px; margin: 0 var(--space-md); }
@@ -1229,7 +1228,6 @@ td.msg { white-space: pre-wrap; word-break: break-word; }
    around each module refresh). A two-pixel accent line at the top of the
    view, and only if the fetch has taken more than 400 ms — the ordinary
    two-second poll answers in a few milliseconds and must not flicker. */
-.page { position: relative; }
 .page::before {
   content: '';
   position: absolute;
@@ -1250,7 +1248,10 @@ td.msg { white-space: pre-wrap; word-break: break-word; }
 .cat-error { color: var(--fail); }
 
 /* ------------------------------------------------------------- settings */
-#page-settings .scroll { flex: 1; overflow-y: scroll; padding: 14px var(--space-lg); min-height: 0; }
+#page-settings .scroll {
+  flex: 1; overflow-y: scroll; padding: 14px var(--space-lg); min-height: 0;
+  scrollbar-color: var(--line) var(--panel); scrollbar-width: auto;
+}
 fieldset {
   margin: 0 0 14px;
   padding: 10px 14px 14px;
@@ -1351,7 +1352,6 @@ fieldset .hint { margin: var(--space-sm) 0 0; }
   background: var(--line); border-radius: var(--radius-pill); border: 2px solid var(--panel);
 }
 #page-settings .scroll::-webkit-scrollbar-thumb:hover { background: var(--accent); }
-#page-settings .scroll { scrollbar-color: var(--line) var(--panel); scrollbar-width: auto; }
 
 /* ------------------------------------------------------------ splitters */
 [data-splitter] { display: flex; min-height: 0; min-width: 0; flex: 1; }

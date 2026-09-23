@@ -5274,6 +5274,24 @@ check("Edge or Chrome 111 or newer" in APP
 check("'shell.time'" in APP and "a UTC offset" in APP,
       "app.js registers shell.time noting the CSV UTC-offset/local-time split")
 
+
+# ---------------------------------------------------------------------------
+# 119. Three duplicated app.css selectors folded into one block each
+#      (#page-settings .scroll, .page, .timeline svg), same computed styles.
+CSS119 = read("app.css")
+check(len(re.findall(r"^\.page \{", CSS119, re.M)) == 1,
+      "app.css defines .page's own declaration block exactly once")
+check(len(re.findall(r"^\.timeline svg \{", CSS119, re.M)) == 1,
+      "app.css defines .timeline svg exactly once")
+check(len(re.findall(r"^#page-settings \.scroll \{", CSS119, re.M)) == 1,
+      "app.css defines #page-settings .scroll's own declaration block exactly once")
+check("position: relative"
+      in re.search(r"^\.page \{([^}]*)\}", CSS119, re.M).group(1),
+      "the folded .page block still carries position: relative")
+check("scrollbar-color: var(--line) var(--panel)"
+      in re.search(r"^#page-settings \.scroll \{([^}]*)\}", CSS119, re.M).group(1),
+      "the folded #page-settings .scroll block still carries its scrollbar colours")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:
