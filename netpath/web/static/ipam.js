@@ -691,6 +691,7 @@
         // operator even reaches the confirm — not a plain button sharing
         // the row with Test connection and Save.
         { label: 'Remove server', danger: true, onClick: () => {
+          const snap = App.modalFormSnapshot();
           App.confirmDestructive('Remove DHCP server',
             `<p>Remove <b>${escape(server.label || server.address)}</b>?</p>` +
             '<p class="hint">Its scopes, leases and usage history are deleted, and ' +
@@ -699,9 +700,10 @@
               await App.del(`/api/ipam/dhcp/servers/${server.id}`);
               view.dhcpServerId = null;
               await loadDhcpServers();
-            }, (confirmed) => { if (!confirmed) editDhcpServer(); });
+            }, (confirmed) => { if (!confirmed) { editDhcpServer(); App.modalFormRestore(snap); } });
         } },
         { label: 'Clear credential', danger: true, onClick: () => {
+          const snap = App.modalFormSnapshot();
           App.confirmDestructive('Clear credential',
             `<p>Clear the stored credential for ` +
             `<b>${escape(server.label || server.address)}</b>?</p>` +
@@ -710,7 +712,7 @@
             'Clear', async () => {
               await App.del(`/api/ipam/dhcp/servers/${server.id}/credential`);
               await loadDhcpServers();
-            }, (confirmed) => { if (!confirmed) editDhcpServer(); });
+            }, (confirmed) => { if (!confirmed) { editDhcpServer(); App.modalFormRestore(snap); } });
         } },
         { label: 'Test connection', onClick: async (b, button) => {
           const fields = readDhcpForm(b);

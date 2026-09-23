@@ -5563,6 +5563,7 @@ check('subnet["scan_started"] = worker_state["scan_started"].get(subnet["id"])'
       "the worker's own job-start tracking")
 
 
+# ---------------------------------------------------------------------------
 # 115. Test a DHCP server before it is saved: the Add dialog gets the same
 #      Test connection button, disabled-while-testing text and result <pre>
 #      as Edit, posting to the new address-only route.
@@ -5591,7 +5592,22 @@ check(r'("POST", r"^/api/ipam/dhcp/servers/test$", api.post_ipam_dhcp_server_tes
 
 
 # ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
+# 116. Nested confirms keep the form: a snapshot is taken before the nested
+#      confirmDestructive opens, and restored after the parent dialog is
+#      rebuilt on Cancel, so an in-progress edit is not lost by backing out
+#      of a destructive sub-action.
+NODES116 = read("nodes.js")
+_EDIT_DEVICE116 = js_function(NODES116, "editDevice")
+check("const snap = App.modalFormSnapshot();" in _EDIT_DEVICE116
+      and "editDevice(); App.modalFormRestore(snap);" in _EDIT_DEVICE116,
+      "editDevice's Clear credential confirm snapshots and restores the form")
+IPAM116 = read("ipam.js")
+_EDIT_DHCP116 = js_function(IPAM116, "editDhcpServer")
+check(_EDIT_DHCP116.count("const snap = App.modalFormSnapshot();") == 2
+      and _EDIT_DHCP116.count("editDhcpServer(); App.modalFormRestore(snap);") == 2,
+      "editDhcpServer's Remove server and Clear credential confirms both "
+      "snapshot and restore the form")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

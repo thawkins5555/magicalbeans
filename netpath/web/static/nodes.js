@@ -5352,6 +5352,7 @@
       // nodes write to open — so a future route into editDevice() cannot
       // reach it ungated.
       ...(App.canWrite('nodes') ? [{ label: 'Clear credential', danger: true, onClick: () => {
+        const snap = App.modalFormSnapshot();
         App.confirmDestructive('Clear credential',
           `<p>Clear the SNMP credential stored on <b>${escape(displayName(d))}</b>?</p>` +
           '<p class="hint">The device falls back to its profile\'s credentials on ' +
@@ -5359,7 +5360,7 @@
           'Clear', async () => {
             await App.del(`/api/nodes/devices/${d.id}/credential`);
             loadDetail();
-          }, (confirmed) => { if (!confirmed) editDevice(); });
+          }, (confirmed) => { if (!confirmed) { editDevice(); App.modalFormRestore(snap); } });
       } }] : []),
       // Built here rather than declared in index.html, so — like every
       // dynamically built control — it checks the permission itself.
