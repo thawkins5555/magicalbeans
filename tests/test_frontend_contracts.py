@@ -5431,6 +5431,15 @@ HELPCSS132 = css_rule(read("app.css"), ".help-body .sev")
 check("width: auto;" in HELPCSS132 and "display: inline-block;" in HELPCSS132
       and "padding: 0 .4em;" in HELPCSS132,
       ".help-body .sev widens to fit its text instead of wrapping")
+
+# ---------------------------------------------------------------------------
+# 133. Storage caps are configured in MiB but sizes are shown decimal
+#      (App.bytes); the cap meter now shows the cap the same way, beside
+#      the size it is compared to, rather than leaving MiB unconverted.
+USAGE133 = js_function(_SETTINGS41, "showUsage")
+check("${Math.round(share * 100)}% of ${App.bytes(cap)} cap" in USAGE133,
+      "the usage meter reads the cap through App.bytes, in the same "
+      "decimal units as the size it bounds")
 check(INDEX.index('id="dash-get-started"') < INDEX.index('id="dash-grid"'),
       "#dash-get-started sits above #dash-grid in index.html")
 DRAW127 = js_function(DASHBOARD101, "draw")

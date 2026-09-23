@@ -484,9 +484,13 @@
         // percentage made a database at 150% of its cap read 100%, exactly
         // like one sitting on it, while the Dashboard's headroom tile
         // printed the true figure for the same store.
+        // The cap is configured in MiB but sizes are shown decimal
+        // (App.bytes); showing the cap the same way keeps the two figures
+        // beside it in the same units instead of leaving the operator to
+        // convert MiB in their head.
         meter.innerHTML = share === null ? ''
           : `<span class="meter"><i style="width:${Math.min(share, 1) * 100}%"></i></span>`
-            + `${Math.round(share * 100)}% of cap`;
+            + `${Math.round(share * 100)}% of ${App.bytes(cap)} cap`;
       }
       const age = App.el(ageId);
       // How far back each file still reaches — bytes alone never said what
