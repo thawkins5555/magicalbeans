@@ -1664,9 +1664,19 @@ check(sum(len(v) for v in ALLOWED_BARE_FIELDS.values()) >= 70,
 # carries no "<". Every bare-field cell body is server-formatted numbers.
 ALLOWED_BARE_CELLS = {
     "netflow.js": {"r.bytes_text", "r.packets_text"},
-    "nodes.js": {"r.if_index"},
+    # r.outage_count, r.n_hours: server-computed counts, String()-wrapped
+    # only so the sort column's numeric value survives the cell's own text.
+    "nodes.js": {"r.if_index", "r.outage_count", "r.n_hours"},
 }
 _CELL_BARE = re.compile(r"cell:\s*\((\w*)\)\s*=>\s*([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+)\s*[,}]")
+# The same bare row field, but wrapped in a fallback ('' or "") default, a
+# ?? default, parens around either, or a plain String(...) call — each is as
+# much an unescaped sink as the bare form _CELL_BARE catches.
+_CELL_BARE_WRAPPED = re.compile(
+    r"cell:\s*\((\w*)\)\s*=>\s*\(?"
+    r"(?:String\(([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+)\)"
+    r"|([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+)\s*(?:\|\||\?\?)\s*(?:''|\"\"))"
+    r"\)?\s*[,}]")
 _CELL_TPL = re.compile(r"cell:\s*\((\w*)\)\s*=>\s*`([^`]*)`")
 bare_cells = []
 for _name in MODULES:
@@ -1677,6 +1687,10 @@ for _name in MODULES:
         if _m.group(2) not in ALLOWED_BARE_CELLS.get(_name, set()):
             bare_cells.append("%s:%d %s" % (_name, _body.count("\n", 0, _m.start()) + 1,
                                             _m.group(2)))
+    for _m in _CELL_BARE_WRAPPED.finditer(_body):
+        _field = _m.group(2) or _m.group(3)
+        if _field not in ALLOWED_BARE_CELLS.get(_name, set()):
+            bare_cells.append("%s:%d %s" % (_name, _body.count("\n", 0, _m.start()) + 1, _field))
     for _m in _CELL_TPL.finditer(_body):
         if "<" in _m.group(2):
             continue
