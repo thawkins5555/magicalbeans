@@ -260,14 +260,6 @@
 
   /* ------------------------------------------------------------- chart */
 
-  function rateLabel(bits) {
-    for (const unit of ['bps', 'Kbps', 'Mbps', 'Gbps', 'Tbps']) {
-      if (bits < 1000 || unit === 'Tbps') return `${Math.round(bits)} ${unit}`;
-      bits /= 1000;
-    }
-    return `${Math.round(bits)} Tbps`;
-  }
-
   // The end of the window the values were read over: the response's own
   // t1, not view.t1, which may already have moved on under a pending fetch.
   function windowEnd(data) {
@@ -467,7 +459,7 @@
       svg.appendChild(App.svgNode('text', {
         x: plot.x - 8, y: y + 4, 'text-anchor': 'end', fill: 'var(--dim)',
         'font-family': 'var(--mono)', 'font-size': 'var(--fs-2xs)',
-      }, rateLabel(axisMax * fraction)));
+      }, App.rate(axisMax * fraction / 8, 1)));
     }
 
     // `drawn` is the slots that cover some of the window: an empty,

@@ -1792,7 +1792,7 @@ check("if (folded) tip.push({ text: FOLDED_TEXT });" in _NF_BARS
 NODE = shutil.which("node") or shutil.which("nodejs")
 
 _NF_HELPERS = (js_function(APP, "niceCeiling")
-               + js_functions(_NETFLOW, "rateLabel", "windowEnd", "slotCovered",
+               + js_functions(_NETFLOW, "windowEnd", "slotCovered",
                              "slotSeconds", "slotCount", "axisOf", "showFocusTip", "drawChart",
                              "slotTip")
                + js_const(_NETFLOW, "SLOT_MIN_FRACTION"))
@@ -5478,6 +5478,16 @@ check("Click to open device" in _NODEBOX109,
 check("App.buildRoute('nodes', ['device', device.id])" in _NODEBOX109,
       "...opening the same #/nodes/device/<id> route every other cross-tab "
       "device link uses")
+
+# ---------------------------------------------------------------------------
+# 110. One rate formatter: netflow.js no longer carries its own rateLabel,
+#      the chart's y-axis reads off App.rate like the tooltip already does.
+check("function rateLabel(" not in NETFLOW107,
+      "netflow.js's local rateLabel is gone")
+check("App.rate(axisMax * fraction / 8, 1)" in NETFLOW107,
+      "the y-axis tick label is formatted through App.rate, the same "
+      "formatter the tooltip uses")
+
 
 # ---------------------------------------------------------------------------
 if failures:
