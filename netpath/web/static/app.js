@@ -849,25 +849,41 @@ const App = (() => {
      promise: "no links" beats a crash. */
   let deviceIndexCache = null;
   let deviceIndexAt = 0;
+  let deviceIndexInFlight = null;
   async function deviceIndex() {
     if (deviceIndexCache && Date.now() - deviceIndexAt < 30000) return deviceIndexCache;
-    const byIp = new Map();
-    const byId = new Map();
-    try {
-      // The projection, not the 25-column device record: this index is two
-      // Maps for a name/ip cross-link, and the full unpaged fleet was 1.5 MB
-      // at 812 devices, decoded on the main thread every 30 s for whichever
-      // modules are open. A server that does not know `fields` answers with
-      // the full rows, which carry these keys too.
-      const payload = await get('/api/nodes/devices', { fields: 'index' });
-      for (const d of payload.devices || []) {
-        if (d.ip) byIp.set(d.ip, d);
-        byId.set(d.id, d);
+    // Held and handed to every caller until the fetch settles, so a burst
+    // (netpath redraws on each pan move) makes one request, not one per call.
+    if (deviceIndexInFlight) return deviceIndexInFlight;
+    deviceIndexInFlight = (async () => {
+      const byIp = new Map();
+      const byId = new Map();
+      try {
+        // The projection, not the 25-column device record: this index is two
+        // Maps for a name/ip cross-link, and the full unpaged fleet was 1.5 MB
+        // at 812 devices, decoded on the main thread every 30 s for whichever
+        // modules are open. A server that does not know `fields` answers with
+        // the full rows, which carry these keys too.
+        const payload = await get('/api/nodes/devices', { fields: 'index' });
+        for (const d of payload.devices || []) {
+          if (d.ip) byIp.set(d.ip, d);
+          byId.set(d.id, d);
+        }
+      } catch (error) {
+        // An abort (a newer deviceIndex() call superseded this fetch) must
+        // not cache an empty index; Nodes unreadable to this account (403)
+        // is the one failure that legitimately means "no links".
+        if (error && error.superseded) return deviceIndexCache || { byIp, byId };
       }
-    } catch (error) { /* Nodes unreadable to this account: empty index, not fatal */ }
-    deviceIndexCache = { byIp, byId };
-    deviceIndexAt = Date.now();
-    return deviceIndexCache;
+      deviceIndexCache = { byIp, byId };
+      deviceIndexAt = Date.now();
+      return deviceIndexCache;
+    })();
+    try {
+      return await deviceIndexInFlight;
+    } finally {
+      deviceIndexInFlight = null;
+    }
   }
 
   /* Upgrades a plain IP address into a link to its Nodes device

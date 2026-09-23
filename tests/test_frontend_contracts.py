@@ -5681,6 +5681,18 @@ check("query === undefined ? parseRoute().query : query" in SETROUTE129,
       "setRoute falls back to parseRoute().query only when query is "
       "undefined, not when it is an explicit {}")
 
+# ---------------------------------------------------------------------------
+# 130. deviceIndex holds its in-flight promise for later callers until the
+#      fetch settles (a burst of calls makes one request), and an aborted
+#      fetch never caches an empty index.
+INDEX130 = js_function(APP, "deviceIndex")
+check("if (deviceIndexInFlight) return deviceIndexInFlight;" in INDEX130,
+      "deviceIndex hands its in-flight promise to later callers instead of "
+      "issuing a fresh fetch per call")
+check("if (error && error.superseded) return deviceIndexCache || { byIp, byId };" in INDEX130,
+      "an aborted (superseded) fetch falls back to the existing cache "
+      "instead of overwriting it with an empty index")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:
