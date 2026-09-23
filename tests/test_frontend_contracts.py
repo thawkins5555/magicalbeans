@@ -5383,13 +5383,17 @@ check("event.target.closest('.module-refresh')" in START124 and "refreshNow();" 
 
 
 # ---------------------------------------------------------------------------
-# 125. Every .card.strip in index.html carries role="toolbar" and its own
-#      aria-label.
-check(INDEX.count('class="card strip"') == INDEX.count('class="card strip" role="toolbar" aria-label='),
-      "every .card.strip carries role=toolbar and an aria-label")
-check(INDEX.count('class="card strip" role="toolbar" aria-label=') == 11,
-      "eleven .card.strip elements are labelled (found %d)"
+# 125. Every .card.strip in index.html that has controls carries
+#      role="toolbar" and its own aria-label; the Debug strip has none (a
+#      single read-only summary span) and carries neither.
+check(INDEX.count('class="card strip"') - 1
+      == INDEX.count('class="card strip" role="toolbar" aria-label='),
+      "every .card.strip but Debug's carries role=toolbar and an aria-label")
+check(INDEX.count('class="card strip" role="toolbar" aria-label=') == 10,
+      "ten .card.strip elements are labelled (found %d)"
       % INDEX.count('class="card strip" role="toolbar" aria-label='))
+check('class="card strip"><span id="dbg-summary"' in INDEX,
+      "the Debug strip carries no role or aria-label — it has no controls")
 
 
 # ---------------------------------------------------------------------------
@@ -5692,6 +5696,20 @@ check("if (deviceIndexInFlight) return deviceIndexInFlight;" in INDEX130,
 check("if (error && error.superseded) return deviceIndexCache || { byIp, byId };" in INDEX130,
       "an aborted (superseded) fetch falls back to the existing cache "
       "instead of overwriting it with an empty index")
+
+# ---------------------------------------------------------------------------
+# 131. Toolbar keyboard: one delegated keydown handler moves focus among a
+#      [role="toolbar"] strip's own controls on ArrowLeft/Right/Home/End.
+#      The Debug strip drops role="toolbar"/aria-label since it has none.
+TOOLBAR131 = js_function(APP, "wireToolbarKeyboard")
+check("event.target.closest('[role=\"toolbar\"]')" in TOOLBAR131,
+      "wireToolbarKeyboard is delegated off a single keydown listener, not "
+      "wired per strip")
+check("'button, input, select, a[href]'" in TOOLBAR131,
+      "the roving set is the strip's own focusable controls")
+START125 = js_function(APP, "start")
+check("wireToolbarKeyboard();" in START125,
+      "start() wires the toolbar keyboard handler once")
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))

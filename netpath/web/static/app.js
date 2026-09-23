@@ -4582,6 +4582,35 @@ const App = (() => {
     });
   }
 
+  /* One delegated keydown handler for every [role="toolbar"] strip, instead
+     of wiring each of the eleven module strips separately. ArrowLeft/Right
+     and Home/End move focus among the strip's own enabled controls — a
+     button, input, select or a[href] — but only when focus is already on
+     one of them, and not while a text input is taking the keys for cursor
+     movement instead. */
+  function wireToolbarKeyboard() {
+    const TOOLBAR_CONTROLS = 'button, input, select, a[href]';
+    const TEXT_INPUT_TYPES = new Set(['text', 'search', 'number', 'email', 'password', 'url', 'tel', 'date', 'time']);
+    document.addEventListener('keydown', (event) => {
+      if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+      const toolbar = event.target.closest('[role="toolbar"]');
+      if (!toolbar) return;
+      const active = event.target;
+      if (!active.matches(TOOLBAR_CONTROLS)) return;
+      if (active.tagName === 'INPUT' && TEXT_INPUT_TYPES.has(active.type)) return;
+      const controls = [...toolbar.querySelectorAll(TOOLBAR_CONTROLS)].filter((el) => !el.disabled);
+      const current = controls.indexOf(active);
+      if (current === -1) return;
+      let next;
+      if (event.key === 'ArrowRight') next = (current + 1) % controls.length;
+      else if (event.key === 'ArrowLeft') next = (current - 1 + controls.length) % controls.length;
+      else if (event.key === 'Home') next = 0;
+      else next = controls.length - 1;
+      event.preventDefault();
+      controls[next].focus();
+    });
+  }
+
   /* The .subtabs groups (Nodes' top-level nav, its nested device-detail
      pane, Alerts, IPAM) are genuinely nested tablists — a second level of
      tabs inside a page the top strip already switched to — and get the
@@ -6566,6 +6595,7 @@ const App = (() => {
     wireSubtabGroups();
     wireSubtabRouting();
     wireIpPopover();
+    wireToolbarKeyboard();
     wirePrintToggle('netpath-print', 'route-canvas');
     wirePrintToggle('mp-print', 'mp-canvas');
     // Every module strip's manual refresh, one delegated handler: refreshes
