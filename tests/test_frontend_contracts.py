@@ -5490,6 +5490,18 @@ check("App.rate(axisMax * fraction / 8, 1)" in NETFLOW107,
 
 
 # ---------------------------------------------------------------------------
+# 111. Live pauses on row select: picking a Syslog/SNMP row stops Live
+#      sliding the window under it, and returning to Live clears the
+#      selection and the route id along with restoring follow.
+_DRAWTABLE111 = js_function(EVENTS107, "drawTable")
+check("view.follow = false;" in _DRAWTABLE111 and "el('live').hidden = false;" in _DRAWTABLE111
+      and "App.announce('Live paused while a row is selected');" in _DRAWTABLE111,
+      "selecting a row pauses Live and announces it")
+_RETURNTOLIVE111 = js_function(EVENTS107, "returnToLive")
+check("view.selected = null;" in _RETURNTOLIVE111 and "App.setRoute([]);" in _RETURNTOLIVE111,
+      "Return to live clears the selection and the route id, not just follow")
+
+# ---------------------------------------------------------------------------
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

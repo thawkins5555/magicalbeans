@@ -120,6 +120,8 @@
       view.follow = true;
       el('follow').checked = true;
       el('live').hidden = true;
+      view.selected = null;
+      App.setRoute([]);
       App.refreshNow(spec.tab);
     }
 
@@ -153,6 +155,13 @@
         tr.onclick = () => {
           view.selected = row.id;
           App.setRoute([row.id]);
+          // A selected row is a snapshot an operator is reading; Live
+          // sliding the window underneath it would move the row out from
+          // under them mid-read.
+          view.follow = false;
+          el('follow').checked = false;
+          el('live').hidden = false;
+          App.announce('Live paused while a row is selected');
           showDetail(row);
           drawTable();
         };
