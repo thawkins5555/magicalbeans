@@ -1155,12 +1155,39 @@
     App.el('dash-done').hidden = !view.editing;
   }
 
+  /* A fresh install's dashboard is 24 tile types over an empty fleet — not
+     wrong, just nothing to point at yet. Shown above the grid (not a tile
+     itself, so the grid's own layout is untouched) only once the fleet
+     count is confirmed at zero; gone the moment a device exists. Gated on
+     Nodes read: an account that cannot read Nodes has nothing here to act
+     on either. */
+  function drawGetStarted() {
+    const root = App.el('dash-get-started');
+    if (!root) return;
+    const fleet = view.dashboard && view.dashboard.fleet;
+    if (!fleet || !fleet.counts || fleet.counts.total !== 0 || !App.canRead('nodes')) {
+      root.innerHTML = '';
+      return;
+    }
+    root.innerHTML = `<div class="card get-started"><p>No devices yet.
+      <button type="button" class="linkish inline" id="dash-gs-add">Add a device</button>,
+      then <a class="linkish inline" href="#/nodes">start the poller</a> to begin monitoring
+      — or <a class="linkish inline" href="#/netpath">add a destination</a> to trace a route.</p></div>`;
+    App.el('dash-gs-add').onclick = async () => {
+      App.selectTab('nodes');
+      await App.whenModuleReady('nodes');
+      const addButton = App.el('nd-add-device');
+      if (addButton) addButton.click();
+    };
+  }
+
   // ifChanged: refresh()'s poll tick only, skipping a rewrite the DOM
   // already matches. Every other caller always repaints, as before.
   function draw({ ifChanged } = {}) {
     const root = App.el('dash-grid');
     if (!root) return;
     syncEditButtons();
+    drawGetStarted();
     const errorLine = view.error
       ? `<p class="warn-text">${escape(view.error)}</p>` : '';
     const d = view.dashboard;

@@ -4878,6 +4878,7 @@ function syncEditButtons() {}
 function activeTiles() { return []; }
 function renderTile() { return ''; }
 function drawCharts() {}
+function drawGetStarted() {}
 const escape = (s) => String(s);
 const document = { activeElement: null };
 const view = { editing: false, error: null, dashboard: { x: 1 } };
@@ -5377,6 +5378,25 @@ check("scrollbar-width: thin;" in TABLEWRAP126
       ".table-wrap sets a thin, themed scrollbar")
 check(".table-wrap::-webkit-scrollbar { width: 10px; height: 10px; }" in read("app.css"),
       ".table-wrap carries the webkit scrollbar twin")
+
+
+# ---------------------------------------------------------------------------
+# 127. Get started card: shown above #dash-grid (not a tile) only when the
+#      fleet is confirmed empty and this account can read Nodes; its three
+#      links are Add device (navigates then opens #nd-add-device), Start
+#      poller and Add destination.
+GS127 = js_function(DASHBOARD101, "drawGetStarted")
+check("fleet.counts.total !== 0" in GS127 and "!App.canRead('nodes')" in GS127,
+      "drawGetStarted only shows once the fleet is confirmed at zero and Nodes is readable")
+check('class="card get-started"' in GS127, "the card carries the get-started class")
+check("href=\"#/nodes\"" in GS127 and "href=\"#/netpath\"" in GS127,
+      "drawGetStarted links Start poller (#/nodes) and Add destination (#/netpath)")
+check("App.el('nd-add-device')" in GS127 and "App.whenModuleReady('nodes')" in GS127,
+      "the Add a device button waits for Nodes then opens #nd-add-device")
+check(INDEX.index('id="dash-get-started"') < INDEX.index('id="dash-grid"'),
+      "#dash-get-started sits above #dash-grid in index.html")
+DRAW127 = js_function(DASHBOARD101, "draw")
+check("drawGetStarted();" in DRAW127, "draw() calls drawGetStarted() every time")
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))
