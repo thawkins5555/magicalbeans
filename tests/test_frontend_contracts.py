@@ -5740,6 +5740,19 @@ check("label: r.src_name || undefined }" in NETFLOW118
       "an empty/unresolved src_name or dst_name falls back to the address, "
       "not to a button-only cell")
 
+# ---------------------------------------------------------------------------
+# 119. "Problems only" select-all: the header checkbox and its onToggle read
+#      off the filtered rows the table actually draws, not the full device
+#      list, so ticking it cannot sweep a hidden device into a bulk action.
+_DRAWTABLE119 = js_function(read("nodes.js"), "drawTable")
+check("const deviceRowIds = new Set(deviceRows.map((d) => d.id));" in _DRAWTABLE119,
+      "drawTable computes the filtered row-id set before building the grid")
+check("checked: deviceRows.length > 0" in _DRAWTABLE119
+      and "some: deviceRows.some((d) => checked.has(d.id))," in _DRAWTABLE119,
+      "select-all's checked/some read off deviceRows, not view.devices")
+check("if (!deviceRowIds.has(id)) checked.delete(id);" in _DRAWTABLE119,
+      "ticking select-all drops any hidden device a prior selection left checked")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

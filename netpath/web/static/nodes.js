@@ -404,17 +404,29 @@
   function drawTable() {
     const columns = deviceColumns();
     const checked = view.devicesChecked;
+    const problemsEl = App.el('nd-problems');
+    const deviceRows = problemsEl && problemsEl.checked
+      ? view.devices.filter((d) => STATUS_TONE[d.status] === 'warn' || STATUS_TONE[d.status] === 'fail')
+      : view.devices;
+    const deviceRowIds = new Set(deviceRows.map((d) => d.id));
     const table = App.grid(App.el('nodes-table'), {
       name: 'nodes-devices', caption: 'Devices', columns,
       sort: view.deviceSort, onSort: onDeviceSort,
       selectAll: {
         key: 'check',
-        checked: view.devices.length > 0
-          && view.devices.every((d) => checked.has(d.id)),
-        some: view.devices.some((d) => checked.has(d.id)),
+        checked: deviceRows.length > 0
+          && deviceRows.every((d) => checked.has(d.id)),
+        some: deviceRows.some((d) => checked.has(d.id)),
         onToggle: (on) => {
-          checked.clear();
-          if (on) for (const d of view.devices) checked.add(d.id);
+          if (on) {
+            // A "Problems only" filter draws deviceRows, not view.devices;
+            // ticking select-all must not sweep in hidden devices, and must
+            // drop any hidden device a prior selection left checked.
+            for (const id of [...checked]) if (!deviceRowIds.has(id)) checked.delete(id);
+            for (const d of deviceRows) checked.add(d.id);
+          } else {
+            checked.clear();
+          }
           drawTable();
         },
       } });
@@ -429,10 +441,6 @@
       row._groupName = groupsById[row.group_id] || '';
       row._devGroupName = devGroupsById[row.device_group_id] || '';
     }
-    const problemsEl = App.el('nd-problems');
-    const deviceRows = problemsEl && problemsEl.checked
-      ? view.devices.filter((d) => STATUS_TONE[d.status] === 'warn' || STATUS_TONE[d.status] === 'fail')
-      : view.devices;
     const rows = App.sortRows(deviceRows, view.deviceSort.key,
                               view.deviceSort.descending, columns);
 
