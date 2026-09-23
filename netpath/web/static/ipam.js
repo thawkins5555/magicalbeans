@@ -147,18 +147,21 @@
                (scan.conflicts ? `, ${scan.conflicts} new conflict(s)` : '')
       : 'Never scanned yet';
 
+    const used = (u.alive || 0) + (u.seen_down || 0);
+    const free = u.never_seen || 0;
     const text = document.createElement('div');
     text.className = 'subnet-detail-text';
     text.innerHTML =
       `<div class="subnet-detail-title">${escape(subnet.label)}` +
       `${subnet.enabled ? '' : ' (disabled)'} \u2014 ${escape(subnet.cidr)}</div>` +
       `<div class="subnet-detail-rows">` +
-      `<div><span class="legend-dot" style="background:var(--ok)"></span>Alive` +
-      ` <b>${u.alive || 0}</b> <span class="hint">(${pct(u.alive || 0)})</span></div>` +
-      `<div><span class="legend-dot" style="background:var(--warn)"></span>Seen before, now down` +
-      ` <b>${u.seen_down || 0}</b> <span class="hint">(${pct(u.seen_down || 0)})</span></div>` +
-      `<div><span class="legend-dot" style="background:var(--data-neutral)"></span>Never seen` +
-      ` <b>${u.never_seen || 0}</b> <span class="hint">(${pct(u.never_seen || 0)})</span></div>` +
+      `<div><span class="legend-dot" style="background:var(--accent)"></span>Used` +
+      ` <b>${used}</b> <span class="hint">(${pct(used)})</span></div>` +
+      `<div><span class="legend-dot" style="background:var(--data-neutral)"></span>Free` +
+      ` <b>${free}</b> <span class="hint">(${pct(free)})</span></div>` +
+      `<div class="hint">Alive ${u.alive || 0} (${pct(u.alive || 0)}) \u00b7 ` +
+      `seen before, now down ${u.seen_down || 0} (${pct(u.seen_down || 0)}) \u00b7 ` +
+      `never seen ${u.never_seen || 0} (${pct(u.never_seen || 0)})</div>` +
       `</div>` +
       `<div class="hint">${total} usable address(es) \u00b7 ${escape(scanLine)}</div>`;
     container.appendChild(text);

@@ -5807,6 +5807,22 @@ check("name: 'nd-q', group: 'nd-filter-group', devgroup: 'nd-filter-devgroup',"
       "syncNodesRoute writes the typed search under 'name', not 'q' — 'q' "
       "arms the MAC search on replay, 'name' does not")
 
+# ---------------------------------------------------------------------------
+# 123. Subnet detail legend matches its two-slice used/free donut: an accent
+#      dot for Used and a grey dot for Free, with the alive/seen-down/
+#      never-seen split as text only, not a third and fourth dot colour.
+_DRAWDETAIL123 = js_function(read("ipam.js"), "drawSubnetDetail")
+check("<span class=\"legend-dot\" style=\"background:var(--accent)\"></span>Used" in _DRAWDETAIL123
+      and "<span class=\"legend-dot\" style=\"background:var(--data-neutral)\"></span>Free"
+      in _DRAWDETAIL123,
+      "the legend shows exactly an accent 'Used' dot and a grey 'Free' dot")
+check("var(--ok)" not in _DRAWDETAIL123 and "var(--warn)" not in _DRAWDETAIL123,
+      "...not the old alive/seen-down/never-seen three-colour dots")
+check("Alive ${u.alive || 0}" in _DRAWDETAIL123
+      and "seen before, now down ${u.seen_down || 0}" in _DRAWDETAIL123
+      and "never seen ${u.never_seen || 0}" in _DRAWDETAIL123,
+      "the alive/seen-down/never-seen breakdown is plain text")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:
