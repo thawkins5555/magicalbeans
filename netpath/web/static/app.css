@@ -1004,8 +1004,17 @@ body.compact .canvas.small, body.tiny .canvas.small { min-height: 120px; }
 
 .table-wrap {
   flex: 1;
-  overflow: auto;
+  overflow-x: auto;
+  overflow-y: auto;
   min-height: 0;
+  scrollbar-width: thin;
+  scrollbar-color: var(--muted) var(--panel);
+}
+/* The webkit twin of the rule above, same shape as #page-settings .scroll's own. */
+.table-wrap::-webkit-scrollbar { width: 10px; height: 10px; }
+.table-wrap::-webkit-scrollbar-track { background: var(--panel); }
+.table-wrap::-webkit-scrollbar-thumb {
+  background: var(--muted); border-radius: var(--radius-pill); border: 2px solid var(--panel);
 }
 .table-wrap.workers { flex: 1; min-height: 80px; margin: 0 var(--space-md); }
 .table-wrap.workers-small { flex: none; min-height: 34px; max-height: 150px; margin: 0 var(--space-md) 10px; }

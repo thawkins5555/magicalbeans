@@ -5367,6 +5367,17 @@ check(INDEX.count('class="card strip" role="toolbar" aria-label=') == 11,
       "eleven .card.strip elements are labelled (found %d)"
       % INDEX.count('class="card strip" role="toolbar" aria-label='))
 
+
+# ---------------------------------------------------------------------------
+# 126. .table-wrap gets a themed (thin, --muted on --panel) scrollbar, same
+#      shape as #page-settings .scroll's own.
+TABLEWRAP126 = css_rule(read("app.css"), ".table-wrap")
+check("scrollbar-width: thin;" in TABLEWRAP126
+      and "scrollbar-color: var(--muted) var(--panel);" in TABLEWRAP126,
+      ".table-wrap sets a thin, themed scrollbar")
+check(".table-wrap::-webkit-scrollbar { width: 10px; height: 10px; }" in read("app.css"),
+      ".table-wrap carries the webkit scrollbar twin")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:
