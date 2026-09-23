@@ -591,6 +591,10 @@
 
 <!-- ============================ NETPATH ============================ -->
 <section id="page-netpath" class="page">
+ <div class="card strip" role="toolbar" aria-label="Routes controls">
+   <span class="grow"></span>
+   <button id="netpath-settings" class="module-settings" data-requires-write="netpath">Settings</button>
+ </div>
  <div class="cols" data-splitter="netpath-main">
   <aside class="sidebar pane" data-grow="1">
     <h2>Destinations</h2>
@@ -632,7 +636,6 @@
       <button id="route-zoom-in" aria-label="Zoom in" title="Zoom in" class="icon">+</button>
       <span id="route-zoom" class="hint zoom">100%</span>
       <button id="route-fit">Fit</button>
-      <button id="netpath-settings" class="module-settings" data-requires-write="netpath">Settings</button>
     </header>
     <p id="target-terms" class="hint pad terms"></p>
     <div id="route-canvas" class="canvas"><svg id="route-svg"></svg></div>

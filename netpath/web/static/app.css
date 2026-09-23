@@ -605,7 +605,13 @@ button.icon { width: 32px; padding: var(--space-xs) 0; text-align: center; }
    resting appearance of an outline primary — sitting at the far end of the
    same strip as the real primary ("Add device"), so every strip had two
    emphatic controls for actions of very different weight, and on the two
-   strips with no primary at all it read as the one. */
+   strips with no primary at all it read as the one.
+
+   Dialog buttons: a form dialog (App.modal's default) puts them at the top,
+   sticky, so Save is reachable without scrolling a long form first.
+   Confirmations (App.confirmDestructive) and the Settings Apply/Revert bar
+   are short enough that there is no fold to be above, so both stay
+   bottom-anchored instead ({buttonsTop: false}). */
 
 input, select, textarea {
   background: var(--raised);

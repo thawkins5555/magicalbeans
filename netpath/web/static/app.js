@@ -129,6 +129,7 @@ const App = (() => {
       <fieldset id="am-sms"><legend>Text alerts (SMS)</legend>
         <div id="am-sms-body"><p class="hint">Loading…</p></div>
       </fieldset>`}
+      ${forced ? '' : `<p class="hint">Conventions ${helpLink('shell.dialogs')}</p>`}
       ${version ? `<p class="hint">SappiWhere v${escapeHtml(version)}</p>` : ''}`,
       [
         // Forced, this dialog is the only thing the account can do — the
@@ -6452,6 +6453,14 @@ const App = (() => {
       html: '<p>Every IP address has an actions button beside it: jump to '
         + 'that address in IPAM, Syslog, SNMP Trap or NetFlow, or to its '
         + 'device in Nodes when the fleet has one at that address.</p>' } });
+    registerHelp({ 'shell.dialogs': { title: 'Dialog conventions',
+      html: '<p>A form dialog keeps its buttons at the top, so Save stays '
+        + 'reachable without scrolling past every field first. A '
+        + "confirmation, and the Settings Apply/Revert bar, keep theirs at "
+        + 'the bottom instead.</p>'
+        + '<p>Remove takes something out of monitoring or configuration; '
+        + 'Delete destroys stored data (backups, maps, rule sets, the '
+        + 'event log).</p>' } });
     // login.js set this the moment /api/login's own response said the
     // account must change its password — first paint, rather than waiting
     // on the first /api/state poll (loadState, below) to say the same
