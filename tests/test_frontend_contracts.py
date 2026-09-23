@@ -5514,6 +5514,23 @@ check("sev sev-0" in EVENTS107 and "sev sev-3" in EVENTS107
 
 
 # ---------------------------------------------------------------------------
+# 113. IPAM subnet donut agrees with its own "N% free" label: the ring is a
+#      two-slice used/free split, and the alive/seen-down/never-seen
+#      breakdown is text, not a third and fourth ring colour.
+IPAM113 = read("ipam.js")
+_USAGE_DONUT113 = js_function(IPAM113, "usageDonut")
+check("{ value: (u.alive || 0) + (u.seen_down || 0), color: 'var(--accent)' }" in _USAGE_DONUT113
+      and "{ value: free, color: 'var(--data-neutral)' }" in _USAGE_DONUT113,
+      "usageDonut draws exactly two slices, used and free")
+check("'var(--ok)'" not in _USAGE_DONUT113 and "'var(--warn)'" not in _USAGE_DONUT113,
+      "...not the old alive/seen-down/never-seen three-colour split")
+check("ariaLabel" in js_function(IPAM113, "donut") and "svg.setAttribute('aria-label', ariaLabel)" in IPAM113,
+      "the donut carries an aria-label describing what the ring shows")
+check("% free — ${free} of ${total} address(es)" in IPAM113,
+      "usageDonut's aria-label agrees with the centre '% free' figure")
+
+
+# ---------------------------------------------------------------------------
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

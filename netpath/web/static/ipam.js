@@ -36,12 +36,16 @@
      is the headroom figure the two larger call sites print in the middle
      ("free" — the address space nothing has claimed yet); the small
      list-row donuts pass nothing and stay a bare ring. */
-  function donut(slices, size, centerPct) {
+  function donut(slices, size, centerPct, ariaLabel) {
     const total = slices.reduce((sum, s) => sum + (s.value || 0), 0);
     const radius = size / 2 - 3;
     const circumference = 2 * Math.PI * radius;
     const svg = App.svgNode('svg', { width: size, height: size,
       viewBox: `0 0 ${size} ${size}`, class: 'usage-donut' });
+    if (ariaLabel) {
+      svg.setAttribute('role', 'img');
+      svg.setAttribute('aria-label', ariaLabel);
+    }
     if (!total) {
       svg.appendChild(App.svgNode('circle', {
         cx: size / 2, cy: size / 2, r: radius, fill: 'none',
@@ -81,13 +85,20 @@
     return svg;
   }
 
+  // The ring is used (accent) vs. free (neutral), matching the "N% free"
+  // wording underneath it in the big chart — the alive/seen-down/never-seen
+  // breakdown a 3-colour ring used to carry is text now (usageTooltipText's
+  // tooltip, and drawSubnetDetail's legend rows beside the big one).
   function usageDonut(usage, size, big) {
     const u = usage || {};
+    const total = u.total || 0;
+    const free = u.never_seen || 0;
+    const freePct = total ? Math.round((free / total) * 100) : undefined;
     return donut([
-      { value: u.alive || 0, color: 'var(--ok)' },
-      { value: u.seen_down || 0, color: 'var(--warn)' },
-      { value: u.never_seen || 0, color: 'var(--data-neutral)' },
-    ], size, big && u.total ? Math.round((u.never_seen || 0) / u.total * 100) : undefined);
+      { value: (u.alive || 0) + (u.seen_down || 0), color: 'var(--accent)' },
+      { value: free, color: 'var(--data-neutral)' },
+    ], size, big ? freePct : undefined,
+    total ? `${freePct}% free — ${free} of ${total} address(es)` : undefined);
   }
 
   function scopeDonut(usage, size, big) {
