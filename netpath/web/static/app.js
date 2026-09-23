@@ -139,7 +139,7 @@ const App = (() => {
           ? [{ label: 'Sign out', onClick: async () => {
               state.modalLocked = false;
               try { await post('/api/logout', {}); } catch (error) { /* going anyway */ }
-              window.location.href = '/login';
+              window.location.href = '/login' + window.location.hash;
             } }]
           : [{ label: 'Cancel', onClick: closeModal },
              { label: 'Save theme', onClick: async () => {
@@ -169,7 +169,7 @@ const App = (() => {
           });
           status.textContent = 'Changed. Signing you back in…';
           status.style.color = 'var(--ok)';
-          setTimeout(() => { window.location.href = '/login'; }, 1200);
+          setTimeout(() => { window.location.href = '/login' + window.location.hash; }, 1200);
         } },
       ],
       // Forced, this is the must-change-password prompt: it can be reached
@@ -729,7 +729,7 @@ const App = (() => {
     // A session that has timed out should land on the sign-in page rather
     // than filling the screen with failures.
     if (response.status === 401 && path !== '/api/login') {
-      window.location.href = '/login';
+      window.location.href = '/login' + window.location.hash;
       throw new Error('Signed out');
     }
     const payload = await response.json().catch(() => ({}));
@@ -6469,7 +6469,7 @@ const App = (() => {
         // this browser must not find this operator's filters waiting.
         forgetView();
         try { await post('/api/logout', {}); } catch (error) { /* going anyway */ }
-        window.location.href = '/login';
+        window.location.href = '/login' + window.location.hash;
       };
     }
     const accountBtn = document.getElementById('account-btn');

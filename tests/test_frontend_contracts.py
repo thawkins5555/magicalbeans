@@ -5155,6 +5155,18 @@ check("route.parts[route.parts.length - 1]" in WAIT110,
 check("MutationObserver" in WAIT110 and "setTimeout(() => observer.disconnect(), 5000)" in WAIT110,
       "waitForNestedSubtab watches for the nav and gives up after 5s")
 
+
+# ---------------------------------------------------------------------------
+# 111. Session expiry keeps the operator's place: every /login redirect in
+#      app.js carries the current hash, and login.js only forces the
+#      stored tab to Dashboard when there is none to finish the journey to.
+check(APP.count("window.location.href = '/login' + window.location.hash;") == 4,
+      "app.js's four /login redirects all carry the current hash")
+LOGIN111 = static_text("login.js")
+check("if (!wanted) {" in LOGIN111
+      and "localStorage.setItem('sappiwhere.tab', 'dashboard')" in LOGIN111,
+      "login.js only forces the stored tab to dashboard when there is no hash")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

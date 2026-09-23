@@ -38,11 +38,16 @@
         document.getElementById('password').focus();
         return;
       }
-      // A fresh sign-in lands on Dashboard; app.js's reload-preserves-tab
-      // logic takes over for every reload after this one.
-      try { localStorage.setItem('sappiwhere.tab', 'dashboard'); } catch (e) { /* private browsing, or storage full */ }
       // ...unless a redirect (e.g. a 401 on #/alerts/998) preserved a hash to finish the journey to.
       const wanted = String(window.location.hash || '');
+      // A fresh sign-in with nowhere named lands on Dashboard; app.js's
+      // reload-preserves-tab logic takes over for every reload after this
+      // one. A named hash is itself the destination — the whole point of
+      // carrying it here — so it must not be overridden by whatever tab
+      // this browser last had open.
+      if (!wanted) {
+        try { localStorage.setItem('sappiwhere.tab', 'dashboard'); } catch (e) { /* private browsing, or storage full */ }
+      }
       // The query string rides along too, so a kiosk link bounced through sign-in still comes back as one.
       const search = String(window.location.search || '');
       window.location.href = `/${search}${wanted.startsWith('#/') ? wanted : ''}`;
