@@ -772,12 +772,12 @@
       cell: (r) => escape(r.exporter_name || r.exporter || '') },
     { key: 'src', label: 'Source', width: 190, on: true,
       value: (r) => r.src_name || r.src_ip,
-      cell: (r) => App.ipCell(r.src_ip, { t0: view.t0, t1: view.t1, label: r.src_name || undefined }) },
+      cell: (r) => App.ipCell(r.src_ip, { label: r.src_name || undefined }) },
     { key: 'src_port', label: 'Src port', numeric: true, on: true,
       width: 96, value: (r) => r.src_port_num, cell: (r) => escape(r.src_port) },
     { key: 'dst', label: 'Destination', width: 190, on: true,
       value: (r) => r.dst_name || r.dst_ip,
-      cell: (r) => App.ipCell(r.dst_ip, { t0: view.t0, t1: view.t1, label: r.dst_name || undefined }) },
+      cell: (r) => App.ipCell(r.dst_ip, { label: r.dst_name || undefined }) },
     { key: 'dst_port', label: 'Dst port', numeric: true, on: true,
       width: 96, value: (r) => r.dst_port_num, cell: (r) => escape(r.dst_port) },
     { key: 'protocol', label: 'Proto', width: 76, on: true,
@@ -790,9 +790,9 @@
       value: (r) => `${r.in_if} / ${r.out_if}`,
       cell: (r) => `${escape(r.in_if)} / ${escape(r.out_if)}` },
     { key: 'src_ip', label: 'Source IP', width: 140,
-      cell: (r) => App.ipCell(r.src_ip, { t0: view.t0, t1: view.t1 }) },
+      cell: (r) => App.ipCell(r.src_ip, {}) },
     { key: 'dst_ip', label: 'Destination IP', width: 140,
-      cell: (r) => App.ipCell(r.dst_ip, { t0: view.t0, t1: view.t1 }) },
+      cell: (r) => App.ipCell(r.dst_ip, {}) },
     { key: 'exporter_ip', label: 'Exporter IP', width: 140,
       value: (r) => r.exporter || '', cell: (r) => escape(r.exporter || '') },
     // The route button is a `fixed` column, not an appendix bolted on after
@@ -1332,5 +1332,9 @@
     }
   }
 
-  App.pages.netflow = { init, refresh, activate, fastTick: drawStatus };
+  function ipWindow() {
+    return { t0: view.t0, t1: view.t1 };
+  }
+
+  App.pages.netflow = { init, refresh, activate, fastTick: drawStatus, ipWindow };
 })();

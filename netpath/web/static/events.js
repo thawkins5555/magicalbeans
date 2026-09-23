@@ -78,7 +78,7 @@
         value: (r) => (view.showHostname && r.source_name) || r.source || '',
         cell: (r) => App.deviceNameLink((view.showHostname && r.source_name)
                                         || r.source)
-          + App.ipCell(r.source, { t0: view.t0, t1: view.t1, label: '' }) },
+          + App.ipCell(r.source, { label: '' }) },
       sourceName: { key: 'source_name', label: 'Source name', width: 160,
         cell: (r) => App.deviceNameLink(r.source_name) || '—' },
     };
@@ -386,7 +386,11 @@
       drawTable();
     }
 
-    return { init, refresh, activate, fastTick: drawStatus };
+    function ipWindow() {
+      return { t0: view.t0, t1: view.t1 };
+    }
+
+    return { init, refresh, activate, fastTick: drawStatus, ipWindow };
   }
 
   /* ============================================================= SYSLOG */

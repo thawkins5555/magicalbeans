@@ -5452,7 +5452,7 @@ check("drawGetStarted();" in DRAW127, "draw() calls drawGetStarted() every time"
 #      Clear also write the hash so the view can be shared as a link.
 NETFLOW107 = read("netflow.js")
 check("function activate(opts)" in NETFLOW107
-      and "App.pages.netflow = { init, refresh, activate, fastTick: drawStatus };" in NETFLOW107,
+      and "App.pages.netflow = { init, refresh, activate, fastTick: drawStatus, ipWindow };" in NETFLOW107,
       "netflow.js exports an activate() reading opts.query")
 check("App.syncFilterRoute('netflow'," in NETFLOW107,
       "NetFlow's Apply/Clear mirror the filters into the hash")
@@ -5759,6 +5759,29 @@ check("if (!deviceRowIds.has(id)) checked.delete(id);" in _DRAWTABLE119,
 _DRAWTABLE120 = js_function(read("events.js"), "drawTable")
 check("if (event.target.closest('.ip-menu')) return;" in _DRAWTABLE120,
       "the row's onclick bails out early for a click on .ip-menu")
+
+# ---------------------------------------------------------------------------
+# 121. ipCell's IP-menu popover reads the current window at open time, off
+#      App.pages.<tab>.ipWindow(), instead of a t0/t1 baked in at render
+#      time that can go stale under Live.
+EVENTS121 = read("events.js")
+_EVENTSPAGE121 = js_function(EVENTS121, "eventsPage")
+check("function ipWindow() {\n      return { t0: view.t0, t1: view.t1 };\n    }" in _EVENTSPAGE121,
+      "eventsPage defines ipWindow(), reused by both Syslog and SNMP")
+check("fastTick: drawStatus, ipWindow };" in _EVENTSPAGE121,
+      "...and returns it on the page object")
+check("App.ipCell(r.source, { label: '' })" in EVENTS121,
+      "the Source cell no longer bakes t0/t1 into ipCell")
+NETFLOW121 = read("netflow.js")
+check("function ipWindow() {\n    return { t0: view.t0, t1: view.t1 };\n  }" in NETFLOW121,
+      "netflow.js defines its own ipWindow()")
+check("App.pages.netflow = { init, refresh, activate, fastTick: drawStatus, ipWindow };" in NETFLOW121,
+      "...and registers it on App.pages.netflow")
+check("App.ipCell(r.src_ip, { label: r.src_name || undefined })" in NETFLOW121
+      and "App.ipCell(r.dst_ip, { label: r.dst_name || undefined })" in NETFLOW121
+      and "App.ipCell(r.src_ip, {})" in NETFLOW121
+      and "App.ipCell(r.dst_ip, {})" in NETFLOW121,
+      "none of NetFlow's four ipCell calls pass t0/t1 any more")
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))
