@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.60.0 — Every STP-blocked link on Mapper is now found: EtherChannel bundles, a per-VLAN scan that finishes, and a bridge-port fallback](#5600--every-stp-blocked-link-on-mapper-is-now-found-etherchannel-bundles-a-per-vlan-scan-that-finishes-and-a-bridge-port-fallback)
 - [5.59.0 — VlanView glows the links carrying a picked VLAN; charts stop bridging gaps in the data; Mapper gets SSH/WEB buttons; SMS sign-up adds a Privacy Policy checkbox](#5590--vlanview-glows-the-links-carrying-a-picked-vlan-charts-stop-bridging-gaps-in-the-data-mapper-gets-sshweb-buttons-sms-sign-up-adds-a-privacy-policy-checkbox)
 - [5.58.0 — Email subjects drop "SappiWhere"; NetFlow names what's missing, raises the per-exporter template cap to 512, and keeps templates across a restart](#5580--email-subjects-drop-sappiwhere-netflow-names-whats-missing-raises-the-per-exporter-template-cap-to-512-and-keeps-templates-across-a-restart)
 - [5.57.0 — IP addresses everywhere get an actions button; filters and nested tabs are links; sign-in returns you to where you were](#5570--ip-addresses-everywhere-get-an-actions-button-filters-and-nested-tabs-are-links-sign-in-returns-you-to-where-you-were)
@@ -193,6 +194,91 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.60.0 — Every STP-blocked link on Mapper is now found: EtherChannel bundles, a per-VLAN scan that finishes, and a bridge-port fallback
+
+One operator report — "the STP blocking visible feature line on Mapper is
+not identifying all links with STP blocking status" — traced to three
+separate ways a genuinely blocked port on this estate (Catalyst IOS/IOS-XE,
+PVST+/Rapid-PVST, SNMPv2c, up to 48 VLANs per switch, uplinks a mix of
+single ports and EtherChannels) could still draw solid, plus one way an
+already-blocked link was drawing more red than it should.
+
+**EtherChannel members now inherit the Port-channel's STP state.** Spanning
+tree runs on the Port-channel, not its physical members, so the switch only
+ever reports a blocking/forwarding state for the Port-channel's own
+ifIndex — while CDP/LLDP name the physical member on the far end of the
+cable, which is what Mapper draws the link against. A bundled uplink could
+never be shown blocked before this release, no matter how it was actually
+behaving. The poller now reads IF-MIB `ifStackStatus` (falling back to
+CISCO-PAGP-MIB `pagpGroupIfIndex` on Cisco gear that doesn't answer the
+standard table) to learn which ifIndex is a Port-channel over which
+members, cached at the same pace as the existing bridge-port map. A member
+with no state of its own now takes on its parent's state, tagged with a new
+`stp_via_if_index` column so it is clearly a copy, not a separate poll
+result; the Port-channel's own row still raises the one blocking alert, so
+a bundle event is never counted twice. A member that later leaves the
+bundle and answers nothing of its own has its STP state, blocking VLANs,
+count and via all cleared outright rather than left at their last known
+value, and this raises no event of its own either — leaving a bundle is
+not a state change to report. The Nodes interface table's STP
+column now reads `blocking · via Port-channel1`, the Mapper detail pane and
+tooltip read `STP: blocking on acc-sw-006 (GigabitEthernet1/0/50, via
+Port-channel1)`, and the link CSV export's STP column carries the same
+`via Port-channel1` text.
+
+**The per-VLAN scan now finishes across passes instead of throwing away
+what it walked.** Classic PVST+ keeps a switch's real per-port state inside
+each VLAN's own SNMP context, one context per VLAN, and this scan used to
+read the first 48 VLANs (by number) inside a single 15-second budget —
+a busy trunk or a WAN-linked site could overrun that budget, and the whole
+pass was then discarded outright. Once the last complete pass aged past
+two VLAN intervals, the affected ports quietly reverted to their VLAN-1
+reading, which is exactly the open item from 5.40.0 about a blocked link's
+dots vanishing on a plain page refresh (`CHANGELOG.md`, 5.40.0 above) —
+**that note is now closed**: it was this scan silently timing out and
+falling back, not a redraw problem. The scan now works through the VLAN
+list in chunks of up to 48, keeping every VLAN it manages to walk and
+picking up where it left off 60 seconds later rather than starting over;
+staleness is now judged per VLAN (two VLAN intervals) rather than for the
+whole cached set, so a switch whose scans keep getting cut short still
+reports every VLAN it has actually managed to cover recently instead of
+reverting to VLAN 1 wholesale. The Events log now says how far a scan got:
+"Per-VLAN STP scan on 10.1.1.1: 31 of 46 VLANs in 30 s, continuing from
+VLAN 210 in 60 s." A port with no fresh per-VLAN reading keeps
+its last known blocking-VLAN detail rather than having it blanked, and
+takes its plain state from the default-context read in the meantime.
+
+**A switch with no bridge-port table answer no longer loses STP entirely.**
+A handful of devices never populate `dot1dBasePortIfIndex` at all; STP
+polling used to come up empty for every port on such a switch. The poller
+now falls back to treating bridge port number and ifIndex as the same
+value — confirmed against that switch's own interface list first — the
+same assumption the VLAN membership walk has used since 5.40.0. Logged
+once an hour per switch it applies to: "Bridge port table empty on
+10.1.1.1: assuming bridge port = ifIndex."
+
+**A blocked trunk drawn as separate VLAN strands no longer dots every
+strand.** The link detail pane already worked out exactly which VLANs on a
+blocked link are actually blocking; the drawing itself dotted every strand
+on a blocked link regardless. Only the blocked VLANs' strands now draw
+dotted — a link with no per-VLAN detail at all still dots every strand, as
+before. A link that is not blocked now says why on the tooltip and the
+detail pane: "STP: forwarding on both ends" when the poller has a reading
+for both ends and neither is blocking, or "STP: no state read on
+acc-sw-014 (GigabitEthernet1/0/12)" naming whichever end (or ends) the
+poller currently has nothing for — so a quiet link is no longer
+indistinguishable from a confirmed, checked, not-blocking one.
+
+The demo fleet's acc-sw-006 now uplinks to core-sw-01 over a Port-channel
+with the access side blocking, so the headless walk covers a bundled link
+as well as a plain one. Files: `netpath/nodeoids.py`,
+`netpath/nodepoll/environment_mixin.py`,
+`netpath/nodepoll/vendor_sensor_psu_mixin.py`, `netpath/nodepoll/poller.py`,
+`netpath/nodesdb.py`, `netpath/mapper.py`, `netpath/web/api/mapper.py`,
+`netpath/web/api/nodes.py`, `netpath/web/static/mapper.js`,
+`netpath/web/static/nodes.js`, `demo/personas.py`, plus the accompanying
+tests.
 
 ### 5.59.0 — VlanView glows the links carrying a picked VLAN; charts stop bridging gaps in the data; Mapper gets SSH/WEB buttons; SMS sign-up adds a Privacy Policy checkbox
 

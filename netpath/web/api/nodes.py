@@ -2665,6 +2665,7 @@ def get_nodes_device_interfaces(service, params, body, device_id) -> dict:
          "stp_state": (r["stp_state"] if "stp_state" in keys else None),
          "stp_blocking_vlans": (r["stp_blocking_vlans"] if "stp_blocking_vlans" in keys else None),
          "stp_vlan_count": (r["stp_vlan_count"] if "stp_vlan_count" in keys else None),
+         "stp_via_if_index": (r["stp_via_if_index"] if "stp_via_if_index" in keys else None),
          "media": (r["media"] if "media" in keys else None),
          "optic_mode": (r["optic_mode"] if "optic_mode" in keys else None),
          "priority": r["if_index"] in priority}
@@ -2694,7 +2695,7 @@ def get_nodes_device_interfaces_export(service, params, body, device_id) -> dict
              "admin_status", "oper_status", "in_bps", "out_bps",
              "in_error_rate", "out_error_rate", "last_in_errors", "last_out_errors",
              "last_seen_ts", "poe_admin", "poe_detect_status", "poe_power_mw",
-             "stp_state", "stp_blocking_vlans", "stp_vlan_count",
+             "stp_state", "stp_blocking_vlans", "stp_vlan_count", "stp_via_if_index",
              "media", "optic_mode", "Priority"]
     csv_rows = [[i.get(key) for key in header[:-1]] +
                 ["yes" if i.get("priority") else "no"] for i in interfaces]

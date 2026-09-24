@@ -863,11 +863,16 @@ def link_csv_rows(links, device_name, peer_name=lambda peer_key: peer_key) -> li
         def stp_vlan_suffix(vlans):
             return f" (VLANs {vlans.replace(',', ', ')})" if vlans else ""
 
+        def stp_via_suffix(via):
+            return f" via {via}" if via else ""
+
         stp_parts = []
         if link.get("a_stp") == "blocking":
-            stp_parts.append("blocking on A" + stp_vlan_suffix(link.get("a_stp_vlans")))
+            stp_parts.append("blocking on A" + stp_vlan_suffix(link.get("a_stp_vlans"))
+                             + stp_via_suffix(link.get("a_stp_via")))
         if link.get("b_stp") == "blocking":
-            stp_parts.append("blocking on B" + stp_vlan_suffix(link.get("b_stp_vlans")))
+            stp_parts.append("blocking on B" + stp_vlan_suffix(link.get("b_stp_vlans"))
+                             + stp_via_suffix(link.get("b_stp_via")))
 
         rows.append([
             a_name, a_id, link["a_port"],

@@ -1268,6 +1268,8 @@
         else if (link.fiber_mode === 'mismatch') underlay.classList.add('fiber-mismatch');
         layer.appendChild(underlay);
       }
+      // Only the blocked VLANs' strands dot; no per-VLAN detail dots them all.
+      const blocked = link.blocking ? stpBlockedVlans(link) : null;
       // Drawn BEFORE the strands, so a strand still wins its own per-VLAN
       // tooltip and this catches only the gaps and the margin around them.
       const hit = App.svgNode('path', {
@@ -1295,7 +1297,9 @@
           // this one. See tokens.css's --canvas-vlan-* comment.
           stroke: `var(--canvas-vlan-${strand.color_index + 1})`, 'stroke-width': plan.width,
         });
-        if (link.blocking) path.classList.add('blocking');
+        if (link.blocking && (!blocked || blocked.has(strand.vlan))) {
+          path.classList.add('blocking');
+        }
         wireOne(path, null, i === 0
           ? { focusable: true, ariaLabel: linkAriaLabel(link), tooltip: () => linkTooltip(link) }
           : {
@@ -1482,13 +1486,26 @@
     if (!link.blocking) return null;
     const who = [];
     const suffix = (vlans) => (withVlans ? esc(stpVlanSuffix(vlans)) : '');
+    const via = (v) => (v ? `, via ${esc(v)}` : '');
     if (link.a_stp === 'blocking') {
-      who.push(`${a} (${esc(link.a_port || '—')})${suffix(link.a_stp_vlans)}`);
+      who.push(`${a} (${esc(link.a_port || '—')}${via(link.a_stp_via)})${suffix(link.a_stp_vlans)}`);
     }
     if (link.b_stp === 'blocking') {
-      who.push(`${b} (${esc(link.b_port || '—')})${suffix(link.b_stp_vlans)}`);
+      who.push(`${b} (${esc(link.b_port || '—')}${via(link.b_stp_via)})${suffix(link.b_stp_vlans)}`);
     }
     return `STP: blocking on ${who.join(', ')}`;
+  }
+
+  // For a link not drawn blocking: both ends forward, or an end has no state.
+  function stpIdleText(link, a, b, esc = (x) => x) {
+    if (link.blocking) return null;
+    const hasA = link.a_stp !== null && link.a_stp !== undefined;
+    const hasB = link.b_stp !== null && link.b_stp !== undefined;
+    if (hasA && hasB) return 'STP: forwarding on both ends';
+    const who = [];
+    if (!hasA) who.push(`${a} (${esc(link.a_port || '—')})`);
+    if (!hasB) who.push(`${b} (${esc(link.b_port || '—')})`);
+    return `STP: no state read on ${who.join(', ')}`;
   }
 
   // null, not an empty Map: a link with nothing blocked leaves its list
@@ -1557,7 +1574,7 @@
     }
     const fiberText = fiberModeText(link, a, b);
     if (fiberText) lines.push(fiberText);
-    const stpText = stpBlockingText(link, a, b);
+    const stpText = stpBlockingText(link, a, b) || stpIdleText(link, a, b);
     if (stpText) lines.push(stpText);
     return lines.join('\n');
   }
@@ -2792,7 +2809,8 @@
       }
     }
     const fiberText = fiberModeText(link, escape(a.name), escape(b.name));
-    const stpText = stpBlockingText(link, escape(a.name), escape(b.name), escape, false);
+    const stpText = stpBlockingText(link, escape(a.name), escape(b.name), escape, false)
+      || stpIdleText(link, escape(a.name), escape(b.name), escape);
     if (fiberText || stpText) lines.push('', ...[fiberText, stpText].filter(Boolean));
     lines.push('', `Last seen   ${escape(App.ago(link.seen_ts))}`);
     return lines.join('\n');

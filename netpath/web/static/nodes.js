@@ -165,6 +165,14 @@
     return { text: r.stp_state, title: null };
   }
 
+  // The list the STP column is drawing from, so a "via" cell can name the Port-channel.
+  let stpViaIfaceList = [];
+
+  function stpViaLabel(ifIndex) {
+    const via = stpViaIfaceList.find((i) => i.if_index === ifIndex);
+    return (via && (via.name || via.descr || via.alias)) || `if ${ifIndex}`;
+  }
+
   /* The one place display-name precedence lives: 'auto' prefers the SNMP
      hostname (sysName) and falls back to the manually entered name, then
      the IP; 'manual' pins the manually entered name. */
@@ -1551,9 +1559,11 @@
       cell: (r) => {
         if (!r.stp_state) return '\u2014';
         const { text, title } = stpStateText(r);
+        const via = r.stp_via_if_index != null
+          ? ` \u00b7 via ${escape(stpViaLabel(r.stp_via_if_index))}` : '';
         const titleAttr = title ? ` title="${escape(title)}"` : '';
         return `<span style="color:${STP_STATE_COLOR[r.stp_state] || 'var(--muted)'}"${titleAttr}>` +
-          `${escape(text)}</span>`;
+          `${escape(text)}${via}</span>`;
       } },
     { key: 'last_seen_ts', label: 'Last seen', width: 100, numeric: true,
       cell: (r) => App.agoCell(r.last_seen_ts) },
@@ -1583,6 +1593,7 @@
   function drawIfaceTable(el, rows, deviceId, onOpen, snmpError, note) {
     const target = el || App.el('nd-if-table');
     const list = rows || view.ifaces;
+    stpViaIfaceList = list;
     const id = deviceId != null ? deviceId : view.selected;
     const error = snmpError !== undefined ? snmpError
       : (view.detail || {}).snmp_error;

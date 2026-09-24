@@ -196,9 +196,9 @@ class NodePoller(Worker, DiscoveryMixin, PollMixin, VendorIdentifyMixin, Environ
         # _maybe_walk_stp_vlan) instead of every single poll.
         self._next_stp_vlan_walk: dict[int, float] = {}
         self._stp_vlan_running: set[int] = set()
-        # device_id -> the last per-VLAN STP walk's {if_index: detail},
-        # merged into every poll's own dot1dStp read (_poll_stp) so a port's
-        # blocking state stays correct between cadence ticks.
+        # device_id -> {"vlans": {vlan: {"ts", "ports"}}, "cursor", "total",
+        # "cycle_seen"}: per-VLAN STP detail merged into every poll's
+        # dot1dStp read. See _cisco_vlan_stp/_run_stp_vlan_pass.
         self._stp_vlan_cache: dict[int, dict] = {}
         # device_id -> whether a per-VLAN STP attempt has ever been made in
         # this process's lifetime, so _poll_stp runs it inline once (a
@@ -213,6 +213,10 @@ class NodePoller(Worker, DiscoveryMixin, PollMixin, VendorIdentifyMixin, Environ
         # table, cached rather than re-walked every poll. See
         # _cached_bridge_port_map.
         self._bridge_port_map_cache: dict[int, dict] = {}
+        # device_id -> {"map", "ts"}: bundle member -> Port-channel ifIndex,
+        # the same static-table cadence as _bridge_port_map_cache. See
+        # _cached_agg_map.
+        self._agg_map_cache: dict[int, dict] = {}
         # device_id -> when UCD-SNMP was last tried/whether it answered,
         # probe-once-remember'd like _mau_read/_mau_capable.
         self._ucd_read: dict[int, float] = {}
@@ -1098,7 +1102,7 @@ class NodePoller(Worker, DiscoveryMixin, PollMixin, VendorIdentifyMixin, Environ
                       self._next_lldp_walk, self._next_vlan_walk,
                       self._next_arp_walk, self._next_stp_vlan_walk,
                       self._stp_vlan_cache, self._stp_topology_seen,
-                      self._bridge_port_map_cache,
+                      self._bridge_port_map_cache, self._agg_map_cache,
                       self._credentials, self._credential_probe_failed,
                       self._addresses_read, self._bulk_repetitions,
                       self._sensor_read, self._sensor_threshold_read,

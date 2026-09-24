@@ -2032,6 +2032,15 @@ From 4.47.0, Nodes walks past the SNMP poll to see the wire itself.
   a spanning-tree event is confined to one VLAN that those overall
   counters miss: the blocking column for that VLAN can then lag by up to
   one schedule interval instead of catching it on the very next poll.
+- **From 5.60.0, that per-VLAN read finishes across passes instead of
+  discarding a run that overran its own time budget** — a trunk carrying
+  more VLANs than fit in one pass no longer keeps reverting to its VLAN-1
+  reading between scans; see Mapper, below, for the full story and what
+  it fixes. **From 5.60.0, a port whose spanning-tree state actually
+  belongs to an EtherChannel it is a member of now shows that too:** the
+  cell reads `blocking · via Port-channel1` (or whichever bundle it
+  belongs to) instead of naming a state the switch never reported for
+  that physical port at all.
 - **PoE power draw** — budget and per-port wattage, Cisco's own per-port
   milliwatt object where present — appears on the interface table for a
   device that answers POWER-ETHERNET-MIB. A device is asked for any of
@@ -5038,9 +5047,12 @@ like any other module.
   merged until something else forced a redraw. An operator also reported
   the same dots vanishing on a plain page refresh; that was not
   reproduced in the client code — a refresh rebuilds the whole map
-  consistently — so it stays open for a closer look. What a refresh
-  *can* change is the underlying spanning-tree state itself, which the
-  map reads live from the device's last poll: if a poll changed which
+  consistently. **Closed by 5.60.0:** the actual cause was the per-VLAN
+  spanning-tree scan on the poller side quietly timing out and reverting
+  a port to its VLAN-1 reading (see below and Nodes, above) — not a
+  drawing defect at all. What a refresh *can* still change is the
+  underlying spanning-tree state itself, which the map reads live from
+  the device's last poll: if a poll changed which
   VLANs are blocking between one page load and the next, the drawing
   simply follows that change.
 - **From 5.37.0, a Cisco PVST+/Rapid-PVST switch's blocked-link line
@@ -5071,7 +5083,29 @@ like any other module.
   words "STP blocked on" and just reads "(`<switch>`)"** — the longer
   wording was enough to wrap a row onto a second line on a busy trunk;
   the row is still red and still names the switch, the red colour and
-  the VLANs heading above it already say the rest.
+  the VLANs heading above it already say the rest. **From 5.60.0, a
+  multi-VLAN link drawn as separate strands only dots the strands that
+  are actually blocked**, not every strand on the link — a link with no
+  per-VLAN detail at all still dots every strand, as it always has.
+  **From 5.60.0, an EtherChannel uplink can be shown blocked at all:** a
+  bundle member the switch never reports STP state for directly now
+  inherits its Port-channel's state, and the pane, tooltip and CSV
+  export all name the bundle it came from — "STP: blocking on
+  acc-sw-006 (GigabitEthernet1/0/50, via Port-channel1)". **From 5.60.0,
+  a link that is not blocked says why:** "STP: forwarding on both ends"
+  when both ends have a reading and neither blocks, or "STP: no state
+  read on `<switch>` (`<port>`)" naming whichever end the poller
+  currently has nothing for — so a link with no state read is no longer
+  indistinguishable from one confirmed clear. **From 5.60.0, the
+  per-VLAN scan itself completes across passes instead of being thrown
+  away when it overruns its budget** — a trunk with more VLANs than fit
+  in one pass used to have its scan discarded whole, and once the last
+  complete scan aged out the port fell back to its VLAN-1 reading; this
+  closes the open item noted above (5.40.0) about a blocked link's dots
+  vanishing on a plain refresh — that was this timeout, not a drawing
+  problem. A switch with no `dot1dBasePortIfIndex` answer at all is no
+  longer blind to STP either: bridge port number now falls back to
+  ifIndex, the same assumption the VLAN membership walk already made.
 - **From 5.36.0, every cable between the same two devices draws as its
   own line, fanned apart from the others** rather than stacking on
   identical coordinates. Each line in the fan keeps its own strands,

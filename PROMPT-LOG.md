@@ -5,6 +5,53 @@ grouped by the version that carries it. This is a working record for the
 operator — the full story of each change is in `CHANGELOG.md`, and this file
 does not replace it.
 
+## 5.60.0 — Every STP-blocked link on Mapper is now found
+
+**Operator report:** "The STP blocking visible feature line on Mapper is
+not identifying all links with STP blocking status."
+
+**Four planning answers, all the recommended options:** the fleet is
+Catalyst IOS/IOS-XE, running PVST+/Rapid-PVST; SNMP is v2c with a
+community; 48 or fewer VLANs per switch; and the links in question are a
+mix of single ports and EtherChannel bundles.
+
+**Diagnosis: three separate ways a genuinely blocked port could still
+draw solid, plus one way an already-blocked link drew too much red.**
+
+1. Spanning tree runs on the Port-channel, not its physical members — a
+   switch never reports STP state for a bundle member directly, and CDP
+   names the physical port, so a bundled uplink could never be shown
+   blocked at all.
+2. The per-VLAN scan that finds blocking on a pruned trunk read the first
+   48 VLANs inside a 15-second budget and threw the whole pass away if it
+   ran long; once the last complete pass aged out, the port reverted to
+   its VLAN-1 reading. This is the same mechanism behind the open 5.40.0
+   note about a blocked link's dots vanishing on a plain refresh — closed
+   now, since that was this timeout, not a drawing bug.
+3. A switch that never populates `dot1dBasePortIfIndex` at all lost STP
+   for every one of its ports outright.
+4. Separately: once a link was blocked, every VLAN strand on it drew
+   dotted, not just the VLANs actually blocking — over-marking rather
+   than under-marking, but misleading on a busy trunk either way.
+
+**Outcome.** Bundle members now inherit the Port-channel's STP state and
+say so ("via Port-channel1") on Nodes, Mapper and the CSV export; the
+per-VLAN scan now completes across passes instead of discarding a
+cut-short one, closing the 5.40.0 note explicitly; a switch with no
+bridge-port table falls back to bridge port = ifIndex, confirmed against
+its own interface list; and only the actually-blocked VLANs' strands
+dot, with a non-blocked link's pane now saying "forwarding on both ends"
+or naming whichever end has no state read at all. Shipped as 5.60.0.
+Testy: targeted suites green, full suite 206/209 with only the three
+known environmental failures, the browser walk 99/100 with the bundle
+demo's link naming its Port-channel live (the one miss was the new
+strand check's own precondition, since fixed to wait for strands).
+Javariius, three passes: the first found the chunked walk stalling on
+one bad VLAN context and discarding a follow-up chunk of portless VLANs;
+the second found a deadline-cut VLAN skipped for a lap, a never-answering
+device re-walked every minute, and a timed-out bundle table clearing
+every member; all fixed with tests before the push.
+
 ## 5.59.0 — VlanView glows the picked VLAN's links, charts stop bridging data gaps, Mapper gets SSH/WEB buttons, and SMS sign-up splits into three checkboxes
 
 **Operator prompt, four items in one message:**

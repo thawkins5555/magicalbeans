@@ -67,6 +67,9 @@ IFX_TABLE = {   # ifXTable, preferred when present (RFC 2863)
 # nodepoll._COPPER_MAU_ARCS/_FIBER_MAU_ARCS).
 IF_MAU_TYPE = "1.3.6.1.2.1.26.2.1.1.3"
 
+# IF-MIB ifStackStatus, index higher.lower: a Port-channel over its members.
+IF_STACK_STATUS = "1.3.6.1.2.1.31.1.2.1.3"
+
 # Best-effort scalars: near-universal across net-snmp/Linux and many
 # hardware vendors, but not part of the SNMPv2 mandatory set, so a failed
 # GET here is silently skipped rather than counted as a poll failure.
@@ -313,6 +316,9 @@ DOT1D_STP_PORT_STATE      = "1.3.6.1.2.1.17.2.15.1.3"  # per dot1dStpPort
 DOT1D_STP_PORT_STATE_ENUM = {1: "disabled", 2: "blocking", 3: "listening",
                              4: "learning", 5: "forwarding", 6: "broken"}
 DOT1D_STP_PROTOCOL_SPEC_ENUM = {1: "unknown", 2: "decLb100", 3: "ieee8021d"}
+
+# CISCO-PAGP-MIB pagpGroupIfIndex: a channel member's Port-channel ifIndex.
+CISCO_PAGP_GROUP_IFINDEX = "1.3.6.1.4.1.9.9.98.1.1.1.1.8"
 
 # -------------------------------------------------------- VLAN membership
 #

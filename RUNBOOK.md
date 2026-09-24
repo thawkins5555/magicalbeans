@@ -24,6 +24,7 @@ backup, `INTERNALS.md` is why any of this works the way it does.
 - [The poll pool is saturated](#the-poll-pool-is-saturated)
 - [Nodes shows "purging history for N device(s)"](#nodes-shows-purging-history-for-n-devices)
 - [A NetPath web page check stays red](#a-netpath-web-page-check-stays-red)
+- [A link I know is STP-blocked is not dotted](#a-link-i-know-is-stp-blocked-is-not-dotted)
 - [A flood of alerts nobody asked for](#a-flood-of-alerts-nobody-asked-for)
 - [Planned maintenance](#planned-maintenance)
 - [Nobody can sign in](#nobody-can-sign-in)
@@ -562,6 +563,62 @@ page opens fine in a browser.
 3. **A redirect off HTTPS, or too many of them.** The check refuses a
    redirect that lands on plain HTTP outright, and follows at most five —
    both read as a failure with the reason stated, not a hang.
+
+---
+
+## A link I know is STP-blocked is not dotted
+
+**Symptom.** A link on Mapper that you know is spanning-tree blocked (or
+used to draw blocked) is drawn solid, or a trunk drawn as separate VLAN
+strands only some of which you'd expect to be dotted shows none dotted at
+all.
+
+**First, open the link and read its STP line.** Click the link; the detail
+pane (and the hover tooltip) always carries one STP line as of 5.60.0:
+
+- **"STP: blocking on `<switch>` (`<port>`)"** — it is drawn dotted; if a
+  trunk's strands aren't, only the VLANs actually named as blocking dot
+  (from 5.60.0) — check the blocked-VLAN list above it for which ones.
+- **"STP: forwarding on both ends"** — both ends have a current reading
+  and neither blocks. This is a genuine result, not a gap.
+- **"STP: no state read on `<switch>` (`<port>`)"** — the poller has
+  nothing for that end at all. This is the case worth chasing:
+  1. Open that switch in Nodes and check the interface table's STP column
+     for the port named. Nothing there at all usually means STP polling
+     hasn't run for that switch yet, or is disabled — check `stp_enabled`
+     under the device's polling settings.
+  2. Confirm the SNMP community configured for the device is still
+     correct; a failed community makes every STP read (default-context
+     and per-VLAN alike) come back empty.
+  3. Check the Events log for "Per-VLAN STP scan on `<ip>`: ... continuing
+     from VLAN `<id>` in 60 s" — a switch with more VLANs than fit in one
+     scan chunk (48) covers the rest over the following minute per chunk,
+     so a brand-new device or one just past an upgrade can take a few
+     minutes to have every VLAN covered.
+
+**An EtherChannel/Port-channel uplink shows "via Port-channel1" (or
+whichever Po it is)** on both the Nodes STP column and the Mapper pane —
+that is expected from 5.60.0: spanning tree runs on the Port-channel, not
+its physical members, so every member inherits the Port-channel's state.
+If the Po itself is not reporting state, none of its members will either;
+check the Po's own row on the switch, not the individual member.
+
+**A trunk drawn as strands dots only the blocked VLANs' strands**, from
+5.60.0 — a strand not dotted does not mean the whole link forwards; read
+the pane's blocked-VLAN list, not the drawing alone, when several VLANs
+are in play.
+
+**A known limit, unchanged by this release: an SNMPv3 switch only ever
+gets the default-context (VLAN 1) reading.** The per-VLAN scan that finds
+blocking on a pruned trunk is Cisco SNMPv1/v2c only; an SNMPv3 credential
+sees the same single global reading it always has. There is no per-VLAN
+workaround for SNMPv3 today.
+
+**After an upgrade to 5.60.0 (or any release that changes this scan),
+give it one full VLAN-poll interval before judging a switch's coverage.**
+The per-VLAN cache starts empty and fills chunk by chunk; the interface
+table's per-port VLAN count climbing toward the switch's real VLAN total
+is the sign it has caught up.
 
 ---
 

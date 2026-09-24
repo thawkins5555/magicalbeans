@@ -407,6 +407,67 @@ async function waitForStpVlanBlockingLink(page, mapId) {
   }
 }
 
+async function waitForStpVlanStrandsLink(page, mapId) {
+  // Same link waitForStpVlanBlockingLink locates, but the VLAN walk that
+  // turns it into per-strand paths (mapper.render_plan's plan.mode) can
+  // still be running when that link first goes blocking -- wait for
+  // plan.mode === 'strands' (or >1 VLAN) before asserting the per-strand
+  // .blocking split (5.60.0).
+  const state = await waitForStpVlanBlockingLink(page, mapId);
+  if (!state.present || !state.ready) return state;
+  const origin = new URL(page.url()).origin;
+  const started = Date.now();
+  const deadline = started + 150000;
+  for (;;) {
+    const res = await page.request.get(`${origin}/api/mapper/maps/${mapId}`);
+    const links = res.ok() ? (await res.json()).links || [] : [];
+    const link = links.find((l) => String(l.id) === String(state.link.id));
+    const plan = link ? (link.plan || {}) : {};
+    if (plan.mode === 'strands' || (Array.isArray(plan.vlans) && plan.vlans.length > 1)) {
+      return { present: true, ready: true, strands: true, link: link || state.link };
+    }
+    if (Date.now() >= deadline) {
+      return { present: true, ready: true, strands: false,
+               waited_s: Math.round((Date.now() - started) / 1000) };
+    }
+    await sleep(2000);
+  }
+}
+
+async function waitForBundleViaLink(page, mapId) {
+  // 5.60.0 EtherChannel demo (demo/personas.py's acc-sw-006 fixture,
+  // reusing its "wrap32" SPECIALS slot): the second uplink's STP state now
+  // comes from a Port-channel1 (Po1) the switch reports separately, so
+  // a_stp_via/b_stp_via only appear once the poller-side bundle
+  // inheritance (nodeoids.IF_STACK_STATUS, nodepoll, nodesdb) has run --
+  // present-but-not-ready just means that has not landed or polled yet.
+  const origin = new URL(page.url()).origin;
+  const list = await page.request.get(`${origin}/api/nodes/devices?q=acc-sw-006`);
+  const devices = list.ok() ? (await list.json()).devices || [] : [];
+  const device = devices.find((d) => d.name === 'acc-sw-006');
+  if (!device) return { present: false };
+  const started = Date.now();
+  const deadline = started + 60000;
+  for (;;) {
+    const res = await page.request.get(`${origin}/api/mapper/maps/${mapId}`);
+    const links = res.ok() ? (await res.json()).links || [] : [];
+    for (const link of links) {
+      if (link.a_device_id === device.id && link.a_port === 'TenGigabitEthernet1/1/2'
+          && link.a_stp_via) {
+        return { present: true, ready: true, link, side: 'a' };
+      }
+      if (link.b_device_id === device.id && link.b_port === 'TenGigabitEthernet1/1/2'
+          && link.b_stp_via) {
+        return { present: true, ready: true, link, side: 'b' };
+      }
+    }
+    if (Date.now() >= deadline) {
+      return { present: true, ready: false, waited_s: Math.round((Date.now() - started) / 1000) };
+    }
+    await sleep(3000);
+  }
+}
+
 async function shoot(page, dir, name) {
   if (process.env.WALK_SHOTS !== '1') return;
   try {
@@ -1626,6 +1687,110 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
         `expected one blocked row "30 ... (STP blocked on acc-sw-005)", got ${JSON.stringify(blockedRows)}`);
 
       return `link ${linkId} blocking, stp_vlans=${stpVlans}, pane names acc-sw-005`;
+    });
+
+  await check('Mapper: with FiberView off, only the VLAN 30 strand on acc-sw-005\'s '
+    + 'blocked link carries .blocking (5.60.0)',
+    async () => {
+      await page.keyboard.press('Escape').catch(() => {});
+      await selectTab(page, 'mapper');
+      await settle(page, 1000);
+      const mapId = await page.evaluate(() => {
+        const sel = document.getElementById('mp-map');
+        return sel && sel.value ? sel.value : null;
+      });
+      if (!mapId) return 'skipped: no map selected on the demo Mapper';
+      await page.uncheck('#mp-fiberview', { timeout: 2000 }).catch(() => {});
+
+      const state = await waitForStpVlanStrandsLink(page, mapId);
+      if (!state.present) return 'skipped: acc-sw-005 is not in this fleet';
+      if (!state.ready) {
+        return `skipped: acc-sw-005's second uplink not blocking yet after ${state.waited_s}s`;
+      }
+      if (!state.strands) {
+        return `skipped: acc-sw-005's uplink not yet drawn in strands (VLAN walk pending) after ${state.waited_s}s`;
+      }
+      const linkId = String(state.link.id);
+      await Promise.all([
+        page.waitForResponse((res) => /\/api\/mapper\/maps\/\d+$/.test(
+          new URL(res.url()).pathname) && res.request().method() === 'GET',
+        { timeout: 20000 }).catch(() => {}),
+        page.click('#mp-refresh'),
+      ]);
+      await settle(page, 1000);
+      const strands = await page.evaluate((id) =>
+        [...document.querySelectorAll(`#mp-svg path.mp-link[data-link-id="${id}"]`)]
+          .map((p) => ({ label: p.getAttribute('aria-label') || '',
+                        blocking: p.classList.contains('blocking') })),
+        linkId);
+      assert(strands.length > 0, `expected strand paths for link ${linkId}, found none`);
+      const vlan30 = strands.filter((s) => s.label.includes('VLAN 30'));
+      const others = strands.filter((s) => !s.label.includes('VLAN 30'));
+      assert(vlan30.length > 0 && vlan30.every((s) => s.blocking),
+        `expected the VLAN 30 strand to carry .blocking, got ${JSON.stringify(strands)}`);
+      assert(others.every((s) => !s.blocking),
+        `expected only the VLAN 30 strand to carry .blocking, got ${JSON.stringify(strands)}`);
+      return `${strands.length} strand(s) on link ${linkId}, only VLAN 30's carries .blocking`;
+    });
+
+  await check('Mapper: a non-blocking link\'s pane reads "STP: forwarding on both ends", '
+    + 'and the bundle demo\'s link (if present) names its via port (5.60.0)',
+    async () => {
+      await page.keyboard.press('Escape').catch(() => {});
+      await selectTab(page, 'mapper');
+      await settle(page, 1000);
+      const mapId = await page.evaluate(() => {
+        const sel = document.getElementById('mp-map');
+        return sel && sel.value ? sel.value : null;
+      });
+      if (!mapId) return 'skipped: no map selected on the demo Mapper';
+      const origin = new URL(page.url()).origin;
+
+      const openLinkPane = async (linkId) => {
+        await Promise.all([
+          page.waitForResponse((res) => /\/api\/mapper\/maps\/\d+$/.test(
+            new URL(res.url()).pathname) && res.request().method() === 'GET',
+          { timeout: 20000 }).catch(() => {}),
+          page.click('#mp-refresh'),
+        ]);
+        await settle(page, 1000);
+        await page.evaluate((id) => {
+          const p = document.querySelector(`#mp-svg path.mp-link[data-link-id="${id}"]`);
+          if (p) p.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        }, linkId);
+        await page.waitForFunction(() => {
+          const pane = document.getElementById('mp-detail');
+          return !!pane && pane.textContent.includes('STP:');
+        }, null, { timeout: 10000 }).catch(() => {});
+        return page.evaluate(() => (document.getElementById('mp-detail') || {}).innerText || '');
+      };
+
+      const res = await page.request.get(`${origin}/api/mapper/maps/${mapId}`);
+      const links = res.ok() ? (await res.json()).links || [] : [];
+      const idle = links.find((l) => !l.manual && l.a_stp && l.b_stp
+        && l.a_stp !== 'blocking' && l.b_stp !== 'blocking');
+      let idleText = 'skipped: no discovered link with STP read on both ends yet';
+      if (idle) {
+        const paneText = await openLinkPane(String(idle.id));
+        assert(paneText.includes('STP: forwarding on both ends'),
+          `expected link ${idle.id}'s pane to read "STP: forwarding on both ends", `
+          + `got: ${paneText.slice(0, 400)}`);
+        idleText = `link ${idle.id}'s pane reads "STP: forwarding on both ends"`;
+      }
+
+      const bundle = await waitForBundleViaLink(page, mapId);
+      let bundleText = 'skipped: acc-sw-006 is not in this fleet';
+      if (bundle.present && bundle.ready) {
+        const paneText = await openLinkPane(String(bundle.link.id));
+        assert(/via (Port-channel1|Po1)/.test(paneText),
+          `expected the bundled link's pane to name its via port, got: ${paneText.slice(0, 400)}`);
+        bundleText = `link ${bundle.link.id}'s pane names its via port`;
+      } else if (bundle.present) {
+        bundleText = `skipped: acc-sw-006's bundle not yet reporting a_stp_via/b_stp_via `
+          + `after ${bundle.waited_s}s (needs the poller-side bundle-inheritance work)`;
+      }
+
+      return `${idleText}; ${bundleText}`;
     });
 
   await check('Mapper: Find selects a device by name (#mp-find)',

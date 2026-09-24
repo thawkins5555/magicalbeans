@@ -1368,6 +1368,8 @@ class NodesDatabase(SqliteStore):
         self.ensure_columns("interfaces", {
             "stp_blocking_vlans": "TEXT", "stp_vlan_count": "INTEGER",
         })
+        # 5.60.0: inherited Port-channel ifIndex (_cached_agg_map); NULL if answered directly.
+        self.ensure_columns("interfaces", {"stp_via_if_index": "INTEGER"})
 
         # The device's own default-route next hop(s) — see
         # nodepoll._refresh_default_gateway and set_default_gateway below.
@@ -2309,8 +2311,8 @@ class NodesDatabase(SqliteStore):
 
     def interface_link_facts_for_devices(self, device_ids) -> dict[tuple[int, int], dict]:
         """(device_id, if_index) -> {"media", "optic_mode", "stp_state",
-        "stp_blocking_vlans"} for every interface of the named devices with
-        any of media/optic_mode/stp_state non-NULL."""
+        "stp_blocking_vlans", "stp_via_if_index"} for every interface of the
+        named devices with any of media/optic_mode/stp_state non-NULL."""
         ids = list(dict.fromkeys(int(d) for d in device_ids))
         if not ids:
             return {}
@@ -2320,7 +2322,7 @@ class NodesDatabase(SqliteStore):
                 marks = marks_for(chunk)
                 for row in self._conn.execute(
                         "SELECT device_id, if_index, media, optic_mode,"
-                        " stp_state, stp_blocking_vlans"
+                        " stp_state, stp_blocking_vlans, stp_via_if_index"
                         " FROM interfaces WHERE device_id IN ({})"
                         " AND (media IS NOT NULL OR optic_mode IS NOT NULL"
                         " OR stp_state IS NOT NULL)".format(marks),
@@ -2329,6 +2331,7 @@ class NodesDatabase(SqliteStore):
                         "media": row["media"], "optic_mode": row["optic_mode"],
                         "stp_state": row["stp_state"],
                         "stp_blocking_vlans": row["stp_blocking_vlans"],
+                        "stp_via_if_index": row["stp_via_if_index"],
                     }
         return facts
 
@@ -3323,6 +3326,14 @@ class NodesDatabase(SqliteStore):
             return self._conn.execute(
                 "SELECT * FROM interfaces WHERE device_id = ? AND if_index = ?",
                 (device_id, if_index)).fetchone()
+
+    def interface_if_indexes_with_stp_via(self, device_id: int) -> list[int]:
+        """if_index of every interface inheriting a Port-channel's STP state."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT if_index FROM interfaces WHERE device_id = ?"
+                " AND stp_via_if_index IS NOT NULL", (device_id,)).fetchall()
+        return [row["if_index"] for row in rows]
 
     def interfaces_with_media(self, device_ids=None,
                               include_empty: bool = False) -> list[sqlite3.Row]:
@@ -4631,37 +4642,46 @@ class NodesDatabase(SqliteStore):
     STP_BLOCKED_STATES = ("blocking", "discarding")
 
     def update_interface_stp(self, device_id: int, rows: list[dict]) -> None:
-        """update_interface_poe's own counterpart for per-port STP state.
-        stp_blocking_vlans/stp_vlan_count COALESCE rather than overwrite: a
-        global-only or cut-short row carries neither key, and must leave
-        stored per-VLAN detail alone.
-
-        A port changing into or out of a blocked state also records an
-        interface event, the channel link_up/link_down already use.
-        """
+        """update_interface_poe's counterpart for per-port STP state:
+        stp_blocking_vlans/stp_vlan_count COALESCE, stp_clear NULLs all
+        four, and stp_via_if_index (this or the prior row) skips the event."""
         if not rows:
             return
-        params = [(row.get("stp_state"), row.get("stp_blocking_vlans"),
-                  row.get("stp_vlan_count"), device_id, row["if_index"])
-                  for row in rows]
+        clear_rows = [row for row in rows if row.get("stp_clear")]
+        data_rows = [row for row in rows if not row.get("stp_clear")]
         prior = self._stp_state_before(device_id, [row["if_index"] for row in rows])
         with self._lock:
             try:
-                self._conn.executemany(
-                    "UPDATE interfaces SET stp_state=?,"
-                    " stp_blocking_vlans=COALESCE(?, stp_blocking_vlans),"
-                    " stp_vlan_count=COALESCE(?, stp_vlan_count)"
-                    " WHERE device_id=? AND if_index=?", params)
+                if data_rows:
+                    params = [(row.get("stp_state"), row.get("stp_blocking_vlans"),
+                              row.get("stp_vlan_count"), row.get("stp_via_if_index"),
+                              device_id, row["if_index"]) for row in data_rows]
+                    self._conn.executemany(
+                        "UPDATE interfaces SET stp_state=?,"
+                        " stp_blocking_vlans=COALESCE(?, stp_blocking_vlans),"
+                        " stp_vlan_count=COALESCE(?, stp_vlan_count),"
+                        " stp_via_if_index=?"
+                        " WHERE device_id=? AND if_index=?", params)
+                if clear_rows:
+                    self._conn.executemany(
+                        "UPDATE interfaces SET stp_state=NULL,"
+                        " stp_blocking_vlans=NULL, stp_vlan_count=NULL,"
+                        " stp_via_if_index=NULL WHERE device_id=? AND if_index=?",
+                        [(device_id, row["if_index"]) for row in clear_rows])
                 self._conn.commit()
             except sqlite3.DatabaseError:
                 self._conn.rollback()
                 raise
-        # After the commit: the state is the thing that must land.
-        for row in rows:
+        # After the commit: only data_rows can raise an event -- a clear is a via leaving, not a state transition.
+        for row in data_rows:
+            if row.get("stp_via_if_index") is not None:
+                continue
             was = prior.get(row["if_index"])
             if was is None:
                 continue   # a port whose state was never read has not changed
-            before, interface_id, descr = was
+            before, interface_id, descr, before_via = was
+            if before_via is not None:
+                continue   # was inheriting -- its own transition raises nothing
             now_state = row.get("stp_state")
             if not now_state or before is None or before == now_state:
                 continue
@@ -4678,18 +4698,20 @@ class NodesDatabase(SqliteStore):
                 detail)
 
     def _stp_state_before(self, device_id: int, if_indexes: list) -> dict:
-        """{if_index: (stp_state, interfaces.id, descr)} for the ports about
-        to be written, read before the UPDATE overwrites them."""
+        """{if_index: (stp_state, interfaces.id, descr, stp_via_if_index)}
+        for the ports about to be written, read before the UPDATE
+        overwrites them."""
         out: dict = {}
         with self._lock:
             for chunk in _id_chunks(if_indexes):
                 marks = marks_for(chunk)
                 for row in self._conn.execute(
-                        "SELECT if_index, stp_state, id, descr FROM interfaces"
+                        "SELECT if_index, stp_state, id, descr, stp_via_if_index"
+                        " FROM interfaces"
                         f" WHERE device_id = ? AND if_index IN ({marks})",
                         [device_id, *chunk]).fetchall():
                     out[row["if_index"]] = (row["stp_state"], row["id"],
-                                            row["descr"])
+                                            row["descr"], row["stp_via_if_index"])
         return out
 
     def replace_interfaces(self, device_id: int, rows: list[dict],

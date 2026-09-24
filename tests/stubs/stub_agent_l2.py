@@ -69,6 +69,29 @@ Modes:
                 30 -- two non-forwarding, non-blocking states with no
                 global reading to fall back on, so the merge must still
                 pick one rather than leave stp_state unset.
+  pvst-3vlan    Three operational VLANs (10, 20, 30); port 7 forwards in 10
+                and 20, blocks only in 30 -- for a second chunk of a
+                multi-pass per-VLAN walk to reveal on its own.
+  pvst-vlan-gap Same three VLANs as pvst-3vlan, except `public@20` is
+                dropped entirely (like pvst-slow) -- a scoped context
+                absent mid-list, so the walk must skip past it and still
+                find port 7 blocking in VLAN 30 on the same pass.
+  pvst-50vlan-portless  pvst-50vlan plus a 51st operational VLAN with no
+                dot1dStpPortState rows at all in its own context -- a
+                follow-up chunk that is all portless VLANs must still
+                count as answered and keep the cache/cursor.
+  stp-bundle    IF-MIB ifStackStatus: Po1 (ifIndex 5000) over members 10
+                and 11, plus a 0-higher and a 0-lower noise row. Only
+                bridge port 50 (-> ifIndex 5000) exists in
+                dot1dBasePortIfIndex -- the members are not bridge ports of
+                their own, same as a real EtherChannel -- and it reads
+                blocking. DROP_STACK_MEMBER <n> (below) removes member n.
+  stp-pagp      No ifStackStatus at all; CISCO-PAGP-MIB pagpGroupIfIndex
+                maps member ifIndex 10 to Po1 (5000) instead -- the
+                fallback path on a Cisco persona.
+  stp-bridge-fallback  No dot1dBasePortIfIndex at all; dot1dStpPortState.10
+                answers directly (blocking), for the "bridge port = ifIndex"
+                fallback onto a device whose own ifIndex 10 exists.
 
   airfiber      a Ubiquiti sysObjectID and the four RF_METRICS[41112]
                 scalars, numbered exactly as demo/personas.py's
@@ -112,6 +135,15 @@ stub_agent_fdb.py, which established this convention):
                  so a test can prove which `@vlan` contexts were actually
                  asked for (pvst modes only -- every other mode answers on
                  the plain community alone).
+  DROP_STACK_MEMBER <n> -> removes member ifIndex n from stp-bundle's
+                 ifStackStatus table, for the "a member leaves the stack"
+                 second-poll case.
+  DROP_OID <oid> -> any request under that OID prefix gets no reply at
+                 all (an SNMP timeout), for the "the walk timed out" case.
+  DROP_ALL_VLAN_CONTEXTS -> every community@vlan request gets no reply
+                 (pvst modes), for the "no scoped context ever answers"
+                 60-second-loop case.
+  CLEAR_DROPS -> undoes DROP_OID and DROP_ALL_VLAN_CONTEXTS.
 """
 import os
 import socket
@@ -297,6 +329,76 @@ PVST_MIXED_PER_VLAN = {
     "20": {"1.3.6.1.2.1.17.2.15.1.3.7": ("int", 3)},    # port 7: listening
     "30": {"1.3.6.1.2.1.17.2.15.1.3.7": ("int", 4)},    # port 7: learning
 }
+
+# pvst-3vlan: three operational VLANs, port 7 forwarding in 10 and 20,
+# blocking only in 30 -- for exercising a second chunk of a multi-pass
+# per-VLAN walk (test_stp_vlan.py, _MAX_VLAN_CONTEXTS lowered to 2).
+PVST_VTP_3 = {f"1.3.6.1.4.1.9.9.46.1.3.1.1.2.1.{v}": ("int", 1)
+             for v in (10, 20, 30)}
+PVST_3VLAN_PER_VLAN = {
+    "10": {"1.3.6.1.2.1.17.2.15.1.3.5": ("int", 5), "1.3.6.1.2.1.17.2.15.1.3.7": ("int", 5)},
+    "20": {"1.3.6.1.2.1.17.2.15.1.3.5": ("int", 5), "1.3.6.1.2.1.17.2.15.1.3.7": ("int", 5)},
+    "30": {"1.3.6.1.2.1.17.2.15.1.3.5": ("int", 5), "1.3.6.1.2.1.17.2.15.1.3.7": ("int", 2)},
+}
+
+# pvst-vlan-gap: VLAN 20's context is dropped outright (see the MODE check
+# in main()); 10 forwards, 30 blocks -- the "skip the absent one, still
+# find the later VLAN" case.
+PVST_GAP_PER_VLAN = {
+    "10": {"1.3.6.1.2.1.17.2.15.1.3.5": ("int", 5), "1.3.6.1.2.1.17.2.15.1.3.7": ("int", 5)},
+    "30": {"1.3.6.1.2.1.17.2.15.1.3.5": ("int", 5), "1.3.6.1.2.1.17.2.15.1.3.7": ("int", 2)},
+}
+
+# pvst-50vlan-portless: VLAN 51 added, operational but its own context
+# answers no dot1dStpPortState rows at all.
+PVST_VTP_50_PORTLESS = {**PVST_VTP_50,
+                        "1.3.6.1.4.1.9.9.46.1.3.1.1.2.1.51": ("int", 1)}
+
+# ------------------------------------------------------- STP: EtherChannel
+#
+# stp-bundle: IF-MIB ifStackStatus, Po1 (ifIndex 5000) over members 10 and
+# 11, plus the usual noise rows (a 0 higher and a 0 lower arc). Members are
+# not bridge ports themselves -- only the Port-channel (bridge port 50) is,
+# same as a real EtherChannel uplink -- so nodepoll._cached_agg_map is the
+# only way a member's row ever gets a state.
+IF_STACK_STATUS = "1.3.6.1.2.1.31.1.2.1.3"
+STACK_TABLE = {
+    f"{IF_STACK_STATUS}.0.5000": ("int", 1),
+    f"{IF_STACK_STATUS}.10.0": ("int", 1),
+    f"{IF_STACK_STATUS}.5000.10": ("int", 1),
+    f"{IF_STACK_STATUS}.5000.11": ("int", 1),
+}
+DROPPED_STACK_MEMBERS = set()   # lower ifIndexes DROP_STACK_MEMBER has removed
+DROPPED_OID_PREFIXES = set()    # DROP_OID columns: no reply at all, an SNMP timeout
+DROP_ALL_VLAN_CONTEXTS = False  # DROP_ALL_VLAN_CONTEXTS: no community@vlan replies
+
+BUNDLE_BRIDGE_PORTS = {
+    "1.3.6.1.2.1.17.1.4.1.2.50": ("int", 5000),   # bridge port 50 -> ifIndex 5000 (Po1)
+}
+BUNDLE_STP_PORT_STATE = {
+    "1.3.6.1.2.1.17.2.15.1.3.50": ("int", 2),     # bridge port 50 (Po1): blocking
+}
+# stp-pagp: CISCO-PAGP-MIB pagpGroupIfIndex, member ifIndex 10 -> Po1 (5000),
+# with no ifStackStatus table at all.
+CISCO_PAGP_GROUP_IFINDEX = "1.3.6.1.4.1.9.9.98.1.1.1.1.8"
+PAGP_TABLE = {f"{CISCO_PAGP_GROUP_IFINDEX}.10": ("int", 5000)}
+# stp-bridge-fallback: no dot1dBasePortIfIndex at all; dot1dStpPortState.10
+# answers directly, ifIndex 10 assumed to be its own bridge port.
+FALLBACK_STP_PORT_STATE = {"1.3.6.1.2.1.17.2.15.1.3.10": ("int", 2)}
+
+
+def _stack_table():
+    table = {}
+    for oid, entry in STACK_TABLE.items():
+        try:
+            lower = int(oid.split(".")[-1])
+        except ValueError:
+            lower = None
+        if lower in DROPPED_STACK_MEMBERS:
+            continue
+        table[oid] = entry
+    return table
+
 
 SEEN_COMMUNITIES = set()   # communities seen since the last RESET (pvst modes)
 
@@ -527,6 +629,36 @@ def table_for(community="public"):
     if MODE == "pvst-50vlan":
         return {**GENERIC_SCALARS, **BRIDGE_PORTS, **STP_SCALARS, **PVST_PORT_STATE,
                 **PVST_VTP_50}
+    if MODE == "pvst-3vlan":
+        table = {**GENERIC_SCALARS, **BRIDGE_PORTS, **STP_SCALARS, **PVST_PORT_STATE}
+        if "@" in community:
+            vlan = community.split("@", 1)[1]
+            table.update(PVST_3VLAN_PER_VLAN.get(vlan, {}))
+        else:
+            table.update(PVST_VTP_3)
+        return table
+    if MODE == "pvst-vlan-gap":
+        table = {**GENERIC_SCALARS, **BRIDGE_PORTS, **STP_SCALARS, **PVST_PORT_STATE}
+        if "@" in community:
+            vlan = community.split("@", 1)[1]
+            table.update(PVST_GAP_PER_VLAN.get(vlan, {}))
+        else:
+            table.update(PVST_VTP_3)
+        return table
+    if MODE == "pvst-50vlan-portless":
+        table = {**GENERIC_SCALARS, **BRIDGE_PORTS, **STP_SCALARS, **PVST_VTP_50_PORTLESS}
+        if "@" in community and community.split("@", 1)[1] == "51":
+            return table
+        table.update(PVST_PORT_STATE)
+        return table
+    if MODE == "stp-bundle":
+        return {**GENERIC_SCALARS, **BUNDLE_BRIDGE_PORTS, **STP_SCALARS,
+                **BUNDLE_STP_PORT_STATE, **_stack_table()}
+    if MODE == "stp-pagp":
+        return {**CISCO_SCALARS, **BUNDLE_BRIDGE_PORTS, **STP_SCALARS,
+                **BUNDLE_STP_PORT_STATE, **PAGP_TABLE}
+    if MODE == "stp-bridge-fallback":
+        return {**GENERIC_SCALARS, **STP_SCALARS, **FALLBACK_STP_PORT_STATE}
     if MODE == "airfiber":
         return {**GENERIC_SCALARS, **AIRFIBER_TABLE,
                 "1.3.6.1.2.1.1.2.0": ("str", "1.3.6.1.4.1.41112.1.3")}
@@ -556,7 +688,7 @@ def reply(request_id, body, community="public", *, version=V2C,
 
 
 def main():
-    global MODE, TOPO_CHANGES
+    global MODE, TOPO_CHANGES, DROP_ALL_VLAN_CONTEXTS
     port = int(sys.argv[1])
     MODE = sys.argv[2] if len(sys.argv) > 2 else "lldp"
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -586,6 +718,28 @@ def main():
                 HIDDEN_IPS.add(ip)
             sock.sendto(b"ok", addr)
             continue
+        if data.startswith(b"DROP_STACK_MEMBER "):
+            try:
+                DROPPED_STACK_MEMBERS.add(int(data[len(b"DROP_STACK_MEMBER "):]))
+            except ValueError:
+                pass
+            sock.sendto(b"ok", addr)
+            continue
+        if data.startswith(b"DROP_OID "):
+            prefix = data[len(b"DROP_OID "):].decode("utf-8", "replace").strip()
+            if prefix:
+                DROPPED_OID_PREFIXES.add(prefix)
+            sock.sendto(b"ok", addr)
+            continue
+        if data == b"CLEAR_DROPS":
+            DROPPED_OID_PREFIXES.clear()
+            DROP_ALL_VLAN_CONTEXTS = False
+            sock.sendto(b"ok", addr)
+            continue
+        if data == b"DROP_ALL_VLAN_CONTEXTS":
+            DROP_ALL_VLAN_CONTEXTS = True
+            sock.sendto(b"ok", addr)
+            continue
         try:
             request = decode_response(data)
         except Exception:
@@ -599,10 +753,17 @@ def main():
         SEEN_COMMUNITIES.add(community)
         if MODE == "pvst-slow" and community == "public@30":
             continue                # the agent stalling on this one VLAN
+        if MODE == "pvst-vlan-gap" and community == "public@20":
+            continue                # this VLAN's context answers nothing
+        if DROP_ALL_VLAN_CONTEXTS and "@" in community:
+            continue                # every community@vlan context times out
+        oids = [vb["oid"] for vb in request.varbinds]
+        if any(oid == p or oid.startswith(p + ".")
+              for oid in oids for p in DROPPED_OID_PREFIXES):
+            continue                # DROP_OID: no reply, an SNMP timeout
         count += 1
         table = table_for(community)
         keys = sorted(table, key=oid_key)
-        oids = [vb["oid"] for vb in request.varbinds]
         if request.pdu_tag == PDU_GET:
             body = b""
             for oid in oids:

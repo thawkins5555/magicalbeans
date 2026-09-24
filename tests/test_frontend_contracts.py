@@ -5909,6 +5909,34 @@ check("App.openSshWindow(" in _MAPPER126 and "App.openWebTunnel(" in _MAPPER126,
 check("openSshWindow, openWebTunnel" in _APP126,
       "and app.js exports both of them")
 
+# ---------------------------------------------------------------------------
+# 127. Every STP-blocked link drawn as blocked (5.60.0): only the actually
+#      blocked VLANs' strands dot, a non-blocking link's pane says why, and
+#      a bundle member's via port names the Port-channel it inherited its
+#      state from.
+_MAPPER127 = read("mapper.js")
+_DRAWLINK127 = js_function(_MAPPER127, "drawLink")
+check("blocked.has(strand.vlan)" in _DRAWLINK127,
+      "drawLink only dots a strand whose own VLAN is actually blocked")
+_STPIDLETEXT127 = js_function(_MAPPER127, "stpIdleText")
+check("no state read on" in _STPIDLETEXT127 and "forwarding on both ends" in _STPIDLETEXT127,
+      "stpIdleText carries both the idle and the no-data-read STP lines")
+_LINKTOOLTIP127 = js_function(_MAPPER127, "linkTooltip")
+check("stpIdleText(" in _LINKTOOLTIP127,
+      "linkTooltip falls back to stpIdleText when the link is not blocking")
+_LINKDETAILHTML127 = js_function(_MAPPER127, "linkDetailHtml")
+check("stpIdleText(" in _LINKDETAILHTML127,
+      "linkDetailHtml falls back to stpIdleText when the link is not blocking")
+_STPBLOCKINGTEXT127 = js_function(_MAPPER127, "stpBlockingText")
+check("via " in _STPBLOCKINGTEXT127,
+      "stpBlockingText names a bundle member's via port")
+_IFACECOLUMNS127 = js_const(read("nodes.js"), "IFACE_COLUMNS")
+check("stp_via_if_index" in _IFACECOLUMNS127,
+      "the Nodes interface table's STP column reads stp_via_if_index")
+_MAPPERAPI127 = python_function("web.api.mapper", "get_mapper_map")
+check("a_stp_via" in _MAPPERAPI127 and "b_stp_via" in _MAPPERAPI127,
+      "get_mapper_map sets a_stp_via/b_stp_via on every link")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

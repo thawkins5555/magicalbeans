@@ -369,7 +369,8 @@ try:
           "interface (B's) is absent, and the seeded row reads back as optic",
           media_direct == {(dev_a, 1): {"media": "optic", "optic_mode": None,
                                         "stp_state": None,
-                                        "stp_blocking_vlans": None}}, media_direct)
+                                        "stp_blocking_vlans": None,
+                                        "stp_via_if_index": None}}, media_direct)
 
     status, payload = call("GET", f"/api/mapper/maps/{map_id}", token=admin)
     links = payload.get("links", []) if status == 200 else []
@@ -399,7 +400,7 @@ try:
     check("every FiberView/STP key is present on a discovered link",
           ab_link is not None and {"a_optic_mode", "b_optic_mode", "fiber_mode",
                                    "a_stp", "b_stp", "a_stp_vlans", "b_stp_vlans",
-                                   "blocking"} <= set(ab_link),
+                                   "a_stp_via", "b_stp_via", "blocking"} <= set(ab_link),
           ab_link)
     check("fiber_mode reads the one end that is known, not a mismatch",
           ab_link is not None and ab_link.get("a_optic_mode") is None
@@ -426,6 +427,32 @@ try:
           ab_link is not None and ab_link.get("a_stp_vlans") is None
           and ab_link.get("b_stp_vlans") == "20,30", ab_link)
 
+    # ---------------------------------- 6f. bundle member's STP via (5.60.0)
+    #
+    # A's own port (if_index 1) reports blocking with stp_via_if_index
+    # pointing at a Port-channel interface (5001) on the same device --
+    # what the nodesdb write path (interface_link_facts_for_devices,
+    # update_interface_stp) produces for a bundle member that inherited its
+    # state from the Po. a_stp_via should read the Po's own label.
+    service.nodes_db.replace_interfaces(dev_a, [
+        {"if_index": 1, "descr": "Gi0/1", "alias": "to-b",
+         "admin_status": "up", "oper_status": "up"},
+        {"if_index": 5001, "name": "Port-channel1",
+         "admin_status": "up", "oper_status": "up"}])
+    service.nodes_db.update_interface_stp(
+        dev_a, [{"if_index": 1, "stp_state": "blocking", "stp_via_if_index": 5001}])
+
+    status, payload = call("GET", f"/api/mapper/maps/{map_id}", token=admin)
+    links = payload.get("links", []) if status == 200 else []
+    ab_link = next((l for l in links
+                    if {l.get("a_device_id"), l.get("b_device_id")} == {dev_a, dev_b}), None)
+    check("a bundle member's a_stp reads blocking and a_stp_via names the "
+          "Port-channel's own interface name",
+          ab_link is not None and ab_link.get("a_stp") == "blocking"
+          and ab_link.get("a_stp_via") == "Port-channel1", ab_link)
+    check("b_stp_via stays None -- B's end is not a bundle member",
+          ab_link is not None and ab_link.get("b_stp_via") is None, ab_link)
+
     # ------------------------------------------------------ 7. export.csv
 
     status, payload = call("GET", f"/api/mapper/maps/{map_id}/export.csv", token=admin)
@@ -442,9 +469,11 @@ try:
     b_id_col = mapper_mod.LINK_CSV_HEADER.index("B Device ID")
     ab_row = next((r for r in csv_rows[1:]
                    if {r[a_id_col], r[b_id_col]} == {str(dev_a), str(dev_b)}), None)
-    check("the CSV row for the A-B link names its fiber mode, STP state and VLAN detail",
+    check("the CSV row for the A-B link names its fiber mode, STP state, VLAN detail "
+          "and the bundle member's via port",
           ab_row is not None and ab_row[fiber_col] == "sm"
-          and ab_row[stp_col] == "blocking on B (VLANs 20, 30)", ab_row)
+          and ab_row[stp_col]
+          == "blocking on A via Port-channel1, blocking on B (VLANs 20, 30)", ab_row)
 
     # -------------------------------------------------- 7b. manual links (D2)
     #
@@ -489,7 +518,7 @@ try:
                                   "a_media", "b_media", "fiber",
                                   "a_optic_mode", "b_optic_mode", "fiber_mode",
                                   "a_stp", "b_stp", "a_stp_vlans", "b_stp_vlans",
-                                  "blocking"}
+                                  "a_stp_via", "b_stp_via", "blocking"}
           <= set(manual), manual)
     check("...with FiberView's keys defaulted (no media on a manual line)",
           manual is not None and manual["a_media"] is None
@@ -499,6 +528,7 @@ try:
           and manual["b_optic_mode"] is None and manual["fiber_mode"] is None
           and manual["a_stp"] is None and manual["b_stp"] is None
           and manual["a_stp_vlans"] is None and manual["b_stp_vlans"] is None
+          and manual["a_stp_via"] is None and manual["b_stp_via"] is None
           and manual["blocking"] is False, manual)
 
     status, payload = call("POST", f"/api/mapper/maps/{map_id}/links",

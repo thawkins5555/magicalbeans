@@ -247,9 +247,8 @@ def _mapper_peer_name(service, rows):
 def _mapper_assemble(service, device_ids, node_rows, now: float, stale_after_s):
     """get_mapper_map's link-assembly phase: the per-port VLAN reads, the
     prefetched port labeller, the on-map predicate and the neighbour read
-    that feed mapper.assemble_links. Returns (links, peers, vlan_ports) --
-    vlan_ports is the only one of this phase's own reads the caller still
-    needs afterwards, to carry each link's port mode/native VLAN."""
+    that feed mapper.assemble_links. Returns (links, peers, vlan_ports,
+    port_label): the caller reuses the prefetched labeller for stp_via."""
     port_vlans = _mapper_port_vlans(
         service, device_ids, now=now, stale_after_s=stale_after_s)
     vlan_ports = _mapper_vlan_ports(
@@ -278,7 +277,7 @@ def _mapper_assemble(service, device_ids, node_rows, now: float, stale_after_s):
         stale_after_s=stale_after_s,
         peer_name=_mapper_peer_name(service, neighbour_rows),
         port_index=port_index)
-    return links, peers, vlan_ports
+    return links, peers, vlan_ports, port_label
 
 
 def _mapper_add_manual_links(service, map_id, node_rows, links: list,
@@ -304,6 +303,7 @@ def _mapper_add_manual_links(service, map_id, node_rows, links: list,
             "a_media": None, "b_media": None, "fiber": False,
             "a_optic_mode": None, "b_optic_mode": None, "fiber_mode": None,
             "a_stp": None, "b_stp": None, "a_stp_vlans": None, "b_stp_vlans": None,
+            "a_stp_via": None, "b_stp_via": None,
             "blocking": False,
             "label": row["label"], "protocols": ["manual"], "vlans": [],
             "native_vlan": None,
@@ -357,7 +357,7 @@ def get_mapper_map(service, params, body, map_id) -> dict:
     now = time.time()
     stale_hours = float(settings.get("stale_link_hours", 24.0))
     stale_after_s = (stale_hours * 3600.0) if stale_hours > 0 else None
-    links, peers, vlan_ports = _mapper_assemble(
+    links, peers, vlan_ports, stp_via_label = _mapper_assemble(
         service, device_ids, node_rows, now, stale_after_s)
 
     color_overrides = service.mapper_db.vlan_colors()
@@ -408,6 +408,12 @@ def get_mapper_map(service, params, body, map_id) -> dict:
         link["b_stp"] = b_stp
         link["a_stp_vlans"] = a_facts["stp_blocking_vlans"] if a_facts else None
         link["b_stp_vlans"] = b_facts["stp_blocking_vlans"] if b_facts else None
+        a_via = a_facts.get("stp_via_if_index") if a_facts else None
+        b_via = b_facts.get("stp_via_if_index") if b_facts else None
+        link["a_stp_via"] = stp_via_label(link["a_device_id"], a_via) \
+            if a_via is not None else None
+        link["b_stp_via"] = stp_via_label(link["b_device_id"], b_via) \
+            if b_via is not None else None
         link["blocking"] = a_stp == "blocking" or b_stp == "blocking"
         link["plan"] = mapper.render_plan(
             link, threshold=threshold, max_strands=max_strands,

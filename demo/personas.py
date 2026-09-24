@@ -1209,6 +1209,11 @@ def _access_second_uplink_port(name: str) -> int:
     return _ACCESS_SECOND_UPLINK_PORT.get(name, 20)
 
 
+# 5.60.0 EtherChannel demo: acc-sw-006 (wrap32) uplinks over Port-channel1.
+_BUNDLE_PO_IF_INDEX = 5001
+_IF_STACK_STATUS = "1.3.6.1.2.1.31.1.2.1.3"
+
+
 def _access_uplink2_vlan_state(vlan_ctx: str):
     """dot1dStpPortState for the second uplink, inside the per-VLAN
     community context built for `vlan_ctx` -- blocking in every context
@@ -1250,6 +1255,20 @@ def _build_cisco_access(wrap32: bool, ports: int, vlan: str | None) -> dict:
     # numbering).
     port_to_if[100 + access + 1] = access + 1
     port_to_if[100 + access + 2] = access + 2
+    # Bundle demo: Po1 replaces the second uplink's own bridge port.
+    bundle = wrap32
+    po_bridge_port = 100 + access + 3
+    if bundle:
+        del port_to_if[100 + access + 2]
+        port_to_if[po_bridge_port] = _BUNDLE_PO_IF_INDEX
+        entries[f"{IF_ENTRY}.1.{_BUNDLE_PO_IF_INDEX}"] = (T_INTEGER, _BUNDLE_PO_IF_INDEX)
+        entries[f"{IF_ENTRY}.2.{_BUNDLE_PO_IF_INDEX}"] = (T_OCTET_STRING, "Port-channel1")
+        entries[f"{IF_ENTRY}.3.{_BUNDLE_PO_IF_INDEX}"] = (T_INTEGER, 161)   # ieee8023adLag
+        entries[f"{IF_ENTRY}.7.{_BUNDLE_PO_IF_INDEX}"] = (T_INTEGER, 1)     # admin up
+        entries[f"{IF_ENTRY}.8.{_BUNDLE_PO_IF_INDEX}"] = (T_INTEGER, 1)     # oper up
+        entries[f"{_IF_STACK_STATUS}.{_BUNDLE_PO_IF_INDEX}.{access + 2}"] = (T_INTEGER, 1)
+        entries[f"{_IF_STACK_STATUS}.0.{_BUNDLE_PO_IF_INDEX}"] = (T_INTEGER, 1)
+        entries[f"{_IF_STACK_STATUS}.{access + 2}.0"] = (T_INTEGER, 1)
     if vlan is not None:
         # Classic IOS: dot1dStpPortState only exists inside a per-VLAN
         # community context (nodepoll._cisco_vlan_stp) -- only the second
@@ -1257,7 +1276,8 @@ def _build_cisco_access(wrap32: bool, ports: int, vlan: str | None) -> dict:
         # this persona answers in its DEFAULT context is repeated here.
         return {
             **bridge_ports(port_to_if),
-            **dot1d_stp_ports({100 + access + 2: _access_uplink2_vlan_state(vlan)}),
+            **dot1d_stp_ports({(po_bridge_port if bundle else 100 + access + 2):
+                               _access_uplink2_vlan_state(vlan)}),
         }
     entries.update(bridge_ports(port_to_if))
     entries.update(qbridge_fdb(port_macs, vlan=10))
@@ -1413,10 +1433,11 @@ def _build_cisco_access(wrap32: bool, ports: int, vlan: str | None) -> dict:
                     for i in range(1, access + 1) if h("poedraw", i) % 3 == 0},
         cisco_extension=True))
     entries.update(dot1d_stp(priority=32768, root_cost=4, root_port=uplink_if))
-    # The second uplink (access + 2) is the redundant/blocked one -- every
-    # other port forwards.
+    # The second uplink (access + 2), or its Po bridge port in the bundle
+    # demo, is the redundant/blocked one -- every other port forwards.
+    blocked_bridge_port = po_bridge_port if bundle else if_to_port[access + 2]
     entries.update(dot1d_stp_ports({
-        port: (_access_uplink2_default_state if port == if_to_port[access + 2] else 5)
+        port: (_access_uplink2_default_state if port == blocked_bridge_port else 5)
         for port in port_to_if}))
     # CISCO-STACKWISE-MIB (5.32.0): 3-member ring, redundant mode, 30 A cables;
     # entPhysicalIndex 1001/2001/3001 sit outside this persona's ~50-port range.
@@ -1552,6 +1573,22 @@ def _build_cisco_core(wrap32: bool, ports: int, vlan: str | None) -> dict:
         entries.update(sfp_cages(populated=downlink_cages))
         entries.update(dot1d_stp(priority=4096, root_cost=0, root_port=0))
         entries.update(dot1d_stp_ports({port: 5 for port in port_to_if}))
+        # Bundle demo, core end: acc-sw-006's uplink now sits under Port-channel1.
+        bundle_member_if = 10 + 6
+        bundle_member_port = 100 + bundle_member_if
+        bundle_po_port = 100 + _BUNDLE_PO_IF_INDEX
+        del entries[f"{DOT1D_BASE_PORT}.{bundle_member_port}"]
+        del entries[f"{DOT1D_STP_PORT_STATE}.{bundle_member_port}"]
+        entries[f"{DOT1D_BASE_PORT}.{bundle_po_port}"] = (T_INTEGER, _BUNDLE_PO_IF_INDEX)
+        entries[f"{DOT1D_STP_PORT_STATE}.{bundle_po_port}"] = (T_INTEGER, 5)
+        entries[f"{IF_ENTRY}.1.{_BUNDLE_PO_IF_INDEX}"] = (T_INTEGER, _BUNDLE_PO_IF_INDEX)
+        entries[f"{IF_ENTRY}.2.{_BUNDLE_PO_IF_INDEX}"] = (T_OCTET_STRING, "Port-channel1")
+        entries[f"{IF_ENTRY}.3.{_BUNDLE_PO_IF_INDEX}"] = (T_INTEGER, 161)   # ieee8023adLag
+        entries[f"{IF_ENTRY}.7.{_BUNDLE_PO_IF_INDEX}"] = (T_INTEGER, 1)     # admin up
+        entries[f"{IF_ENTRY}.8.{_BUNDLE_PO_IF_INDEX}"] = (T_INTEGER, 1)     # oper up
+        entries[f"{_IF_STACK_STATUS}.{_BUNDLE_PO_IF_INDEX}.{bundle_member_if}"] = (T_INTEGER, 1)
+        entries[f"{_IF_STACK_STATUS}.0.{_BUNDLE_PO_IF_INDEX}"] = (T_INTEGER, 1)
+        entries[f"{_IF_STACK_STATUS}.{bundle_member_if}.0"] = (T_INTEGER, 1)
         # The ARP cache, gated the same way and for the same reason as the
         # neighbour table above: core-sw-01 is the plant's one router, and
         # two "core" devices both claiming to hold every fleet address

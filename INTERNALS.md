@@ -7029,6 +7029,236 @@ taken and `_next_stp_vlan_walk` advances by a full interval; a cache
 older than twice the cadence being discarded rather than merged; and a
 complete-but-empty per-VLAN answer clearing a previously cached result.
 
+### Every STP-blocked link on Mapper is found: bundle members, a per-VLAN scan that finishes, and a bridge-port fallback — 5.60.0
+
+One operator report — a blocked link Mapper was not drawing as blocked —
+traced to three separate gaps in the polling path above, plus one drawing
+defect on an already-blocked link. All four are one release.
+
+**The per-VLAN cache becomes per-VLAN, not per-pass.** `_stp_vlan_cache`
+used to hold the last *complete* pass's whole `{"rows", "ts"}` result
+(5.50.0, above); a pass that ran out of budget partway through a large
+VLAN list was thrown away in full, and once the last complete pass aged
+past `2 * _stp_vlan_cadence_s` every port on that switch reverted to the
+plain default-context (VLAN 1) reading. That is the mechanism behind the
+5.40.0 "dots vanish on refresh" note, closed here: nothing was wrong with
+the redraw path, the per-VLAN data behind it was going stale and falling
+back.
+
+`_stp_vlan_cache[device_id]` is now `{"vlans": {vlan: {"ts", "ports":
+{if_index: state_name}}}, "cursor", "total", "cycle_seen"}` — one entry per
+VLAN, independently timestamped; `cycle_seen` is the set of VLANs walked
+this lap, used to prune any VLAN this lap never re-walked once it
+completes. `_cisco_vlan_stp(device, config, port_map,
+start=0, budget_s=None)` (`vendor_sensor_psu_mixin.py`) takes a starting
+index into the sorted, operational VLAN list and walks up to
+`_MAX_VLAN_CONTEXTS` (48) VLANs from there, stopping at the end of the
+list; the walk budget (`_VLAN_WALK_BUDGET_S`) is raised 15 → 30 s for the
+cadence-driven chunk, while the inline first-sighting/topology-change run
+in `_poll_stp` passes `budget_s=15.0` so it holds a poll worker no longer
+than before. It returns `(vlan_rows, answered, complete, next_start,
+vlan_total, next_vlan)`: `vlan_rows` is `{vlan: {if_index: state_name}}`
+for every VLAN whose column walk actually finished this call; `answered`
+is True once any context's column walk finished, even empty (the context
+exists); `complete` is True only when the requested chunk finished
+outright. A context that fails for any reason other than the budget (a
+timeout, noSuchName, no per-VLAN bridge map) clears `complete` but is
+counted as covered, so the cursor still advances past it and it is
+retried next lap; only the budget deadline breaks the loop, and the VLAN
+it cut is not counted, so the follow-up chunk starts on it — unless that
+VLAN was the chunk's first and only one, in which case it is skipped so
+one context that alone overruns the budget cannot pin the whole lap. `next_start`
+is the index of the first VLAN not yet covered, 0 once the list has been
+walked in full, and `next_vlan` its id for the Events line.
+
+`_run_stp_vlan_pass` (`environment_mixin.py`) merges `vlan_rows` into the
+cache by VLAN — each walked VLAN's entry is replaced, VLAN entries older
+than `2 * _stp_vlan_cadence_s` are dropped, and the cursor and VLAN total
+are updated. A pass with `next_start != 0` — a chunk that did not reach
+the end of the list — is followed up 60 seconds later rather than waiting
+out the whole cadence: both `_run_stp_vlan_walk_job`
+(`environment_mixin.py`, the cadence path) and the inline run in
+`_poll_stp` set `self._next_stp_vlan_walk[device_id] = time.time() + 60`
+when the pass reports a non-zero `next_start` and answered something; a
+device whose contexts never answer at all is not rescheduled every
+minute, only at its cadence. `_stp_vlan_seen` — the latch that stops
+`_poll_stp` re-running the walk inline on a device's first sighting — is
+now set on any answered or complete pass rather than only a complete
+one, since the cadence carries an unfinished list forward on its own; a
+chunk that starts at cursor 0 and answers nothing at all (no VTP table,
+or every context refused) still pops the cache, the 5.50.0 rule, while a
+mid-lap chunk that answers nothing keeps the cache and advances. Once a
+full lap completes (`next_start` wraps to 0), any VLAN cached from an
+earlier lap that this one never re-walked is dropped — a VLAN pruned off
+a trunk between laps does not linger in the cache forever.
+
+**`_poll_stp`'s merge is now per port, built fresh from every VLAN entry
+still within its own staleness window**, rather than reading one
+pass-wide `stale` flag: for each fresh VLAN entry, every `(if_index,
+state)` it names is folded into a per-port accumulator (`blocking` list,
+`states` set, `count`); the existing precedence — blocking beats
+forwarding beats a single other state beats the plain minimum — is
+unchanged, `stp_vlan_count` is now the number of *fresh* VLAN entries
+that named that port, not the whole cache's original tally. A port with
+no fresh VLAN entry at all takes its plain state from the default-context
+read and keeps whatever `stp_blocking_vlans`/`stp_vlan_count` it already
+had stored — `update_interface_stp`'s COALESCE (below) is what leaves it
+alone.
+
+**Diagnostics.** The `stp_vlan_cut_short` `_log_media_diag` line now
+names how much of the switch's VLAN list this chunk actually covered:
+"Per-VLAN STP scan on 10.1.1.1: 31 of 46 VLANs in 30 s, continuing from
+VLAN 210 in 60 s."
+
+**Bundle members inherit the Port-channel's STP state.** Spanning tree
+runs on the Port-channel's own ifIndex; a member port is not a bridge
+port in its own right and the switch reports no STP state for it
+directly, while CDP/LLDP (and so the Mapper link) name the physical
+member. `_cached_agg_map(device, config, now)` (`environment_mixin.py`),
+alongside `_cached_bridge_port_map` and on the same cadence and
+reboot-drop rule, walks IF-MIB `ifStackStatus`
+(`nodeoids.IF_STACK_STATUS`, index `higher.lower`) and records `member
+lower -> parent higher` for every suffix where `higher` is present among
+the bridge-port map's own ifIndex values (i.e. `higher` really is
+something STP reports on). When that table answers nothing at all and
+the device is Cisco, it falls back to walking CISCO-PAGP-MIB
+`pagpGroupIfIndex` (`nodeoids.CISCO_PAGP_GROUP_IFINDEX`), which IOS
+populates for LACP channels too, not only PAgP ones — `member -> value`
+wherever `value` is non-zero and not the member itself. The result is
+cached as a plain `{member: parent}` dict.
+
+`_poll_stp`, after the per-VLAN merge and before `update_interface_stp`,
+walks this map: for every `(member, parent)` where `parent` has a row
+this poll and `member` does not, `rows[member] = {**rows[parent],
+"stp_via_if_index": parent}` — a straight copy of the parent's state,
+VLAN detail included, tagged with which ifIndex it came from. A member
+the switch *does* answer for directly keeps its own row untouched. A
+port that used to carry a `stp_via_if_index` but is neither answered
+directly nor found in the current `agg_map` (it left the stack table; a
+stack table that answers empty and complete counts as left, while a walk
+that times out is not cached and leaves every member's via and state
+untouched until a later walk finishes), and answers nothing of its own
+this poll, has `stp_state`, `stp_blocking_vlans`, `stp_vlan_count` and
+`stp_via_if_index` all cleared to `NULL`, with no event raised — a row
+that was only ever a copy of its parent's state has nothing of its own
+to fall back to once that copy ends.
+
+**Storage.** `interfaces.stp_via_if_index INTEGER` (`nodesdb.py`,
+`ensure_columns` beside `stp_blocking_vlans`), NULL for a port answered
+directly, including the Port-channel's own row. `update_interface_stp`
+still overwrites `stp_state` outright and COALESCEs
+`stp_blocking_vlans`/`stp_vlan_count` for a port answered directly with
+no fresh per-VLAN detail this poll; a row leaving a bundle that
+answers nothing of its own instead has `stp_state`,
+`stp_blocking_vlans`, `stp_vlan_count` and `stp_via_if_index` all
+overwritten to `NULL` outright, on the very poll that notices, not left
+at their last known value. The interface-event pass at the bottom of
+`update_interface_stp` skips any row carrying a (non-NULL)
+`stp_via_if_index`: the Port-channel's own row is what raises the one
+`stp_blocking`/`stp_unblocked` event for the whole bundle, so a member's
+copied row never raises a second one for the same transition. The same
+pass also raises no event when the *previous* stored row carried a
+`stp_via_if_index` — a member leaving its bundle is not a state change
+of its own, so it is never reported as one.
+`interface_link_facts_for_devices` adds `stp_via_if_index` to its
+per-port dict alongside `stp_state`/`stp_blocking_vlans`.
+
+**Bridge-port fallback.** `_bridge_port_map` (`vendor_sensor_psu_mixin.py`)
+already backs the VLAN membership walk's own bridge-port-equals-ifIndex
+guess (`vlan_mixin.py`); it now applies the same rule to STP. When
+`dot1dBasePortIfIndex` answers nothing at all but `dot1dStpPortState`
+does, each bridge port number is mapped to itself provided that number is
+an ifIndex the device's own interface table actually has (`self.db.
+interfaces`), confirmed rather than assumed — logged once an hour per
+switch (`_log_media_diag`'s rate limit), cause `stp_bridge_port_fallback`:
+"Bridge port table
+empty on 10.1.1.1: assuming bridge port = ifIndex."
+
+**API.** `get_mapper_map` (`web/api/mapper.py`) sets `a_stp_via`/
+`b_stp_via` on every link: the via ifIndex's own port label (through the
+same labeller `a_port`/`b_port` already use), falling back to
+`if <ifIndex>` — the port labeller's own fallback — when that interface
+isn't in the prefetched list, or `None` when the end answered directly.
+A manual link defaults both to `None` alongside its other
+FiberView/STP keys. `mapper.link_csv_rows`'s STP column gains a
+`" via <label>"` suffix after the VLAN suffix: `"blocking on A via
+Port-channel1, blocking on B (VLANs 20, 30)"`. `get_nodes_device_
+interfaces` and its CSV export (`web/api/nodes.py`) add the raw
+`stp_via_if_index` column alongside `stp_state`/`stp_blocking_vlans`/
+`stp_vlan_count`.
+
+**`nodes.js`'s interface table STP column** keeps `stpStateText`'s
+existing cell text unchanged and appends ` · via <label>` when
+`stp_via_if_index` is set, looking the via ifIndex's own name/descr/alias
+up against the same interface list the table is currently drawing
+(`stpViaIfaceList`, set by `drawIfaceTable` right before each draw, since
+the device pane and the summary pane draw from different lists) —
+falling back to `if <ifIndex>` if that interface has none of those three
+fields.
+
+**`mapper.js`'s strand drawing only dots the actually-blocked VLANs.**
+`drawLink`'s strands branch used to add the `.blocking` class to every
+strand once `link.blocking` was true at all, even though the detail
+pane's own `stpBlockedVlans(link)` already knew exactly which VLAN ids
+were responsible. `drawLink` now computes `blocked = stpBlockedVlans(link)`
+once per link and gives a strand `.blocking` only when `!blocked ||
+blocked.has(strand.vlan)` — a link with no
+per-VLAN detail at all (both ends' `*_stp_vlans` empty or missing) still
+dots every strand, exactly as before this existed, since there is
+nothing more specific to go on. Collapsed and plain-line links are
+unaffected — they only ever draw one dashed line for the whole link.
+`stpBlockingText` gains the via port, through `esc()`: `acc-sw-005
+(Gi1/0/49, via Po1)` whenever `a_stp_via`/`b_stp_via` is set.
+
+**A new `stpIdleText(link, a, b, esc)` covers the not-blocking case.**
+Companion to `stpBlockingText`, called only when `!link.blocking`: `"STP:
+forwarding on both ends"` when both `a_stp` and `b_stp` are set
+(non-null/undefined) — a manual or unmanaged far end, which never has an
+`*_stp` reading, does not count as "forwarding" here, it counts as "no
+state"; otherwise `"STP: no state read on <switch> (<port>)"`, naming
+each end whose `*_stp` is null/undefined, joined by a comma when both
+ends qualify. `linkTooltip` and `linkDetailHtml` both call
+`stpBlockingText(...) || stpIdleText(...)`, so every link now carries
+exactly one STP line — blocking, forwarding, or "no state" — never none
+at all once either end has been polled for anything.
+
+**Demo.** `demo/personas.py`'s `_build_cisco_access`/`_build_cisco_core`
+give acc-sw-006 (the estate's `wrap32` persona) a Port-channel1 uplink to
+core-sw-01: the second uplink's own bridge port is replaced by a Po
+bridge port on both ends (IF-MIB `ifStackStatus` entries added on the
+access side; the core side's existing per-uplink bridge-port/STP-state
+entries are replaced with the Po's own), with CDP/LLDP still naming the
+physical member the way real hardware does — the whole reason bundle inheritance
+exists. The access-side Po forwards or blocks exactly where the plain
+second uplink used to; the core-side Po always forwards, the same rule
+every other core-side port already follows.
+
+**Tests.** `tests/test_stp_vlan.py`'s 50-VLAN case now runs two passes:
+the first covers VLANs 1-48 and reports `cursor == 48`, the second covers
+the last two and wraps the cursor to 0, with the merged cache spanning
+all 50; new cases cover a cut-short pass keeping only the VLANs it
+actually walked (and `_stp_vlan_seen` being set anyway), a VLAN entry
+older than two intervals being dropped while a fresh one alongside it
+survives, and a port with no fresh VLAN entry at all COALESCE-ing in its
+stored blocking-VLAN detail while its plain `stp_state` still follows the
+default-context read. New `tests/test_stp_bundle.py` covers the
+`ifStackStatus` path (two members inheriting one Po's blocking state,
+exactly one `stp_blocking` event raised on the Po's own row, a member
+that later drops out of the stack table and answers nothing of its own
+having its state, blocking VLANs, count and via all cleared with no
+event raised), the PAgP fallback with an empty stack table, and the
+bridge-port-equals-ifIndex fallback logging once an hour.
+`tests/test_mapper_api.py` (6f) checks a bundle member's `a_stp_via`
+reads the Po's own label and the CSV row carries `"via Port-channel1"`.
+`tests/test_frontend_contracts.py` section 127 pins `blocked.has(strand.
+vlan)` in `drawLink`, both lines of `stpIdleText`, `stpIdleText(` being
+called from `linkTooltip`/`linkDetailHtml`, `"via "` in
+`stpBlockingText`, `stp_via_if_index` in `nodes.js`'s `IFACE_COLUMNS`,
+and `a_stp_via`/`b_stp_via` in `get_mapper_map`. `tests/ui/walk.mjs`
+checks that, on acc-sw-005's trunk, only the VLAN 30 strand carries
+`.blocking`, and that a non-blocking link's pane reads "STP: forwarding
+on both ends".
+
 ### Notes: `map_notes` (`mapperdb.py`, `web/api/mapper.py`, `mapper.js`, `app.css`) — 5.38.0
 
 **Storage and validation are the Frame idiom (5.31.0, above), copied for
