@@ -258,6 +258,14 @@ check("VLANs union across the two ends of a link",
 if links_vlan:
     check("...and the native (untagged) vlan from whichever end reports one",
           links_vlan[0]["native_vlan"] == 1, links_vlan[0])
+    link_vlan = links_vlan[0]
+    if link_vlan["a_device_id"] == 1:
+        dev1_vlans, dev2_vlans = link_vlan["a_vlans"], link_vlan["b_vlans"]
+    else:
+        dev1_vlans, dev2_vlans = link_vlan["b_vlans"], link_vlan["a_vlans"]
+    check("...and each end's own list is kept separately for VlanView's "
+          "both-ends rule",
+          dev1_vlans == [1, 10] and dev2_vlans == [20], link_vlan)
 
 # a link where only one end reports VLANs at all keeps them (no intersection)
 port_vlans_one_sided = {(1, 30): [{"vlan": 50, "tagged": True}, {"vlan": 60, "tagged": True}]}
@@ -270,6 +278,58 @@ links_one_sided, _ = assemble_links(rows_one_sided, port_vlans=port_vlans_one_si
 check("a link with VLAN data on only one end keeps that end's VLANs "
       "(union, not an intersection that would erase them)",
       links_one_sided and links_one_sided[0]["vlans"] == [50, 60], links_one_sided)
+if links_one_sided:
+    link_os = links_one_sided[0]
+    if link_os["a_device_id"] == 1:
+        reporting_vlans, silent_vlans = link_os["a_vlans"], link_os["b_vlans"]
+    else:
+        reporting_vlans, silent_vlans = link_os["b_vlans"], link_os["a_vlans"]
+    check("...the reporting end's own list is [50, 60] and the silent "
+          "end's is None, not an empty list",
+          reporting_vlans == [50, 60] and silent_vlans is None, link_os)
+
+# a link assembled from ONE row only (the far end's own neighbour walk
+# hasn't produced a row yet) still reads the far end's own port_vlans rows
+port_vlans_far_end = {
+    (1, 30): [{"vlan": 50, "tagged": True}, {"vlan": 60, "tagged": True}],
+    (2, 31): [{"vlan": 50, "tagged": True}, {"vlan": 70, "tagged": True}],
+}
+rows_far_end = [
+    row(1, 30, chassis_id="far-end-a", matched_device_id=2, matched_if_index=31),
+]
+links_far_end, _ = assemble_links(rows_far_end, port_vlans=port_vlans_far_end,
+                                  port_label=label_of, on_map=all_on_map, now=NOW)
+check("a link built from a single row still unions in the far end's own "
+      "VLANs from port_vlans",
+      links_far_end and links_far_end[0]["vlans"] == [50, 60, 70], links_far_end)
+if links_far_end:
+    link_fe = links_far_end[0]
+    check("...device 1's own end reads [50, 60] and device 2's own end "
+          "reads [50, 70], read independently of which side walked",
+          link_fe["a_vlans"] == [50, 60] and link_fe["b_vlans"] == [50, 70], link_fe)
+
+# a reciprocal sysName-only fold (_fold_reciprocal_name_matched) keeps both
+# ends' own VLAN lists after the two rows merge into one link
+port_vlans_fold = {
+    (1, 51): [{"vlan": 70, "tagged": True}],
+    (2, 52): [{"vlan": 80, "tagged": True}],
+}
+rows_fold = [
+    row(1, 51, sys_name="core-sw2", matched_device_id=2, matched_if_index=None),
+    row(2, 52, sys_name="edge-sw2", matched_device_id=1, matched_if_index=None),
+]
+links_fold, _ = assemble_links(rows_fold, port_vlans=port_vlans_fold, port_label=label_of,
+                               on_map=all_on_map, now=NOW)
+check("a reciprocal sysName-only fold still produces ONE link",
+      len(links_fold) == 1, links_fold)
+if len(links_fold) == 1:
+    link_fold = links_fold[0]
+    if link_fold["a_device_id"] == 1:
+        dev1_fold_vlans, dev2_fold_vlans = link_fold["a_vlans"], link_fold["b_vlans"]
+    else:
+        dev1_fold_vlans, dev2_fold_vlans = link_fold["b_vlans"], link_fold["a_vlans"]
+    check("...with both ends' own VLAN lists kept separate after the fold",
+          dev1_fold_vlans == [70] and dev2_fold_vlans == [80], link_fold)
 
 # ------------------------------------------------------------- link_identity
 

@@ -559,6 +559,31 @@
     App.refreshNow('nodes');
   }
 
+  async function vlanScanNow() {
+    const button = App.el('nd-vlan-scan');
+    if (button.disabled) return;
+    const settle = App.settleButton(button, 'VLAN scan');
+    button.disabled = true;
+    button.textContent = 'Scanning…';
+    let result;
+    try {
+      result = await App.post('/api/nodes/vlan-scan', {});
+    } catch (error) {
+      App.toast(`Could not start the VLAN scan: ${error.message}`, 'fail');
+      settle('Failed');
+      return;
+    }
+    // Results land as each device's walk finishes and the Nodes columns
+    // refresh on their own cadence.
+    const queued = Number(result.queued || 0);
+    const already = Number(result.already_running || 0);
+    App.toast(`VLAN scan queued on ${queued} devices` +
+      (already ? `, ${already} already scanning` : ''), 'ok');
+    if (queued) settle(`Queued ${queued}`);
+    else if (already) settle(`${already} already scanning`);
+    else settle('Nothing to scan');
+  }
+
   /* Re-identify every ticked device. Same shape as bulkPollNow: the POST
      returning means the walks were started on their own threads, and the
      list shows the outcome as the Vendor column changes. */
@@ -6952,6 +6977,7 @@
     App.el('nd-import-devices').onclick = importDevicesDialog;
     App.el('nd-duplicates').onclick = () => duplicatesDialog().catch((error) =>
       App.toast(`Could not open duplicates: ${error.message}`, 'fail'));
+    App.el('nd-vlan-scan').onclick = () => { vlanScanNow().catch(() => {}); };
     App.el('nd-export-csv').onclick = exportDevicesCsv;
     App.el('nd-if-export-csv').onclick = exportInterfacesCsv;
     App.el('nd-page-size').onchange = () => { view.pageOffset = 0; App.refreshNow('nodes'); };

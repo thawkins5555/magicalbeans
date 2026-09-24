@@ -25,6 +25,7 @@ backup, `INTERNALS.md` is why any of this works the way it does.
 - [Nodes shows "purging history for N device(s)"](#nodes-shows-purging-history-for-n-devices)
 - [A NetPath web page check stays red](#a-netpath-web-page-check-stays-red)
 - [A link I know is STP-blocked is not dotted](#a-link-i-know-is-stp-blocked-is-not-dotted)
+- [A link does not glow in VlanView](#a-link-does-not-glow-in-vlanview)
 - [A flood of alerts nobody asked for](#a-flood-of-alerts-nobody-asked-for)
 - [Planned maintenance](#planned-maintenance)
 - [Nobody can sign in](#nobody-can-sign-in)
@@ -619,6 +620,37 @@ give it one full VLAN-poll interval before judging a switch's coverage.**
 The per-VLAN cache starts empty and fills chunk by chunk; the interface
 table's per-port VLAN count climbing toward the switch's real VLAN total
 is the sign it has caught up.
+
+---
+
+## A link does not glow in VlanView
+
+**Symptom.** You pick a VLAN in MAPPER's "VLANs on this map" table and a
+link you expect to light up stays plain instead.
+
+**From 5.61.0, the glow means the VLAN is on both ends of the link, not
+just one.** Open the link (click it, or hover for the tooltip); while a
+VLAN is picked it always carries a line saying which case applies (the
+VLAN's name follows its number when the switch reports one, as in
+"VLAN 30 (guest): …"):
+
+- **"VLAN `<n>`: on both ends"** — it should be glowing; if it isn't,
+  refresh the map.
+- **"VLAN `<n>`: on `<switch>` (`<port>`) only"** — the other switch does
+  not list that VLAN on its own end of this cable. Check its trunk
+  allow-list (the VLANs permitted on that port) — the VLAN is very likely
+  pruned there.
+- **"VLAN `<n>`: on `<switch>` (`<port>`); `<other switch>` reports no
+  VLAN data"** — that other switch has no VLAN membership rows for that
+  port at all, meaning its own VLAN walk has not covered that port yet
+  (from 5.61.0 this no longer waits on that switch's neighbour discovery
+  too, only on its VLAN walk). Press **VLAN scan** on Nodes to read it
+  now, or check that switch's VLAN interval and SNMP settings if the
+  scan keeps coming back empty.
+
+**A link to an unmanaged peer still glows correctly** on the managed
+switch end's word alone — a device Nodes has no polling for cannot report
+VLAN data, and this is expected, not a fault.
 
 ---
 

@@ -321,6 +321,7 @@ ROUTES = [
     ("POST", r"^/api/nodes/devices/(\d+)/merge$", api.post_nodes_device_merge, ("nodes", W)),
     ("GET", r"^/api/nodes/duplicates$", api.get_nodes_duplicates, ("nodes", R)),
     ("POST", r"^/api/nodes/devices/bulk-poll$", api.post_nodes_devices_bulk_poll, ("nodes", W)),
+    ("POST", r"^/api/nodes/vlan-scan$", api.post_nodes_vlan_scan, ("nodes", W)),
     ("POST", r"^/api/nodes/devices/bulk-identify$", api.post_nodes_devices_bulk_identify, ("nodes", W)),
     ("POST", r"^/api/nodes/devices/(\d+)/poll$", api.post_nodes_device_poll, ("nodes", W)),
     # Focus sets a three-second poll interval on a device. That is traffic

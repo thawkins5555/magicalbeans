@@ -5,6 +5,54 @@ grouped by the version that carries it. This is a working record for the
 operator — the full story of each change is in `CHANGELOG.md`, and this file
 does not replace it.
 
+## 5.61.0 — Team grows by four; VlanView glows only on both ends; Nodes gets a fleet-wide VLAN scan button
+
+**Operator message, five asks (verbatim):** "Update Dora to be 5.5 opus.
+Add additional Teammates Thing3 and Thing4 that are Copies of Thing1. Add
+additional Teammates Dingus3 and Dingus4 that are Copies of Dingus1. The
+VlanView should only glow if the VLAN is on BOTH interfaces of a link and
+not just one side. On the Nodes module add a global button next to
+'Duplicates' that will immediately run a VLAN scan."
+
+**Four planning answers.** A one-sided link draws plain — no glow, and
+not dimmed either. An end with no VLAN data at all (an unmanaged peer, or
+a switch that has never answered a VLAN walk) does not veto the glow —
+the known end's word stands on its own. The scan button covers every
+managed device, not a selection. Feedback is a toast carrying the count,
+alongside an Events log line.
+
+**Who built what.** Dora explored first: why the glow needs backend
+changes at all (`assemble_links` only ever kept the union of both ends'
+VLANs, so `mapper.js` had no way to see which end reported what), and why
+the scan button needs a new poller method rather than reusing Poll now's
+path (that path also queues a full poll and the MAC/ARP walks, and drops
+caches the scan has no business touching). Dingus1 built the four new
+team files to Bob's exact spec (byte copies with the name/description
+swapped); Bob updated `CLAUDE.md`'s team list and Dora's model. Thing1
+built the per-end VLAN lists (`mapper.py`, the API, their tests); Thing2
+built the glow rule, legend, pane line and the walk check. Thing3 built the poller method, the endpoint and their
+backend tests; Thing4 built the button, its contract pins and its walk
+check — both only became spawnable partway through the session, once
+Dingus1 had written their agent files; before that point Thing1 and
+Thing2 were set to cover their parts instead.
+
+**Outcome.** Shipped as 5.61.0. Full suite 208 of 211 with only the three
+environmental failures (test_alert_sms, test_collectors_hardening,
+test_prune_lock_hold); the thirteen targeted suites green. Javariius pass
+one found a P1 (the pane line interpolated the VLAN name unescaped; fixed
+and pinned) and a P2 (the walk check counted against a stale payload).
+The first walk skipped the VlanView check because no link had VLAN data
+yet, so the check was made to trigger the new VLAN scan itself; its first
+real run then failed and exposed a genuine gap: a link's far end only got
+VLANs from its own neighbour row, so a core whose neighbour walk had not
+run read as VLAN-blind although its port rows were on file. Thing1 made
+`assemble_links` read the far end's own rows; the demo persona change was
+dropped as unnecessary; Thing2 rewrote the check around VLAN 20 (both
+ends) and VLAN 30 (one-sided) comparing per link id, since the link set
+grows in bursts mid-walk. Javariius pass three approved the far-end read.
+Final walk 102 of 102: 23 links glowing for VLAN 20; for VLAN 30, 11
+glowing, 10 plain one-sided, 2 dimmed; the VLAN scan button queued 250.
+
 ## 5.60.0 — Every STP-blocked link on Mapper is now found
 
 **Operator report:** "The STP blocking visible feature line on Mapper is

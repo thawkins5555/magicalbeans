@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.61.0 — VlanView glows a link only when the picked VLAN is on both ends; Nodes gets a fleet-wide VLAN scan button](#5610--vlanview-glows-a-link-only-when-the-picked-vlan-is-on-both-ends-nodes-gets-a-fleet-wide-vlan-scan-button)
 - [5.60.0 — Every STP-blocked link on Mapper is now found: EtherChannel bundles, a per-VLAN scan that finishes, and a bridge-port fallback](#5600--every-stp-blocked-link-on-mapper-is-now-found-etherchannel-bundles-a-per-vlan-scan-that-finishes-and-a-bridge-port-fallback)
 - [5.59.0 — VlanView glows the links carrying a picked VLAN; charts stop bridging gaps in the data; Mapper gets SSH/WEB buttons; SMS sign-up adds a Privacy Policy checkbox](#5590--vlanview-glows-the-links-carrying-a-picked-vlan-charts-stop-bridging-gaps-in-the-data-mapper-gets-sshweb-buttons-sms-sign-up-adds-a-privacy-policy-checkbox)
 - [5.58.0 — Email subjects drop "SappiWhere"; NetFlow names what's missing, raises the per-exporter template cap to 512, and keeps templates across a restart](#5580--email-subjects-drop-sappiwhere-netflow-names-whats-missing-raises-the-per-exporter-template-cap-to-512-and-keeps-templates-across-a-restart)
@@ -194,6 +195,68 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.61.0 — VlanView glows a link only when the picked VLAN is on both ends; Nodes gets a fleet-wide VLAN scan button
+
+One operator message, two changes to the same area plus a team update.
+
+**VlanView's glow now means both ends actually carry the VLAN, not just
+one.** Picking a VLAN in MAPPER's "VLANs on this map" table already dimmed
+every link that does not carry it and, from 5.59.0, glowed every link that
+does. That glow could not tell one-sided from two-sided: a trunk carrying
+the VLAN on only one switch's end lit up exactly like a trunk carrying it
+on both. A link now glows only when both of its interfaces report the
+picked VLAN; a link carrying it on one end only draws plain — neither
+glowed nor dimmed — instead of a false positive. An end with no VLAN data
+at all (an unmanaged peer, or a managed switch that has never answered a
+VLAN walk) does not veto the other end's glow, so a link to a VLAN-blind
+device still glows correctly on the known end's word. The legend above the
+canvas now says so: "VlanView: links carrying VLAN 20 on both ends glow in
+its colour; a link carrying it on one end only draws plain; the rest are
+dimmed." The link's tooltip and its detail pane both gain a line, while a
+VLAN is picked, naming exactly what the glow (or its absence) is based on:
+"VLAN 30 (guest): on both ends", "VLAN 30 (guest): on acc-sw-004 (Gi1/0/49) only", or
+"VLAN 30 (guest): on acc-sw-004 (Gi1/0/49); core-sw-01 reports no VLAN data" —
+so a plain link's cause is never a guess. Under the hood, the Mapper API's
+links now carry `a_vlans`/`b_vlans` — each end's own reported VLAN list,
+`null` when that end recorded none at all — alongside the existing
+`vlans`, which stays the union of both ends and keeps deciding dimming,
+strand colours and the VLAN tile's own link count exactly as before. Each
+end's list is read from that end's own port-VLAN data regardless of which
+side's neighbour walk actually found the cable, so the map can now show a
+VLAN a managed far end lists even before that far end has run its own
+neighbour walk — before this release the union only ever came from
+whichever end(s) had already walked LLDP/CDP, so a genuinely two-sided
+trunk could briefly read as one-sided (or VLAN-blind on that end) purely
+because its neighbour walk hadn't come round yet.
+
+**Nodes gets a "VLAN scan" button that reads every managed device now,
+not just one.** Sitting next to **Duplicates**, it queues the per-port
+VLAN walk on every enabled device in one click (`POST
+/api/nodes/vlan-scan`, needs Nodes write) rather than waiting for each
+device's own interval, or clicking **Poll now** one device at a time. A
+toast reports how many were queued and how many were already mid-walk; an
+Events line records the same breakdown ("VLAN scan requested: 12 device(s)
+queued, 2 already scanning, 3 skipped (VLAN walk off, SNMP off or down)"),
+and the click is written to the audit trail as `device.vlan_scan`. A
+device is skipped when its VLAN interval is switched off, SNMP is off, or
+it is down or currently failing — the same rules the scheduled VLAN walk
+already applies. A device already mid-scan is not queued a second time, so
+clicking the button again straight away re-queues nothing that is still
+running rather than piling walks up. With the poller stopped, the button's
+toast says so plainly rather than doing nothing silently.
+
+**Team.** Dora, the team's exploration step, now runs on Opus 5.5.
+Thing3 and Thing4 join as general-task teammates, copies of Thing1;
+Dingus3 and Dingus4 join as mechanical-task teammates, copies of Dingus1.
+
+Files: `netpath/mapper.py`, `netpath/nodepoll/poller.py`,
+`netpath/web/api/mapper.py`, `netpath/web/api/nodes.py`,
+`netpath/web/server.py`, `netpath/web/static/index.html`,
+`netpath/web/static/mapper.js`, `netpath/web/static/nodes.js`,
+`.claude/agents/dora.md`, `.claude/agents/thing3.md`,
+`.claude/agents/thing4.md`, `.claude/agents/dingus3.md`,
+`.claude/agents/dingus4.md`, `CLAUDE.md`, plus the accompanying tests.
 
 ### 5.60.0 — Every STP-blocked link on Mapper is now found: EtherChannel bundles, a per-VLAN scan that finishes, and a bridge-port fallback
 

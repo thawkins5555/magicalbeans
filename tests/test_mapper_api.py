@@ -120,6 +120,9 @@ try:
     service.nodes_db.replace_port_vlans(dev_a, [
         {"if_index": 1, "vlan": 10, "tagged": True},
         {"if_index": 1, "vlan": 20, "tagged": True}])
+    # B's own end of the A-B link gets its own VLAN, so a_vlans/b_vlans can be checked.
+    service.nodes_db.replace_port_vlans(dev_b, [
+        {"if_index": 2, "vlan": 30, "tagged": True}])
 
     service.nodes_db.replace_neighbors(dev_a, [
         # Matched, by sysName, to Switch B -- a real device-to-device link.
@@ -131,11 +134,14 @@ try:
          "chassis_id": "aa:bb:cc:00:11:22", "sys_name": "",
          "platform": "Some AP", "port_id": "eth0", "remote_address": "192.0.2.200"},
     ])
-    # B's own neighbour row, matched to Switch C -- so once A and B are both
-    # placed but C is not, "candidates" for this map has someone to offer
-    # under "neighbours" (seen from B) that isn't already on it.
+    # B's own neighbour rows: one back to Switch A (the reciprocal half of
+    # the same cable), one to Switch C -- so once A and B are both placed
+    # but C is not, "candidates" has someone to offer under "neighbours".
     service.nodes_db.replace_neighbors(dev_b, [
-        {"if_index": 3, "protocol": "lldp", "rem_index": "1",
+        {"if_index": 2, "protocol": "lldp", "rem_index": "1",
+         "chassis_id": "", "sys_name": "Switch A", "port_id": "Gi0/1",
+         "port_descr": "Gi0/1"},
+        {"if_index": 3, "protocol": "lldp", "rem_index": "2",
          "chassis_id": "", "sys_name": "Switch C", "port_id": "Gi0/1",
          "port_descr": "Gi0/1"},
     ])
@@ -208,12 +214,19 @@ try:
     check("now both ends are placed, the A-B link draws",
           status == 200 and len(payload["links"]) == 1, (status, payload))
     link = payload["links"][0] if status == 200 and payload["links"] else {}
-    check("...carrying the VLANs A's port reported",
-          sorted(link.get("vlans", [])) == [10, 20], link)
+    check("...carrying the union of VLANs both ports reported",
+          sorted(link.get("vlans", [])) == [10, 20, 30], link)
+    if link.get("a_device_id") == dev_a:
+        a_end_vlans, b_end_vlans = link.get("a_vlans"), link.get("b_vlans")
+    else:
+        a_end_vlans, b_end_vlans = link.get("b_vlans"), link.get("a_vlans")
+    check("...and each end's own VLANs are kept separate (a_vlans/b_vlans) "
+          "for VlanView's both-ends rule",
+          a_end_vlans == [10, 20] and b_end_vlans == [30], link)
     check("...and a render plan from mapper.render_plan",
           link.get("plan", {}).get("mode") in ("strands", "collapsed", "plain"), link)
-    check("the VLAN summary lists both VLANs with a link_count of 1 so far",
-          status == 200 and {v["vlan"] for v in payload["vlans"]} == {10, 20}
+    check("the VLAN summary lists all three VLANs with a link_count of 1 so far",
+          status == 200 and {v["vlan"] for v in payload["vlans"]} == {10, 20, 30}
           and all(v["link_count"] == 1 for v in payload["vlans"]), payload)
     check("nodes carry status/ip for a real device",
           status == 200 and next(n for n in payload["nodes"] if n["id"] == node_a)["ip"]
@@ -514,7 +527,8 @@ try:
     check("...with every key a discovered link carries also present, so a "
           "client that reads them blind does not throw",
           manual is not None and {"a_port", "b_port", "a_if_index", "b_if_index",
-                                  "vlans", "native_vlan", "seen_ts", "plan",
+                                  "vlans", "a_vlans", "b_vlans", "native_vlan",
+                                  "seen_ts", "plan",
                                   "a_media", "b_media", "fiber",
                                   "a_optic_mode", "b_optic_mode", "fiber_mode",
                                   "a_stp", "b_stp", "a_stp_vlans", "b_stp_vlans",
@@ -1326,8 +1340,13 @@ try:
     ab_link = next((l for l in payload.get("links", [])
                     if l.get("a_device_id") == dev_a and l.get("b_device_id") == dev_b),
                    None) if status == 200 else None
+    # dev_b's own VLAN 30 (its own port_vlans row, untouched here) still
+    # counts even though dev_b's reciprocal neighbour row was dropped at
+    # section 6b (line 338's replace_neighbors) -- assemble_links reads
+    # each end's own port_vlans by device/if_index, not only from a row
+    # that end itself walked.
     check("a VLAN aged to present=0 no longer draws on the A-B link",
-          ab_link is not None and ab_link.get("vlans") == [10], (status, ab_link))
+          ab_link is not None and ab_link.get("vlans") == [10, 30], (status, ab_link))
 
     # Now age VLAN 10 itself, not via present, but via staleness: seen_ts far
     # enough in the past to exceed stale_link_hours (24h default = 86400s),
@@ -1339,7 +1358,7 @@ try:
                     if l.get("a_device_id") == dev_a and l.get("b_device_id") == dev_b),
                    None) if status == 200 else None
     check("a present=1 but stale-by-seen_ts VLAN also stops drawing",
-          ab_link is not None and ab_link.get("vlans") == [], (status, ab_link))
+          ab_link is not None and ab_link.get("vlans") == [30], (status, ab_link))
     check("...and the link itself still draws (only its VLANs vanished, "
           "not the L2 link the neighbour row still confirms)",
           ab_link is not None, ab_link)

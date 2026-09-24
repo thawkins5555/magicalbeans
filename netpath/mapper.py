@@ -397,6 +397,8 @@ def _fold_name_matched(links_by_key: dict) -> None:
         target = min(candidates, key=lambda one: one["id"])
         target["protocols"] |= link["protocols"]
         target["vlans"] |= link["vlans"]
+        for end_key, vlan_set in link["end_vlans"].items():
+            target["end_vlans"].setdefault(end_key, set()).update(vlan_set)
         if target["native_vlan"] is None:
             target["native_vlan"] = link["native_vlan"]
         target["seen_ts"] = max(target["seen_ts"], link["seen_ts"])
@@ -466,6 +468,8 @@ def _fold_reciprocal_name_matched(links_by_key: dict) -> None:
         survivor["b_port"] = other["a_port"]
         survivor["protocols"] |= other["protocols"]
         survivor["vlans"] |= other["vlans"]
+        for end_key, vlan_set in other["end_vlans"].items():
+            survivor["end_vlans"].setdefault(end_key, set()).update(vlan_set)
         if survivor["native_vlan"] is None:
             survivor["native_vlan"] = other["native_vlan"]
         survivor["seen_ts"] = max(survivor["seen_ts"], other["seen_ts"])
@@ -547,8 +551,8 @@ def assemble_links(neighbour_rows, *, port_vlans, port_label, on_map, now,
     clock racing the first one).
 
     VLANs on a link are the UNION of what each end's OWN port reports
-    (`_port_vlans`, applied once per row to that row's local device/
-    if_index), never the intersection. A trunk is only really usable for a
+    (`_port_vlans`, applied per row to that row's local port and, where
+    the far port is resolved, to the far port too), never the intersection. A trunk is only really usable for a
     VLAN both ends allow, so intersection looks like the "more correct"
     answer -- but in practice one end very often has NO VLAN data at all
     (an unmanaged peer has no VLAN MIB to ask; plenty of managed devices
@@ -556,6 +560,14 @@ def assemble_links(neighbour_rows, *, port_vlans, port_label, on_map, now,
     set is the empty set. That would erase every VLAN on the link the
     moment either end is VLAN-blind, which is a strictly worse failure mode
     than occasionally showing a VLAN the far end happens not to carry.
+
+    `a_vlans`/`b_vlans` carry each end's OWN reported list (`None` when that
+    end reported no VLAN data at all) so VlanView can glow a link only when
+    the picked VLAN is on both ends; `vlans` stays the union above for
+    dimming, counts, strands and the pane. Each end's list is read from
+    `port_vlans` for that end's own device/if_index regardless of which end
+    the row was walked from, so a managed far end that has not (yet) walked
+    its own neighbours still shows its own VLANs.
     """
     port_vlans = port_vlans or {}
     links_by_key: dict = {}
@@ -645,13 +657,21 @@ def assemble_links(neighbour_rows, *, port_vlans, port_label, on_map, now,
                     "a_if_index": if_index, "b_device_id": b_device_id,
                     "b_peer_key": b_peer_key, "b_port": b_port, "b_if_index": b_if_index,
                     "protocols": set(), "unmanaged": unmanaged, "vlans": set(),
-                    "native_vlan": None, "seen_ts": seen_ts}
+                    "native_vlan": None, "seen_ts": seen_ts, "end_vlans": {}}
             links_by_key[key] = link
         link["protocols"].add(protocol)
         link["vlans"] |= set(a_vlans)
+        if a_vlans:
+            link["end_vlans"].setdefault((device_id, if_index), set()).update(a_vlans)
         if link["native_vlan"] is None and a_native is not None:
             link["native_vlan"] = a_native
         link["seen_ts"] = max(link["seen_ts"], seen_ts)
+
+        if matched_id is not None and b_if_index is not None:
+            b_vlans, _ = _port_vlans(port_vlans, matched_id, b_if_index)
+            if b_vlans:
+                link["vlans"] |= set(b_vlans)
+                link["end_vlans"].setdefault((matched_id, b_if_index), set()).update(b_vlans)
 
     _fold_name_matched(links_by_key)
     _fold_reciprocal_name_matched(links_by_key)
@@ -660,6 +680,12 @@ def assemble_links(neighbour_rows, *, port_vlans, port_label, on_map, now,
     for link in links_by_key.values():
         link["protocols"] = sorted(link["protocols"])
         link["vlans"] = sorted(link["vlans"])
+        end_vlans = link["end_vlans"]
+        a_key = (link["a_device_id"], link["a_if_index"])
+        b_key = (link["b_device_id"], link["b_if_index"])
+        link["a_vlans"] = sorted(end_vlans[a_key]) if a_key in end_vlans else None
+        link["b_vlans"] = sorted(end_vlans[b_key]) if b_key in end_vlans else None
+        del link["end_vlans"]
         links.append(link)
     return links, list(peers_by_key.values())
 

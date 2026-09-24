@@ -148,7 +148,7 @@ MUST_BE_GATED = {
     "disc-start": "nodes", "disc-promote": "nodes",
     "nd-add-profile": "nodes", "nd-edit-profile": "nodes",
     "nd-remove-profile": "nodes", "nd-default-profile": "nodes",
-    "nd-upload-mib": "nodes", "nd-resolve-all": "nodes",
+    "nd-upload-mib": "nodes", "nd-resolve-all": "nodes", "nd-vlan-scan": "nodes",
     "alerts-add-rule": "alerts", "alerts-edit-rule": "alerts",
     "alerts-remove-rule": "alerts", "alerts-add-template": "alerts",
     "alerts-edit-template": "alerts",
@@ -5936,6 +5936,48 @@ check("stp_via_if_index" in _IFACECOLUMNS127,
 _MAPPERAPI127 = python_function("web.api.mapper", "get_mapper_map")
 check("a_stp_via" in _MAPPERAPI127 and "b_stp_via" in _MAPPERAPI127,
       "get_mapper_map sets a_stp_via/b_stp_via on every link")
+
+# ---------------------------------------------------------------------------
+# 128. VlanView glows a link only when the picked VLAN is on BOTH ends
+#      (5.61.0): a one-sided link draws plain, and the tooltip/pane say
+#      which end carries it.
+_MAPPER128 = read("mapper.js")
+_DRAWLINK128 = js_function(_MAPPER128, "drawLink")
+check("vlanOnBothEnds(link, view.selectedVlan)" in _DRAWLINK128,
+      "drawLink's glow only fires when the picked VLAN is on both ends")
+_DRAWLEGEND128 = js_function(_MAPPER128, "drawLegend")
+check("on both ends" in _DRAWLEGEND128,
+      "the VlanView legend explains the both-ends rule")
+_LINKTOOLTIP128 = js_function(_MAPPER128, "linkTooltip")
+check("vlanEndsText(" in _LINKTOOLTIP128,
+      "linkTooltip shows where the picked VLAN sits on this link's ends")
+_LINKDETAILHTML128 = js_function(_MAPPER128, "linkDetailHtml")
+check("vlanEndsText(" in _LINKDETAILHTML128,
+      "linkDetailHtml shows where the picked VLAN sits on this link's ends")
+_VLANENDSTEXT128 = js_function(_MAPPER128, "vlanEndsText")
+check("esc(vlanDisplay(" in _VLANENDSTEXT128,
+      "vlanEndsText escapes the VLAN label (device-reported names reach the pane's HTML)")
+_MAPPERPY128 = python_text("mapper")
+check('"a_vlans"' in _MAPPERPY128,
+      "mapper.assemble_links sets a_vlans/b_vlans per end")
+_MAPPERAPIPY128 = python_text("web.api.mapper")
+check('"a_vlans": None' in _MAPPERAPIPY128,
+      "web.api.mapper's manual links carry a_vlans/b_vlans as None")
+
+# ---------------------------------------------------------------------------
+# 129. Global VLAN scan button on the Nodes toolbar (5.61.0): a gated button
+#      next to Duplicates that queues a VLAN scan on every managed device.
+check('<button id="nd-vlan-scan"' in INDEX,
+      "index.html has the VLAN scan button")
+NODES129 = read("nodes.js")
+_VLANSCAN129 = js_function(NODES129, "vlanScanNow")
+check("'/api/nodes/vlan-scan'" in _VLANSCAN129,
+      "vlanScanNow posts to the vlan-scan route")
+_SERVER_PY129 = python_text("web.server")
+check(r'("POST", r"^/api/nodes/vlan-scan$", api.post_nodes_vlan_scan, ("nodes", W)),'
+      in _SERVER_PY129,
+      "the vlan-scan route is wired to its handler with the same "
+      "('nodes', W) permission as bulk-poll")
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))

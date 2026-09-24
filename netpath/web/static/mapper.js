@@ -1138,6 +1138,12 @@
     return `var(--canvas-vlan-${((v && v.color_index) || 0) + 1})`;
   }
 
+  // An end with no VLAN data (null/empty) is skipped, so a blind peer never vetoes the known end.
+  function vlanOnBothEnds(link, vlan) {
+    const ends = [link.a_vlans, link.b_vlans].filter((v) => Array.isArray(v) && v.length);
+    return ends.every((v) => v.includes(vlan));
+  }
+
   function drawLink(layer, link, labelLayer = layer) {
     const a = linkNodeA(link), b = linkNodeB(link);
     if (!a || !b) return;   // an end not placed on THIS map: server already filters this out, belt-and-braces
@@ -1159,9 +1165,8 @@
     const selected = view.selectedLinkId === link.id;
     const dimmed = view.selectedVlan !== null
       && !(plan.vlans || []).includes(view.selectedVlan);
-    // A picked VLAN gets a steady halo under every link that carries it,
-    // FiberView on or off -- .dimmed already faded out the rest.
-    const glow = view.selectedVlan !== null && !dimmed && (plan.vlans || []).length > 0;
+    // Halo only when BOTH ends carry the picked VLAN; one-sided draws plain, .dimmed fades the rest.
+    const glow = view.selectedVlan !== null && !dimmed && vlanOnBothEnds(link, view.selectedVlan);
     // opts.focusable (default true) and opts.ariaLabel/opts.tooltip (default
     // the whole-link text) let the strands branch below give every strand
     // its OWN name and tooltip while keeping only one of them in the Tab
@@ -1508,6 +1513,22 @@
     return `STP: no state read on ${who.join(', ')}`;
   }
 
+  // VlanView's pane line: callers only reach this once the VLAN is on at least one end.
+  function vlanEndsText(link, vlan, esc = (x) => x) {
+    const a = esc(resolveNode(linkNodeA(link)).name);
+    const b = esc(resolveNode(linkNodeB(link)).name);
+    const hasA = Array.isArray(link.a_vlans) && link.a_vlans.length > 0;
+    const hasB = Array.isArray(link.b_vlans) && link.b_vlans.length > 0;
+    const onA = hasA && link.a_vlans.includes(vlan);
+    const onB = hasB && link.b_vlans.includes(vlan);
+    const label = esc(vlanDisplay(vlan));
+    if (onA && onB) return `VLAN ${label}: on both ends`;
+    const [name, port, other, otherHas] = onA
+      ? [a, link.a_port, b, hasB] : [b, link.b_port, a, hasA];
+    const base = `VLAN ${label}: on ${name} (${esc(port || '—')})`;
+    return otherHas ? `${base} only` : `${base}; ${other} reports no VLAN data`;
+  }
+
   // null, not an empty Map: a link with nothing blocked leaves its list
   // neutral rather than painting every row green for no reason. Each end's
   // ids count only while that end itself blocks, the footer's own gate.
@@ -1576,6 +1597,9 @@
     if (fiberText) lines.push(fiberText);
     const stpText = stpBlockingText(link, a, b) || stpIdleText(link, a, b);
     if (stpText) lines.push(stpText);
+    if (view.selectedVlan !== null && (plan.vlans || []).includes(view.selectedVlan)) {
+      lines.push(vlanEndsText(link, view.selectedVlan));
+    }
     return lines.join('\n');
   }
 
@@ -2374,8 +2398,8 @@
     const hasLinks = view.links.length > 0;
     let text = '';
     if (view.selectedVlan !== null) {
-      text = `VlanView: links carrying VLAN ${vlanDisplay(view.selectedVlan)} glow in its colour; ` +
-        'the rest are dimmed. ';
+      text = `VlanView: links carrying VLAN ${vlanDisplay(view.selectedVlan)} on both ends glow in ` +
+        'its colour; a link carrying it on one end only draws plain; the rest are dimmed. ';
     }
     if (view.fiberView && hasFiber) {
       text += 'FiberView: dark orange = multimode, bright yellow = single-mode, ' +
@@ -2812,6 +2836,9 @@
     const stpText = stpBlockingText(link, escape(a.name), escape(b.name), escape, false)
       || stpIdleText(link, escape(a.name), escape(b.name), escape);
     if (fiberText || stpText) lines.push('', ...[fiberText, stpText].filter(Boolean));
+    if (view.selectedVlan !== null && (plan.vlans || []).includes(view.selectedVlan)) {
+      lines.push('', vlanEndsText(link, view.selectedVlan, escape));
+    }
     lines.push('', `Last seen   ${escape(App.ago(link.seen_ts))}`);
     return lines.join('\n');
   }

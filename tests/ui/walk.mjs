@@ -434,6 +434,32 @@ async function waitForStpVlanStrandsLink(page, mapId) {
   }
 }
 
+async function waitForVlanBothEndsLink(page, mapId) {
+  // Deterministic wait for the map JSON to carry a_vlans/b_vlans (5.61.0)
+  // non-empty on both ends of some link: assemble_links now fills a link's
+  // far end from its own port_vlans rows even without a neighbour row from
+  // that side, so any access uplink satisfies this once a VLAN scan has
+  // walked both switches. With a scan running fleet-wide, absence after the
+  // deadline is a real defect, not timing luck.
+  const origin = new URL(page.url()).origin;
+  const started = Date.now();
+  const deadline = started + 180000;
+  const aKnown = (l) => Array.isArray(l.a_vlans) && l.a_vlans.length > 0;
+  const bKnown = (l) => Array.isArray(l.b_vlans) && l.b_vlans.length > 0;
+  for (;;) {
+    const res = await page.request.get(`${origin}/api/mapper/maps/${mapId}`);
+    const links = res.ok() ? (await res.json()).links || [] : [];
+    const bothEndsKnown = links.filter((l) => aKnown(l) && bKnown(l)).length;
+    if (bothEndsKnown > 0) return { present: true, links };
+    if (Date.now() >= deadline) {
+      const oneEndKnown = links.filter((l) => aKnown(l) !== bKnown(l)).length;
+      return { present: false, total: links.length, oneEndKnown, bothEndsKnown,
+               waited_s: Math.round((Date.now() - started) / 1000) };
+    }
+    await sleep(3000);
+  }
+}
+
 async function waitForBundleViaLink(page, mapId) {
   // 5.60.0 EtherChannel demo (demo/personas.py's acc-sw-006 fixture,
   // reusing its "wrap32" SPECIALS slot): the second uplink's STP state now
@@ -1733,6 +1759,164 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       return `${strands.length} strand(s) on link ${linkId}, only VLAN 30's carries .blocking`;
     });
 
+  await check('Mapper: VlanView glows only when the picked VLAN is on both ends, '
+    + 'one-sided links draw plain (5.61.0)',
+    async () => {
+      await page.keyboard.press('Escape').catch(() => {});
+      await selectTab(page, 'mapper');
+      await settle(page, 1000);
+      const mapId = await page.evaluate(() => {
+        const sel = document.getElementById('mp-map');
+        return sel && sel.value ? sel.value : null;
+      });
+      if (!mapId) return 'skipped: no map selected on the demo Mapper';
+      const origin = new URL(page.url()).origin;
+
+      // Each device's own first VLAN walk otherwise lands at a random point
+      // inside its 3600s interval (_maybe_walk_vlans) -- queue a scan on
+      // every device up front. Same fetch shape app.js's App.post/call use:
+      // JSON content type, no extra headers.
+      const scan = await page.evaluate(async () => {
+        const res = await fetch('/api/nodes/vlan-scan', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({}),
+        });
+        const payload = await res.json().catch(() => ({}));
+        return { status: res.status, payload };
+      });
+      assert(scan.status === 200,
+        `expected 200 from POST /api/nodes/vlan-scan, got ${scan.status}: `
+        + `${JSON.stringify(scan.payload)}`);
+      assert((scan.payload.queued || 0) + (scan.payload.already_running || 0) > 0,
+        `expected the VLAN scan to queue or already be running on some device, got `
+        + `${JSON.stringify(scan.payload)}`);
+
+      // With a scan running fleet-wide, no link ever reaching both ends known
+      // is a real defect, not timing -- fail rather than skip.
+      const gate = await waitForVlanBothEndsLink(page, mapId);
+      assert(gate.present,
+        `expected some link to have both ends known after ${gate.waited_s}s of scanning `
+        + `(${gate.total} link(s), ${gate.oneEndKnown} with one end known, `
+        + `${gate.bothEndsKnown} with both ends known)`);
+
+      await Promise.all([
+        page.waitForResponse((r) => /\/api\/mapper\/maps\/\d+$/.test(
+          new URL(r.url()).pathname) && r.request().method() === 'GET',
+          { timeout: 20000 }).catch(() => {}),
+        page.click('#mp-refresh'),
+      ]);
+      await settle(page, 1000);
+
+      // "VLANs on this map" rows are tr.clickable; the swatch is the first
+      // cell (data-vlan-swatch), so click via the row itself, same as
+      // drawVlanTable's own tr.onclick.
+      const clickVlanRow = (vlan) => page.evaluate((v) => {
+        const rows = [...document.querySelectorAll('#mapper-vlan-table tbody tr.clickable')];
+        const row = rows.find((tr) => tr.children[1] && tr.children[1].textContent.trim() === String(v));
+        if (row) row.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      }, vlan);
+      const glowUnderlays = () => page.evaluate(() =>
+        document.querySelectorAll('#mp-svg path.mp-vlan-view').length);
+
+      // The link set grows in bursts mid-walk (core-sw-01's own neighbour
+      // walk lands ~20 links at once), so a payload read taken once at the
+      // top of the check goes stale by the time the row is clicked -- read
+      // the DOM and the payload back-to-back right after each click and
+      // compare per link id, dropping ids the other side doesn't have yet.
+      const snapshotVlan = async (vlan) => {
+        const dom = await page.evaluate(() => {
+          const seen = new Map();
+          for (const p of document.querySelectorAll('#mp-svg path.mp-link[data-link-id]')) {
+            if (p.classList.contains('mp-vlan-view')) continue;
+            const id = p.dataset.linkId;
+            if (seen.has(id)) continue;
+            seen.set(id, {
+              dimmed: p.classList.contains('dimmed'),
+              glow: !!p.parentElement.querySelector('path.mp-vlan-view'),
+            });
+          }
+          return [...seen.entries()];
+        });
+        const map = await page.request.get(`${origin}/api/mapper/maps/${mapId}`);
+        const payloadLinks = map.ok() ? (await map.json()).links || [] : [];
+        const byId = new Map(payloadLinks.map((l) => [String(l.id), l]));
+        // Mirrors mapper.js's vlanOnBothEnds.
+        const bothEnds = (link, v) => [link.a_vlans, link.b_vlans]
+          .filter(Array.isArray).filter((x) => x.length).every((x) => x.includes(v));
+        const mismatches = [];
+        let compared = 0, glowing = 0, oneSided = 0, dimmedCount = 0, firstOneSided = null;
+        for (const [id, state] of dom) {
+          const link = byId.get(id);
+          if (!link) continue;
+          compared += 1;
+          const expectGlow = bothEnds(link, vlan);
+          const expectDimmed = !(Array.isArray(link.vlans) && link.vlans.includes(vlan));
+          if (state.glow) glowing += 1;
+          if (state.dimmed) dimmedCount += 1;
+          if (!state.glow && !state.dimmed) {
+            oneSided += 1;
+            if (firstOneSided === null) firstOneSided = id;
+          }
+          if (state.glow !== expectGlow || state.dimmed !== expectDimmed) {
+            mismatches.push({ id, a_vlans: link.a_vlans, b_vlans: link.b_vlans,
+                               glow: state.glow, dimmed: state.dimmed });
+          }
+        }
+        return { compared, glowing, oneSided, dimmed: dimmedCount, mismatches, firstOneSided };
+      };
+
+      await clickVlanRow(20);
+      await settle(page, 800);
+      const snap20 = await snapshotVlan(20);
+      assert(snap20.mismatches.length === 0,
+        `VLAN 20 per-link mismatch(es): ${JSON.stringify(snap20.mismatches)}`);
+      assert(snap20.glowing >= 1,
+        `expected at least one link to glow for VLAN 20, compared ${snap20.compared} link(s)`);
+      const legendText20 = await page.evaluate(() =>
+        (document.getElementById('mp-legend') || {}).textContent || '');
+      assert(legendText20.includes('on both ends'),
+        `expected the legend to mention "on both ends", got: ${legendText20}`);
+
+      // Clear the VlanView selection and confirm the glow underlay is gone.
+      await clickVlanRow(20);
+      await settle(page, 1000);
+      const remaining20 = await glowUnderlays();
+      assert(remaining20 === 0, `expected no .mp-vlan-view underlays after clearing, got ${remaining20}`);
+
+      await clickVlanRow(30);
+      await settle(page, 800);
+      const snap30 = await snapshotVlan(30);
+      assert(snap30.mismatches.length === 0,
+        `VLAN 30 per-link mismatch(es): ${JSON.stringify(snap30.mismatches)}`);
+      assert(snap30.oneSided >= 1,
+        `expected at least one one-sided link (neither dimmed nor glowing) for VLAN 30, `
+        + `compared ${snap30.compared} link(s)`);
+      assert(snap30.dimmed >= 1,
+        `expected at least one dimmed link for VLAN 30, compared ${snap30.compared} link(s)`);
+      assert(snap30.firstOneSided !== null,
+        'expected a one-sided VLAN 30 link present in both the DOM and the map payload');
+
+      await page.evaluate((id) => {
+        const p = document.querySelector(`#mp-svg path.mp-link[data-link-id="${id}"]:not(.mp-vlan-view)`);
+        if (p) p.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      }, snap30.firstOneSided);
+      await page.waitForFunction(() => {
+        const pane = document.getElementById('mp-detail');
+        return !!pane && /VLAN 30( \([^)]*\))?: on .* only/.test(pane.textContent);
+      }, null, { timeout: 10000 }).catch(() => {});
+      const paneText30 = await page.evaluate(() => (document.getElementById('mp-detail') || {}).innerText || '');
+      assert(/VLAN 30( \([^)]*\))?: on .* only/.test(paneText30),
+        `expected the pane to read "VLAN 30 (name): on ... only", got: ${paneText30.slice(0, 400)}`);
+
+      await clickVlanRow(30);
+      await settle(page, 1000);
+
+      return `VLAN 20: ${snap20.compared} link(s) compared, ${snap20.glowing} glowing; `
+        + `VLAN 30: ${snap30.compared} compared, ${snap30.glowing} glowing, `
+        + `${snap30.oneSided} one-sided, ${snap30.dimmed} dimmed`;
+    });
+
   await check('Mapper: a non-blocking link\'s pane reads "STP: forwarding on both ends", '
     + 'and the bundle demo\'s link (if present) names its via port (5.60.0)',
     async () => {
@@ -2199,6 +2383,28 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       await page.click('#modal:not([hidden]) .modal-buttons button');
       await page.waitForSelector('#modal[hidden]', { timeout: 10000 }).catch(() => {});
       return 'Duplicates dialog carries the own-interfaces scope note';
+    });
+
+  await check('the VLAN scan button queues a scan on every managed device',
+    async () => {
+      await page.keyboard.press('Escape').catch(() => {});
+      await selectTab(page, 'nodes');
+      await settle(page, 800);
+      await page.click('#nd-vlan-scan');
+      await page.waitForFunction(
+        () => document.getElementById('nd-vlan-scan').textContent !== 'Scanning…',
+        { timeout: 15000 });
+      const result = await page.evaluate(() => ({
+        disabled: document.getElementById('nd-vlan-scan').disabled,
+        label: document.getElementById('nd-vlan-scan').textContent,
+        toast: (document.querySelector('.toast.ok, .toast.fail') || {}).textContent || null,
+      }));
+      assert(!result.disabled, 'VLAN scan button did not re-enable once settled');
+      assert(!(result.toast && /Could not start the VLAN scan/.test(result.toast)),
+        `VLAN scan failed to start: ${result.toast}`);
+      assert(result.toast || /queued|already scanning|Nothing to scan/i.test(result.label),
+        `VLAN scan gave neither a toast nor a recognizable label: label="${result.label}"`);
+      return `VLAN scan label: "${result.label}"${result.toast ? `, toast: "${result.toast}"` : ''}`;
     });
 
   await check('the Addresses subtab explains which addresses it holds',

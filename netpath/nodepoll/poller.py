@@ -722,6 +722,27 @@ class NodePoller(Worker, DiscoveryMixin, PollMixin, VendorIdentifyMixin, Environ
             self._walk_now(device_id)
         return self._submit(device_id)
 
+    def _queue_walk(self, device_id: int, interval: float, running: set,
+                    next_walk: dict, run_fn, now: float) -> bool:
+        """Queues one walk on `self._mac_executor` if its interval is on and
+        no walk for this device is already in `running`. True when queued,
+        False when the interval is off, the device is already in flight, or
+        the submit itself failed (the in-flight mark is then undone)."""
+        if interval <= 0:
+            return False
+        with self._lock:
+            if device_id in running:
+                return False
+            running.add(device_id)
+        next_walk[device_id] = now + interval
+        try:
+            self._mac_executor.submit(run_fn, device_id)
+        except (RuntimeError, AttributeError):
+            with self._lock:
+                running.discard(device_id)
+            return False
+        return True
+
     # Same in-flight guard/executor as the scheduled MAC/VLAN/ARP walks.
     def _walk_now(self, device_id: int) -> None:
         device = self.db.device(device_id)
@@ -748,18 +769,33 @@ class NodePoller(Worker, DiscoveryMixin, PollMixin, VendorIdentifyMixin, Environ
             # a setting to read directly.
             interval = (interval_key(config) if callable(interval_key)
                        else float(config.get(interval_key) or 0))
-            if interval <= 0:
+            self._queue_walk(device_id, interval, running, next_walk, run_fn, now)
+
+    def walk_vlans_now(self) -> dict:
+        """The fleet-wide VLAN scan button: queues a VLAN walk for every
+        enabled device with the walk on, reachable and not already walking.
+        A device stays in `_vlan_running` from queue to finish, so a second
+        click before the first round completes re-queues nothing pending."""
+        if self._mac_executor is None:
+            return {"running": False, "queued": 0, "already_running": 0, "skipped": 0}
+        now = time.time()
+        configs = self.db.effective_configs()
+        queued = already_running = skipped = 0
+        for row in self.db.schedule_rows():
+            config = configs.get(row["id"])
+            interval = float(config.get("vlan_interval_s") or 0) if config else 0
+            if (config is None or interval <= 0
+                    or not config.get("snmp_enabled", True)
+                    or row["status"] == "down" or row["consecutive_fail"]):
+                skipped += 1
                 continue
-            with self._lock:
-                if device_id in running:
-                    continue
-                running.add(device_id)
-            next_walk[device_id] = now + interval
-            try:
-                self._mac_executor.submit(run_fn, device_id)
-            except (RuntimeError, AttributeError):
-                with self._lock:
-                    running.discard(device_id)
+            if self._queue_walk(row["id"], interval, self._vlan_running,
+                                self._next_vlan_walk, self._run_vlan_table, now):
+                queued += 1
+            else:
+                already_running += 1
+        return {"running": True, "queued": queued,
+               "already_running": already_running, "skipped": skipped}
 
     def set_focus(self, device_id: int, ttl_s: float, interval_s: float) -> None:
         """The device a browser has selected polls at interval_s until the

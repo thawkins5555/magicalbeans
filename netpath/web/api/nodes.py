@@ -1698,6 +1698,20 @@ def post_nodes_devices_bulk_poll(service, params, body) -> dict:
     return {"ok": True, "queued": queued, "already_polling": busy, "missing": missing}
 
 
+def post_nodes_vlan_scan(service, params, body) -> dict:
+    """The Nodes toolbar's "VLAN scan" button: a VLAN-only walk of every
+    managed device, queued through the poller."""
+    if not service.node_poller.running:
+        raise ValueError("Start the poller to run a VLAN scan")
+    counts = service.node_poller.walk_vlans_now()
+    queued, already, skipped = counts["queued"], counts["already_running"], counts["skipped"]
+    service.log.add(NODES_CATEGORY,
+                    f"VLAN scan requested: {queued} device(s) queued, {already} already "
+                    f"scanning, {skipped} skipped (VLAN walk off, SNMP off or down)")
+    _audit(service, params, "device.vlan_scan", target=f"{queued} devices")
+    return {"ok": True, "queued": queued, "already_running": already, "skipped": skipped}
+
+
 def post_nodes_device_focus(service, params, body, device_id) -> dict:
     """The browser renews this every refresh tick while the device is
     selected on the Nodes tab; the short TTL means fast polling lapses on

@@ -4852,6 +4852,77 @@ pre-seeded) is not started a second time, and a plain `poll_now(device_id)`
 call with `walks` left at its default starts none of the three — the
 shape every non-button caller (bulk import, the trap re-read) uses.
 
+### Nodes toolbar "VLAN scan": a fleet-wide VLAN walk on demand (`nodepoll/poller.py`, `web/api/nodes.py`, `web/server.py`) — 5.61.0
+
+**`_queue_walk` is `_walk_now`'s per-walk body, pulled out so a second
+caller can reuse it.** `_walk_now`'s loop body — the interval guard, the
+`_lock`-guarded in-flight check, stamping `next_walk[device_id] = now +
+interval`, and the submit with its `RuntimeError`/`AttributeError`
+unwind — is now `_queue_walk(device_id, interval, running, next_walk,
+run_fn, now) -> bool`, True when it actually queued the walk, False when
+the interval is off, the device is already in `running`, or the submit
+itself failed (the in-flight mark is undone; `walk_vlans_now` counts that
+one-tick race as `already_running`). `_walk_now`
+calls it once per walk with its own tuple's `running`/`next_walk`/
+`run_fn`, behaviour unchanged; `tests/test_poll_now_walks.py` stays green
+against it untouched.
+
+**`walk_vlans_now(self) -> dict`** is the VLAN scan button's poller side:
+one VLAN-only walk of every enabled device, using `_queue_walk` against
+the scheduler's own `_vlan_running`/`_next_vlan_walk`/`_run_vlan_table`.
+With `_mac_executor` `None` (the poller stopped) it returns all-zero
+counts and `"running": False` without looking at a single device (the
+API checks `node_poller.running` first and answers 400 before calling
+it, so this is the belt to that brace). Otherwise it reads `self.db.schedule_rows()`
+(enabled devices, not being purged) and one `self.db.effective_configs()`
+call rather than one config lookup per device, and applies `_maybe_walk_
+vlans`'s own skip rule to each: `vlan_interval_s <= 0`, SNMP off, or the
+device down or currently failing, all count as `skipped`; otherwise
+`_queue_walk` decides `queued` or `already_running`. The result is
+`{"running": True, "queued", "already_running", "skipped"}` — one
+`skipped` bucket covers every reason a device did not run, since the
+button's toast only ever needs the count, not which rule fired.
+
+**Why a second click is safe.** A device stays in `_vlan_running` from
+the moment it is queued until its walk actually finishes — the same
+guard the scheduled cadence and `_walk_now` already share — so calling
+`walk_vlans_now` again before the first round completes re-queues
+nothing still pending; it just moves those devices from `queued` to
+`already_running` in the count. The walk pool's own worker count (4 by
+default) is what actually paces how many switches are read at once; a
+fleet-wide click enqueues a burst, it does not run one.
+
+**`post_nodes_vlan_scan` (`web/api/nodes.py`)** raises `ValueError`
+("Start the poller to run a VLAN scan") when `service.node_poller.
+running` is False — the same 400 path every other validation error in
+this API takes — otherwise calls `walk_vlans_now()`, writes one Events
+line naming all three counts ("VLAN scan requested: 12 device(s)
+queued, 2 already scanning, 3 skipped (VLAN walk off, SNMP off or
+down)"), records an audit row `device.vlan_scan` targeting `"<queued>
+devices"` (the same shape a bulk delete's audit row uses), and returns
+`{"ok": True, "queued", "already_running", "skipped"}`. Routed at `POST
+/api/nodes/vlan-scan` beside bulk-poll in `web/server.py`, gated
+`("nodes", W)` — the same write permission Poll now and bulk-poll
+already require.
+
+**Tests.** `tests/test_vlan_scan_now.py` (fixture copied from `tests/
+test_poll_now_walks.py`) drives `walk_vlans_now` directly: one normal
+device queued and its `_next_vlan_walk` stamped, an interval-off and a
+down device both `skipped`, a device pre-seeded into `_vlan_running`
+read as `already_running`, a disabled device counted nowhere at all, a
+second call straight after queuing nothing new, and `_mac_executor is
+None` giving all zeros with `running: False`; a separate case confirms
+`_walk_now` still queues all four of its walks (mac, vlan, arp,
+stp_vlan) after the `_queue_walk` extraction. `tests/
+test_vlan_scan_api.py` (fixture copied from `tests/test_bulk_import.py`)
+spies on `walk_vlans_now`, checking the admin POST returns 200 with the
+spy's counts, the spy is called exactly once, the Events log carries
+the line, the audit row lands, a nodes-read-only account gets 403, and
+the poller-stopped case answers 400 naming the poller. `tests/
+test_frontend_contracts.py` pins `nd-vlan-scan` in `MUST_BE_GATED` and,
+section 129, the button's id, `vlanScanNow`, the `/api/nodes/vlan-scan`
+route in `nodes.js` and its wiring in `server.py`.
+
 ### Cisco fan state: `FAN_TABLES` (`nodeoids.py`, `nodepoll/vendor_sensor_psu_mixin.py`, `web/api/nodes.py`, `alertrules.py`, `alertsdb.py`) — 5.33.0
 
 `nodeoids.FAN_TABLES` is keyed by enterprise arc (9, Cisco only) to a pair
@@ -7258,6 +7329,89 @@ and `a_stp_via`/`b_stp_via` in `get_mapper_map`. `tests/ui/walk.mjs`
 checks that, on acc-sw-005's trunk, only the VLAN 30 strand carries
 `.blocking`, and that a non-blocking link's pane reads "STP: forwarding
 on both ends".
+
+### VlanView glows a link only when the picked VLAN is on both ends (`mapper.py`, `web/api/mapper.py`, `mapper.js`) — 5.61.0
+
+`assemble_links` already unions each end's own port VLAN list into one
+`link["vlans"]` (see "VLANs on a link are the union..." above) precisely
+because an intersection would erase every VLAN the moment either end is
+VLAN-blind. That union alone gives `mapper.js` no way to tell a link
+carrying a VLAN on both ends from one carrying it on only one, so the
+5.59.0 glow lit both cases identically. The fix keeps `vlans` exactly as
+it was and adds a second, per-end view of the same data.
+
+**`end_vlans`, a scratch dict, is built alongside `vlans` and thrown away
+before the link is returned.** Keyed `(device_id, if_index)`, each row
+with a non-empty `a_vlans` does `link["end_vlans"].setdefault(key,
+set()).update(a_vlans)`; an empty `a_vlans` updates nothing, which is
+what keeps "this end reported VLANs, just not this one" distinguishable
+from "this end has never reported any VLAN data at all". `_fold_name_
+matched` and `_fold_reciprocal_name_matched` merge `end_vlans` per key
+the same way they already merge `vlans`, so a link folded from two
+neighbour rows (sysName-matched, or a reciprocal fold with no `matched_
+if_index` on either side) still keeps both ends' own lists straight
+rather than losing one side to the merge. In the output loop, `a_vlans`
+is `sorted(end_vlans[a_key])` when that key was ever recorded, else
+`None`; `b_vlans` the same for the b-end's key; `end_vlans` itself is
+popped before the link is appended, so it never reaches the API or the
+browser. A manual link (`web/api/mapper.py`'s `_mapper_add_manual_links`)
+sets both to `None` outright — it has no port data on either end.
+
+**The far end's own VLANs are read directly, not only from its own
+neighbour row.** For a row with a resolved far-end if_index (`matched_id`
+and a known `b_if_index`, whether from `matched_if_index` or a
+port-name-resolved index), `assemble_links` also calls `_port_vlans(port_
+vlans, matched_id, b_if_index)` and folds the result into both `vlans`
+and `end_vlans[(matched_id, b_if_index)]`. Before this, a link's per-end
+(and union) VLAN data came only from rows this pass actually walked from
+each side, so a managed far end read as VLAN-blind — "reports no VLAN
+data" on the pane — until its own neighbour walk happened to run (staggered
+randomly inside the LLDP interval); now its own `port_vlans` rows show up
+immediately, on the very first pass that sees the cable from either end.
+`native_vlan` is unaffected by this and still comes only from whichever
+row's own `a_native` was set — the far-end lookup discards its own native
+VLAN reading (`_port_vlans`'s second return value) rather than folding it
+in, since a link's native VLAN has always meant "whichever end answered
+first," not "the far end specifically."
+
+**`vlanOnBothEnds(link, vlan)` (`mapper.js`) is the whole predicate:**
+filter `[link.a_vlans, link.b_vlans]` down to the ends that are a
+non-empty array (a blind or unmanaged end drops out here, before the
+check runs), then require every surviving end's list to include the
+picked VLAN. `drawLink`'s `glow` becomes `view.selectedVlan !== null &&
+!dimmed && vlanOnBothEnds(link, view.selectedVlan)` — `!dimmed` already
+guarantees at least one end lists the VLAN, so a one-sided link (one
+end lists it, the other doesn't) is neither glowed nor dimmed: it draws
+plain, which is the point. `drawLegend` states the rule in the VlanView
+line. `vlanEndsText(link, vlan, esc)`, called from `linkTooltip` and
+`linkDetailHtml` only once the link is known not to be dimmed, works out
+which of the three lines applies — both ends list it, one end only (and
+names the other end's own reported list to say so), or one end only
+because the other end has never reported any VLAN data — with every
+device name run through `esc`.
+
+**Tests.** `tests/test_mapper_links.py`'s VLAN-union block gains checks
+for `a_vlans`/`b_vlans` on the two-ended case, the one-sided case (the
+reporting end's list, `None` on the silent one, not an empty list), and
+a reciprocal sysName-only fold (both ends' own lists survive the merge).
+`tests/test_mapper_api.py` seeds VLANs on both ends of the same
+discovered link and checks `a_vlans`/`b_vlans` independently of the
+union; the manual-link key-pin check gains both keys. `tests/
+test_frontend_contracts.py` section 128 pins `vlanOnBothEnds` in
+`drawLink`, `"on both ends"` in `drawLegend`, `vlanEndsText` in
+`linkTooltip`/`linkDetailHtml`, and `"a_vlans"` in both `mapper.py` and
+the manual-link dict in `web/api/mapper.py`. `tests/ui/walk.mjs`'s
+"Mapper: VlanView glows only when the picked VLAN is on both ends,
+one-sided links draw plain" check drives this against the demo fleet's
+real trunk lists rather than a staged fixture: it POSTs `/api/nodes/
+vlan-scan` itself so it isn't waiting out every device's own random
+first-due walk, waits for the map to report at least one link with both
+ends known, then checks VLAN 20 (present on both ends of every access
+uplink, since the core answers (10, 20) and every default closet answers
+(10, 20, 30)) for the glow count, and VLAN 30 (on the access end only,
+for any switch still on the default trunk list) for a plain, undimmed
+link whose pane reads "VLAN 30 (guest): on `<switch>` ... only" — plus a
+dimmed link that carries neither.
 
 ### Notes: `map_notes` (`mapperdb.py`, `web/api/mapper.py`, `mapper.js`, `app.css`) — 5.38.0
 

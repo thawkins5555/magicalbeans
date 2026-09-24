@@ -2104,6 +2104,16 @@ evidence, since 5.27.0, that ever made two devices look like one.
   and the dialog says so; from 5.29.0 there is nothing else in a
   device's address list to confuse this with. Nothing is fetched for it
   until it is opened, and nothing is ever merged automatically.
+- **From 5.61.0, a "VLAN scan" button next to Duplicates reads VLANs,
+  trunk modes and port memberships from every managed device right
+  now**, rather than waiting for each device's own interval to come
+  round or clicking Poll now one device at a time. A toast reports how
+  many devices were queued and how many were already mid-scan; a device
+  whose VLAN interval is off, whose SNMP is off, or that is down is
+  skipped, and a device already scanning is never queued a second time —
+  clicking it again straight away just reports what is still running.
+  Needs Nodes write; with the poller stopped it says so instead of doing
+  nothing.
 - **Merging is an operator's decision, previewed first.** Opening a pair
   shows which row survives (swap it if the suggestion is wrong) and
   exactly what the merge would move: addresses, event history, upstream
@@ -4699,23 +4709,34 @@ like any other module.
   own VLAN — the wide target only catches the narrow gaps and margin
   between them that used to be impossible to land a cursor on.
 - **Clicking a row in the VLANs-on-this-map table picks that VLAN out on
-  the canvas — VlanView.** Every other link dims, and, from 5.59.0, every
-  link that actually carries the picked VLAN gets a steady glow in that
-  VLAN's own colour, the same colour its table row swatches — so the path
-  a VLAN takes across the map reads at a glance instead of being read off
-  the dimming alone. The glow works whether FiberView is ticked or not,
-  and is carried through in **Export PNG**. Click the same row again, or
-  any other VLAN row, to change or clear the pick.
+  the canvas — VlanView.** Every other link dims, and every link that
+  carries the picked VLAN gets a steady glow in that VLAN's own colour,
+  the same colour its table row swatches — so the path a VLAN takes
+  across the map reads at a glance instead of being read off the dimming
+  alone. **From 5.61.0, the glow only lights a link when the VLAN is on
+  BOTH of its interfaces**, not just one — a link carrying it on one end
+  only draws plain instead of glowing, and an end with no VLAN data at
+  all (an unmanaged peer, or a switch that has never answered a VLAN
+  walk) does not stop the other end's glow. Opening a link, or hovering
+  it, while a VLAN is picked adds a line saying exactly where that VLAN
+  sits: "VLAN 30 (guest): on both ends", "VLAN 30 (guest): on acc-sw-004 (Gi1/0/49)
+  only", or "VLAN 30 (guest): on acc-sw-004 (Gi1/0/49); core-sw-01 reports no
+  VLAN data" — so a plain link's cause is never a guess. The glow works
+  whether FiberView is ticked or not, and is carried through in **Export
+  PNG**. Click the same row again, or any other VLAN row, to change or
+  clear the pick.
 - **The legend above the canvas.** If two placed devices have no CDP/LLDP
   adjacency between them at all, it says so plainly rather than leaving an
   operator to wonder whether the link is missing by mistake or because
   nothing has been seen. With FiberView ticked and a fiber link on the
   map, it spells out FiberView's own colour key: dark orange for
   multimode, bright yellow for single-mode, dotted red for a single/
-  multimode mismatch. **From 5.59.0, a picked VLAN adds its own line** —
-  "VlanView: links carrying VLAN 20 (Engineering) glow in its colour; the
-  rest are dimmed." — naming the VLAN so a colour-blind viewer or a screen
-  reader gets the same fact a sighted viewer reads off the glow.
+  multimode mismatch. **From 5.59.0, a picked VLAN adds its own line**,
+  naming the VLAN so a colour-blind viewer or a screen reader gets the
+  same fact a sighted viewer reads off the glow; **from 5.61.0 it also
+  spells out the both-ends rule** — "VlanView: links carrying VLAN 20 on
+  both ends glow in its colour; a link carrying it on one end only draws
+  plain; the rest are dimmed."
   **From 5.39.0, the legend no longer explains what a
   dashed or dotted line means** — the "Trunks of N+ VLANs draw as one
   thick line… / a dashed line means no VLAN data… / a dotted line means
