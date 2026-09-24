@@ -575,27 +575,83 @@ strands only some of which you'd expect to be dotted shows none dotted at
 all.
 
 **First, open the link and read its STP line.** Click the link; the detail
-pane (and the hover tooltip) always carries one STP line as of 5.60.0:
+pane (and the hover tooltip) always carry one STP line. As of 5.62.0 that
+line names the exact reason whenever it isn't a clean "blocking" or
+"forwarding" result — you should not need this runbook to work out why a
+link isn't dotted, only to know what to do about the reason it gives:
 
 - **"STP: blocking on `<switch>` (`<port>`)"** — it is drawn dotted; if a
   trunk's strands aren't, only the VLANs actually named as blocking dot
-  (from 5.60.0) — check the blocked-VLAN list above it for which ones.
+  (from 5.60.0) — check the blocked-VLAN list above it for which ones. A
+  `broken` port (from 5.62.0, BPDU-guarded or otherwise errored out of
+  forwarding) reads and draws exactly the same way, worded "broken" so
+  you can tell the two apart.
 - **"STP: forwarding on both ends"** — both ends have a current reading
-  and neither blocks. This is a genuine result, not a gap.
-- **"STP: no state read on `<switch>` (`<port>`)"** — the poller has
-  nothing for that end at all. This is the case worth chasing:
-  1. Open that switch in Nodes and check the interface table's STP column
-     for the port named. Nothing there at all usually means STP polling
-     hasn't run for that switch yet, or is disabled — check `stp_enabled`
-     under the device's polling settings.
-  2. Confirm the SNMP community configured for the device is still
-     correct; a failed community makes every STP read (default-context
-     and per-VLAN alike) come back empty.
-  3. Check the Events log for "Per-VLAN STP scan on `<ip>`: ... continuing
-     from VLAN `<id>` in 60 s" — a switch with more VLANs than fit in one
-     scan chunk (48) covers the rest over the following minute per chunk,
-     so a brand-new device or one just past an upgrade can take a few
-     minutes to have every VLAN covered.
+  and neither blocks. Read both ends' polling as current before trusting
+  this: a stale reading on a switch that has since been re-cabled, moved
+  to a different VLAN, or had its trunk pruned can still say "forwarding"
+  until its next per-VLAN scan runs. This is ordinarily a genuine result,
+  not a gap — but it is only as fresh as that switch's last completed
+  scan, not a live read.
+- **"STP: no state read on `<switch>` (`<port>`): `<reason>`"** — the
+  poller has nothing for that end, and the reason tells you which of the
+  following applies, so start there rather than working down the list:
+  - **"that switch answers no BRIDGE-MIB (re-probed hourly)"** — this
+    switch has never answered spanning-tree SNMP objects at all. Confirm
+    it actually runs STP and answers BRIDGE-MIB; the poller retries this
+    verdict every hour on its own, so nothing needs to be kicked to pick
+    up a switch that starts answering.
+  - **"no scan yet (first lap due within 5 min)"** — the switch is new to
+    Nodes, or was just re-added; the per-VLAN scan runs on a five-minute
+    cadence (`stp_interval_s`), so give it that long before checking
+    again.
+  - **"per-VLAN scan never completed (`<note>`)"** — the scan itself is
+    failing or running out of time; `<note>` says how: "cut short at VLAN
+    `n`" means the switch has more VLANs than fit in one pass and the rest
+    follow within a minute (see the Events line below); "VLAN list
+    unavailable" means the switch's own VTP/VLAN table itself timed out or
+    errored — check the SNMP community and reachability first; "contexts
+    refused" means every `community@vlan` context was rejected outright —
+    confirm the community string is valid for per-VLAN reads on this
+    switch (some non-Cisco or locked-down configurations refuse them).
+  - **"per-VLAN scan answered N of M VLANs on that switch"** — the scan
+    reached the end of the switch's VLAN list, but one or more individual
+    `community@vlan` contexts along the way never answered at all. Check
+    the Events log for that switch's own scan lines to see which VLAN(s)
+    were skipped, and confirm the community string works for a per-VLAN
+    read of each one — a VLAN newly added to the switch, or one with a
+    stricter SNMP view, is the usual cause.
+  - **"N bridge port(s) on that switch mapped in no VLAN's port table
+    (this port may be one)"** — the scan completed, but at least one of
+    the switch's own bridge ports was never reported by any VLAN's
+    bridge-port table; the pane can only give the count, not point at this
+    exact port, since that mapping isn't something the browser has. Open
+    the switch in Nodes: its device pane's "STP scan:" line and the hourly
+    Events line both name the actual bridge port number(s) involved.
+    Confirm the port in question is actually up and carrying at least one
+    VLAN; a port administratively down or unpatched will not appear
+    anywhere.
+  - **"interface not yet polled"** — the switch has been added but its
+    interface table hasn't been walked yet at all; wait for its first poll.
+  - **"`<peer>` is not polled"** — the far end is an unmanaged neighbour,
+    never an SNMP-managed device, so there is no state to read from it at
+    all; this is expected, not a fault.
+
+**The Nodes device pane and the Events log carry the same evidence
+directly, without opening Mapper at all.** Open the switch in Nodes: its
+device pane shows a "STP scan: 2 min ago, 46 of 46 VLANs, 3 bridge ports
+unmapped" line (or "STP: this switch answers no BRIDGE-MIB (re-probed
+hourly)"), and the interface table's STP column shows the state for every
+port the last scan actually resolved. A completed, healthy lap reads "N of
+N" — the count is a real signal: fewer answered than listed means one or
+more `community@vlan` contexts genuinely did not answer this lap, and an
+unreadable link's pane names the same fact as "per-VLAN scan answered N of
+M VLANs on that switch." Events carries the same facts as
+they happen: "Per-VLAN STP scan on `<ip>`: ... continuing from VLAN `<id>`
+in 60 s" while a scan is still working through a long VLAN list, and an
+hourly "STP scan on `<ip>`: N VLANs, M ports; bridge port(s) ... in no
+VLAN's port table" whenever a completed scan still leaves something
+unmapped.
 
 **An EtherChannel/Port-channel uplink shows "via Port-channel1" (or
 whichever Po it is)** on both the Nodes STP column and the Mapper pane —
@@ -607,7 +663,10 @@ check the Po's own row on the switch, not the individual member.
 **A trunk drawn as strands dots only the blocked VLANs' strands**, from
 5.60.0 — a strand not dotted does not mean the whole link forwards; read
 the pane's blocked-VLAN list, not the drawing alone, when several VLANs
-are in play.
+are in play. From 5.62.0 the dotted overlay itself draws at every link
+width, plain or collapsed as well as under FiberView, so a link that
+still looks solid despite a "blocking" pane line is worth a hard page
+refresh before anything else — it should not happen otherwise.
 
 **A known limit, unchanged by this release: an SNMPv3 switch only ever
 gets the default-context (VLAN 1) reading.** The per-VLAN scan that finds
@@ -615,11 +674,29 @@ blocking on a pruned trunk is Cisco SNMPv1/v2c only; an SNMPv3 credential
 sees the same single global reading it always has. There is no per-VLAN
 workaround for SNMPv3 today.
 
-**After an upgrade to 5.60.0 (or any release that changes this scan),
-give it one full VLAN-poll interval before judging a switch's coverage.**
-The per-VLAN cache starts empty and fills chunk by chunk; the interface
-table's per-port VLAN count climbing toward the switch's real VLAN total
-is the sign it has caught up.
+**A trunk that does not carry VLAN 1 is now covered — after an upgrade to
+5.62.0, give it one scan interval (five minutes by default,
+`stp_interval_s`) before judging a switch's coverage.** Before 5.62.0
+such a trunk read blank in every VLAN with no error at all; that is now
+fixed, but the per-VLAN cache still starts fresh per switch and fills
+chunk by chunk. The Nodes device pane's "STP scan:" line climbing toward
+that switch's real VLAN total, or reading "complete," is the sign it has
+caught up.
+
+**The five-minute cadence is per switch, and only starts counting once
+that switch's scan is actually queued.** `stp_interval_s` schedules each
+switch's next scan the moment its own turn comes up; the scan itself then
+runs on the same background worker pool as MAC/VLAN/LLDP table walks
+(**Nodes → Settings → Table-walk threads**, `mac_walk_workers`). On a
+large fleet, undersized worker threads mean queued scans simply wait
+their turn behind everyone else's table walks, so five minutes can
+stretch out in practice even though nothing is broken — if per-VLAN scans
+are consistently running late fleet-wide, raise that worker count rather
+than shortening `stp_interval_s` further. The per-VLAN cache also now
+holds a VLAN's last reading for at least 30 minutes (twice the cadence,
+with a 1800-second floor) regardless of how short `stp_interval_s` is
+set, specifically so a slow or backed-up lap cannot let a genuine block
+revert to "forwarding" just because its own cadence window passed.
 
 ---
 

@@ -4444,8 +4444,10 @@ check("blocking · " in NODES94,
       "the Nodes STP cell names a partially-blocking port's n/count of VLANs")
 check("title:" in NODES94 and "Blocking in VLANs" in NODES94,
       "the span title lists which VLANs the port is blocking in")
-check("r.stp_state === 'blocking' &&" in NODES94,
-      "partial-VLAN STP text only renders when stp_state is actually blocking")
+check("r.stp_state === 'blocking' || r.stp_state === 'broken'" in NODES94,
+      "partial-VLAN STP text renders for both blocking and broken (5.62.0)")
+check("broken · " in NODES94 and "Broken in VLANs" in NODES94,
+      "a partially-broken port gets its own n/count cell and VLAN-list title")
 MAPPER94 = read("mapper.js")
 check("(VLANs " in MAPPER94,
       "the Mapper's STP tooltip/aria/detail text appends the blocking end's VLAN list")
@@ -4495,22 +4497,21 @@ check("FiberView: dark orange = multimode" in _LEGEND96
 
 # 96b. The blocked dots are their own unglowed path, not a dasharray on the
 #      glowing one -- the glow's blur was smearing them into a solid line.
-check("const overlaidBlocking = link.blocking && link.fiber === true && view.fiberView;"
-      in MAPPER96,
-      "drawLink knows when the glow is carrying an overlay instead of dots")
+#      5.62.0: the overlay draws at ANY width now, not only under FiberView
+#      (round caps close .blocking's dash gaps past ~6px on their own), so
+#      the main path always keeps .blocking and strands get one overlay
+#      each, per blocked strand -- see block 130.
+check("const overlaidBlocking = link.blocking;" in MAPPER96,
+      "drawLink draws the overlay for every blocking link, not only under FiberView")
 check("class: 'mp-link blocking mp-blocking-over', 'stroke-width': plan.width," in MAPPER96,
       "the overlay is a .blocking path with no .fiber, so no glow filter")
-check("if (link.blocking && !overlaidBlocking) path.classList.add('blocking');" in MAPPER96,
-      "the plain/collapsed link stops dashing its own glow where the overlay draws")
+check("if (link.blocking) path.classList.add('blocking');" in MAPPER96,
+      "the plain/collapsed main path always carries .blocking, for selection "
+      "styling and tests, regardless of the overlay")
 check(".mp-link.mp-blocking-over { stroke: var(--fail); stroke-linecap: butt; }" in CSS96,
       "red, and butt-capped -- .mp-link's round caps lengthen each 2px dash by "
       "the stroke width, which is what closed the gaps in the first place")
 _DRAW_LINK96 = js_function(MAPPER96, "drawLink")
-check("mp-blocking-over" not in
-      _DRAW_LINK96[_DRAW_LINK96.index("if (plan.mode === 'strands'"):
-                    _DRAW_LINK96.index("const neutral =")],
-      "the strands ribbon gets NO overlay: its strands are thin and already "
-      "dotted, and a bundle-width dashed stroke would paint a solid bar")
 
 # 96c. One wide invisible hit target under the strands, not a fatter strand:
 #      each strand must still answer for its own VLAN on hover.
@@ -4532,7 +4533,7 @@ check("function stpBlockedVlans(link) {" in MAPPER96,
       "the blocked map is parsed from a_stp_vlans/b_stp_vlans")
 check("if (blocked === null) lines.push(row);" in MAPPER96,
       "a link with no blocking leaves its list uncoloured")
-check('<span class="mp-vlan-blocked">${row}  (${where})</span>' in MAPPER96,
+check('<span class="mp-vlan-blocked">${row}  (STP blocked on ${where})</span>' in MAPPER96,
       "a blocked VLAN names the blocking switch beside the red, one line per VLAN")
 check("stpBlockingText(link, escape(a.name), escape(b.name), escape, false)" in MAPPER96,
       "the detail pane's STP footer drops the VLAN ids the list now shows")
@@ -5978,6 +5979,79 @@ check(r'("POST", r"^/api/nodes/vlan-scan$", api.post_nodes_vlan_scan, ("nodes", 
       in _SERVER_PY129,
       "the vlan-scan route is wired to its handler with the same "
       "('nodes', W) permission as bulk-poll")
+
+# ---------------------------------------------------------------------------
+# 130. Every STP-blocked link found, with the evidence to prove it (5.62.0):
+#      a blocked link always draws dotted regardless of width, its own
+#      cadence, and a pane that names why any remaining link is not dotted.
+MAPPER130 = read("mapper.js")
+_DRAWLINK130 = js_function(MAPPER130, "drawLink")
+_STRANDS130_END = _DRAWLINK130.index("const neutral =")
+check(_DRAWLINK130.count("mp-blocking-over") == 2
+      and "mp-blocking-over" in _DRAWLINK130[:_STRANDS130_END]
+      and "mp-blocking-over" in _DRAWLINK130[_STRANDS130_END:],
+      "drawLink draws the .mp-blocking-over overlay in both the strands "
+      "branch (one per blocked strand) and the plain/collapsed branch")
+
+NODES130 = read("nodes.js")
+_STPSCANLINETEXT130 = js_function(NODES130, "stpScanLineText")
+check("'STP scan: not yet run'" in _STPSCANLINETEXT130
+      and "`STP scan: ${" in _STPSCANLINETEXT130,
+      "stpScanLineText carries both the never-run and the filled-in STP "
+      "scan lines")
+_DRAWCAPSTAB130 = js_function(NODES130, "drawCapabilitiesTab")
+check("stpScanLineText(d)" in _DRAWCAPSTAB130
+      and "STP: this switch answers no " in _DRAWCAPSTAB130
+      and "BRIDGE-MIB (re-probed hourly)" in _DRAWCAPSTAB130,
+      "the device pane's STP capability line shows the scan summary or the "
+      "re-probed-hourly hint")
+_DEVICEFORM130 = js_function(NODES130, "deviceForm")
+check("nd-f-stpinterval" in _DEVICEFORM130,
+      "the device settings form has its own STP interval override")
+_DEVICEOVERRIDES130 = js_function(NODES130, "deviceOverrides")
+check("overrides.stp_interval_s" in _DEVICEOVERRIDES130,
+      "the device settings form reads the STP interval override back")
+
+NODES_CRED130 = read("nodes_credentials.js")
+_PROFILEFORM130 = js_function(NODES_CRED130, "profileForm")
+check("nd-p-stpinterval" in _PROFILEFORM130,
+      "the group (polling profile) settings form has its own STP interval field")
+_PROFILEFIELDS130 = js_function(NODES_CRED130, "profileFields")
+check("stp_interval_s: blankToNull(" in _PROFILEFIELDS130,
+      "the group settings form reads the STP interval field back")
+_SHARED_PY130 = python_text("web.api._shared")
+check('"stp_interval_s")' in _SHARED_PY130,
+      "_GROUP_EDITABLE_BODY carries stp_interval_s, so a group save persists it")
+
+_STPIDLETEXT130 = js_function(MAPPER130, "stpIdleText")
+check("no state read on" in _STPIDLETEXT130 and "is not polled" in _STPIDLETEXT130,
+      "stpIdleText names both an unread end and an unmanaged one")
+_STPNOSTATECAUSE130 = js_function(MAPPER130, "stpNoStateCause")
+check("that switch answers no BRIDGE-MIB (re-probed hourly)" in _STPNOSTATECAUSE130
+      and "no scan yet (first lap due within 5 min)" in _STPNOSTATECAUSE130
+      and "mapped in no VLAN's port table" in _STPNOSTATECAUSE130
+      and "answered ${scan.answered} of ${scan.vlans} VLANs" in _STPNOSTATECAUSE130
+      and "per-VLAN scan never completed" in _STPNOSTATECAUSE130
+      and "interface not yet polled" in _STPNOSTATECAUSE130,
+      "stpNoStateCause gives all six reasons a link end shows no STP state")
+
+_MAPPERAPIPY130 = python_text("web.api.mapper")
+check('a_stp in ("blocking", "broken")' in _MAPPERAPIPY130
+      and 'b_stp in ("blocking", "broken")' in _MAPPERAPIPY130,
+      "web/api/mapper.py's blocking test treats broken like blocking")
+
+# ---------------------------------------------------------------------------
+# 131. STP capability and cadence follow-ups to block 130 (5.62.0).
+NODES131 = read("nodes.js")
+check("d.stp_capable === false" in NODES131,
+      "the device pane's STP capability check reads the real boolean, not "
+      "the legacy 0/1 the column used to store")
+check('id="nd-f-stpinterval" type="number"' in NODES131
+      and 'min="30"' in js_function(NODES131, "deviceForm"),
+      "the device settings form's STP interval floors at 30s")
+NODES_CRED131 = read("nodes_credentials.js")
+check('id="nd-p-stpinterval" type="number" min="30"' in NODES_CRED131,
+      "the group settings form's STP interval floors at 30s too")
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))

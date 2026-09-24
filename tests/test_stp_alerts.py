@@ -27,7 +27,8 @@ def check(name, ok, detail=""):
 db = NodesDatabase(f"{TMP}/stp_alerts.db")
 did = db.add_device("10.0.0.1", name="core-sw")
 db.replace_interfaces(did, [{"if_index": 1, "descr": "Gi1/0/1"},
-                            {"if_index": 2, "descr": "Gi1/0/2"}])
+                            {"if_index": 2, "descr": "Gi1/0/2"},
+                            {"if_index": 3, "descr": "Gi1/0/3"}])
 interface_id = {row["if_index"]: row["id"] for row in db.interfaces(did)}
 
 
@@ -84,6 +85,16 @@ db.update_interface_stp(did, [{"if_index": 2, "stp_state": "forwarding"}])
 check("discarding counts as blocked, so an agent using RSTP's spelling "
       "raises and clears the same pair",
       [row["kind"] for row in events(2)] == ["stp_unblocked"], events(2))
+
+# --- broken(6): a port errored out of forwarding is blocked too (5.62.0)
+db.update_interface_stp(did, [{"if_index": 3, "stp_state": "forwarding"}])
+db.update_interface_stp(did, [{"if_index": 3, "stp_state": "broken"}])
+check("broken counts as blocked, so forwarding -> broken raises stp_blocking",
+      [row["kind"] for row in events(3)] == ["stp_blocking"], events(3))
+db.update_interface_stp(did, [{"if_index": 3, "stp_state": "forwarding"}])
+check("...and broken -> forwarding clears it with stp_unblocked",
+      [row["kind"] for row in events(3)] == ["stp_unblocked", "stp_blocking"],
+      events(3))
 db.close()
 
 # --- the rules that read those events

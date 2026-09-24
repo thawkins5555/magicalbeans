@@ -5,6 +5,79 @@ grouped by the version that carries it. This is a working record for the
 operator — the full story of each change is in `CHANGELOG.md`, and this file
 does not replace it.
 
+## 5.62.0 — Every STP-blocked link found, with the evidence to prove it; the in-flight set clears on stop
+
+**Operator message, verbatim:** "Fix the STP in-flight set not clearing on
+poller stop and also - not all spanning tree blocking links are being
+identified STILL by mapper - please come to a complete resolution on
+that."
+
+**Seven planning answers.** The link pane reads "STP: no state read on
+`<switch>` (`<port>`)". On Nodes that port's STP column is blank, while
+the switch's other ports do show a value. The misses are physical trunks
+blocked in some VLANs, not every VLAN. Events has no STP line for the
+switch at all. VLAN 1 is not carried on those trunks. A new block should
+be visible within five minutes.
+
+**Dora's ranked list.** Fifteen causes, grouped here by which lane ended up
+fixing them rather than Dora's own rank order: the root cause —
+bridge-port-to-interface mapping read once from VLAN 1's own context and
+reused inside every other VLAN, so a trunk pruned off VLAN 1 vanishes from
+every VLAN's read — followed by a truncated default-context map still
+being cached and trusted, the bridge-port-equals-ifIndex fallback firing
+on Cisco switches it should no longer apply to, a failed VLAN-list read
+being treated the same as a genuine "no VLANs" answer, the scan's cursor
+being a list position rather than a VLAN id (so an inserted or removed
+VLAN could shift it), VLAN 1 never being seeded back in from the default
+context once it stopped being walked as its own VLAN, a dropped STP write
+for a port with no interface row yet vanishing without a trace, the scan
+cadence being tied to the (often slower, sometimes disabled) VLAN
+membership walk instead of running on its own schedule, the in-flight set
+not clearing on poller stop, a `broken` port not counting as blocked
+anywhere in the product, a latched "no BRIDGE-MIB" verdict never being
+re-checked, a chassis-MAC neighbour match landing on a switch's own
+routed VLAN interface instead of the real cable, and three drawing gaps —
+the dotted overlay only appearing under FiberView, not at every link
+width, and a multi-VLAN trunk with no strand overlap dotting nothing at
+all.
+
+**Who built what.** Dora explored first and produced the ranked list
+above. Thing1 built lane A: the per-VLAN bridge-port maps, the truncated
+default-map fix, the Cisco-only fallback restriction, the VLAN-list
+failure handling, the VLAN-id cursor, the VLAN 1 seeding rule, and the
+dropped-write log line. Thing3 built lane B: the five-minute
+`stp_interval_s` cadence and its link-flap trigger, `begin_stop` clearing
+`_stp_vlan_running`, `broken` counting as blocked everywhere, the hourly
+`stp_capable` re-probe, the `is_cisco` gate, and the chassis-MAC match
+ordering. Thing2 built lane C: the dotted overlay drawing at every link
+width and per blocked strand, the Mapper API's new per-end STP fields,
+and the pane's specific reason text for an unread end. Thing4 built lane
+D: the six new stub agent modes, the demo change to acc-sw-005, the walk
+checks, and `tests/test_stp_coverage.py` — reading Thing1's and Thing3's
+own reports to finish the coverage tests once their code landed. Bob
+relayed the stub agent layouts between lanes so Thing1 and Thing3 could
+write their assertions against modes Thing4 was still building.
+
+**Outcome.** Shipped as 5.62.0. Full suite 209 of 212 with only the three
+environmental failures; sixteen targeted suites green, the new
+test_stp_coverage among them. Javariius pass one: no P1, seven P2s (an
+empty-but-complete per-VLAN map was counted as "cut short", the unmapped
+list held bridge ports while the pane compared ifIndexes, a dead
+`stp_capable === 0` branch, a double-escaped name, no bounds on the new
+interval, a ten-minute staleness window that could let a block revert
+between laps on a big fleet, comment prose over the ceiling), all fixed;
+Stephen_King then caught that the answered count left out VLAN 1 while the
+total counted it, which would have fired the new pane cause on every
+healthy switch; pass two approved. Three browser walks: the first two
+found only check and demo defects (the demo's second uplinks carried no
+VLAN list, the scan line lives on the BRIDGE & RF subtab, manual lines
+have no STP, the Connect check counted a moving total); the third passed
+104 of 105 with every STP check real: acc-sw-005's uplink without VLAN 1
+drawn blocking in VLAN 30, only that strand dotted, the same link drawn
+collapsed with the overlay dots, the device pane's "STP scan:" line, and
+no console or request errors. The one miss was a check assuming a link
+without VLAN 30 exists, now dropped.
+
 ## 5.61.0 — Team grows by four; VlanView glows only on both ends; Nodes gets a fleet-wide VLAN scan button
 
 **Operator message, five asks (verbatim):** "Update Dora to be 5.5 opus.

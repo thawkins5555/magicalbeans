@@ -1546,6 +1546,7 @@ def test_stop_then_start_leaves_no_device_permanently_queued():
             poller._vlan_running.add(device_id)
             poller._arp_running.add(device_id)
             poller._lldp_running.add(device_id)
+            poller._stp_vlan_running.add(device_id)
         poller._mac_executor = ThreadPoolExecutor(max_workers=1)
 
         poller.begin_stop()
@@ -1554,7 +1555,8 @@ def test_stop_then_start_leaves_no_device_permanently_queued():
         check(not poller._queued,
               f"begin_stop clears every device cancelled before it ever "
               f"ran, not left stuck in _queued ({poller._queued})")
-        for name in ("_mac_running", "_vlan_running", "_arp_running", "_lldp_running"):
+        for name in ("_mac_running", "_vlan_running", "_arp_running", "_lldp_running",
+                     "_stp_vlan_running"):
             running = getattr(poller, name)
             check(not running, f"...and {name} too ({running})")
 

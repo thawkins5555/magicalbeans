@@ -8,6 +8,7 @@ import time
 from ... import namelookup
 from ... import mapper
 from ... import nodepoll
+from ... import nodesdb
 from ... import report as reportmod
 
 from ._shared import Conflict, _audit, _csv_response, _mapper_port_index, _matched_device_names, _neighbor_local_port_labeler, _pick, _require
@@ -304,6 +305,9 @@ def _mapper_add_manual_links(service, map_id, node_rows, links: list,
             "a_optic_mode": None, "b_optic_mode": None, "fiber_mode": None,
             "a_stp": None, "b_stp": None, "a_stp_vlans": None, "b_stp_vlans": None,
             "a_stp_via": None, "b_stp_via": None,
+            "a_stp_state": None, "b_stp_state": None,
+            "a_stp_vlan_count": None, "b_stp_vlan_count": None,
+            "a_stp_scan": None, "b_stp_scan": None,
             "blocking": False,
             "label": row["label"], "protocols": ["manual"], "vlans": [],
             "a_vlans": None, "b_vlans": None,
@@ -370,6 +374,10 @@ def get_mapper_map(service, params, body, map_id) -> dict:
     # optic mode and STP state, then a pure lookup per link -- neither
     # mapper.link_is_fiber nor mapper.fiber_mode ever touches the db.
     link_facts = service.nodes_db.interface_link_facts_for_devices(device_ids)
+    # Once per on-map device, not once per link -- the same fact for every
+    # link touching that device.
+    stp_scan_by_device = {device_id: nodesdb.device_stp_scan_summary(row)
+                          for device_id, row in devices_by_id.items()}
     for link in links:
         # Each end's own vlan_ports row (never the far end's -- same
         # locality rule _mapper_vlan_ports' docstring gives port_vlans):
@@ -407,15 +415,24 @@ def get_mapper_map(service, params, body, map_id) -> dict:
         b_stp = b_facts["stp_state"] if b_facts else None
         link["a_stp"] = a_stp
         link["b_stp"] = b_stp
+        # Same raw word as a_stp/b_stp (kept for compatibility) -- may be "broken".
+        link["a_stp_state"] = a_stp
+        link["b_stp_state"] = b_stp
         link["a_stp_vlans"] = a_facts["stp_blocking_vlans"] if a_facts else None
         link["b_stp_vlans"] = b_facts["stp_blocking_vlans"] if b_facts else None
+        link["a_stp_vlan_count"] = a_facts["stp_vlan_count"] if a_facts else None
+        link["b_stp_vlan_count"] = b_facts["stp_vlan_count"] if b_facts else None
+        link["a_stp_scan"] = stp_scan_by_device.get(link["a_device_id"]) \
+            if link["a_device_id"] is not None else None
+        link["b_stp_scan"] = stp_scan_by_device.get(link["b_device_id"]) \
+            if link["b_device_id"] is not None else None
         a_via = a_facts.get("stp_via_if_index") if a_facts else None
         b_via = b_facts.get("stp_via_if_index") if b_facts else None
         link["a_stp_via"] = stp_via_label(link["a_device_id"], a_via) \
             if a_via is not None else None
         link["b_stp_via"] = stp_via_label(link["b_device_id"], b_via) \
             if b_via is not None else None
-        link["blocking"] = a_stp == "blocking" or b_stp == "blocking"
+        link["blocking"] = a_stp in ("blocking", "broken") or b_stp in ("blocking", "broken")
         link["plan"] = mapper.render_plan(
             link, threshold=threshold, max_strands=max_strands,
             width_min=width_min, width_max=width_max,

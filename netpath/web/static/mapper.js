@@ -1213,10 +1213,12 @@
       layer.appendChild(path);
       return path;
     };
-    // .mp-link's round caps lengthen every dash by the stroke width, so the
-    // glow's own 5px-plus stroke closes .blocking's 2-on/6-off gaps and the
-    // dots read solid. Below, a thin unglowed path carries them instead.
-    const overlaidBlocking = link.blocking && link.fiber === true && view.fiberView;
+    // Round caps lengthen every dash, closing .blocking's gaps at any width
+    // past ~6px -- a wide collapsed trunk, not only a FiberView glow -- so a
+    // blocking link always gets the thin, flat-capped overlay now, on top of
+    // any VlanView halo or FiberView underlay below. Main path keeps
+    // .blocking regardless, for selection styling and tests.
+    const overlaidBlocking = link.blocking;
     let bundleHalf = plan.width / 2;
     const isStrandBundle = plan.mode === 'strands' && plan.strands.length;
     if (isStrandBundle) {
@@ -1294,17 +1296,18 @@
       layer.appendChild(hit);
       plan.strands.forEach((strand, i) => {
         const ox = nx * strand.offset, oy = ny * strand.offset;
+        const d = `M ${from.x + ox} ${from.y + oy} L ${to.x + ox} ${to.y + oy}`;
         const path = App.svgNode('path', {
-          d: `M ${from.x + ox} ${from.y + oy} L ${to.x + ox} ${to.y + oy}`,
+          d,
           // --canvas-vlan-*, not --vlan-* — this strand is drawn on
           // #mp-canvas (background: var(--canvas)), and --vlan-1..16 is
           // tuned against --panel, the VLAN table's swatch background, not
           // this one. See tokens.css's --canvas-vlan-* comment.
           stroke: `var(--canvas-vlan-${strand.color_index + 1})`, 'stroke-width': plan.width,
         });
-        if (link.blocking && (!blocked || blocked.has(strand.vlan))) {
-          path.classList.add('blocking');
-        }
+        // No overlap with the drawn strands (blocked null) dots every one.
+        const strandBlocking = link.blocking && (!blocked || blocked.has(strand.vlan));
+        if (strandBlocking) path.classList.add('blocking');
         wireOne(path, null, i === 0
           ? { focusable: true, ariaLabel: linkAriaLabel(link), tooltip: () => linkTooltip(link) }
           : {
@@ -1312,6 +1315,15 @@
             ariaLabel: `VLAN ${vlanDisplay(strand.vlan)} strand on the link.`,
             tooltip: () => strandTooltip(link, strand),
           });
+        if (strandBlocking) {
+          // Same overlay as the plain/collapsed case, on this strand's own offset line.
+          const overlay = App.svgNode('path', {
+            d, fill: 'none', class: 'mp-link blocking mp-blocking-over',
+            'stroke-width': plan.width, 'pointer-events': 'none',
+          });
+          if (dimmed) overlay.classList.add('dimmed');
+          layer.appendChild(overlay);
+        }
         if (view.settings.show_vlan_labels) {
           // label_step (server-computed, render_plan) staggers each
           // strand's number along the link instead of stacking every one
@@ -1346,7 +1358,7 @@
       if (link.fiber_mode === 'sm') path.classList.add('fiber-sm');
       else if (link.fiber_mode === 'mismatch') path.classList.add('fiber-mismatch');
     }
-    if (link.blocking && !overlaidBlocking) path.classList.add('blocking');
+    if (link.blocking) path.classList.add('blocking');
     if (overlaidBlocking) {
       const overlay = App.svgNode('path', {
         d: `M ${from.x} ${from.y} L ${to.x} ${to.y}`, fill: 'none',
@@ -1487,30 +1499,80 @@
   }
   // withVlans: the tooltip and aria-label have no list to colour, so they
   // keep naming the ids. The pane passes false -- its list is red/green.
+  // A broken port is named "broken", not "blocking".
   function stpBlockingText(link, a, b, esc = (x) => x, withVlans = true) {
     if (!link.blocking) return null;
     const who = [];
     const suffix = (vlans) => (withVlans ? esc(stpVlanSuffix(vlans)) : '');
     const via = (v) => (v ? `, via ${esc(v)}` : '');
-    if (link.a_stp === 'blocking') {
-      who.push(`${a} (${esc(link.a_port || '—')}${via(link.a_stp_via)})${suffix(link.a_stp_vlans)}`);
+    const word = (state) => (state === 'broken' ? 'broken' : 'blocking');
+    if (link.a_stp === 'blocking' || link.a_stp === 'broken') {
+      who.push(`${word(link.a_stp)} on ${a} (${esc(link.a_port || '—')}${via(link.a_stp_via)})`
+        + suffix(link.a_stp_vlans));
     }
-    if (link.b_stp === 'blocking') {
-      who.push(`${b} (${esc(link.b_port || '—')}${via(link.b_stp_via)})${suffix(link.b_stp_vlans)}`);
+    if (link.b_stp === 'blocking' || link.b_stp === 'broken') {
+      who.push(`${word(link.b_stp)} on ${b} (${esc(link.b_port || '—')}${via(link.b_stp_via)})`
+        + suffix(link.b_stp_vlans));
     }
-    return `STP: blocking on ${who.join(', ')}`;
+    return `STP: ${who.join(', ')}`;
   }
 
-  // For a link not drawn blocking: both ends forward, or an end has no state.
+  // For a link not drawn blocking: both ends read some non-blocking state,
+  // one or both never reported one, or one end is an unmanaged peer.
   function stpIdleText(link, a, b, esc = (x) => x) {
     if (link.blocking) return null;
     const hasA = link.a_stp !== null && link.a_stp !== undefined;
     const hasB = link.b_stp !== null && link.b_stp !== undefined;
-    if (hasA && hasB) return 'STP: forwarding on both ends';
-    const who = [];
-    if (!hasA) who.push(`${a} (${esc(link.a_port || '—')})`);
-    if (!hasB) who.push(`${b} (${esc(link.b_port || '—')})`);
-    return `STP: no state read on ${who.join(', ')}`;
+    if (hasA && hasB) {
+      if (link.a_stp === 'forwarding' && link.b_stp === 'forwarding') {
+        return 'STP: forwarding on both ends';
+      }
+      const parts = [];
+      if (link.a_stp !== 'forwarding') {
+        parts.push(`${esc(link.a_stp)} on ${a} (${esc(link.a_port || '—')})`);
+      }
+      if (link.b_stp !== 'forwarding') {
+        parts.push(`${esc(link.b_stp)} on ${b} (${esc(link.b_port || '—')})`);
+      }
+      return `STP: ${parts.join('; ')}`;
+    }
+    // a/b arrive escaped by the pane caller, as in stpBlockingText.
+    const missing = [];
+    if (!hasA) {
+      missing.push(link.a_device_id === null ? `${a} is not polled`
+        : `no state read on ${a} (${esc(link.a_port || '—')}): ${esc(stpNoStateCause(link, 'a'))}`);
+    }
+    if (!hasB) {
+      missing.push(link.b_device_id === null ? `${b} is not polled`
+        : `no state read on ${b} (${esc(link.b_port || '—')}): ${esc(stpNoStateCause(link, 'b'))}`);
+    }
+    return `STP: ${missing.join('; ')}`;
+  }
+
+  // The one-line reason one end shows no STP state, from that device's own
+  // stp_scan summary: no BRIDGE-MIB at all, never scanned, the scan failed
+  // outright or answered short, bridge ports left unmapped, or just unpolled.
+  function stpNoStateCause(link, end) {
+    const scan = link[`${end}_stp_scan`];
+    if (scan && scan.capable === 0) return 'that switch answers no BRIDGE-MIB (re-probed hourly)';
+    if (!scan || scan.ts === null || scan.ts === undefined) {
+      return 'no scan yet (first lap due within 5 min)';
+    }
+    const note = scan.note || '';
+    if (note.startsWith('cut short') || note.startsWith('VLAN list unavailable')
+        || note.startsWith('contexts refused')) {
+      return `per-VLAN scan never completed (${note})`;
+    }
+    if (typeof scan.answered === 'number' && typeof scan.vlans === 'number'
+        && scan.answered < scan.vlans) {
+      return `per-VLAN scan answered ${scan.answered} of ${scan.vlans} VLANs on that switch`;
+    }
+    // stp_scan_unmapped is bridge-port numbers, not ifIndexes -- there is no
+    // way to say THIS port is one of them, only that some are.
+    if (Array.isArray(scan.unmapped) && scan.unmapped.length) {
+      return `${scan.unmapped.length} bridge port(s) on that switch mapped in no VLAN's port table (this port may be one)`;
+    }
+    return 'interface not yet polled';
   }
 
   // VlanView's pane line: callers only reach this once the VLAN is on at least one end.
@@ -2405,6 +2467,9 @@
       text += 'FiberView: dark orange = multimode, bright yellow = single-mode, ' +
         'dotted red = single/multimode mismatch.';
     }
+    if (view.links.some((l) => l.blocking)) {
+      text += 'Dotted = STP blocked on the named end. ';
+    }
     if (view.nodes.length && !hasLinks) {
       text = 'No CDP/LLDP adjacency was found between the devices placed here — ' +
         'that is information, not an error; add neighbours once they report one.';
@@ -2823,7 +2888,7 @@
           const end = blocked.get(vlan);
           const where = end === 'both' ? `${escape(a.name)} and ${escape(b.name)}`
             : escape(end === 'a' ? a.name : b.name);
-          lines.push(`<span class="mp-vlan-blocked">${row}  (${where})</span>`);
+          lines.push(`<span class="mp-vlan-blocked">${row}  (STP blocked on ${where})</span>`);
         } else lines.push(`<span class="mp-vlan-pass">${row}</span>`);
       }
       if (!all) {

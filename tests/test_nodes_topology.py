@@ -267,6 +267,30 @@ try:
           "10.40.0.77" in service._extra_resolve_targets(),
           [a for a in service._extra_resolve_targets() if a.startswith("10.40.0.")])
 
+    # ------------------------------------------- chassis MAC: SVI vs physical
+    # A switch's routed VLAN interface answers the chassis MAC just like its
+    # physical ports do. Its if_index (1) is deliberately LOWER than the
+    # physical port's (24) sharing the same MAC, so a plain "lowest if_index"
+    # tie-break would pick the SVI -- the far end must never be that.
+    print("chassis MAC shared by an SVI and a physical port: physical wins")
+    svi_id = db.add_device("10.40.0.6", name="svi-sw-1", group_id=gid)
+    db.replace_interfaces(svi_id, [
+        {"if_index": 1, "descr": "Vlan1", "phys_addr": "ee:ee:ee:ee:ee:01"},
+        {"if_index": 24, "descr": "GigabitEthernet0/24", "phys_addr": "ee:ee:ee:ee:ee:01"},
+    ])
+    db.replace_neighbors(core_id, [
+        {"if_index": 9, "protocol": "lldp", "rem_index": "0.9.1",
+         "chassis_id": "ee:ee:ee:ee:ee:01", "chassis_id_subtype": 4,
+         "sys_name": "svi-sw-1", "port_id": "Gi0/24"},
+    ])
+    # matched_if_index is _NEIGHBOR_MATCH_SQL's own column, not surfaced over
+    # the neighbours route (mapper.py reads it internally) — check it at the
+    # nodesdb level, same as the route's own matched_device_id above.
+    row = next((r for r in db.neighbours_of(core_id) if r["if_index"] == 9), None)
+    check("the physical port, not the lower-numbered SVI, is the matched interface",
+          row is not None and row["matched_device_id"] == svi_id
+          and row["matched_if_index"] == 24, row)
+
     # ----------------------------------------------------- PoE/STP surfaced
     print("PoE/STP fields on the device and interfaces responses")
     db.set_poe_capable(core_id, True)

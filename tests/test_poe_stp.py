@@ -206,10 +206,15 @@ try:
           device["stp_capable"] == 0, device["stp_capable"])
     check("...that first probe cost at least one request", first_requests >= 1, first_requests)
 
+    # 5.62.0: a latched incapable is re-probed hourly rather than forever,
+    # so a device that later gains BRIDGE-MIB is not stuck invisible -- but
+    # the latching probe itself stamps the reprobe clock, so the very next
+    # poll is already suppressed rather than repeating it immediately.
     reset_count(port)
     poller._poll_stp(did, device, config)
     second_requests = request_count(port)
-    check("a device already known incapable is never walked again",
+    check("a device already known incapable is not walked again within "
+          "the hour",
           second_requests == 0, second_requests)
     db.close()
 finally:

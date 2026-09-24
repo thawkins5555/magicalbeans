@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.62.0 — Every STP-blocked link is now found: a trunk without VLAN 1 was invisible on every VLAN, the scan runs every five minutes, and an undotted link names its own cause](#5620--every-stp-blocked-link-is-now-found-a-trunk-without-vlan-1-was-invisible-on-every-vlan-the-scan-runs-every-five-minutes-and-an-undotted-link-names-its-own-cause)
 - [5.61.0 — VlanView glows a link only when the picked VLAN is on both ends; Nodes gets a fleet-wide VLAN scan button](#5610--vlanview-glows-a-link-only-when-the-picked-vlan-is-on-both-ends-nodes-gets-a-fleet-wide-vlan-scan-button)
 - [5.60.0 — Every STP-blocked link on Mapper is now found: EtherChannel bundles, a per-VLAN scan that finishes, and a bridge-port fallback](#5600--every-stp-blocked-link-on-mapper-is-now-found-etherchannel-bundles-a-per-vlan-scan-that-finishes-and-a-bridge-port-fallback)
 - [5.59.0 — VlanView glows the links carrying a picked VLAN; charts stop bridging gaps in the data; Mapper gets SSH/WEB buttons; SMS sign-up adds a Privacy Policy checkbox](#5590--vlanview-glows-the-links-carrying-a-picked-vlan-charts-stop-bridging-gaps-in-the-data-mapper-gets-sshweb-buttons-sms-sign-up-adds-a-privacy-policy-checkbox)
@@ -195,6 +196,142 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.62.0 — Every STP-blocked link is now found: a trunk without VLAN 1 was invisible on every VLAN, the scan runs every five minutes, and an undotted link names its own cause
+
+One operator message, two asks: "Fix the STP in-flight set not clearing
+on poller stop and also - not all spanning tree blocking links are being
+identified STILL by mapper - please come to a complete resolution on
+that." Live evidence on the operator's own estate pinned the second ask
+down: the link pane read "STP: no state read" on a physical trunk; that
+port's Nodes STP column sat blank while the switch's other ports showed a
+value; Events had no STP line for that switch at all; and the trunk in
+question does not carry VLAN 1.
+
+**Root cause, stated plainly: a trunk that does not carry VLAN 1 was
+dropped from spanning-tree polling in every VLAN, silently.** The poller
+translates a switch's bridge-port numbers to interfaces with
+`dot1dBasePortIfIndex`, read once in SNMP's default context — which on
+IOS *is* VLAN 1's own bridge instance — and then reused that one mapping
+inside every `community@vlan` context it queried afterward. A trunk
+deliberately pruned off VLAN 1, exactly the estates 5.37.0 and 5.60.0
+were built for, simply has no row in that table, so its state in every
+*other* VLAN it does carry was thrown away too: no database row, a blank
+Nodes column, and the pane's honest but unhelpful "no state read."
+5.60.0's own bridge-port fallback never caught this — it only fires when
+the whole table comes back empty, and this table was never empty, only
+missing the one port that mattered. Each VLAN context now walks its own
+`dot1dBasePortIfIndex` before reading that VLAN's port states; a VLAN
+whose map comes back incomplete is marked not-done and retried on the
+next lap instead of being dropped from the count. VLAN 1 itself is never
+walked as its own context — the default context already *is* VLAN 1's
+bridge instance — so the merge now seeds a VLAN 1 reading from that
+default-context read (restricted to ports the per-VLAN scan already
+tracks from other VLANs), which stops a genuine VLAN 1 block from being
+overwritten by a later VLAN's forwarding.
+
+**Six other ways a block could go missing, on the same estate, are closed
+in the same pass.** A default-context bridge-port map cut short mid-walk
+is no longer cached at all — a partial map used to be cached and trusted
+for the next hour. The bridge-port-equals-ifIndex fallback (5.60.0) no
+longer applies to Cisco switches, which now get a real per-VLAN map
+instead of a guess. A failed VLAN-list read (`vtpVlanState` timing out or
+erroring) now leaves the existing cache and cursor untouched and retries
+in 60 seconds, logging "VLAN list unavailable," instead of being treated
+the same as a genuine "no VLANs configured" answer. The scan's own cursor
+is now a VLAN id rather than a position in a list, so a VLAN added or
+removed mid-scan can no longer cause others to be skipped or repeated. A
+per-VLAN or bundle STP answer for a port with no interface row yet is now
+logged once an hour instead of vanishing without a trace. And a `broken`
+bridge port — one BPDU-guarded or otherwise errored out of forwarding —
+now counts as blocked everywhere a `blocking` one does: the alert rules,
+the Nodes STP cell, the Mapper dots and pane, and the link CSV export
+(worded "broken" rather than "blocking," so the two are never confused).
+
+**A new per-device scan summary is the evidence an operator can read
+without our help.** Every per-VLAN pass — complete, cut short, or refused
+outright — writes a plain record to the device: how many VLANs (VLAN 1
+included) were covered and answered, which of the switch's own bridge
+ports were seen in some VLAN's state table but mapped in none of them,
+and the outcome in words ("complete", "complete, 2 VLAN(s) unanswered"
+when a lap reached the end of the list but one or two individual VLANs
+along the way never answered, "cut short at VLAN 210", "VLAN list
+unavailable", "contexts refused").
+The Nodes device pane shows it as "STP scan: 2 min ago, 46 of 46 VLANs, 3
+bridge ports unmapped," or "STP: this switch answers no BRIDGE-MIB
+(re-probed hourly)" for a switch that has never answered BRIDGE-MIB —
+that verdict is now re-checked every hour instead of being permanent, so
+a switch that later gains STP support (a firmware upgrade, a config
+change) does not stay invisible for good. Events gains an hourly "STP
+scan on `<ip>`: N VLANs, M ports; bridge port(s) ... in no VLAN's port
+table" line whenever a completed scan still leaves something unmapped.
+
+**The scan now runs every five minutes, per switch, on its own
+schedule.** A new `stp_interval_s` setting (default 300 s, 30 s floor —
+anything lower or non-numeric falls back to the default rather than
+hammering a switch) sits next to the VLAN-membership interval on both the
+Manage groups polling-profile form and a device's own override form — it
+does not ride on `vlan_interval_s`, so PVST+ blocking detection keeps
+running at its own pace even with VLAN membership discovery switched off
+or slow. That cadence starts counting once a switch's scan is actually
+queued onto the same worker pool as the other table walks (**Nodes →
+Settings → Table-walk threads**), so a large fleet needs that pool sized
+for the scan rate a five-minute cadence implies, or laps run late; the
+per-VLAN cache also now keeps a VLAN's last reading for at least 30
+minutes regardless of the cadence set, so a lap that falls behind cannot
+let an already-confirmed block quietly revert to forwarding in the
+meantime. A Cisco device's own link up/down flap on a bridge port now
+wakes the per-VLAN scan for its very next tick, damped to once per minute
+per device so a flapping trunk cannot itself flood the scan queue,
+alongside the existing VLAN-1 topology-change trigger. A typed vendor
+override that merely contains "Cisco" (e.g. "Cisco Systems," rather than
+the value the identify walk itself detected) now gets the per-VLAN pass
+too, through one `is_cisco` check every STP and bundle code path now
+shares.
+
+**The drawing itself can no longer hide a block.** The flat-capped dotted
+overlay, drawn at the link's own width, used to appear only under
+FiberView; it now draws on every blocked link at every width — plain,
+collapsed, or one strand of a multi-VLAN bundle — so the dash pattern can
+no longer be swallowed by a glow or by round line caps closing its gaps
+on a thinner link. A trunk drawn as
+separate strands whose blocked-VLAN list has no overlap with the drawn
+strands now dots every strand rather than none. The link pane's reason
+line for an unreadable end is now specific: no BRIDGE-MIB on that switch,
+the per-VLAN scan hasn't finished (naming why), the scan answered fewer
+VLANs than the switch actually carries, one or more of the switch's own
+bridge ports were never mapped by any VLAN's scan (named as a count, since
+it cannot always point at this exact port), no scan has run yet (due
+within five minutes), or the interface simply hasn't been polled — an
+unmanaged peer reads "`<name>` is not polled" instead of a scan-based
+cause it has no scan for. The legend adds "Dotted = STP blocked on the
+named end" whenever a blocked link is on the map.
+
+**A chassis-MAC neighbour match can no longer land on a switch's own SVI
+instead of the real cable.** A routed VLAN interface, loopback, or
+management interface answering the same chassis MAC as a physical port
+used to win a neighbour match whenever its ifIndex happened to be the
+lower of the two; the match now prefers a physical interface outright,
+falling back to the lowest ifIndex only when every candidate is one.
+
+**Stop.** `begin_stop` now clears `_stp_vlan_running` alongside the other
+four in-flight sets it already cleared — the operator's first ask — so
+stopping the poller mid-scan no longer leaves a device permanently marked
+as still scanning.
+
+The demo fleet's acc-sw-005 drops VLAN 1 from its second uplink's
+bridge-port table, mirroring the operator's own estate, so the existing
+walk checks now prove this fix instead of quietly skipping past it; six
+new stub agent modes and a new `tests/test_stp_coverage.py` pin each
+cause above end-to-end against a real poller.
+
+Files: `netpath/nodesdb.py`, `netpath/nodepoll/environment_mixin.py`,
+`netpath/nodepoll/vendor_sensor_psu_mixin.py`, `netpath/nodepoll/poller.py`,
+`netpath/nodepoll/poll_mixin.py`, `netpath/mapper.py`,
+`netpath/web/api/mapper.py`, `netpath/web/api/nodes.py`,
+`netpath/web/api/_shared.py`, `netpath/web/static/mapper.js`,
+`netpath/web/static/nodes.js`, `netpath/web/static/nodes_credentials.js`,
+`demo/personas.py`, plus the accompanying tests.
 
 ### 5.61.0 — VlanView glows a link only when the picked VLAN is on both ends; Nodes gets a fleet-wide VLAN scan button
 

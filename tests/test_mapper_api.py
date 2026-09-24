@@ -383,6 +383,7 @@ try:
           media_direct == {(dev_a, 1): {"media": "optic", "optic_mode": None,
                                         "stp_state": None,
                                         "stp_blocking_vlans": None,
+                                        "stp_vlan_count": None,
                                         "stp_via_if_index": None}}, media_direct)
 
     status, payload = call("GET", f"/api/mapper/maps/{map_id}", token=admin)
@@ -413,8 +414,14 @@ try:
     check("every FiberView/STP key is present on a discovered link",
           ab_link is not None and {"a_optic_mode", "b_optic_mode", "fiber_mode",
                                    "a_stp", "b_stp", "a_stp_vlans", "b_stp_vlans",
-                                   "a_stp_via", "b_stp_via", "blocking"} <= set(ab_link),
+                                   "a_stp_via", "b_stp_via", "blocking",
+                                   "a_stp_state", "b_stp_state",
+                                   "a_stp_vlan_count", "b_stp_vlan_count",
+                                   "a_stp_scan", "b_stp_scan"} <= set(ab_link),
           ab_link)
+    check("a_stp_state stays None and b_stp_state carries the same raw word as b_stp",
+          ab_link is not None and ab_link.get("a_stp_state") is None
+          and ab_link.get("b_stp_state") == "blocking", ab_link)
     check("fiber_mode reads the one end that is known, not a mismatch",
           ab_link is not None and ab_link.get("a_optic_mode") is None
           and ab_link.get("b_optic_mode") == "sm" and ab_link.get("fiber_mode") == "sm",
@@ -439,6 +446,8 @@ try:
     check("a blocking end's per-VLAN detail rides along as a_stp_vlans/b_stp_vlans",
           ab_link is not None and ab_link.get("a_stp_vlans") is None
           and ab_link.get("b_stp_vlans") == "20,30", ab_link)
+    check("...and b_stp_vlan_count carries the interfaces row's own stp_vlan_count",
+          ab_link is not None and ab_link.get("b_stp_vlan_count") == 3, ab_link)
 
     # ---------------------------------- 6f. bundle member's STP via (5.60.0)
     #
@@ -532,7 +541,10 @@ try:
                                   "a_media", "b_media", "fiber",
                                   "a_optic_mode", "b_optic_mode", "fiber_mode",
                                   "a_stp", "b_stp", "a_stp_vlans", "b_stp_vlans",
-                                  "a_stp_via", "b_stp_via", "blocking"}
+                                  "a_stp_via", "b_stp_via", "blocking",
+                                  "a_stp_state", "b_stp_state",
+                                  "a_stp_vlan_count", "b_stp_vlan_count",
+                                  "a_stp_scan", "b_stp_scan"}
           <= set(manual), manual)
     check("...with FiberView's keys defaulted (no media on a manual line)",
           manual is not None and manual["a_media"] is None
@@ -544,6 +556,11 @@ try:
           and manual["a_stp_vlans"] is None and manual["b_stp_vlans"] is None
           and manual["a_stp_via"] is None and manual["b_stp_via"] is None
           and manual["blocking"] is False, manual)
+    check("...including the new 5.62.0 keys",
+          manual is not None and manual["a_stp_state"] is None
+          and manual["b_stp_state"] is None
+          and manual["a_stp_vlan_count"] is None and manual["b_stp_vlan_count"] is None
+          and manual["a_stp_scan"] is None and manual["b_stp_scan"] is None, manual)
 
     status, payload = call("POST", f"/api/mapper/maps/{map_id}/links",
                            {"a_node_id": node_b, "b_node_id": node_peer, "label": ""},
@@ -1482,6 +1499,64 @@ try:
                 if status == 200 else None)
     check("...and the profile's own value reads back",
           group_row is not None and group_row.get("vlan_interval_s") == 900, group_row)
+
+    # ------------------- 18. broken state and scan summary (5.62.0)
+    #
+    # A fresh pair, kept apart from A/B's carefully-tracked state above: F's
+    # own port reports state 6 ("broken"), never "blocking" -- blocking must
+    # follow from broken alone -- and F's device row carries the per-VLAN
+    # scan summary the pane's "why no state" story reads.
+    dev_e = service.nodes_db.add_device("192.0.2.30", name="Switch E", group_id=gid)
+    dev_f = service.nodes_db.add_device("192.0.2.31", name="Switch F", group_id=gid)
+    service.nodes_db.replace_interfaces(dev_e, [
+        {"if_index": 1, "descr": "Gi0/1", "alias": "to-f",
+         "admin_status": "up", "oper_status": "up"}])
+    service.nodes_db.replace_interfaces(dev_f, [
+        {"if_index": 1, "descr": "Gi0/1", "alias": "to-e",
+         "admin_status": "up", "oper_status": "up"}])
+    service.nodes_db.replace_neighbors(dev_e, [
+        {"if_index": 1, "protocol": "lldp", "rem_index": "1",
+         "chassis_id": "", "sys_name": "Switch F", "port_id": "Gi0/1",
+         "port_descr": "Gi0/1"}])
+    service.nodes_db.update_interface_stp(
+        dev_f, [{"if_index": 1, "stp_state": "broken", "stp_blocking_vlans": "20,30",
+                 "stp_vlan_count": 2}])
+
+    service.nodes_db.set_stp_scan(dev_f, ts=time.time(), vlans=46, answered=44,
+                                  unmapped="9", note="complete")
+
+    status, payload = call("POST", f"/api/mapper/maps/{map_id}/nodes",
+                           {"device_id": dev_e, "x": 500, "y": 300}, token=admin)
+    check("placing E is accepted", status == 200 and "id" in payload, (status, payload))
+    status, payload = call("POST", f"/api/mapper/maps/{map_id}/nodes",
+                           {"device_id": dev_f, "x": 600, "y": 300}, token=admin)
+    check("placing F is accepted", status == 200 and "id" in payload, (status, payload))
+
+    status, payload = call("GET", f"/api/mapper/maps/{map_id}", token=admin)
+    ef_link = next((l for l in payload.get("links", [])
+                   if {l.get("a_device_id"), l.get("b_device_id")} == {dev_e, dev_f}), None)
+    check("a broken end alone makes the link blocking",
+          ef_link is not None and ef_link.get("blocking") is True, ef_link)
+    f_end = None
+    if ef_link is not None:
+        f_end = "a" if ef_link.get("a_device_id") == dev_f else "b"
+        e_end = "b" if f_end == "a" else "a"
+    check("F's own *_stp_state names the real state word, broken, not blocking",
+          f_end is not None and ef_link.get(f"{f_end}_stp_state") == "broken", ef_link)
+    check("...and *_stp_vlan_count rides along the same way a_stp_vlan_count does",
+          f_end is not None and ef_link.get(f"{f_end}_stp_vlan_count") == 2, ef_link)
+    check("F's own *_stp_scan carries its devices row's scan summary",
+          f_end is not None and ef_link.get(f"{f_end}_stp_scan") is not None
+          and ef_link[f"{f_end}_stp_scan"]["vlans"] == 46
+          and ef_link[f"{f_end}_stp_scan"]["answered"] == 44
+          and ef_link[f"{f_end}_stp_scan"]["unmapped"] == [9]
+          and ef_link[f"{f_end}_stp_scan"]["note"] == "complete"
+          and ef_link[f"{f_end}_stp_scan"]["ts"], ef_link)
+    check("E's own *_stp_scan is still the empty summary -- a managed end with "
+          "nothing scanned yet is not the same as an unmanaged one",
+          f_end is not None and ef_link.get(f"{e_end}_stp_scan") == {
+              "ts": None, "vlans": None, "answered": None, "unmapped": [],
+              "note": None, "capable": None}, ef_link)
 finally:
     server.stop()
     service.shutdown()

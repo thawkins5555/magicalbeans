@@ -244,6 +244,39 @@ try:
 finally:
     stub.kill()
 
+# -------------------------- 5.62.0: a Port-channel outside VLAN 1 inherits
+
+stub, port = spawn_stub("stub_agent_l2.py", "stp-po-outside-vlan1")
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
+try:
+    db = new_db("po_outside_vlan1")
+    did = device_against(db, port, "po-outside-sw")
+    db.replace_interfaces(did, [
+        {"if_index": 10, "descr": "Gi1/0/1"}, {"if_index": 11, "descr": "Gi1/0/2"},
+        {"if_index": 5000, "descr": "Po1"}])
+    mark_cisco(db, did)
+    poller = NodePoller(db)
+    device = db.device(did)
+    config = db.effective_config(device)
+
+    poller._poll_stp(did, device, config)
+
+    ifaces = {i["if_index"]: dict(i) for i in db.interfaces(did)}
+    check("the Port-channel's bridge port answers only inside @20 (never "
+          "the DEFAULT context), and still reads blocking",
+          ifaces[5000]["stp_state"] == "blocking", ifaces[5000])
+    check("member 10 inherits it anyway -- _cached_agg_map recognises "
+          "ifIndex 5000 through the per-VLAN cache's own port union, not "
+          "just the (here empty) DEFAULT-context bridge port map",
+          ifaces[10]["stp_state"] == "blocking"
+          and ifaces[10]["stp_via_if_index"] == 5000, ifaces[10])
+    check("member 11 does too",
+          ifaces[11]["stp_state"] == "blocking"
+          and ifaces[11]["stp_via_if_index"] == 5000, ifaces[11])
+    db.close()
+finally:
+    stub.kill()
+
 print()
 print("FAILURES:", FAILS if FAILS else "none")
 raise SystemExit(1 if FAILS else 0)

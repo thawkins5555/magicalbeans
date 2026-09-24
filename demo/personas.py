@@ -1213,6 +1213,10 @@ def _access_second_uplink_port(name: str) -> int:
 _BUNDLE_PO_IF_INDEX = 5001
 _IF_STACK_STATUS = "1.3.6.1.2.1.31.1.2.1.3"
 
+# 5.62.0: marks acc-sw-005's own Table variant (via chassis_ports, SPECIALS[6])
+# so its second uplink alone can drop VLAN 1 from the DEFAULT context.
+_NOVLAN1_TRUNK_CHASSIS_PORTS = 1
+
 
 def _access_uplink2_vlan_state(vlan_ctx: str):
     """dot1dStpPortState for the second uplink, inside the per-VLAN
@@ -1415,6 +1419,12 @@ def _build_cisco_access(wrap32: bool, ports: int, vlan: str | None) -> dict:
     entries[f"{VTP_TRUNK_VLANS_ENABLED}.{uplink_if}"] = (
         T_OCTET_STRING,
         lambda st, now: encode_vlan_bitmap(_access_trunk_vlans(st.name), 0))
+    # The second uplink trunks the same list, so its STP block draws over strands or a collapsed line.
+    entries[f"{VTP_TRUNK_DYNAMIC_STATUS}.{access + 2}"] = (T_INTEGER, 1)
+    entries[f"{VTP_TRUNK_NATIVE_VLAN}.{access + 2}"] = (T_INTEGER, 10)
+    entries[f"{VTP_TRUNK_VLANS_ENABLED}.{access + 2}"] = (
+        T_OCTET_STRING,
+        lambda st, now: encode_vlan_bitmap(_access_trunk_vlans(st.name), 0))
     # vtpVlanName: the whole plant VLAN database, the same on every switch
     # trunked into it, whether or not this switch's own uplink currently
     # carries every entry — see PLANT_VLAN_NAMES' own comment.
@@ -1439,6 +1449,9 @@ def _build_cisco_access(wrap32: bool, ports: int, vlan: str | None) -> dict:
     entries.update(dot1d_stp_ports({
         port: (_access_uplink2_default_state if port == blocked_bridge_port else 5)
         for port in port_to_if}))
+    if ports == _NOVLAN1_TRUNK_CHASSIS_PORTS:
+        del entries[f"{DOT1D_BASE_PORT}.{blocked_bridge_port}"]
+        del entries[f"{DOT1D_STP_PORT_STATE}.{blocked_bridge_port}"]
     # CISCO-STACKWISE-MIB (5.32.0): 3-member ring, redundant mode, 30 A cables;
     # entPhysicalIndex 1001/2001/3001 sit outside this persona's ~50-port range.
     stack_switches = {1001: 1, 2001: 2, 3001: 3}
@@ -2440,8 +2453,11 @@ SPECIALS: dict[int, dict] = {
     5: {"persona": "cisco_access", "profile": "v2c-public", "knob": "slow_ms=2600",
         "note": "replies 2.6 s late — inside a 3 s timeout, outside a 2 s one"},
     6: {"persona": "cisco_access", "profile": "v2c-public", "knob": "toobig",
+        "chassis_ports": _NOVLAN1_TRUNK_CHASSIS_PORTS,
         "note": "GETBULK with max_repetitions > 8 gets error_status=1 tooBig; "
-                "exercises _walk_column's halve-and-retry"},
+                "exercises _walk_column's halve-and-retry; also acc-sw-005's "
+                "own Table variant (5.62.0) so its second uplink can drop "
+                "VLAN 1 without touching any other access switch"},
     7: {"persona": "cisco_access", "profile": "v2c-public", "knob": "wrap32",
         "note": "no ifXTable at all and a rate that laps a 32-bit octet "
                 "counter every ~60 s"},
@@ -2696,6 +2712,8 @@ def fleet_plan(count: int) -> list[dict]:
                 knobs["temp_hot"] = True
             elif knob == "stack_cable_down":
                 knobs["stack_cable_down"] = True
+            if "chassis_ports" in spec:
+                knobs["chassis_ports"] = spec["chassis_ports"]
 
         if version == 3:
             knobs.setdefault("v3", "sha" if profile == "v3-sha" else "noauth")

@@ -89,6 +89,7 @@ def _device_json(row, reveal: bool = False, keys: frozenset | None = None) -> di
         # three above, defensively keyed for the same reason, and the one
         # whose _merge_config fallback is 0 rather than an hour (see there).
         "arp_table_interval_s": (row["arp_table_interval_s"] if "arp_table_interval_s" in keys else None),
+        "stp_interval_s": (row["stp_interval_s"] if "stp_interval_s" in keys else None),
         "poe_enabled": (_tri(row["poe_enabled"]) if "poe_enabled" in keys else None),
         "stp_enabled": (_tri(row["stp_enabled"]) if "stp_enabled" in keys else None),
         # The capability probe's verdict — True/False once probed, None
@@ -102,6 +103,8 @@ def _device_json(row, reveal: bool = False, keys: frozenset | None = None) -> di
                         and row["poe_capable"] is not None else None),
         "stp_capable": (bool(row["stp_capable"]) if "stp_capable" in keys
                         and row["stp_capable"] is not None else None),
+        "stp_scan": {k: v for k, v in nodesdb.device_stp_scan_summary(row).items()
+                    if k != "capable"},
         "stp_protocol_spec": (row["stp_protocol_spec"] if "stp_protocol_spec" in keys else None),
         "stp_priority": (row["stp_priority"] if "stp_priority" in keys else None),
         "stp_root_id": (row["stp_root_id"] if "stp_root_id" in keys else None),
@@ -221,6 +224,7 @@ def _group_json(service, row, reveal: bool = False) -> dict:
         # ARP-cache walk interval, for the same "show what inherit means"
         # reason as vlan_interval_s immediately above.
         "arp_table_interval_s": (row["arp_table_interval_s"] if "arp_table_interval_s" in row.keys() else None),
+        "stp_interval_s": (row["stp_interval_s"] if "stp_interval_s" in row.keys() else None),
         "vendor_oid": row["vendor_oid"] or "",
         "location_oid": row["location_oid"] or "",
         "is_default": bool(row["is_default"]),
@@ -275,7 +279,7 @@ _DEVICE_EDITABLE_BODY = ("name", "group_id", "device_group_id",
                          "snmp_enabled", "oid_set", "mib_file_id",
                          "ping_count", "ping_timeout_ms", "unreachable_ping_only",
                          "vendor_oid", "location_oid", "mac_table_interval_s",
-                         "vlan_interval_s", "arp_table_interval_s",
+                         "vlan_interval_s", "arp_table_interval_s", "stp_interval_s",
                          "vendor_override", "upstream_id",
                          # Per-device, never inherited (nodesdb._DEVICE_ONLY_COLUMNS)
                          # — absent from _GROUP_EDITABLE_BODY below on purpose.

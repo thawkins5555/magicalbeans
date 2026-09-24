@@ -4,7 +4,7 @@ import time
 import traceback
 from .. import nodeoids
 from ..eventlog import ERROR, NODES
-from ..nodesdb import detected_vendor
+from ..nodesdb import detected_vendor, is_cisco
 from ._decode import _flatten_vendor_idx, _vendor_numeric, _vendor_state_value
 from ._session import snmp_version_of
 
@@ -773,18 +773,23 @@ class VendorSensorPsuMixin:
     def _bridge_port_map(self, device, config: dict,
                          deadline: float | None = None) -> dict:
         """bridge port -> ifIndex; falls back to bridge port == ifIndex
-        when dot1dBasePortIfIndex answers nothing, default-context callers
-        only (`deadline is None`; a per-VLAN call already walked
-        dot1dStpPortState per context)."""
-        base_port_if_index = self._walk_column(
+        when dot1dBasePortIfIndex answers nothing, non-Cisco devices only
+        (a Cisco device gets a per-VLAN map instead -- see _cisco_vlan_stp)
+        and default-context callers only (`deadline is None`; a per-VLAN
+        call already walks dot1dStpPortState per context). An incomplete
+        walk returns {} rather than a partial map, so the cache above never
+        remembers a truncated one."""
+        base_port_if_index, complete = self._walk_column_status(
             device, config, self._DOT1D_BASE_PORT_IF_INDEX, deadline=deadline)
+        if not complete:
+            return {}
         mapping = {}
         for suffix, value in base_port_if_index.items():
             try:
                 mapping[int(suffix)] = int(value)
             except (TypeError, ValueError):
                 continue
-        if mapping or deadline is not None:
+        if mapping or deadline is not None or is_cisco(device):
             return mapping
         port_state = self._walk_column(
             device, config, nodeoids.DOT1D_STP_PORT_STATE, deadline=deadline)
@@ -846,26 +851,43 @@ class VendorSensorPsuMixin:
                 fdb_port, set(mapping), vlan, False, mapping))
         return entries, answered
 
-    def _cisco_vlan_stp(self, device, config: dict, port_map: dict,
+    def _cisco_vlan_stp(self, device, config: dict,
                         start: int = 0, budget_s: float | None = None):
         """dot1dStpPortState read inside each VLAN's own `community@vlan`
         context -- classic PVST+'s real per-port state lives there, not in
-        the device's default context.
+        the device's default context. Each VLAN's own dot1dBasePortIfIndex
+        is walked too, rather than reused from the DEFAULT context (VLAN
+        1's bridge instance on IOS): a trunk that does not carry VLAN 1 is
+        simply absent from that table, and reusing it drops that trunk from
+        every VLAN silently -- the root cause this method exists to close.
 
-        Walks the operational VLAN list from index `start`, up to
+        Walks the operational VLAN list starting at the first VLAN id >=
+        `start` (wrapping to the lowest VLAN when none is), up to
         _MAX_VLAN_CONTEXTS VLANs or `budget_s` (default _VLAN_WALK_BUDGET_S).
 
-        Returns (vlan_rows, answered, complete, next_start, vlan_total,
-        next_vlan): one vlan_rows entry per VLAN whose column walk finished
-        (empty counts as answered); complete is False only on the deadline,
-        any other failure just advances next_start (0 once covered,
-        next_vlan names it)."""
+        Returns (vlan_rows, answered, complete, next_vlan_id, vlan_total,
+        next_vlan, unmapped, list_unavailable): one vlan_rows entry per VLAN
+        whose own map and state walks both finished -- a complete, confirmed
+        -empty map (a VTP-propagated VLAN with no local port) counts as
+        answered too, with an empty ports dict and no state walk attempted;
+        complete is False only on the deadline, any other failure just
+        advances next_vlan_id (0 once the lap is covered, next_vlan names
+        it); unmapped is the set of bridge ports seen in some VLAN's
+        dot1dStpPortState but absent from THAT VLAN's own map;
+        list_unavailable is True when vtpVlanState itself did not answer in
+        full, in which case every other field is a no-op zero/empty value."""
         if snmp_version_of(config) == 3:
-            return {}, False, True, 0, 0, None
+            return {}, False, True, 0, 0, None, set(), False
         community = config.get("community")
         if not community:
-            return {}, False, True, 0, 0, None
-        vlan_states = self._walk_column(device, config, self._VTP_VLAN_STATE)
+            return {}, False, True, 0, 0, None, set(), False
+        vlan_states, list_complete = self._walk_column_status(
+            device, config, self._VTP_VLAN_STATE)
+        if not list_complete:
+            # A genuine timeout/error/cut-short walk, not a device that
+            # simply has no VTP table (that is a confirmed-empty, complete
+            # answer, handled below like any other "no VLANs" case).
+            return {}, False, True, 0, 0, None, set(), True
         vlans = []
         for suffix, state in vlan_states.items():
             try:
@@ -874,18 +896,23 @@ class VendorSensorPsuMixin:
             except (TypeError, ValueError):
                 continue
             vlan = suffix.split(".")[-1]
-            if vlan.isdigit() and not (1002 <= int(vlan) <= 1005):
+            # VLAN 1 IS the DEFAULT context on IOS (_poll_stp's merge seeds
+            # it from there); asking for it again as "@1" is redundant at
+            # best, and 1002-1005 are the legacy VLANs VTP always lists but
+            # a real switch never actually carries traffic on.
+            if vlan.isdigit() and vlan != "1" and not (1002 <= int(vlan) <= 1005):
                 vlans.append(vlan)
         if not vlans:
-            return {}, False, True, 0, 0, None
+            return {}, False, True, 0, 0, None, set(), False
         ordered = sorted(vlans, key=int)
         total = len(ordered)
-        start = start % total
-        window = ordered[start:start + self._MAX_VLAN_CONTEXTS]
+        start_idx = next((i for i, v in enumerate(ordered) if int(v) >= start), 0)
+        window = ordered[start_idx:start_idx + self._MAX_VLAN_CONTEXTS]
         complete = True
         budget = self._VLAN_WALK_BUDGET_S if budget_s is None else budget_s
         deadline = time.monotonic() + budget
         vlan_rows: dict[str, dict] = {}
+        unmapped: set[int] = set()
         answered = False
         covered = 0
         for vlan in window:
@@ -893,14 +920,28 @@ class VendorSensorPsuMixin:
                 complete = False
                 break
             scoped = {**config, "community": f"{community}@{vlan}"}
-            mapping = port_map
-            if not mapping:
-                mapping = self._bridge_port_map(device, scoped, deadline=deadline)
-            if not mapping:
+            raw_map, map_done = self._walk_column_status(
+                device, scoped, self._DOT1D_BASE_PORT_IF_INDEX, deadline=deadline)
+            if not map_done:
                 complete = False
                 if time.monotonic() > deadline:
                     covered += covered == 0   # alone over budget: skip it, not the lap
                     break
+                covered += 1
+                continue
+            mapping = {}
+            for suffix, value in raw_map.items():
+                try:
+                    mapping[int(suffix)] = int(value)
+                except (TypeError, ValueError):
+                    continue
+            if not mapping:
+                # A complete, confirmed-empty map -- a VTP-propagated VLAN
+                # with no local port on this switch -- is a real answer,
+                # not a failure; there is nothing to walk dot1dStpPortState
+                # for.
+                vlan_rows[vlan] = {}
+                answered = True
                 covered += 1
                 continue
             state, done = self._walk_column_status(
@@ -920,18 +961,25 @@ class VendorSensorPsuMixin:
                 except ValueError:
                     continue
                 if_index = mapping.get(bridge_port)
-                if if_index is None or not isinstance(value, (int, float)):
+                if if_index is None:
+                    unmapped.add(bridge_port)
+                    continue
+                if not isinstance(value, (int, float)):
                     continue
                 state_name = nodeoids.DOT1D_STP_PORT_STATE_ENUM.get(int(value))
                 if state_name is not None:
                     ports[if_index] = state_name
             vlan_rows[vlan] = ports
             covered += 1
-        next_start = start + covered
-        if next_start >= total:
-            next_start = 0
-        next_vlan = ordered[next_start] if ordered else None
-        return vlan_rows, answered, complete, next_start, total, next_vlan
+        next_index = start_idx + covered
+        if next_index >= total:
+            next_vlan_id = 0
+            next_vlan = ordered[0] if ordered else None
+        else:
+            next_vlan = ordered[next_index]
+            next_vlan_id = int(next_vlan)
+        return (vlan_rows, answered, complete, next_vlan_id, total, next_vlan,
+                unmapped, False)
 
     def _run_mac_table(self, device_id: int) -> None:
         """One scheduled forwarding-table walk, on the poll pool.

@@ -228,6 +228,11 @@
         seen in the MAC table) — MAPPER's strand colours come from this. <b>3600 (one
         hour) is the shipped default</b>; an explicit 0 switches it off for every device
         on this profile that does not override it.</p>
+      <label>Walk per-VLAN spanning tree every <input id="nd-p-stpinterval" type="number" min="30"
+        step="60" placeholder="inherit" value="${p.stp_interval_s ?? ''}"> s</label>
+      <p class="hint">PVST+ blocking state per VLAN, on its own cadence — not tied to the
+        VLAN membership interval above, so a new block is found even with that walk off.
+        <b>300 (five minutes) is the shipped default</b>.</p>
       <label>Custom MIB <select id="nd-p-mib">${mibOptionsHtml(p.mib_file_id, true)}</select></label>
       <p class="hint">Polls that MIB's own scalar objects for every device on this
         profile (unless a device overrides it), shown under its own names.</p>
@@ -260,6 +265,7 @@
       mac_table_interval_s: blankToNull(box.querySelector('#nd-p-mactable').value),
       vlan_interval_s: blankToNull(box.querySelector('#nd-p-vlaninterval').value),
       arp_table_interval_s: blankToNull(box.querySelector('#nd-p-arptable').value),
+      stp_interval_s: blankToNull(box.querySelector('#nd-p-stpinterval').value),
       mib_file_id: Number(box.querySelector('#nd-p-mib').value) || null,
       ...identityOidValues(box, true),
     };

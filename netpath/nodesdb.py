@@ -784,7 +784,8 @@ _OVERRIDE_COLUMNS = ("snmp_version", "community", "v3_user", "v3_auth_proto",
                      "mib_file_id", "ping_count", "ping_timeout_ms",
                      "unreachable_ping_only", "vendor_oid", "location_oid",
                      "mac_table_interval_s", "lldp_interval_s", "poe_enabled",
-                     "stp_enabled", "vlan_interval_s", "arp_table_interval_s")
+                     "stp_enabled", "vlan_interval_s", "arp_table_interval_s",
+                     "stp_interval_s")
 
 # These two are cleared to "" rather than NULL, so "" is also "inherit".
 _EMPTY_IS_UNSET = frozenset(("vendor_oid", "location_oid"))
@@ -821,7 +822,8 @@ _GROUP_EDITABLE = ("name", "snmp_version", "community", "v3_user",
                    "mib_file_id", "ping_count", "ping_timeout_ms",
                    "unreachable_ping_only", "vendor_oid", "location_oid",
                    "mac_table_interval_s", "lldp_interval_s", "poe_enabled",
-                   "stp_enabled", "vlan_interval_s", "arp_table_interval_s")
+                   "stp_enabled", "vlan_interval_s", "arp_table_interval_s",
+                   "stp_interval_s")
 
 # Settable but never inherited, like vendor_override: a management page's
 # scheme/port is a fact about one box, and a polling profile handing it to a
@@ -976,6 +978,29 @@ def detected_vendor(device_row) -> str:
     if detected:
         return detected
     return (device_row["vendor"] if "vendor" in keys else "") or ""
+
+
+def is_cisco(device_row) -> bool:
+    """The single Cisco gate every per-vendor STP/MAC read must share."""
+    return "cisco" in detected_vendor(device_row).lower()
+
+
+def device_stp_scan_summary(device_row) -> dict:
+    """{"ts", "vlans", "answered", "unmapped" (a list of bridge-port numbers,
+    not ifIndexes), "note", "capable"} from one device row's stp_scan_*
+    columns -- missing columns read as None/[] rather than raising, like
+    detected_vendor's own tolerance."""
+    keys = device_row.keys() if device_row is not None and hasattr(device_row, "keys") else []
+
+    def col(name):
+        return device_row[name] if name in keys else None
+
+    unmapped_raw = col("stp_scan_unmapped")
+    unmapped = [int(part) for part in str(unmapped_raw).split(",") if part.strip().isdigit()] \
+        if unmapped_raw else []
+    return {"ts": col("stp_scan_ts"), "vlans": col("stp_scan_vlans"),
+            "answered": col("stp_scan_answered"), "unmapped": unmapped,
+            "note": col("stp_scan_note"), "capable": col("stp_capable")}
 
 
 def _upstream_confidence(match_kind: str, present: bool) -> tuple[str, int]:
@@ -1346,6 +1371,16 @@ class NodesDatabase(SqliteStore):
         # walks nothing until an operator sets a number somewhere.
         self.ensure_columns("devices", {"arp_table_interval_s": "INTEGER"})
         self.ensure_columns("groups", {"arp_table_interval_s": "INTEGER"})
+        # Per-VLAN STP cadence, NULL = inherit; the chain ends at 300 s.
+        self.ensure_columns("devices", {"stp_interval_s": "INTEGER"})
+        self.ensure_columns("groups", {"stp_interval_s": "INTEGER"})
+        # Per-device per-VLAN scan summary, the evidence for a link that is
+        # still not dotted -- see set_stp_scan below.
+        self.ensure_columns("devices", {
+            "stp_scan_ts": "REAL", "stp_scan_vlans": "INTEGER",
+            "stp_scan_answered": "INTEGER", "stp_scan_unmapped": "TEXT",
+            "stp_scan_note": "TEXT",
+        })
         # Per-port PoE and STP state, the same kind of fact as oper_status
         # and refreshed by the same poll cycle rather than a table of its own.
         # media: 'optic' once a port-mapped ENTITY-SENSOR row proves a
@@ -2311,8 +2346,9 @@ class NodesDatabase(SqliteStore):
 
     def interface_link_facts_for_devices(self, device_ids) -> dict[tuple[int, int], dict]:
         """(device_id, if_index) -> {"media", "optic_mode", "stp_state",
-        "stp_blocking_vlans", "stp_via_if_index"} for every interface of the
-        named devices with any of media/optic_mode/stp_state non-NULL."""
+        "stp_blocking_vlans", "stp_vlan_count", "stp_via_if_index"} for every
+        interface of the named devices with any of media/optic_mode/stp_state
+        non-NULL."""
         ids = list(dict.fromkeys(int(d) for d in device_ids))
         if not ids:
             return {}
@@ -2322,7 +2358,8 @@ class NodesDatabase(SqliteStore):
                 marks = marks_for(chunk)
                 for row in self._conn.execute(
                         "SELECT device_id, if_index, media, optic_mode,"
-                        " stp_state, stp_blocking_vlans, stp_via_if_index"
+                        " stp_state, stp_blocking_vlans, stp_vlan_count,"
+                        " stp_via_if_index"
                         " FROM interfaces WHERE device_id IN ({})"
                         " AND (media IS NOT NULL OR optic_mode IS NOT NULL"
                         " OR stp_state IS NOT NULL)".format(marks),
@@ -2331,6 +2368,7 @@ class NodesDatabase(SqliteStore):
                         "media": row["media"], "optic_mode": row["optic_mode"],
                         "stp_state": row["stp_state"],
                         "stp_blocking_vlans": row["stp_blocking_vlans"],
+                        "stp_vlan_count": row["stp_vlan_count"],
                         "stp_via_if_index": row["stp_via_if_index"],
                     }
         return facts
@@ -2850,6 +2888,8 @@ class NodesDatabase(SqliteStore):
             config["poe_enabled"] = 1
         if config.get("stp_enabled") is None:
             config["stp_enabled"] = 1
+        if config.get("stp_interval_s") is None:
+            config["stp_interval_s"] = 300
         return config
 
     _CREDENTIAL_KEYS = ("snmp_version", "community", "v3_user", "v3_auth_proto",
@@ -3925,11 +3965,15 @@ class NodesDatabase(SqliteStore):
         # port index is an endpoint that does not exist — mapper.link_identity
         # keys on exactly that pair. Lowest if_index, so a MAC repeated across
         # a stack resolves the same way on every read.
+        # Ordered so a physical port outranks an SVI/loopback/mgmt interface sharing the same chassis MAC.
         " (SELECT i3.if_index FROM interfaces i3"
         "   WHERE n.chassis_id_subtype = 4 AND n.chassis_id != ''"
         "     AND i3.phys_addr = n.chassis_id COLLATE NOCASE"
         "     AND i3.device_id = COALESCE(byname.id, bymac.id)"
-        "   ORDER BY i3.if_index LIMIT 1) AS matched_if_index,"
+        "   ORDER BY CASE WHEN lower(i3.descr) LIKE 'vlan%'"
+        "                   OR lower(i3.descr) LIKE 'loopback%'"
+        "                   OR lower(i3.descr) LIKE 'mgmt%' THEN 1 ELSE 0 END,"
+        "            i3.if_index LIMIT 1) AS matched_if_index,"
         " byname.id AS matched_by_name_id,"
         " bymac.id AS matched_by_mac_id"
         " FROM neighbors n"
@@ -3960,7 +4004,11 @@ class NodesDatabase(SqliteStore):
         "           ON macdev.id = i2.device_id AND macdev.enabled = 1"
         "         WHERE n.chassis_id_subtype = 4 AND n.chassis_id != ''"
         "           AND i2.phys_addr = n.chassis_id COLLATE NOCASE"
-        "         ORDER BY i2.device_id, i2.if_index LIMIT 1)"
+        "         ORDER BY i2.device_id,"
+        "                  CASE WHEN lower(i2.descr) LIKE 'vlan%'"
+        "                         OR lower(i2.descr) LIKE 'loopback%'"
+        "                         OR lower(i2.descr) LIKE 'mgmt%' THEN 1 ELSE 0 END,"
+        "                  i2.if_index LIMIT 1)"
         " LEFT JOIN devices bymac ON bymac.id = iface.device_id AND bymac.enabled = 1")
 
     def neighbours_of(self, device_id: int) -> list[sqlite3.Row]:
@@ -4386,6 +4434,17 @@ class NodesDatabase(SqliteStore):
                 (None if capable is None else (1 if capable else 0), device_id))
             self._conn.commit()
 
+    def set_stp_scan(self, device_id: int, *, ts: float, vlans: int, answered: int,
+                     unmapped: str, note: str) -> None:
+        """nodepoll._run_stp_vlan_pass's own scan summary -- see there."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE devices SET stp_scan_ts = ?, stp_scan_vlans = ?,"
+                " stp_scan_answered = ?, stp_scan_unmapped = ?,"
+                " stp_scan_note = ? WHERE id = ?",
+                (ts, vlans, answered, unmapped, note, device_id))
+            self._conn.commit()
+
     def set_default_gateway(self, device_id: int, text: str) -> None:
         """The comma-joined next hop(s) _refresh_default_gateway read, or ""
         for an answered read with no default route; NULL means never read
@@ -4637,19 +4696,22 @@ class NodesDatabase(SqliteStore):
         return {(row["device_id"], row["if_index"]) for row in rows}
 
     # Spanning tree holding a link down: dot1dStpPortState blocking(2) and
-    # RSTP's discarding. listening/learning are a port coming up, and
-    # disabled/broken are the port being off.
-    STP_BLOCKED_STATES = ("blocking", "discarding")
+    # RSTP's discarding and broken(6) count: a guarded-out port is blocked too.
+    STP_BLOCKED_STATES = ("blocking", "discarding", "broken")
 
-    def update_interface_stp(self, device_id: int, rows: list[dict]) -> None:
+    def update_interface_stp(self, device_id: int, rows: list[dict]) -> list[int]:
         """update_interface_poe's counterpart for per-port STP state:
         stp_blocking_vlans/stp_vlan_count COALESCE, stp_clear NULLs all
-        four, and stp_via_if_index (this or the prior row) skips the event."""
+        four, and stp_via_if_index (this or the prior row) skips the event.
+
+        Returns the if_indexes among `rows` with no interfaces row (their
+        state is dropped; the caller logs them)."""
         if not rows:
-            return
+            return []
         clear_rows = [row for row in rows if row.get("stp_clear")]
         data_rows = [row for row in rows if not row.get("stp_clear")]
         prior = self._stp_state_before(device_id, [row["if_index"] for row in rows])
+        missing = sorted({row["if_index"] for row in rows} - set(prior))
         with self._lock:
             try:
                 if data_rows:
@@ -4696,6 +4758,7 @@ class NodesDatabase(SqliteStore):
             self.record_interface_event(
                 interface_id, "stp_blocking" if blocked_now else "stp_unblocked",
                 detail)
+        return missing
 
     def _stp_state_before(self, device_id: int, if_indexes: list) -> dict:
         """{if_index: (stp_state, interfaces.id, descr, stp_via_if_index)}

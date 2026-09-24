@@ -2041,6 +2041,34 @@ From 4.47.0, Nodes walks past the SNMP poll to see the wire itself.
   cell reads `blocking · via Port-channel1` (or whichever bundle it
   belongs to) instead of naming a state the switch never reported for
   that physical port at all.
+- **From 5.62.0, the root cause behind a whole class of missing blocks is
+  fixed: a trunk that does not carry VLAN 1 no longer drops out of every
+  VLAN's spanning-tree read.** Bridge-port-to-interface mapping used to be
+  read once, in VLAN 1's own context, and reused for every other VLAN; a
+  trunk pruned off VLAN 1 simply had no row in that mapping, so its state
+  everywhere else was silently thrown away — no row, a blank Nodes column,
+  no error. Each VLAN now reads its own mapping, and a switch's own
+  `broken(6)` bridge ports now count as blocked, the same as `blocking`.
+  The device pane shows the evidence directly: "STP scan: 2 min ago, 46 of
+  46 VLANs, 3 bridge ports unmapped," or "STP: this switch answers no
+  BRIDGE-MIB (re-probed hourly)" for a switch that has never answered at
+  all — that verdict is rechecked hourly rather than kept forever. The
+  per-VLAN scan runs on its own five-minute cadence (**Walk per-VLAN
+  spanning tree every N seconds**, `stp_interval_s`, next to the VLAN
+  membership interval on both the polling profile and a device's own
+  override — 30 seconds is the floor; anything lower, or a non-numeric
+  value, is treated as the 300-second default rather than hammering a
+  switch), rather than riding the VLAN-membership walk's own schedule, and
+  a link flapping on a bridge port now wakes the scan immediately instead
+  of waiting out the interval. That cadence is per switch, and only starts
+  counting once a scan is actually queued onto the same worker pool as the
+  MAC/VLAN/LLDP table walks (**Nodes → Settings → Table-walk threads**) —
+  on a large fleet, that pool needs sizing for the scan rate a five-minute
+  cadence implies, or laps fall behind schedule; the per-VLAN cache also
+  keeps a VLAN's last reading for at least 30 minutes regardless, so a
+  slow lap cannot let a genuine block revert to forwarding in the
+  meantime. See Mapper, below, for what the drawing itself no longer
+  hides.
 - **PoE power draw** — budget and per-port wattage, Cisco's own per-port
   milliwatt object where present — appears on the interface table for a
   device that answers POWER-ETHERNET-MIB. A device is asked for any of
@@ -5127,6 +5155,37 @@ like any other module.
   problem. A switch with no `dot1dBasePortIfIndex` answer at all is no
   longer blind to STP either: bridge port number now falls back to
   ifIndex, the same assumption the VLAN membership walk already made.
+- **From 5.62.0, the root cause of the remaining blind spot in that
+  per-VLAN scan is closed: a trunk that does not carry VLAN 1 no longer
+  disappears from spanning tree in every VLAN it does carry.** The scan
+  used to reuse VLAN 1's own bridge-port-to-interface mapping inside every
+  other VLAN's context; a trunk pruned off VLAN 1 — exactly the estates
+  this feature targets — was simply absent from that mapping, so its
+  state everywhere else was silently dropped: no row, a blank Nodes
+  column, and a pane that read "no state read" with no further reason
+  given. Each VLAN now reads its own mapping; an incomplete one marks that
+  VLAN unfinished and retries it rather than dropping the port from the
+  count. **The dotted overlay itself now draws on every blocked link at
+  every width, not only under FiberView** — a plain, collapsed, or single
+  blocked strand can no longer have its dash pattern swallowed by a glow
+  or by a line drawn too thin to show one; a trunk drawn as strands with
+  no overlap between the blocked-VLAN list and the drawn strands now dots
+  every strand rather than none. **The pane's reason for an unreadable end
+  is now specific** rather than the bare "no state read" above: no
+  BRIDGE-MIB on that switch, the per-VLAN scan hasn't finished yet (naming
+  why), the scan answered fewer VLANs than the switch actually carries, one
+  or more of the switch's own bridge ports were never mapped by any VLAN's
+  scan (named as a count, since it cannot always point at this exact port),
+  no scan has run yet (due within five minutes), or the interface simply
+  hasn't been polled — an unmanaged peer reads "`<name>` is not polled"
+  instead. The legend
+  adds "Dotted = STP blocked on the named end" whenever a blocked link is
+  on the map. **A `broken` port is now treated as blocked everywhere a
+  `blocking` one is** — the dots, the pane, and the CSV export — worded
+  "broken" rather than "blocking" so the distinction is never lost. **The
+  scan now runs every five minutes**, on its own setting independent of
+  the VLAN-membership walk's schedule, and a link flapping on a bridge
+  port wakes it immediately rather than waiting out the interval.
 - **From 5.36.0, every cable between the same two devices draws as its
   own line, fanned apart from the others** rather than stacking on
   identical coordinates. Each line in the fan keeps its own strands,

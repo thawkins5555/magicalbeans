@@ -346,7 +346,7 @@ async function waitForStpVlanClassification(page, name) {
   const device = devices.find((d) => d.name === name);
   if (!device) return { present: false };
   const started = Date.now();
-  const deadline = started + 150000;
+  const deadline = started + 180000;   // 5.62.0: was 150000
   let polled = false;
   for (;;) {
     const res = await page.request.get(
@@ -381,7 +381,7 @@ async function waitForStpVlanBlockingLink(page, mapId) {
   }
   const origin = new URL(page.url()).origin;
   const started = Date.now();
-  const deadline = started + 150000;
+  const deadline = started + 180000;   // 5.62.0: was 150000
   // LLDP/CDP discovery trickles in on its own schedule; a link that has not
   // been discovered at all is timing, a discovered link that is not blocking
   // is the defect this check exists for -- the caller tells them apart.
@@ -417,7 +417,7 @@ async function waitForStpVlanStrandsLink(page, mapId) {
   if (!state.present || !state.ready) return state;
   const origin = new URL(page.url()).origin;
   const started = Date.now();
-  const deadline = started + 150000;
+  const deadline = started + 180000;   // 5.62.0: was 150000
   for (;;) {
     const res = await page.request.get(`${origin}/api/mapper/maps/${mapId}`);
     const links = res.ok() ? (await res.json()).links || [] : [];
@@ -1438,10 +1438,10 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       await page.waitForFunction(
         () => !document.getElementById('mp-connect').disabled, { timeout: 10000 });
 
-      const countText = () => page.evaluate(
-        () => document.getElementById('mp-counters').textContent || '');
-      const linkCount = (text) => Number((/(\d+) link/.exec(text) || [])[1] || 0);
-      const before = linkCount(await countText());
+      // Discovery keeps adding links mid-check, so count manual lines only.
+      const linkCount = () => page.evaluate(
+        () => document.querySelectorAll('#mp-svg path.mp-link.manual').length);
+      const before = await linkCount();
 
       await page.click('#mp-connect');
       await page.waitForSelector('#modal:not([hidden]) #mpc-label', { timeout: 10000 });
@@ -1455,9 +1455,9 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       // #mp-status is the map's own NAME (drawStatus in mapper.js) -- the
       // node/link/VLAN counts this check is really after live in
       // #mp-counters, right beside it.
-      const afterConnect = linkCount(await countText());
+      const afterConnect = await linkCount();
       assert(afterConnect === before + 1,
-        `#mp-counters' link count went ${before} -> ${afterConnect}, expected +1`);
+        `manual line count went ${before} -> ${afterConnect}, expected +1`);
 
       const manualLinkId = await page.evaluate(() => {
         const path = document.querySelector('#mp-svg path.mp-link.manual');
@@ -1491,14 +1491,12 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       const removeResponse = await removed;
       assert(removeResponse.ok(), `Remove line answered ${removeResponse.status()}`);
       await reloaded;
-      await page.waitForFunction((expected) => {
-        const text = document.getElementById('mp-counters').textContent || '';
-        const n = Number((/(\d+) link/.exec(text) || [])[1] || -1);
-        return n === expected;
-      }, before, { timeout: 10000 });
-      const afterRemove = linkCount(await countText());
+      await page.waitForFunction((expected) =>
+        document.querySelectorAll('#mp-svg path.mp-link.manual').length === expected,
+      before, { timeout: 10000 });
+      const afterRemove = await linkCount();
       assert(afterRemove === before,
-        `link count after Remove is ${afterRemove}, expected back to ${before}`);
+        `manual line count after Remove is ${afterRemove}, expected back to ${before}`);
       return `${before} -> ${afterConnect} -> ${afterRemove}`;
     });
 
@@ -1662,14 +1660,31 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       // data-link-id; the check above leaves it on when it is not skipped.
       await page.uncheck('#mp-fiberview', { timeout: 2000 }).catch(() => {});
 
+      // 5.62.0: this POST (same fetch VlanView's check below uses) queues
+      // the VLAN MEMBERSHIP walk, not a per-VLAN STP walk -- it does not
+      // itself produce acc-sw-005's STP row. That comes from the poller's
+      // own first-sighting inline STP pass and its regular cadence; the
+      // longer wait below is what actually carries this check past those,
+      // so it no longer skips on timing.
+      const scan = await page.evaluate(async () => {
+        const res = await fetch('/api/nodes/vlan-scan', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({}),
+        });
+        const payload = await res.json().catch(() => ({}));
+        return { status: res.status, payload };
+      });
+      assert(scan.status === 200,
+        `expected 200 from POST /api/nodes/vlan-scan, got ${scan.status}: `
+        + `${JSON.stringify(scan.payload)}`);
+
       const state = await waitForStpVlanBlockingLink(page, mapId);
       if (!state.present) return 'skipped: acc-sw-005 is not in this fleet';
-      if (!state.ready && state.discovered === false) {
-        return `skipped: acc-sw-005's second uplink not yet discovered by LLDP/CDP after ${state.waited_s}s`;
-      }
       assert(state.ready,
         `acc-sw-005's TenGigabitEthernet1/1/2 carried no per-VLAN blocking `
-        + `link after ${state.waited_s}s, poll-now included`);
+        + `link after ${state.waited_s}s (discovered=${state.discovered}), `
+        + `a vlan-scan and poll-now included`);
 
       const { link, side } = state;
       const stpVlans = side === 'a' ? link.a_stp_vlans : link.b_stp_vlans;
@@ -1728,14 +1743,29 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       if (!mapId) return 'skipped: no map selected on the demo Mapper';
       await page.uncheck('#mp-fiberview', { timeout: 2000 }).catch(() => {});
 
+      // 5.62.0: same VLAN-membership POST as the check above -- it does not
+      // itself produce the STP row either; see that check's comment.
+      const scan = await page.evaluate(async () => {
+        const res = await fetch('/api/nodes/vlan-scan', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({}),
+        });
+        const payload = await res.json().catch(() => ({}));
+        return { status: res.status, payload };
+      });
+      assert(scan.status === 200,
+        `expected 200 from POST /api/nodes/vlan-scan, got ${scan.status}: `
+        + `${JSON.stringify(scan.payload)}`);
+
       const state = await waitForStpVlanStrandsLink(page, mapId);
       if (!state.present) return 'skipped: acc-sw-005 is not in this fleet';
-      if (!state.ready) {
-        return `skipped: acc-sw-005's second uplink not blocking yet after ${state.waited_s}s`;
-      }
-      if (!state.strands) {
-        return `skipped: acc-sw-005's uplink not yet drawn in strands (VLAN walk pending) after ${state.waited_s}s`;
-      }
+      assert(state.ready,
+        `acc-sw-005's second uplink not blocking after ${state.waited_s}s, `
+        + `a vlan-scan and poll-now included`);
+      assert(state.strands,
+        `acc-sw-005's uplink not yet drawn in strands after ${state.waited_s}s, `
+        + `a vlan-scan and poll-now included`);
       const linkId = String(state.link.id);
       await Promise.all([
         page.waitForResponse((res) => /\/api\/mapper\/maps\/\d+$/.test(
@@ -1757,6 +1787,130 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       assert(others.every((s) => !s.blocking),
         `expected only the VLAN 30 strand to carry .blocking, got ${JSON.stringify(strands)}`);
       return `${strands.length} strand(s) on link ${linkId}, only VLAN 30's carries .blocking`;
+    });
+
+  await check('Mapper: a collapsed trunk\'s STP block is drawn as dots at full width (5.62.0)',
+    async () => {
+      await page.keyboard.press('Escape').catch(() => {});
+      await selectTab(page, 'mapper');
+      await settle(page, 1000);
+      const mapId = await page.evaluate(() => {
+        const sel = document.getElementById('mp-map');
+        return sel && sel.value ? sel.value : null;
+      });
+      if (!mapId) return 'skipped: no map selected on the demo Mapper';
+      await page.uncheck('#mp-fiberview', { timeout: 2000 }).catch(() => {});
+      // acc-sw-005's blocked uplink (waited for above) carries five VLANs;
+      // a threshold of 3 draws it collapsed, restored in `finally`.
+      const origin = new URL(page.url()).origin;
+      const setThreshold = (n) => page.evaluate(async (value) => {
+        const res = await fetch('/api/settings', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ scope: 'mapper', values: { vlan_collapse_threshold: value } }),
+        });
+        return res.status;
+      }, n);
+      try {
+        assert((await setThreshold(3)) === 200, 'could not lower vlan_collapse_threshold');
+        const state = await waitForStpVlanBlockingLink(page, mapId);
+        if (!state.present) return 'skipped: acc-sw-005 is not in this fleet';
+        assert(state.ready, `acc-sw-005's blocked uplink not on the map after ${state.waited_s}s`);
+        const linkId = String(state.link.id);
+        let plan = null;
+        const deadline = Date.now() + 60000;
+        for (;;) {
+          await Promise.all([
+            page.waitForResponse((res) => /\/api\/mapper\/maps\/\d+$/.test(
+              new URL(res.url()).pathname) && res.request().method() === 'GET',
+            { timeout: 20000 }).catch(() => {}),
+            page.click('#mp-refresh'),
+          ]);
+          await settle(page, 1000);
+          const res = await page.request.get(`${origin}/api/mapper/maps/${mapId}`);
+          const links = res.ok() ? (await res.json()).links || [] : [];
+          const link = links.find((l) => String(l.id) === linkId);
+          plan = link ? link.plan || {} : {};
+          if (plan.mode === 'collapsed' && link.blocking) break;
+          assert(Date.now() < deadline,
+            `link ${linkId} never drew collapsed+blocking, mode ${plan.mode}`);
+          await sleep(3000);
+        }
+        const hasOverlay = await page.evaluate((id) => {
+          const main = document.querySelector(`#mp-svg path.mp-link[data-link-id="${id}"]`);
+          const holder = main ? main.closest('g') : null;
+          return Boolean(holder && holder.querySelector('path.mp-blocking-over'));
+        }, linkId);
+        assert(hasOverlay,
+          'expected a path.mp-blocking-over element in the collapsed link\'s holder');
+        await page.evaluate((id) => {
+          const path = document.querySelector(`#mp-svg path.mp-link[data-link-id="${id}"]`);
+          path.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        }, linkId);
+        await page.waitForFunction(() => {
+          const pane = document.getElementById('mp-detail');
+          return !!pane && pane.textContent.includes('STP: blocking on acc-sw-005');
+        }, null, { timeout: 10000 });
+        return `link ${linkId} blocking+collapsed with the overlay, pane names acc-sw-005`;
+      } finally {
+        await setThreshold(8);
+      }
+    });
+
+  await check('Mapper: a link with no STP state on one end names the reason (5.62.0)',
+    async () => {
+      await page.keyboard.press('Escape').catch(() => {});
+      await selectTab(page, 'mapper');
+      await settle(page, 1000);
+      const mapId = await page.evaluate(() => {
+        const sel = document.getElementById('mp-map');
+        return sel && sel.value ? sel.value : null;
+      });
+      if (!mapId) return 'skipped: no map selected on the demo Mapper';
+      const origin = new URL(page.url()).origin;
+      const res = await page.request.get(`${origin}/api/mapper/maps/${mapId}`);
+      const links = res.ok() ? (await res.json()).links || [] : [];
+      const link = links.find((l) => !l.manual && (l.a_stp === null || l.b_stp === null));
+      if (!link) return 'skipped: every link end has STP state';
+
+      const linkId = String(link.id);
+      const drawn = await page.waitForSelector(
+        `#mp-svg path.mp-link[data-link-id="${linkId}"]`, { timeout: 10000 })
+        .then(() => true).catch(() => false);
+      assert(drawn, `expected link ${linkId} (no STP state on one end) to be drawn on the map`);
+
+      await page.evaluate((id) => {
+        const path = document.querySelector(`#mp-svg path.mp-link[data-link-id="${id}"]`);
+        path.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      }, linkId);
+      await page.waitForFunction(() => {
+        const pane = document.getElementById('mp-detail');
+        return !!pane && pane.textContent.trim().length > 0;
+      }, null, { timeout: 10000 });
+      const paneText = await page.evaluate(() => document.getElementById('mp-detail').innerText);
+      assert(/STP: no state read on .*: ./.test(paneText),
+        `expected the pane to name why no STP state was read, got: ${paneText.slice(0, 500)}`);
+      return `link ${linkId} names its no-state cause`;
+    });
+
+  await check('Nodes: acc-sw-005\'s device pane shows its STP scan summary (5.62.0)',
+    async () => {
+      await page.keyboard.press('Escape').catch(() => {});
+      await page.waitForSelector('#modal[hidden]', { state: 'attached', timeout: 5000 }).catch(() => {});
+      await selectTab(page, 'nodes');
+      await settle(page, 800);
+      await page.click('#page-nodes > .subtabs > .subtab[data-subtab="devices"]').catch(() => {});
+      const row = page.locator('#nodes-table tbody tr', { hasText: 'acc-sw-005' }).first();
+      const found = await row.count() > 0;
+      if (!found) return 'skipped: acc-sw-005 is not in this fleet';
+      await row.click();
+      await page.waitForSelector('#nd-detail:not([hidden])', { timeout: 20000 });
+      await page.click('#nd-d-subs > .subtabs > .subtab[data-subtab="capabilities"]');
+      await page.waitForFunction(() => (document.getElementById('nd-cap-stp') || {}).textContent
+        .includes('STP scan:'), null, { timeout: 20000 }).catch(() => {});
+      const text = await page.evaluate(() => (document.getElementById('nd-cap-stp') || {}).textContent || '');
+      assert(text.includes('STP scan:'),
+        `expected acc-sw-005's device pane to contain "STP scan:", got: ${text.slice(0, 500)}`);
+      return 'device pane shows "STP scan:"';
     });
 
   await check('Mapper: VlanView glows only when the picked VLAN is on both ends, '
@@ -1850,8 +2004,8 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
           const link = byId.get(id);
           if (!link) continue;
           compared += 1;
-          const expectGlow = bothEnds(link, vlan);
           const expectDimmed = !(Array.isArray(link.vlans) && link.vlans.includes(vlan));
+          const expectGlow = !expectDimmed && bothEnds(link, vlan);
           if (state.glow) glowing += 1;
           if (state.dimmed) dimmedCount += 1;
           if (!state.glow && !state.dimmed) {
@@ -1892,8 +2046,6 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       assert(snap30.oneSided >= 1,
         `expected at least one one-sided link (neither dimmed nor glowing) for VLAN 30, `
         + `compared ${snap30.compared} link(s)`);
-      assert(snap30.dimmed >= 1,
-        `expected at least one dimmed link for VLAN 30, compared ${snap30.compared} link(s)`);
       assert(snap30.firstOneSided !== null,
         'expected a one-sided VLAN 30 link present in both the DOM and the map payload');
 

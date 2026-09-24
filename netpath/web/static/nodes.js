@@ -149,20 +149,33 @@
     listening: 'var(--warn)', learning: 'var(--warn)', broken: 'var(--fail)',
     disabled: 'var(--muted)' };
 
-  // Cisco PVST+/Rapid-PVST per-VLAN detail (5.37.0): a port blocking in only
-  // some of the VLANs it carries names the count, with the blocked ids in
-  // the title; blocked in every VLAN, or no per-VLAN read at all (non-Cisco,
-  // stp_blocking_vlans NULL), keeps the plain word.
+  // Cisco PVST+/Rapid-PVST per-VLAN detail: names the n/count of VLANs a port is blocking/broken in.
   function stpStateText(r) {
     const ids = r.stp_blocking_vlans;
-    if (r.stp_state === 'blocking' && ids && r.stp_vlan_count != null) {
+    if ((r.stp_state === 'blocking' || r.stp_state === 'broken') &&
+        ids && r.stp_vlan_count != null) {
       const blocked = ids.split(',').filter(Boolean);
       if (blocked.length > 0 && blocked.length < r.stp_vlan_count) {
+        if (r.stp_state === 'broken') {
+          return { text: `broken · ${blocked.length}/${r.stp_vlan_count} VLANs`,
+            title: `Broken in VLANs ${blocked.join(', ')}` };
+        }
         return { text: `blocking · ${blocked.length}/${r.stp_vlan_count} VLANs`,
           title: `Blocking in VLANs ${blocked.join(', ')}` };
       }
     }
     return { text: r.stp_state, title: null };
+  }
+
+  // The device pane's own line of evidence for the per-VLAN scan. Escaped: reaches the pane via innerHTML.
+  function stpScanLineText(d) {
+    const scan = d.stp_scan || {};
+    if (scan.ts == null) return 'STP scan: not yet run';
+    const n = (scan.unmapped || []).length;
+    const unmapped = n > 0
+      ? `, ${escape(String(n))} bridge port${n === 1 ? '' : 's'} unmapped` : '';
+    return `STP scan: ${App.ago(scan.ts)}, ${escape(String(scan.answered))}` +
+      ` of ${escape(String(scan.vlans))} VLANs${unmapped}`;
   }
 
   // The list the STP column is drawing from, so a "via" cell can name the Port-channel.
@@ -3271,7 +3284,13 @@
         (d.stp_protocol_spec ? `, ${escape(d.stp_protocol_spec)}` : '') +
         (d.stp_time_since_change_s != null
           ? ` — last topology change ${App.duration(d.stp_time_since_change_s)} ago` : '') +
-        (topo ? ` (${topo.last_value} recorded since this device was added)` : ''));
+        (topo ? ` (${topo.last_value} recorded since this device was added)` : '') +
+        `<br><span class="hint">${stpScanLineText(d)}</span>`);
+    } else if (d.stp_capable === false) {
+      // Latched by the hourly re-probe (see _poll_stp), not permanent: said
+      // plainly so an operator does not read a blank column as a bug.
+      App.setHtml(stpEl, '<span class="hint">STP: this switch answers no '
+        + 'BRIDGE-MIB (re-probed hourly)</span>');
     } else {
       App.setHtml(stpEl, '<span class="section">STP</span> ' +
         '<span class="hint">Not answering BRIDGE-MIB, or not polled yet.</span>');
@@ -3432,6 +3451,7 @@
       mac_table_interval_s: pick('mac_table_interval_s'),
       vlan_interval_s: pick('vlan_interval_s'),
       arp_table_interval_s: pick('arp_table_interval_s'),
+      stp_interval_s: pick('stp_interval_s'),
       mib_file_id: profile.mib_file_id,
       vendor_oid: profile.vendor_oid, location_oid: profile.location_oid,
     };
@@ -3475,6 +3495,7 @@
     set('#nd-f-mactable', inheritText(eff.mac_table_interval_s, (v) => (Number(v) ? `${v} s` : 'off')));
     set('#nd-f-vlaninterval', inheritText(eff.vlan_interval_s, (v) => (Number(v) ? `${v} s` : 'off')));
     set('#nd-f-arptable', inheritText(eff.arp_table_interval_s, (v) => (Number(v) ? `${v} s` : 'off')));
+    set('#nd-f-stpinterval', inheritText(eff.stp_interval_s, (v) => `${v} s`));
     const mib = (view.mibFiles || []).find((f) => f.id === eff.mib_file_id);
     opt('#nd-f-mib', inheritOption(mib ? (mib.module || mib.filename) : (eff.mib_file_id ? eff.mib_file_id : null)));
     set('#nd-f-vendoroid', inheritText(eff.vendor_oid));
@@ -3602,6 +3623,12 @@
           come from. Same shape as MAC address learning above: blank inherits the profile, an
           explicit <b>0 turns it off</b> for this device, and 3600 (one hour) is the shipped
           default so a fleet with no opinion still gets a walk, not silence.</p>
+        <label>Walk per-VLAN spanning tree every <input id="nd-f-stpinterval" type="number"
+          min="30" step="60"
+          value="${d.stp_interval_s ?? ''}"> s</label>
+        <p class="hint">PVST+ per-VLAN blocking state, on its own cadence so a new block
+          shows up even with the VLAN membership walk above off or slow. Blank inherits the
+          profile; 300 (five minutes) is the shipped default.</p>
         <label>Custom MIB <select id="nd-f-mib">${mibOptionsHtml(d.mib_file_id)}</select>
           ${d.mib_file_auto ? '<span class="hint">(assigned automatically from the vendor walk; not an override)</span>' : ''}</label>
         <p class="hint">Polls that MIB's own scalar objects alongside the usual metrics,
@@ -3759,6 +3786,7 @@
     overrides.mac_table_interval_s = blankToNull(box.querySelector('#nd-f-mactable').value);
     overrides.vlan_interval_s = blankToNull(box.querySelector('#nd-f-vlaninterval').value);
     overrides.arp_table_interval_s = blankToNull(box.querySelector('#nd-f-arptable').value);
+    overrides.stp_interval_s = blankToNull(box.querySelector('#nd-f-stpinterval').value);
     // Always sent, like the tri-states: "" is how the operator clears an
     // upstream, and the server accepts "", null and 0 as "none".
     const upstream = box.querySelector('#nd-f-upstream');

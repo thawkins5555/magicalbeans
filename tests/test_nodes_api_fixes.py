@@ -433,6 +433,57 @@ try:
     stored_kinds = [e["kind"] for e in service.nodes_db.device_events(device_id=overrun_dev)]
     check("...but nodes_db.device_events() itself still returns it, for alerting",
           "poll_overrun" in stored_kinds, stored_kinds)
+
+    # --------------------------- 8. stp_scan and stp_interval_s (5.62.0)
+    stp_dev = service.nodes_db.add_device("203.0.113.211", name="stp-scan-dev",
+                                          group_id=group_id)
+    status, payload = call("GET", f"/api/nodes/devices/{stp_dev}", token=admin)
+    scan = payload["device"].get("stp_scan") if status == 200 else None
+    check("a device never scanned carries a null-safe stp_scan",
+          status == 200 and scan == {"ts": None, "vlans": None,
+                                     "answered": None, "unmapped": [], "note": None},
+          (status, scan))
+
+    service.nodes_db.set_stp_scan(stp_dev, ts=1_700_000_000.0, vlans=46,
+                                  answered=44, unmapped="12,15", note="complete")
+    status, payload = call("GET", f"/api/nodes/devices/{stp_dev}", token=admin)
+    scan = payload["device"].get("stp_scan") if status == 200 else None
+    check("a completed scan's summary is carried on the device JSON",
+          status == 200 and scan == {"ts": 1_700_000_000.0, "vlans": 46,
+                                     "answered": 44, "unmapped": [12, 15],
+                                     "note": "complete"},
+          (status, scan))
+
+    status, payload = call("PUT", f"/api/nodes/devices/{stp_dev}",
+                           {"stp_interval_s": 180}, token=admin)
+    check("stp_interval_s is accepted on a device override",
+          status == 200, (status, payload))
+    status, payload = call("GET", f"/api/nodes/devices/{stp_dev}", token=admin)
+    check("...and read back on the device and its effective_config",
+          status == 200 and payload["device"]["stp_interval_s"] == 180
+          and payload["device"]["effective_config"]["stp_interval_s"] == 180,
+          (status, payload.get("device", {}).get("stp_interval_s")))
+
+    status, payload = call("PUT", f"/api/nodes/devices/{stp_dev}",
+                           {"stp_interval_s": None}, token=admin)
+    status, payload = call("GET", f"/api/nodes/devices/{stp_dev}", token=admin)
+    check("a blanked override inherits the 300s default",
+          status == 200 and payload["device"]["stp_interval_s"] is None
+          and payload["device"]["effective_config"]["stp_interval_s"] == 300,
+          (status, payload.get("device", {}).get("effective_config", {}).get("stp_interval_s")))
+
+    status, payload = call("PUT", f"/api/nodes/groups/{group_id}",
+                           {"stp_interval_s": 240}, token=admin)
+    check("stp_interval_s is accepted on a polling profile",
+          status == 200, (status, payload))
+    status, payload = call("GET", "/api/nodes/groups", token=admin)
+    group_row = next((g for g in payload.get("groups", []) if g["id"] == group_id), None)
+    check("...and read back on the profile",
+          group_row is not None and group_row["stp_interval_s"] == 240, group_row)
+    status, payload = call("GET", f"/api/nodes/devices/{stp_dev}", token=admin)
+    check("...which an inheriting device's effective_config now follows",
+          status == 200 and payload["device"]["effective_config"]["stp_interval_s"] == 240,
+          payload.get("device", {}).get("effective_config", {}).get("stp_interval_s"))
 finally:
     server.stop()
     service.shutdown()

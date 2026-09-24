@@ -1096,7 +1096,7 @@ _GROUP_EDITABLE_BODY = ("name", "snmp_version", "community", "v3_user",
                         "mib_file_id", "ping_count", "ping_timeout_ms",
                         "unreachable_ping_only", "vendor_oid", "location_oid",
                         "mac_table_interval_s", "vlan_interval_s",
-                        "arp_table_interval_s")
+                        "arp_table_interval_s", "stp_interval_s")
 
 
 def _planned_scope(service) -> tuple[set[int], set[int]]:

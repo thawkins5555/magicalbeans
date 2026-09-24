@@ -93,6 +93,37 @@ Modes:
                 answers directly (blocking), for the "bridge port = ifIndex"
                 fallback onto a device whose own ifIndex 10 exists.
 
+  pvst-no-vlan1-trunk  5.62.0 root-cause case: a trunk (bridge port 3 ->
+                ifIndex 12) absent from the DEFAULT context's
+                dot1dBasePortIfIndex and dot1dStpPortState, present and
+                forwarding in @20, blocking (2) in @30. Bridge ports 1 and
+                2 (-> ifIndex 1, 2) answer in every context. vtpVlanState
+                lists VLANs 1, 20, 30.
+  pvst-unmapped Same three-VLAN layout as pvst-3vlan, except @30's
+                dot1dStpPortState also answers a bridge port 9 that no
+                context's dot1dBasePortIfIndex ever maps.
+  pvst-map-truncated  Three bridge ports (5, 7, 9 -> ifIndex 1, 2, 3)
+                answered in full by every context; GETNEXT/GETBULK's next
+                request always cursors off the LAST accepted row, so
+                DROP_OID on port 7's own dot1dBasePortIfIndex row (the
+                second of three) times out the request that would have
+                fetched port 9's, cutting the DEFAULT context's walk to two
+                rows -- scoped to that context alone, so every @vlan
+                context still answers its own map in full.
+  pvst-vtp-timeout  pvst-3vlan's tables under a new mode name, so DROP_OID
+                can be aimed at the vtpVlanState column on demand.
+  pvst-broken   pvst-3vlan with port 7 (ifIndex 2) reading broken(6) in @20
+                instead of forwarding(5).
+  stp-po-outside-vlan1  Like stp-bundle, except the Port-channel's bridge
+                port (50 -> ifIndex 5000, blocking) exists only inside @20;
+                the DEFAULT context answers neither a dot1dBasePortIfIndex
+                nor a dot1dStpPortState row for it. ifStackStatus answers
+                the same as stp-bundle's, context-independent.
+  pvst-empty-map-vlan  pvst-3vlan plus VLAN 40, whose own @40 context
+                answers a confirmed-empty dot1dBasePortIfIndex and
+                dot1dStpPortState (a VTP-propagated VLAN with no local
+                port) -- a complete, empty map must count as answered.
+
   airfiber      a Ubiquiti sysObjectID and the four RF_METRICS[41112]
                 scalars, numbered exactly as demo/personas.py's
                 ubiquiti_airfiber persona answers them.
@@ -341,6 +372,12 @@ PVST_3VLAN_PER_VLAN = {
     "30": {"1.3.6.1.2.1.17.2.15.1.3.5": ("int", 5), "1.3.6.1.2.1.17.2.15.1.3.7": ("int", 2)},
 }
 
+# pvst-empty-map-vlan: pvst-3vlan plus VLAN 40, whose own @40 context
+# answers a confirmed-empty dot1dBasePortIfIndex and dot1dStpPortState (a
+# VTP-propagated VLAN with no local port) -- a complete, empty map must
+# count as answered, not cut short.
+PVST_VTP_3_PLUS_40 = {**PVST_VTP_3, "1.3.6.1.4.1.9.9.46.1.3.1.1.2.1.40": ("int", 1)}
+
 # pvst-vlan-gap: VLAN 20's context is dropped outright (see the MODE check
 # in main()); 10 forwards, 30 blocks -- the "skip the absent one, still
 # find the later VLAN" case.
@@ -385,6 +422,60 @@ PAGP_TABLE = {f"{CISCO_PAGP_GROUP_IFINDEX}.10": ("int", 5000)}
 # stp-bridge-fallback: no dot1dBasePortIfIndex at all; dot1dStpPortState.10
 # answers directly, ifIndex 10 assumed to be its own bridge port.
 FALLBACK_STP_PORT_STATE = {"1.3.6.1.2.1.17.2.15.1.3.10": ("int", 2)}
+
+# ----------------------------------------------------- 5.62.0 STP coverage
+# pvst-no-vlan1-trunk: bridge port 3 (-> ifIndex 12) is the trunk that does
+# not carry VLAN 1 -- absent from the DEFAULT context entirely, present and
+# forwarding in @20, blocking in @30. Ports 1 and 2 (-> ifIndex 1, 2) answer
+# everywhere.
+NOVLAN1_BASE_DEFAULT = {"1.3.6.1.2.1.17.1.4.1.2.1": ("int", 1),
+                       "1.3.6.1.2.1.17.1.4.1.2.2": ("int", 2)}
+NOVLAN1_BASE_FULL = {**NOVLAN1_BASE_DEFAULT,
+                     "1.3.6.1.2.1.17.1.4.1.2.3": ("int", 12)}
+NOVLAN1_STATE_DEFAULT = {"1.3.6.1.2.1.17.2.15.1.3.1": ("int", 5),
+                         "1.3.6.1.2.1.17.2.15.1.3.2": ("int", 5)}
+NOVLAN1_STATE_20 = {**NOVLAN1_STATE_DEFAULT, "1.3.6.1.2.1.17.2.15.1.3.3": ("int", 5)}
+NOVLAN1_STATE_30 = {**NOVLAN1_STATE_DEFAULT, "1.3.6.1.2.1.17.2.15.1.3.3": ("int", 2)}
+NOVLAN1_VTP = {"1.3.6.1.4.1.9.9.46.1.3.1.1.2.1.1": ("int", 1),
+              "1.3.6.1.4.1.9.9.46.1.3.1.1.2.1.20": ("int", 1),
+              "1.3.6.1.4.1.9.9.46.1.3.1.1.2.1.30": ("int", 1)}
+
+# pvst-unmapped: @30 answers state for bridge port 9, mapped in no context.
+UNMAPPED_PER_VLAN_30 = {**PVST_3VLAN_PER_VLAN["30"],
+                        "1.3.6.1.2.1.17.2.15.1.3.9": ("int", 5)}
+
+# pvst-map-truncated: three bridge ports (5, 7, 9 -> ifIndex 1, 2, 3)
+# answered by every context; DROP_OID on port 7's row (the request that
+# would fetch port 9's, GETNEXT/GETBULK cursoring off the last accepted
+# row) silences only the DEFAULT context's copy (see the MODE check in
+# main()), leaving every @vlan context's own map walk complete.
+TRUNCATED_BRIDGE_MAP = {"1.3.6.1.2.1.17.1.4.1.2.5": ("int", 1),
+                        "1.3.6.1.2.1.17.1.4.1.2.7": ("int", 2),
+                        "1.3.6.1.2.1.17.1.4.1.2.9": ("int", 3)}
+TRUNCATED_STATE_DEFAULT = {"1.3.6.1.2.1.17.2.15.1.3.5": ("int", 5),
+                           "1.3.6.1.2.1.17.2.15.1.3.7": ("int", 5),
+                           "1.3.6.1.2.1.17.2.15.1.3.9": ("int", 5)}
+TRUNCATED_PER_VLAN = {
+    "10": dict(TRUNCATED_STATE_DEFAULT),
+    "20": dict(TRUNCATED_STATE_DEFAULT),
+    "30": {**TRUNCATED_STATE_DEFAULT, "1.3.6.1.2.1.17.2.15.1.3.7": ("int", 2)},
+}
+
+# pvst-broken: port 7 (ifIndex 2) reads broken(6) in @20, forwarding
+# everywhere else -- unlike pvst-3vlan, VLAN 30 forwards too, so nothing
+# else in the merge ever calls this port "blocking".
+PVST_BROKEN_PER_VLAN = {
+    "10": {"1.3.6.1.2.1.17.2.15.1.3.5": ("int", 5), "1.3.6.1.2.1.17.2.15.1.3.7": ("int", 5)},
+    "20": {"1.3.6.1.2.1.17.2.15.1.3.5": ("int", 5), "1.3.6.1.2.1.17.2.15.1.3.7": ("int", 6)},
+    "30": {"1.3.6.1.2.1.17.2.15.1.3.5": ("int", 5), "1.3.6.1.2.1.17.2.15.1.3.7": ("int", 5)},
+}
+
+# stp-po-outside-vlan1: the Port-channel's bridge port (50 -> ifIndex 5000)
+# exists only inside @20, blocking there; the DEFAULT context has no row
+# for it at all. ifStackStatus (context-independent) answers as stp-bundle's.
+POOUT_BRIDGE_20 = {"1.3.6.1.2.1.17.1.4.1.2.50": ("int", 5000)}
+POOUT_STATE_20 = {"1.3.6.1.2.1.17.2.15.1.3.50": ("int", 2)}
+POOUT_VTP = {"1.3.6.1.4.1.9.9.46.1.3.1.1.2.1.20": ("int", 1)}
 
 
 def _stack_table():
@@ -629,12 +720,55 @@ def table_for(community="public"):
     if MODE == "pvst-50vlan":
         return {**GENERIC_SCALARS, **BRIDGE_PORTS, **STP_SCALARS, **PVST_PORT_STATE,
                 **PVST_VTP_50}
-    if MODE == "pvst-3vlan":
+    if MODE in ("pvst-3vlan", "pvst-vtp-timeout"):
         table = {**GENERIC_SCALARS, **BRIDGE_PORTS, **STP_SCALARS, **PVST_PORT_STATE}
         if "@" in community:
             vlan = community.split("@", 1)[1]
             table.update(PVST_3VLAN_PER_VLAN.get(vlan, {}))
         else:
+            table.update(PVST_VTP_3)
+        return table
+    if MODE == "pvst-empty-map-vlan":
+        if "@" in community:
+            vlan = community.split("@", 1)[1]
+            if vlan == "40":
+                return {**GENERIC_SCALARS, **STP_SCALARS}
+            table = {**GENERIC_SCALARS, **BRIDGE_PORTS, **STP_SCALARS}
+            table.update(PVST_3VLAN_PER_VLAN.get(vlan, {}))
+            return table
+        return {**GENERIC_SCALARS, **BRIDGE_PORTS, **STP_SCALARS, **PVST_PORT_STATE,
+                **PVST_VTP_3_PLUS_40}
+    if MODE == "pvst-unmapped":
+        table = {**GENERIC_SCALARS, **BRIDGE_PORTS, **STP_SCALARS, **PVST_PORT_STATE}
+        if "@" in community:
+            vlan = community.split("@", 1)[1]
+            per_vlan = UNMAPPED_PER_VLAN_30 if vlan == "30" else PVST_3VLAN_PER_VLAN.get(vlan, {})
+            table.update(per_vlan)
+        else:
+            table.update(PVST_VTP_3)
+        return table
+    if MODE == "pvst-broken":
+        table = {**GENERIC_SCALARS, **BRIDGE_PORTS, **STP_SCALARS, **PVST_PORT_STATE}
+        if "@" in community:
+            vlan = community.split("@", 1)[1]
+            table.update(PVST_BROKEN_PER_VLAN.get(vlan, {}))
+        else:
+            table.update(PVST_VTP_3)
+        return table
+    if MODE == "pvst-no-vlan1-trunk":
+        if "@" in community:
+            vlan = community.split("@", 1)[1]
+            state = NOVLAN1_STATE_20 if vlan == "20" else NOVLAN1_STATE_30
+            return {**GENERIC_SCALARS, **NOVLAN1_BASE_FULL, **STP_SCALARS, **state}
+        return {**GENERIC_SCALARS, **NOVLAN1_BASE_DEFAULT, **STP_SCALARS,
+               **NOVLAN1_STATE_DEFAULT, **NOVLAN1_VTP}
+    if MODE == "pvst-map-truncated":
+        table = {**GENERIC_SCALARS, **TRUNCATED_BRIDGE_MAP, **STP_SCALARS}
+        if "@" in community:
+            vlan = community.split("@", 1)[1]
+            table.update(TRUNCATED_PER_VLAN.get(vlan, {}))
+        else:
+            table.update(TRUNCATED_STATE_DEFAULT)
             table.update(PVST_VTP_3)
         return table
     if MODE == "pvst-vlan-gap":
@@ -659,6 +793,15 @@ def table_for(community="public"):
                 **BUNDLE_STP_PORT_STATE, **PAGP_TABLE}
     if MODE == "stp-bridge-fallback":
         return {**GENERIC_SCALARS, **STP_SCALARS, **FALLBACK_STP_PORT_STATE}
+    if MODE == "stp-po-outside-vlan1":
+        table = {**CISCO_SCALARS, **STP_SCALARS, **_stack_table()}
+        if "@" in community:
+            if community.split("@", 1)[1] == "20":
+                table.update(POOUT_BRIDGE_20)
+                table.update(POOUT_STATE_20)
+        else:
+            table.update(POOUT_VTP)
+        return table
     if MODE == "airfiber":
         return {**GENERIC_SCALARS, **AIRFIBER_TABLE,
                 "1.3.6.1.2.1.1.2.0": ("str", "1.3.6.1.4.1.41112.1.3")}
@@ -758,8 +901,11 @@ def main():
         if DROP_ALL_VLAN_CONTEXTS and "@" in community:
             continue                # every community@vlan context times out
         oids = [vb["oid"] for vb in request.varbinds]
-        if any(oid == p or oid.startswith(p + ".")
-              for oid in oids for p in DROPPED_OID_PREFIXES):
+        # pvst-map-truncated: DROP_OID on the bridge-port map only silences
+        # the DEFAULT context, so every @vlan context still answers in full.
+        drop_scoped = (MODE != "pvst-map-truncated" or "@" not in community)
+        if drop_scoped and any(oid == p or oid.startswith(p + ".")
+                              for oid in oids for p in DROPPED_OID_PREFIXES):
             continue                # DROP_OID: no reply, an SNMP timeout
         count += 1
         table = table_for(community)

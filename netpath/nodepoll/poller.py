@@ -9,7 +9,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from ..eventlog import ERROR, NODES, NullLog
 from ..nodediscover import DiscoveryJob
-from ..nodesdb import NodesDatabase, detected_vendor
+from ..nodesdb import NodesDatabase, is_cisco
 from ..worker import Worker, ago
 from .discovery_mixin import DiscoveryMixin
 from .poll_mixin import PollMixin
@@ -196,9 +196,7 @@ class NodePoller(Worker, DiscoveryMixin, PollMixin, VendorIdentifyMixin, Environ
         # _maybe_walk_stp_vlan) instead of every single poll.
         self._next_stp_vlan_walk: dict[int, float] = {}
         self._stp_vlan_running: set[int] = set()
-        # device_id -> {"vlans": {vlan: {"ts", "ports"}}, "cursor", "total",
-        # "cycle_seen"}: per-VLAN STP detail merged into every poll's
-        # dot1dStp read. See _cisco_vlan_stp/_run_stp_vlan_pass.
+        # device_id -> per-VLAN STP detail, shape in _run_stp_vlan_pass.
         self._stp_vlan_cache: dict[int, dict] = {}
         # device_id -> whether a per-VLAN STP attempt has ever been made in
         # this process's lifetime, so _poll_stp runs it inline once (a
@@ -209,6 +207,8 @@ class NodePoller(Worker, DiscoveryMixin, PollMixin, VendorIdentifyMixin, Environ
         # pair _poll_stp read, so a topology change wakes the per-VLAN walk
         # immediately instead of waiting for its cadence.
         self._stp_topology_seen: dict[int, tuple] = {}
+        self._stp_capable_reprobe: dict[int, float] = {}
+        self._stp_flap_kick: dict[int, float] = {}
         # device_id -> {"map", "ts"}: dot1dBasePortIfIndex is a static
         # table, cached rather than re-walked every poll. See
         # _cached_bridge_port_map.
@@ -485,6 +485,7 @@ class NodePoller(Worker, DiscoveryMixin, PollMixin, VendorIdentifyMixin, Environ
             self._vlan_running.clear()
             self._arp_running.clear()
             self._lldp_running.clear()
+            self._stp_vlan_running.clear()
 
     finish_stop = Worker._finish_stop_draining
 
@@ -1138,6 +1139,7 @@ class NodePoller(Worker, DiscoveryMixin, PollMixin, VendorIdentifyMixin, Environ
                       self._next_lldp_walk, self._next_vlan_walk,
                       self._next_arp_walk, self._next_stp_vlan_walk,
                       self._stp_vlan_cache, self._stp_topology_seen,
+                      self._stp_capable_reprobe, self._stp_flap_kick,
                       self._bridge_port_map_cache, self._agg_map_cache,
                       self._credentials, self._credential_probe_failed,
                       self._addresses_read, self._bulk_repetitions,
@@ -1365,7 +1367,7 @@ class NodePoller(Worker, DiscoveryMixin, PollMixin, VendorIdentifyMixin, Environ
         # stp_capable=0 means this device answers no dot1dStp at all -- not
         # a bridge, so it can never be a PVST+ one either; skip it the same
         # way _poll_stp's own early return does.
-        if full is None or full["stp_capable"] == 0 or detected_vendor(full).lower() != "cisco":
+        if full is None or full["stp_capable"] == 0 or not is_cisco(full):
             return
         with self._lock:
             if device_id in self._stp_vlan_running:

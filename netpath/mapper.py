@@ -896,8 +896,14 @@ def link_csv_rows(links, device_name, peer_name=lambda peer_key: peer_key) -> li
         if link.get("a_stp") == "blocking":
             stp_parts.append("blocking on A" + stp_vlan_suffix(link.get("a_stp_vlans"))
                              + stp_via_suffix(link.get("a_stp_via")))
+        elif link.get("a_stp") == "broken":
+            stp_parts.append("broken on A" + stp_vlan_suffix(link.get("a_stp_vlans"))
+                             + stp_via_suffix(link.get("a_stp_via")))
         if link.get("b_stp") == "blocking":
             stp_parts.append("blocking on B" + stp_vlan_suffix(link.get("b_stp_vlans"))
+                             + stp_via_suffix(link.get("b_stp_via")))
+        elif link.get("b_stp") == "broken":
+            stp_parts.append("broken on B" + stp_vlan_suffix(link.get("b_stp_vlans"))
                              + stp_via_suffix(link.get("b_stp_via")))
 
         rows.append([

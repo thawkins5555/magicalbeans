@@ -97,13 +97,19 @@ try:
           ifaces[2]["stp_state"] == "blocking", ifaces[2])
     check("...with the blocking VLAN named",
           ifaces[2]["stp_blocking_vlans"] == "20", ifaces[2])
-    check("...and both VLAN contexts counted",
-          ifaces[2]["stp_vlan_count"] == 2, ifaces[2])
-    check("port 5 (-> ifIndex 1), forwarding in every VLAN, reads forwarding "
-          "even though the DEFAULT context called it blocking",
-          ifaces[1]["stp_state"] == "forwarding", ifaces[1])
-    check("...blocked nowhere",
-          ifaces[1]["stp_blocking_vlans"] == "", ifaces[1])
+    check("...and VLAN 1 (seeded from the DEFAULT context) plus both walked "
+          "VLAN contexts counted",
+          ifaces[2]["stp_vlan_count"] == 3, ifaces[2])
+    # 5.62.0 (risk 14): port 5's DEFAULT-context reading IS VLAN 1's own
+    # state (blocking here); @20/@30 both forward, but VLAN 1's block must
+    # not be overwritten by them -- the exact silent loss the operator
+    # reported on a trunk that keeps its block in one VLAN only.
+    check("port 5 (-> ifIndex 1), blocking in VLAN 1 (the DEFAULT context) "
+          "even though @20/@30 both forward, stays blocking -- not "
+          "overwritten by their forwarding",
+          ifaces[1]["stp_state"] == "blocking", ifaces[1])
+    check("...naming VLAN 1 as the blocking VLAN",
+          ifaces[1]["stp_blocking_vlans"] == "1", ifaces[1])
 
     seen = communities(port)
     check("VLAN 1002 (legacy, in the VTP table) is never asked",
@@ -157,12 +163,14 @@ try:
     config = {**db.effective_config(device), "snmp_version": 3}
 
     reset_count(port)
-    rows, answered, complete, next_start, total, next_vlan = poller._cisco_vlan_stp(
-        device, config, {})
+    (rows, answered, complete, next_start, total, next_vlan, unmapped,
+     list_unavailable) = poller._cisco_vlan_stp(device, config)
     check("a v3 config skips the per-VLAN pass outright",
           rows == {} and answered is False and complete is True
-          and next_start == 0 and total == 0 and next_vlan is None,
-          (rows, answered, complete, next_start, total, next_vlan))
+          and next_start == 0 and total == 0 and next_vlan is None
+          and unmapped == set() and list_unavailable is False,
+          (rows, answered, complete, next_start, total, next_vlan, unmapped,
+           list_unavailable))
     check("...without sending a single request",
           request_count(port) == 0, request_count(port))
     db.close()
@@ -189,9 +197,9 @@ try:
     calls = []
     real_cisco_vlan_stp = poller._cisco_vlan_stp
 
-    def spy(device_arg, config_arg, port_map_arg, start=0, budget_s=None):
+    def spy(device_arg, config_arg, start=0, budget_s=None):
         calls.append(1)
-        return real_cisco_vlan_stp(device_arg, config_arg, port_map_arg,
+        return real_cisco_vlan_stp(device_arg, config_arg,
                                    start=start, budget_s=budget_s)
     poller._cisco_vlan_stp = spy
 
@@ -248,10 +256,10 @@ try:
           "actually answered, reads blocking -- not flapped to the global "
           "read's forwarding",
           ifaces[2]["stp_state"] == "blocking", ifaces[2])
-    check("...with the blocking VLAN named and the count reflecting just "
-          "that one fresh VLAN",
+    check("...with the blocking VLAN named and the count reflecting that "
+          "one fresh VLAN plus the seeded VLAN 1 default reading",
           ifaces[2]["stp_blocking_vlans"] == "20"
-          and ifaces[2]["stp_vlan_count"] == 1, ifaces[2])
+          and ifaces[2]["stp_vlan_count"] == 2, ifaces[2])
     db.close()
 finally:
     stub.kill()
@@ -268,11 +276,11 @@ try:
     poller = NodePoller(db)
     device = db.device(did)
     config = db.effective_config(device)
-    port_map = poller._bridge_port_map(device, config)
 
-    # VLAN 10 walks normally; VLAN 20's own column walk is made to notice
-    # the overall deadline has already passed (not an SNMP timeout of its
-    # own), the way a slow-but-live context can eat the whole budget.
+    # VLAN 10 walks normally; VLAN 20's own column walk (map or state, both
+    # now read inside its own context) is made to notice the overall
+    # deadline has already passed (not an SNMP timeout of its own), the way
+    # a slow-but-live context can eat the whole budget.
     real_walk_status = poller._walk_column_status
 
     def fake_walk_status(device_arg, config_arg, base_oid, **kwargs):
@@ -283,13 +291,13 @@ try:
         return real_walk_status(device_arg, config_arg, base_oid, **kwargs)
     poller._walk_column_status = fake_walk_status
 
-    rows, answered, complete, next_start, total, next_vlan = poller._cisco_vlan_stp(
-        device, config, port_map, budget_s=1.0)
+    (rows, answered, complete, next_start, total, next_vlan, unmapped,
+     list_unavailable) = poller._cisco_vlan_stp(device, config, budget_s=1.0)
 
     check("VLAN 20 is cut off by the caller's own deadline, not a plain "
           "per-context failure, so it is not counted covered -- the "
-          "cursor lands ON it rather than past it",
-          next_start == 1 and next_vlan == "20" and complete is False,
+          "cursor (a VLAN id) lands ON it rather than past it",
+          next_start == 20 and next_vlan == "20" and complete is False,
           (next_start, next_vlan, complete))
     check("...VLAN 10, walked before the deadline hit, is still recorded",
           "10" in rows, rows)
@@ -397,33 +405,38 @@ try:
     device = db.device(did)
     config = db.effective_config(device)
 
+    # VLAN 1 is excluded from the per-VLAN walk (the DEFAULT context IS
+    # VLAN 1's bridge instance), so the 50 operational VLANs vtpVlanState
+    # lists here (1-50) leave 49 actually walked (2-50).
     reset_count(port)
-    poller._poll_stp(did, device, config)   # pass one: VLANs 1-48
+    poller._poll_stp(did, device, config)   # pass one: VLANs 2-49
 
-    check("pass one covers the first 48 of 50 VLANs and reports next_start",
-          poller._stp_vlan_cache[did]["cursor"] == 48
-          and poller._stp_vlan_cache[did]["total"] == 50
+    check("pass one covers the first 48 of 49 VLANs and reports next_start "
+          "(the next VLAN id, 50)",
+          poller._stp_vlan_cache[did]["cursor"] == 50
+          and poller._stp_vlan_cache[did]["total"] == 49
           and len(poller._stp_vlan_cache[did]["vlans"]) == 48,
           poller._stp_vlan_cache[did])
     ifaces = {i["if_index"]: dict(i) for i in db.interfaces(did)}
-    check("...port 7 forwards in the 48 walked so far",
+    check("...port 7 forwards in the 48 walked so far, plus the seeded "
+          "VLAN 1 default reading",
           ifaces[2]["stp_state"] == "forwarding"
-          and ifaces[2]["stp_vlan_count"] == 48, ifaces[2])
+          and ifaces[2]["stp_vlan_count"] == 49, ifaces[2])
 
-    poller._run_stp_vlan_pass(db.device(did), config)   # pass two: VLANs 49-50
+    poller._run_stp_vlan_pass(db.device(did), config)   # pass two: VLAN 50 alone
 
-    check("pass two covers the last two and wraps the cursor back to 0",
+    check("pass two covers the last one and wraps the cursor back to 0",
           poller._stp_vlan_cache[did]["cursor"] == 0
-          and len(poller._stp_vlan_cache[did]["vlans"]) == 50,
+          and len(poller._stp_vlan_cache[did]["vlans"]) == 49,
           poller._stp_vlan_cache[did])
 
     poller._poll_stp(did, db.device(did), config)   # merges the now-full cache
     ifaces = {i["if_index"]: dict(i) for i in db.interfaces(did)}
-    check("the merged rows cover all 50 VLANs",
+    check("the merged rows cover all 49 walked VLANs plus the seeded VLAN 1",
           ifaces[2]["stp_vlan_count"] == 50, ifaces[2])
-    check("...port 7 forwards in all 50",
+    check("...port 7 forwards in all of them",
           ifaces[2]["stp_state"] == "forwarding", ifaces[2])
-    check("...port 5 blocks in all 50",
+    check("...port 5 blocks in all of them (VLAN 1 through 50)",
           ifaces[1]["stp_state"] == "blocking" and ifaces[1]["stp_vlan_count"] == 50,
           ifaces[1])
     db.close()
@@ -483,9 +496,15 @@ try:
     poller._poll_stp(did, device, config)
 
     ifaces = {i["if_index"]: dict(i) for i in db.interfaces(did)}
-    check("disabled(1) in every VLAN context stays disabled, not "
-          "forwarding",
-          ifaces[2]["stp_state"] == "disabled", ifaces[2])
+    # 5.62.0: port 7's DEFAULT-context (VLAN 1) reading is forwarding, so
+    # once that is folded in alongside @20/@30's disabled(1), "forwarding"
+    # correctly outranks "disabled" -- the link genuinely passes VLAN 1
+    # traffic, disabled(1) elsewhere is not a block. blocking/broken are
+    # the only states VLAN 1 forwarding cannot override.
+    check("disabled(1) in @20/@30 does not force a non-forwarding verdict "
+          "once VLAN 1's own (DEFAULT-context) forwarding reading is folded "
+          "in -- disabled is not blocking",
+          ifaces[2]["stp_state"] == "forwarding", ifaces[2])
     db.close()
 finally:
     stub.kill()
@@ -561,8 +580,9 @@ try:
     check("a v1 device's noSuchName at dot1dStpPortState's last row still "
           "lands the per-VLAN detail (RFC 1157, not a PAN-OS-style refusal)",
           ifaces[2]["stp_blocking_vlans"] == "20", ifaces[2])
-    check("...and the VLAN count",
-          ifaces[2]["stp_vlan_count"] == 2, ifaces[2])
+    check("...and the VLAN count (VLAN 1 seeded from the DEFAULT context "
+          "plus the one walked VLAN)",
+          ifaces[2]["stp_vlan_count"] == 3, ifaces[2])
 
     # Direct check of _walk_column_status itself, against the "@20" context
     # where dot1dStpPortState really is the view's last object: v1 rows
@@ -598,9 +618,9 @@ try:
     calls = []
     real_cisco_vlan_stp = poller._cisco_vlan_stp
 
-    def spy(device_arg, config_arg, port_map_arg, start=0, budget_s=None):
+    def spy(device_arg, config_arg, start=0, budget_s=None):
         calls.append(1)
-        return real_cisco_vlan_stp(device_arg, config_arg, port_map_arg,
+        return real_cisco_vlan_stp(device_arg, config_arg,
                                    start=start, budget_s=budget_s)
     poller._cisco_vlan_stp = spy
 
@@ -627,7 +647,7 @@ db = new_db("stp_vlan_schedule")
 gid = db.ensure_default_group()
 db.update_group(gid, snmp_version=1, community="public")
 did_on = db.add_device("10.1.0.1", name="cadence-sw", group_id=gid,
-                       vlan_interval_s=900)
+                       stp_interval_s=900)
 did_off = db.add_device("10.1.0.2", name="cadence-off-sw", group_id=gid,
                         vlan_interval_s=0)
 did_noncisco = db.add_device("10.1.0.3", name="cadence-generic-sw",
@@ -665,7 +685,8 @@ check("every v1/v2c device with a community is staggered on first sighting, "
       all(did in poller._next_stp_vlan_walk
           for did in (did_on, did_off, did_noncisco, did_not_bridge)),
       poller._next_stp_vlan_walk)
-check("...off vlan_interval_s=0 still falls inside the hourly fallback",
+check("...vlan_interval_s=0 does not touch it -- the cadence reads "
+      "stp_interval_s, which falls back to 300s",
       now <= poller._next_stp_vlan_walk[did_off] <= now + poller._SENSOR_REPROBE_S,
       poller._next_stp_vlan_walk)
 
@@ -691,8 +712,8 @@ check("a due, capable Cisco device takes the in-flight guard and submits",
       (poller._stp_vlan_running, submitted))
 check("...advancing next-walk by a full interval",
       poller._next_stp_vlan_walk[did_on] == now + 900, poller._next_stp_vlan_walk)
-check("a due Cisco device with vlan_interval_s=0 also submits, on its "
-      "hourly fallback cadence",
+check("a due Cisco device with vlan_interval_s=0 also submits -- its "
+      "cadence reads stp_interval_s, not vlan_interval_s",
       (poller._run_stp_vlan_walk_job, did_off) in submitted, submitted)
 check("a due non-Cisco device is checked once due but never submitted",
       did_noncisco not in poller._stp_vlan_running
@@ -721,16 +742,17 @@ try:
     check("sanity: the fresh per-VLAN merge blocks ifIndex 2 (VLAN 20)",
           ifaces[2]["stp_state"] == "blocking", ifaces[2])
 
-    # Age VLAN 20's own cache entry only -- VLAN 30's stays fresh.
+    # Age VLAN 20's own cache entry only -- VLAN 30's stays fresh. Past the
+    # 30-minute staleness floor (Javariius P2-6), not just 2x the cadence.
     poller._stp_vlan_cache[did]["vlans"]["20"]["ts"] = (
-        time.time() - 2 * poller._stp_vlan_cadence_s(config) - 1)
+        time.time() - max(2 * poller._stp_vlan_cadence_s(config), 1800) - 1)
     poller._poll_stp(did, db.device(did), config)   # no trigger: reads the cache as-is
     ifaces = {i["if_index"]: dict(i) for i in db.interfaces(did)}
     check("a VLAN entry older than 2x the cadence is skipped at merge time "
-          "-- ifIndex 2 now reads from VLAN 30 alone (forwarding), not the "
-          "stale VLAN 20 verdict",
+          "-- ifIndex 2 now reads from VLAN 30 alone plus the re-seeded "
+          "VLAN 1 default (forwarding), not the stale VLAN 20 verdict",
           ifaces[2]["stp_state"] == "forwarding"
-          and ifaces[2]["stp_vlan_count"] == 1, ifaces[2])
+          and ifaces[2]["stp_vlan_count"] == 2, ifaces[2])
     check("...while the still-fresh VLAN 30 entry stays in the cache",
           "30" in poller._stp_vlan_cache[did]["vlans"],
           poller._stp_vlan_cache[did])
@@ -754,10 +776,12 @@ try:
     poller._stp_vlan_cache[did] = {
         "vlans": {"20": {"ts": time.time(), "ports": {2: "blocking"}}},
         "cursor": 0, "total": 1, "cycle_seen": set()}
-    rows, answered, complete, next_start = poller._run_stp_vlan_pass(device, config)
+    rows, answered, complete, next_start, needs_retry = poller._run_stp_vlan_pass(
+        device, config)
     check("a complete walk that answers no VLANs returns no rows",
-          rows == {} and answered is False and complete is True and next_start == 0,
-          (rows, answered, complete, next_start))
+          rows == {} and answered is False and complete is True and next_start == 0
+          and needs_retry is False,
+          (rows, answered, complete, next_start, needs_retry))
     check("...and clears whatever was cached, rather than leaving it to "
           "override the fresh global read forever",
           did not in poller._stp_vlan_cache, poller._stp_vlan_cache)
@@ -781,9 +805,9 @@ try:
     calls = []
     real_cisco_vlan_stp = poller._cisco_vlan_stp
 
-    def spy(device_arg, config_arg, port_map_arg, start=0, budget_s=None):
+    def spy(device_arg, config_arg, start=0, budget_s=None):
         calls.append(1)
-        return real_cisco_vlan_stp(device_arg, config_arg, port_map_arg,
+        return real_cisco_vlan_stp(device_arg, config_arg,
                                    start=start, budget_s=budget_s)
     poller._cisco_vlan_stp = spy
 
@@ -820,9 +844,9 @@ try:
     calls = []
     real_cisco_vlan_stp = poller._cisco_vlan_stp
 
-    def spy(device_arg, config_arg, port_map_arg, start=0, budget_s=None):
+    def spy(device_arg, config_arg, start=0, budget_s=None):
         calls.append(1)
-        return real_cisco_vlan_stp(device_arg, config_arg, port_map_arg,
+        return real_cisco_vlan_stp(device_arg, config_arg,
                                    start=start, budget_s=budget_s)
     poller._cisco_vlan_stp = spy
 
@@ -842,9 +866,10 @@ try:
           "per-VLAN walk",
           calls == [], calls)
     ifaces = {i["if_index"]: dict(i) for i in db.interfaces(did)}
-    check("...but still merges the pre-seeded cache onto the interfaces",
+    check("...but still merges the pre-seeded cache onto the interfaces "
+          "(plus the seeded VLAN 1 default reading)",
           ifaces[2]["stp_blocking_vlans"] == "20"
-          and ifaces[2]["stp_vlan_count"] == 2, ifaces[2])
+          and ifaces[2]["stp_vlan_count"] == 3, ifaces[2])
     check("...and does not release a guard it never took",
           did in poller._stp_vlan_running, poller._stp_vlan_running)
     db.close()
@@ -889,18 +914,21 @@ try:
     two_ports(db, did)
     mark_cisco(db, did)
     poller = NodePoller(db)
-    poller._MAX_VLAN_CONTEXTS = 50
+    # VLAN 1 excluded, so the 51 VLANs vtpVlanState lists (1-51) leave 50
+    # actually walked (2-51); the cap is one below that so VLAN 51 alone is
+    # left for the follow-up pass.
+    poller._MAX_VLAN_CONTEXTS = 49
     device = db.device(did)
     config = db.effective_config(device)
 
-    poller._poll_stp(did, device, config)   # pass one: VLANs 1-50
-    check("pass one covers the first 50 of 51 VLANs",
-          poller._stp_vlan_cache[did]["cursor"] == 50
-          and poller._stp_vlan_cache[did]["total"] == 51
-          and len(poller._stp_vlan_cache[did]["vlans"]) == 50,
+    poller._poll_stp(did, device, config)   # pass one: VLANs 2-50
+    check("pass one covers the first 49 of 50 walked VLANs",
+          poller._stp_vlan_cache[did]["cursor"] == 51
+          and poller._stp_vlan_cache[did]["total"] == 50
+          and len(poller._stp_vlan_cache[did]["vlans"]) == 49,
           poller._stp_vlan_cache[did])
 
-    rows, answered, complete, next_start = poller._run_stp_vlan_pass(
+    rows, answered, complete, next_start, needs_retry = poller._run_stp_vlan_pass(
         db.device(did), config)   # pass two: VLAN 51 alone, portless
     check("a follow-up chunk whose only VLAN is portless still answers "
           "(the column walk finished, just empty) and keeps the cache "
@@ -928,11 +956,11 @@ try:
     config = db.effective_config(device)
 
     before = time.time()
-    poller._poll_stp(did, device, config)   # first sighting: inline, 48 of 50
+    poller._poll_stp(did, device, config)   # first sighting: inline, 48 of 49
 
-    check("the inline first-sighting pass covers only 48 of 50 VLANs "
-          "(the per-context cap)",
-          poller._stp_vlan_cache[did]["cursor"] == 48,
+    check("the inline first-sighting pass covers only 48 of the 49 walked "
+          "VLANs (the per-context cap), cursor landing on VLAN id 50",
+          poller._stp_vlan_cache[did]["cursor"] == 50,
           poller._stp_vlan_cache[did])
     check("...and reschedules the per-VLAN walk about a minute out, the "
           "same follow-up the cadence job's own next_start handling gives",
@@ -1016,6 +1044,434 @@ try:
     db.close()
 finally:
     stub.kill()
+
+# =====================================================================
+# 5.62.0 additions (Thing1): the root-cause fix itself -- per-VLAN bridge
+# port maps, the unmapped-port count, a truncated default map not caching,
+# a vtpVlanState timeout keeping the prior lap, and the cursor surviving a
+# VLAN renumbered mid-lap.
+# =====================================================================
+
+# --------------------- root cause: a trunk missing VLAN 1 is not dropped
+
+stub, port = spawn_stub("stub_agent_l2.py", "pvst-no-vlan1-trunk")
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
+try:
+    db = new_db("no_vlan1_trunk")
+    did = device_against(db, port, "no-vlan1-trunk-sw")
+    db.replace_interfaces(did, [
+        {"if_index": 1, "descr": "Gi0/1"}, {"if_index": 2, "descr": "Gi0/2"},
+        {"if_index": 12, "descr": "Te1/0/1"}])
+    mark_cisco(db, did)
+    poller = NodePoller(db)
+    device = db.device(did)
+    config = db.effective_config(device)
+
+    poller._poll_stp(did, device, config)
+
+    ifaces = {i["if_index"]: dict(i) for i in db.interfaces(did)}
+    check("the trunk (bridge port 3 -> ifIndex 12), entirely absent from "
+          "the DEFAULT context, is not silently dropped -- it reads "
+          "blocking off @30's own bridge-port map",
+          ifaces[12]["stp_state"] == "blocking", ifaces[12])
+    check("...naming VLAN 30 as the blocking one",
+          ifaces[12]["stp_blocking_vlans"] == "30", ifaces[12])
+    check("...counting both VLANs the trunk was actually walked in "
+          "(20 forwarding, 30 blocking) -- VLAN 1 is never seeded here "
+          "since the DEFAULT context never saw this ifIndex at all",
+          ifaces[12]["stp_vlan_count"] == 2, ifaces[12])
+    device = db.device(did)
+    check("no bridge port went unmapped -- the trunk resolves through "
+          "every VLAN's own map",
+          device["stp_scan_unmapped"] == "", device["stp_scan_unmapped"])
+    db.close()
+finally:
+    stub.kill()
+
+# ------------------------- an unmapped bridge port is counted and logged
+
+class CapturingLog:
+    """Same shape test_stp_bundle.py's own CapturingLog uses."""
+
+    def __init__(self):
+        self.lines = []
+
+    def add(self, category, message, target="", detail=""):
+        self.lines.append((category, message))
+
+
+stub, port = spawn_stub("stub_agent_l2.py", "pvst-unmapped")
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
+try:
+    db = new_db("pvst_unmapped")
+    did = device_against(db, port, "unmapped-sw")
+    two_ports(db, did)
+    mark_cisco(db, did)
+    log = CapturingLog()
+    poller = NodePoller(db, log=log)
+    device = db.device(did)
+    config = db.effective_config(device)
+
+    poller._poll_stp(did, device, config)
+
+    device = db.device(did)
+    check("bridge port 9, seen in @30's dot1dStpPortState but mapped in no "
+          "context, lands in the device's stp_scan_unmapped summary",
+          device["stp_scan_unmapped"] == "9", device["stp_scan_unmapped"])
+    check("...and the scan otherwise completed the full 3-VLAN lap",
+          device["stp_scan_note"] == "complete", device["stp_scan_note"])
+    said = [m for _, m in log.lines if "in no VLAN's port table" in m]
+    check("...with an Events line naming it",
+          len(said) == 1 and "9" in said[0], log.lines)
+    db.close()
+finally:
+    stub.kill()
+
+# ------------------------- a truncated default map is not cached, but the
+
+# ------------------------- per-VLAN maps still resolve every port
+
+stub, port = spawn_stub("stub_agent_l2.py", "pvst-map-truncated")
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
+try:
+    db = new_db("pvst_map_truncated")
+    did = device_against(db, port, "map-truncated-sw")
+    db.replace_interfaces(did, [
+        {"if_index": 1, "descr": "Gi0/1"}, {"if_index": 2, "descr": "Gi0/2"},
+        {"if_index": 3, "descr": "Gi0/3"}])
+    mark_cisco(db, did)
+    # One row per GETBULK response, so the DEFAULT context's walk really
+    # does stop mid-table at port 7's row (the second of three) rather than
+    # fetching all three in one round trip.
+    db.save_settings({"snmp_bulk_max_repetitions": 1})
+    stub_stat(port, b"DROP_OID 1.3.6.1.2.1.17.1.4.1.2.7")
+    poller = NodePoller(db)
+    device = db.device(did)
+    config = db.effective_config(device)
+
+    poller._poll_stp(did, device, config)
+
+    check("the DEFAULT context's own bridge-port map, cut mid-walk by the "
+          "missing port 7 row, is not cached",
+          did not in poller._bridge_port_map_cache, poller._bridge_port_map_cache)
+    ifaces = {i["if_index"]: dict(i) for i in db.interfaces(did)}
+    check("every @vlan context's own map still resolves in full -- port 7 "
+          "(-> ifIndex 2) blocks only in VLAN 30",
+          ifaces[2]["stp_state"] == "blocking"
+          and ifaces[2]["stp_blocking_vlans"] == "30", ifaces[2])
+    check("...and ifIndex 3 (bridge port 9), unaffected by the DEFAULT "
+          "context's own dropped row, still resolves through the "
+          "per-VLAN maps",
+          ifaces[3]["stp_state"] == "forwarding", ifaces[3])
+    stub_stat(port, b"CLEAR_DROPS")
+    db.close()
+finally:
+    stub.kill()
+
+# --------------------- vtpVlanState timing out keeps the prior lap's cache
+
+stub, port = spawn_stub("stub_agent_l2.py", "pvst-vtp-timeout")
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
+try:
+    db = new_db("pvst_vtp_timeout")
+    did = device_against(db, port, "vtp-timeout-sw")
+    two_ports(db, did)
+    mark_cisco(db, did)
+    poller = NodePoller(db)
+    device = db.device(did)
+    config = db.effective_config(device)
+
+    poller._poll_stp(did, device, config)   # first lap: warms the cache
+    ifaces = {i["if_index"]: dict(i) for i in db.interfaces(did)}
+    check("sanity: the first lap blocks ifIndex 2 in VLAN 30",
+          ifaces[2]["stp_state"] == "blocking"
+          and ifaces[2]["stp_blocking_vlans"] == "30", ifaces[2])
+    cursor_before = poller._stp_vlan_cache[did]["cursor"]
+    vlans_before = set(poller._stp_vlan_cache[did]["vlans"])
+
+    stub_stat(port, b"DROP_OID 1.3.6.1.4.1.9.9.46.1.3.1.1.2")
+    rows, answered, complete, next_start, needs_retry = poller._run_stp_vlan_pass(
+        db.device(did), config)
+    check("a vtpVlanState timeout is its own list_unavailable outcome -- "
+          "not a plain empty answer that would pop the cache",
+          rows == {} and answered is False and needs_retry is True,
+          (rows, answered, needs_retry))
+    check("...and the prior lap's cache and cursor are left exactly alone",
+          poller._stp_vlan_cache[did]["cursor"] == cursor_before
+          and set(poller._stp_vlan_cache[did]["vlans"]) == vlans_before,
+          poller._stp_vlan_cache[did])
+    device = db.device(did)
+    check("...with the scan summary noting the VLAN list outage",
+          device["stp_scan_note"] == "VLAN list unavailable",
+          device["stp_scan_note"])
+
+    poller._poll_stp(did, db.device(did), config)   # merges the untouched cache
+    ifaces = {i["if_index"]: dict(i) for i in db.interfaces(did)}
+    check("...so the interfaces still read the first lap's detail through "
+          "the outage",
+          ifaces[2]["stp_state"] == "blocking"
+          and ifaces[2]["stp_blocking_vlans"] == "30", ifaces[2])
+
+    stub_stat(port, b"CLEAR_DROPS")
+    db.close()
+finally:
+    stub.kill()
+
+# ------------------------- the cursor survives a VLAN inserted mid-lap
+
+stub, port = spawn_stub("stub_agent_l2.py", "pvst-3vlan")
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
+try:
+    db = new_db("pvst_cursor_mid_lap")
+    did = device_against(db, port, "cursor-sw")
+    two_ports(db, did)
+    mark_cisco(db, did)
+    poller = NodePoller(db)
+    device = db.device(did)
+    config = db.effective_config(device)
+
+    # A cursor of 15 -- as if the lap had last stopped just past a VLAN 15
+    # that has since been removed (or never existed) -- must resume at the
+    # next real VLAN id above it (20), not crash and not restart at 10.
+    (rows, answered, complete, next_start, total, next_vlan, unmapped,
+     list_unavailable) = poller._cisco_vlan_stp(device, config, start=15)
+    check("a cursor with no exact VLAN match resumes at the next higher "
+          "operational VLAN (20), skipping the lower one (10) that a plain "
+          "index-based cursor would have restarted from",
+          set(rows) == {"20", "30"} and "10" not in rows,
+          rows)
+    db.close()
+finally:
+    stub.kill()
+
+# ------------------- Javariius P2-1: a confirmed-empty per-VLAN map answers
+
+stub, port = spawn_stub("stub_agent_l2.py", "pvst-empty-map-vlan")
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
+try:
+    db = new_db("pvst_empty_map_vlan")
+    did = device_against(db, port, "empty-map-vlan-sw")
+    two_ports(db, did)
+    mark_cisco(db, did)
+    log = CapturingLog()
+    poller = NodePoller(db, log=log)
+    device = db.device(did)
+    config = db.effective_config(device)
+
+    poller._poll_stp(did, device, config)
+
+    device = db.device(did)
+    check("VLAN 40's own context answers a confirmed-empty map -- the lap "
+          "still completes, not cut short",
+          device["stp_scan_note"] == "complete", device["stp_scan_note"])
+    check("...and a fully-answered lap reports answered == vlans, not "
+          "short by one from VLAN 1 being counted on only one side",
+          device["stp_scan_answered"] == device["stp_scan_vlans"],
+          (device["stp_scan_answered"], device["stp_scan_vlans"]))
+    check("...counting VLAN 40 among the answered VLANs",
+          poller._stp_vlan_cache[did]["cursor"] == 0
+          and "40" in poller._stp_vlan_cache[did]["vlans"],
+          poller._stp_vlan_cache[did])
+    cut_short = [m for _, m in log.lines
+                if "cut short" in m or "continuing from VLAN" in m]
+    check("...with no cut-short Events line",
+          cut_short == [], log.lines)
+    db.close()
+finally:
+    stub.kill()
+
+# =====================================================================
+# 5.62.0 additions (Thing3): stp_capable hourly re-probe, a typed vendor
+# override still getting the per-VLAN pass, and the link-state trigger.
+# Kept in their own block, separate from the per-VLAN merge tests above,
+# per the coordination note with Thing1's rework of this file's earlier
+# call shapes.
+# =====================================================================
+
+# ------------------------------------------- stp_capable=0 re-probed hourly
+
+stub, port = spawn_stub("stub_agent_l2.py", "no_stp")
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
+try:
+    db = new_db("stp_reprobe")
+    did = device_against(db, port, "no-bridge-mib-sw")
+    two_ports(db, did)
+    poller = NodePoller(db)
+    device = db.device(did)
+    config = db.effective_config(device)
+
+    poller._poll_stp(did, device, config)
+    device = db.device(did)
+    check("a device answering no BRIDGE-MIB scalars latches stp_capable=0 "
+          "on its first probe",
+          device["stp_capable"] == 0, device["stp_capable"])
+    check("...and stamps the reprobe clock right there -- the latching "
+          "probe IS the reprobe clock's first tick",
+          did in poller._stp_capable_reprobe, poller._stp_capable_reprobe)
+
+    reset_count(port)
+    poller._poll_stp(did, device, config)
+    check("a poll moments later is suppressed -- the hourly latch holds",
+          request_count(port) == 0, request_count(port))
+
+    real_time = time.time
+    time.time = lambda: real_time() + 3601
+    try:
+        reset_count(port)
+        poller._poll_stp(did, device, config)
+        check("past the hour, stp_capable=0 is re-probed again",
+              request_count(port) > 0, request_count(port))
+    finally:
+        time.time = real_time
+    db.close()
+finally:
+    stub.kill()
+
+stub, port = spawn_stub("stub_agent_l2.py", "stp")
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
+try:
+    db = new_db("stp_reprobe_flip")
+    did = device_against(db, port, "gains-stp-sw")
+    two_ports(db, did)
+    poller = NodePoller(db)
+    device = db.device(did)
+    config = db.effective_config(device)
+    # Seed a latched "no BRIDGE-MIB" with the reprobe clock already an
+    # hour old, as if this device had been silent since before this
+    # process started -- _poll_stp must not wait out a fresh hour on top.
+    db.set_stp_capable(did, False)
+    poller._stp_capable_reprobe[did] = time.time() - 3601
+
+    device = db.device(did)
+    poller._poll_stp(did, device, config)
+    device = db.device(did)
+    check("a device that gained BRIDGE-MIB answers is un-latched on its "
+          "next re-probe, not stuck at stp_capable=0 forever",
+          device["stp_capable"] == 1, device["stp_capable"])
+    db.close()
+finally:
+    stub.kill()
+
+# ---------------------------------------- stp_interval_s is clamped, not trusted raw
+
+db = new_db("stp_interval_clamp")
+poller = NodePoller(db)
+check("a negative stp_interval_s falls back to the 300s default",
+      poller._stp_vlan_cadence_s({"stp_interval_s": -30}) == 300,
+      poller._stp_vlan_cadence_s({"stp_interval_s": -30}))
+check("a too-low positive value (below the 30s floor) also falls back",
+      poller._stp_vlan_cadence_s({"stp_interval_s": 5}) == 300,
+      poller._stp_vlan_cadence_s({"stp_interval_s": 5}))
+check("a non-numeric value falls back rather than raising",
+      poller._stp_vlan_cadence_s({"stp_interval_s": "garbage"}) == 300,
+      poller._stp_vlan_cadence_s({"stp_interval_s": "garbage"}))
+check("a valid value at the floor is honoured",
+      poller._stp_vlan_cadence_s({"stp_interval_s": 30}) == 30,
+      poller._stp_vlan_cadence_s({"stp_interval_s": 30}))
+db.close()
+
+# ------------------------------------ typed vendor override still runs Cisco
+
+stub, port = spawn_stub("stub_agent_l2.py", "pvst")
+_paths.patch_nodepoll("DEFAULT_SNMP_PORT", port)
+try:
+    db = new_db("pvst_vendor_override")
+    did = device_against(db, port, "override-sw")
+    two_ports(db, did)
+    # No mark_cisco: vendor_detected only comes from a typed override, the
+    # same shape a real "the sysObjectID lied" operator override takes.
+    db.set_vendor_override(did, "Cisco Systems")
+    poller = NodePoller(db)
+    device = db.device(did)
+    config = db.effective_config(device)
+
+    poller._poll_stp(did, device, config)
+
+    device = db.device(did)
+    check("a typed vendor override of 'Cisco Systems' still gates is_cisco "
+          "true and runs the per-VLAN pass",
+          device["stp_vlan_capable"] == 1, device["stp_vlan_capable"])
+    ifaces = {i["if_index"]: dict(i) for i in db.interfaces(did)}
+    check("...and its per-port detail comes from the per-VLAN merge",
+          ifaces[2]["stp_blocking_vlans"] == "20", ifaces[2])
+    db.close()
+finally:
+    stub.kill()
+
+# --------------------------------------------------- link-state trigger
+
+from test_poller_behaviour import _ReassignableInterfaceAgent, _poll_once
+
+agent = _ReassignableInterfaceAgent()
+agent.start()
+try:
+    db = new_db("stp_link_trigger")
+    _paths.patch_nodepoll("DEFAULT_SNMP_PORT", agent.port)
+    gid = db.ensure_default_group()
+    did = db.add_device("127.0.0.1", "trigger-sw", group_id=gid,
+                        snmp_version=1, community="public",
+                        ping_enabled=0, poll_interval_s=999,
+                        snmp_timeout_s=1.0, snmp_retries=1)
+    # A manual override, not mark_cisco: _poll_once runs a real identify
+    # walk every time, which would overwrite a plain record_poll() latch
+    # right back off this agent's own (non-Cisco) identity.
+    db.set_vendor_override(did, "Cisco")   # the trigger is gated on is_cisco(device)
+    poller = NodePoller(db)
+
+    _poll_once(poller, db, did)
+    ifaces = {row["if_index"]: row for row in db.interfaces(did)}
+    check("poll 1: interface baseline is up", ifaces[1]["oper_status"] == "up",
+          ifaces[1])
+
+    # A cache Thing1's per-VLAN pass would normally have filled -- seeded
+    # directly so this test does not depend on a real BRIDGE-MIB walk.
+    poller._stp_vlan_cache[did] = {"ports": {1}}
+    poller._next_stp_vlan_walk[did] = time.time() + 9999   # far in the future
+
+    agent.if_oper = "down"
+    _poll_once(poller, db, did)
+
+    due = poller._next_stp_vlan_walk.get(did)
+    check("a link-state change on an ifIndex in the STP port union pulls "
+          "the next per-VLAN walk forward to now, not left far in the future",
+          due is not None and due < time.time() + 60, due)
+finally:
+    agent.stop()
+    db.close()
+
+agent = _ReassignableInterfaceAgent()
+agent.start()
+try:
+    db = new_db("stp_link_trigger_unrelated")
+    _paths.patch_nodepoll("DEFAULT_SNMP_PORT", agent.port)
+    gid = db.ensure_default_group()
+    did = db.add_device("127.0.0.1", "trigger-unrelated-sw", group_id=gid,
+                        snmp_version=1, community="public",
+                        ping_enabled=0, poll_interval_s=999,
+                        snmp_timeout_s=1.0, snmp_retries=1)
+    db.set_vendor_override(did, "Cisco")   # cisco too, so this proves the
+                                           # port-union check itself, not
+                                           # just the is_cisco gate above it
+    poller = NodePoller(db)
+
+    _poll_once(poller, db, did)
+    # The STP port union names some OTHER ifIndex -- this device's only
+    # port (1) carries no spanning tree, so its flap must not touch the
+    # schedule at all.
+    poller._stp_vlan_cache[did] = {"ports": {99}}
+    far_future = time.time() + 9999
+    poller._next_stp_vlan_walk[did] = far_future
+
+    agent.if_oper = "down"
+    _poll_once(poller, db, did)
+
+    check("a link-state change on an ifIndex NOT in the STP port union "
+          "leaves the schedule untouched",
+          poller._next_stp_vlan_walk.get(did) == far_future,
+          poller._next_stp_vlan_walk.get(did))
+finally:
+    agent.stop()
+    db.close()
 
 print()
 print("FAILURES:", FAILS if FAILS else "none")

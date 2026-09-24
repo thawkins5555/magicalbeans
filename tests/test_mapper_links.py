@@ -512,6 +512,10 @@ vlan_stp_row = link_csv_rows(
           a_stp_vlans="20,30")], device_name)[0]
 check("...a blocking end with a per-VLAN detail lists its VLAN ids",
       vlan_stp_row[STP_COL] == "blocking on A (VLANs 20, 30)", vlan_stp_row)
+broken_stp_row = link_csv_rows(
+    [dict(links[0], fiber_mode=None, a_stp="broken", b_stp="forwarding")], device_name)[0]
+check("...a broken end reads 'broken on A', not 'blocking on A'",
+      broken_stp_row[STP_COL] == "broken on A", broken_stp_row)
 check("...and a link with neither key set (a manual line) leaves both columns blank",
       link_csv_rows([links[0]], device_name)[0][FIBER_COL] == ""
       and link_csv_rows([links[0]], device_name)[0][STP_COL] == "",

@@ -6,7 +6,7 @@ import traceback
 from .. import mibcatalog, nodeoids, nodesdb, swversion, vendorid
 from ..eventlog import ERROR, NODES
 from ..ipam_scan import ping_many
-from ..nodesdb import NodesDatabase
+from ..nodesdb import NodesDatabase, is_cisco
 from ..snmppoll import PDU_GET, Response, SnmpAccessDenied, SnmpDowngrade, SnmpError, SnmpTimeout, SnmpUnsupported, build_request
 from ._decode import _DEVICE_MAX_KEYS, _INTERFACE_METRICS, _inet_address_text, _int_keyed, _interface_reassigned, counter_rate, detect_reboot, max_event_rate
 from ._session import Credential, SnmpBadOid, _AuthFailure, _CREDENTIAL_VERDICTS, _Session, _assemble, _credential_contradicted, _error_specificity, access_denied_reason, credential_for, security_level, snmp_version_of, v3_exchange
@@ -644,6 +644,17 @@ class PollMixin:
                                 interface_id, kind,
                                 f"{row.get('descr') or if_index}: {prior['oper_status']} -> {row.get('oper_status')}"
                                 + (" (spanning tree blocked)" if blocked else ""))
+                            # A flapping trunk's blocking set is likely to move; wake the per-VLAN walk, damped to once per 60s.
+                            if is_cisco(device):
+                                stp_ports = self._stp_vlan_cache.get(device_id, {}).get("ports")
+                                if stp_ports is None:
+                                    stp_ports = self._cached_bridge_port_map(
+                                        device, config, now).values()
+                                if if_index in stp_ports:
+                                    last_kick = self._stp_flap_kick.get(device_id, 0.0)
+                                    if now - last_kick >= 60:
+                                        self._next_stp_vlan_walk[device_id] = now
+                                        self._stp_flap_kick[device_id] = now
                 if interface_id is not None:
                     label = row.get("descr") or f"if{if_index}"
                     # A down port's counters are not "zero traffic" -- they
