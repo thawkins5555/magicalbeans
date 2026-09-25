@@ -21,8 +21,12 @@ missing — and the chart cannot tell the two apart, so the band an operator
 is watching simply has holes in it. Every bucket where the cap bit is
 therefore recorded (flow_rollup_trunc), and a read repairs those buckets
 from the raw rows for as long as the raw rows still cover them; only a
-bucket older than the raw retention keeps the hole. Filtered queries are
-never rollup-served and are exact throughout.
+bucket older than the raw retention keeps the hole.
+
+Summaries are kept per scope as well as globally: per exporter at both tiers,
+and per (exporter, interface, direction) at the hourly tier, each with its own
+smaller cap. An exporter or interface filter reads its scope; an address,
+port or protocol filter has no scope and reads raw.
 """
 
 from __future__ import annotations
@@ -33,7 +37,7 @@ import time
 
 from .sqlitebase import (  # re-exported: tests adjust netpath.flowdb.TRIM_CHUNK
     LIKE_ESCAPE, TRIM_BUDGET_S, TRIM_CHUNK, TRIM_CHUNK_MAX, TRIM_CHUNK_MIN,
-    SqliteStore, like_contains)
+    SqliteStore, id_chunks, like_contains, marks_for)
 
 log = logging.getLogger(__name__)
 
@@ -109,27 +113,34 @@ CREATE TABLE IF NOT EXISTS samplers (
     updated_ts REAL,
     PRIMARY KEY (exporter, domain, sampler_id)
 );
+"""
 
+# Also run statement by statement by _before_schema's rebuild of an older store.
+ROLLUP_SCHEMA = """
 -- The heaviest keys of one dimension in one bucket, with the sampling factor
 -- already multiplied in: it is per row, so it cannot be reapplied to a stored
 -- sum. BLOB affinity stores each key as whatever the raw GROUP BY produced —
 -- an integer port comes back an integer, an address comes back text — so the
 -- two query paths hand api._flow_label the same thing. WITHOUT ROWID makes
--- the table its own clustered index in (tier, dim, bucket) order, which is
--- the order every read scans it in.
+-- the table its own clustered index in (tier, scope, dim, bucket) order,
+-- which is the order every read scans it in. The scope columns default to
+-- the global scope ('', -1, ''); see GLOBAL_SCOPE.
 CREATE TABLE IF NOT EXISTS flow_rollup (
-    tier    INTEGER NOT NULL,   -- bucket width in seconds: 60 or 3600
-    dim     INTEGER NOT NULL,   -- flowdb.DIMENSION_IDS, append-only
-    bucket  INTEGER NOT NULL,   -- epoch seconds, always a multiple of tier
-    key     BLOB    NOT NULL,
-    bytes   INTEGER NOT NULL,
-    packets INTEGER NOT NULL,
-    flows   INTEGER NOT NULL,
-    PRIMARY KEY (tier, dim, bucket, key)
+    tier     INTEGER NOT NULL,   -- bucket width in seconds: 60 or 3600
+    exporter TEXT    NOT NULL DEFAULT '',
+    iface    INTEGER NOT NULL DEFAULT -1,
+    dir      TEXT    NOT NULL DEFAULT '',   -- 'in' / 'out' with an iface
+    dim      INTEGER NOT NULL,   -- flowdb.DIMENSION_IDS, append-only
+    bucket   INTEGER NOT NULL,   -- epoch seconds, always a multiple of tier
+    key      BLOB    NOT NULL,
+    bytes    INTEGER NOT NULL,
+    packets  INTEGER NOT NULL,
+    flows    INTEGER NOT NULL,
+    PRIMARY KEY (tier, exporter, iface, dir, dim, bucket, key)
 ) WITHOUT ROWID;
 
--- Retention deletes by age across every dimension at once, which the
--- dimension-leading primary key cannot serve.
+-- Retention deletes by age across every scope and dimension at once, which
+-- the scope-leading primary keys cannot serve; so do the per-bucket rebuilds.
 CREATE INDEX IF NOT EXISTS ix_flow_rollup_bucket ON flow_rollup(tier, bucket);
 
 -- What every dimension sums to, kept once rather than eleven times: the same
@@ -137,13 +148,18 @@ CREATE INDEX IF NOT EXISTS ix_flow_rollup_bucket ON flow_rollup(tier, bucket);
 -- totals exact under the top-K cap — the residual is this minus the keys
 -- that were stored.
 CREATE TABLE IF NOT EXISTS flow_rollup_span (
-    tier    INTEGER NOT NULL,
-    bucket  INTEGER NOT NULL,
-    bytes   INTEGER NOT NULL,
-    packets INTEGER NOT NULL,
-    flows   INTEGER NOT NULL,
-    PRIMARY KEY (tier, bucket)
+    tier     INTEGER NOT NULL,
+    exporter TEXT    NOT NULL DEFAULT '',
+    iface    INTEGER NOT NULL DEFAULT -1,
+    dir      TEXT    NOT NULL DEFAULT '',
+    bucket   INTEGER NOT NULL,
+    bytes    INTEGER NOT NULL,
+    packets  INTEGER NOT NULL,
+    flows    INTEGER NOT NULL,
+    PRIMARY KEY (tier, exporter, iface, dir, bucket)
 ) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS ix_flow_rollup_span_bucket
+    ON flow_rollup_span(tier, bucket);
 
 -- Which (tier, dim, bucket) cells the ROLLUP_KEYS cap actually cut short:
 -- present when the bucket held at least as many distinct keys as the cap
@@ -151,17 +167,21 @@ CREATE TABLE IF NOT EXISTS flow_rollup_span (
 -- instead of the capped ones while the raw rows still reach it, so a key
 -- that dipped below the cap for a minute is not drawn as zero for that
 -- minute. Written and cleared by _compact_bucket alongside the rows it
--- describes, and aged out with them. CREATE IF NOT EXISTS is the whole
--- migration: an older store starts with it empty, and nothing is repaired
--- until a bucket is next compacted or backfilled — which is today's answer,
--- not a worse one.
+-- describes, and aged out with them.
 CREATE TABLE IF NOT EXISTS flow_rollup_trunc (
-    tier   INTEGER NOT NULL,
-    dim    INTEGER NOT NULL,
-    bucket INTEGER NOT NULL,
-    PRIMARY KEY (tier, dim, bucket)
+    tier     INTEGER NOT NULL,
+    exporter TEXT    NOT NULL DEFAULT '',
+    iface    INTEGER NOT NULL DEFAULT -1,
+    dir      TEXT    NOT NULL DEFAULT '',
+    dim      INTEGER NOT NULL,
+    bucket   INTEGER NOT NULL,
+    PRIMARY KEY (tier, exporter, iface, dir, dim, bucket)
 ) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS ix_flow_rollup_trunc_bucket
+    ON flow_rollup_trunc(tier, bucket);
 """
+
+SCHEMA += ROLLUP_SCHEMA
 
 DEFAULTS = {
     "enabled": True,
@@ -181,6 +201,7 @@ DEFAULTS = {
     "max_flows": 5_000_000,
     "rollup_minute_days": 2,
     "rollup_retention_days": 90,
+    "rollup_interface_days": 30,
     "resolve_addresses": False,
     "resolve_ports": True,
     "top_n": 10,
@@ -232,8 +253,20 @@ ROLLUP_TIERS = (60, 3600)
 # above that for every bar the page draws to be exact.
 ROLLUP_KEYS = {60: 48, 3600: 64}
 
+# The same cap for the scoped summaries. Smaller, because there are many
+# more of them: E exporters x 10 dimensions per bucket, and for interfaces
+# E x I x 2 directions x 10 per hour. Interface breakdowns are hourly only.
+SCOPED_KEYS = {"exporter": {60: 32, 3600: 48}, "interface": {3600: 16}}
+
+# (exporter, iface, dir) of the unscoped summaries.
+GLOBAL_SCOPE = ("", -1, "")
+_GLOBAL_SQL = "exporter = '' AND iface = -1 AND dir = ''"
+_DIRECTIONS = {"in": ("in",), "out": ("out",), "both": ("in", "out")}
+_IF_COLUMN = {"in": "in_if", "out": "out_if"}
+
 # How much one read will repair from the raw rows before it gives up and
 # serves the capped rollup as stored — two bounds, for two different costs.
+# Both are for the global scope; see _repair_budget for the scoped ones.
 #
 # _REPAIR_MAX_BUCKETS bounds the statement. Each contiguous run of flagged
 # buckets costs the key statement _agg_rows builds SIX bound parameters: two
@@ -260,6 +293,19 @@ ROLLUP_KEYS = {60: 48, 3600: 64}
 # is where it stood before.
 _REPAIR_MAX_BUCKETS = 120
 _REPAIR_MAX_FLOWS = 100_000
+
+
+def _repair_budget(scopes) -> tuple[int, int]:
+    """(flagged buckets, raw flows) one scope of a query may repair.
+
+    A scoped run costs up to eight parameters rather than six (the raw arm
+    carries exporter = ? and in_if/out_if = ?), so 90 runs are the global
+    120's ~730 parameters, split between the scopes of an 'both' query.
+    """
+    if list(scopes) == [GLOBAL_SCOPE]:
+        return _REPAIR_MAX_BUCKETS, _REPAIR_MAX_FLOWS
+    return (_REPAIR_MAX_BUCKETS * 3 // 4 // len(scopes),
+            _REPAIR_MAX_FLOWS // len(scopes))
 
 # Which setting bounds each tier's history. The minute tier is the expensive
 # one (~42 MB a day against ~0.9 MB for the hourly tier), and only the windows
@@ -289,10 +335,89 @@ _FLOOR = "flow_rollup_floor_%d"             # backward edge backfill has reached
 # tier, because each consumes it at its own pace — one shared mark was
 # cleared by whichever tier compacted first, and the other never saw it.
 _DIRTY = "flow_rollup_dirty_ts_%d"
+# How far back each tier's exporter-scope rows (and every scoped span row)
+# reach, and the hourly interface breakdown's own: a store upgraded from the
+# unscoped layout has none below the watermark it had. Backfill lowers each
+# only while contiguous with it.
+_SCOPED_FLOOR = "flow_rollup_scoped_floor_%d"
+_IFACE_FLOOR = "flow_rollup_iface_floor"
 
 
 def _align_down(ts: float, width: float) -> int:
     return int(float(ts) // width) * int(width)
+
+
+def _align_up(ts: float, width: float) -> int:
+    return -_align_down(-float(ts), width)
+
+
+def _iface_filter(filters: dict) -> int | None:
+    """The interface a filter names, only meaningful with an exporter."""
+    iface = filters.get("iface")
+    if not filters.get("exporter") or iface is None or iface == "":
+        return None
+    iface = int(iface)
+    return iface if iface >= 0 else None
+
+
+def _scopes(filters: dict) -> tuple[str | None, list]:
+    """(kind, scopes) a filter set reads, kind None when only raw can answer."""
+    if any(filters.get(name) for name in ("src_ip", "dst_ip", "port",
+                                            "protocol")):
+        return None, []
+    exporter = filters.get("exporter")
+    if not exporter:
+        return "global", [GLOBAL_SCOPE]
+    iface = _iface_filter(filters)
+    if iface is None:
+        return "exporter", [(exporter, -1, "")]
+    sides = _DIRECTIONS.get(filters.get("direction") or "both",
+                            _DIRECTIONS["both"])
+    return "interface", [(exporter, iface, side) for side in sides]
+
+
+def _sides(filters: dict) -> tuple:
+    """The raw arms an aggregate needs: one per direction of an interface
+    filter, so a hairpin flow counts once each way, as the scopes do."""
+    if _iface_filter(filters) is None:
+        return (None,)
+    return _DIRECTIONS.get(filters.get("direction") or "both",
+                           _DIRECTIONS["both"])
+
+
+def _scope_where(scope) -> tuple[str, list]:
+    """The raw-row clause equivalent to one scope."""
+    exporter, iface, side = scope
+    if not exporter:
+        return "", []
+    if iface < 0:
+        return " AND exporter = ?", [exporter]
+    return f" AND exporter = ? AND {_IF_COLUMN[side]} = ?", [exporter, iface]
+
+
+def _statements(script: str):
+    """Split a DDL script into statements, comments and all."""
+    pending = ""
+    for line in script.splitlines(keepends=True):
+        pending += line
+        if sqlite3.complete_statement(pending):
+            yield pending
+            pending = ""
+
+
+def _top_k_sql(scope_cols: str, partition: str, source: str) -> str:
+    """INSERT the heaviest keys of every partition of `source`: bind tier,
+    dim, bucket, then the source's own parameters, then the cap."""
+    return (f"INSERT INTO flow_rollup(tier, exporter, iface, dir, dim, bucket,"
+            f" key, bytes, packets, flows) SELECT ?, {scope_cols}, ?, ?, key,"
+            f" bytes, packets, flows FROM (SELECT *, ROW_NUMBER() OVER"
+            f" (PARTITION BY {partition} ORDER BY bytes DESC, key) AS rn"
+            f" FROM ({source})) WHERE rn <= ?")
+
+
+_RAW_SUMS = ("COALESCE(SUM(bytes * sampling), 0) AS bytes,"
+             " COALESCE(SUM(packets * sampling), 0) AS packets,"
+             " COUNT(*) AS flows")
 
 
 class FlowDatabase(SqliteStore):
@@ -308,12 +433,14 @@ class FlowDatabase(SqliteStore):
     # flow_rollup walked ix_flow_rollup_bucket in full, that index leading on
     # tier defeating the MIN optimisation. The oldest id is the oldest
     # arrival, and flow_rollup_span holds a row for every bucket flow_rollup
-    # does — one arm per tier, since its primary key leads on tier too.
+    # does — one arm per tier, since its primary key leads on tier and then
+    # scope, so the global scope is bound to keep each arm a probe.
     OLDEST_TS_SQL = (
         "SELECT MIN(ts) FROM ("
         "SELECT ts FROM (SELECT ts_start AS ts FROM flows ORDER BY id LIMIT 1)"
         + "".join(f" UNION ALL SELECT MIN(bucket) FROM flow_rollup_span"
-                  f" WHERE tier = {tier}" for tier in ROLLUP_TIERS) + ")")
+                  f" WHERE tier = {tier} AND {_GLOBAL_SQL}"
+                  for tier in ROLLUP_TIERS) + ")")
     TRIM_FLOOR = 1000
     # Rollup rows a tier keeps whatever the size cap says: below this the wide
     # charts it is the only source for have nothing left to draw, and the raw
@@ -325,9 +452,71 @@ class FlowDatabase(SqliteStore):
         # inside budget, so a caller can tell a partial sweep from a
         # complete one.
         self.last_prune_incomplete = False
-        self.cap_held_back = 0   # rows prune()'s row-cap stage spared, not yet summarised by the minute rollup
+        self.cap_held_back = 0   # rows prune()'s row-cap stage spared, not yet summarised
         self._compact_hit_limit: dict[int, bool] = {}   # tier -> whether compact_rollup's last call used its full bucket limit
+        self._iface_built: int | None = None   # the last hourly bucket whose interface breakdown _compact_bucket rebuilt
         super().__init__(path)
+
+    def _before_schema(self) -> None:
+        """Rebuild an unscoped store's summaries with the scope columns.
+
+        Before SCHEMA, so its CREATE ... IF NOT EXISTS never lands an index
+        on an old table. One transaction; a *_old table found at open is a
+        rebuild to finish, not one to start.
+        """
+        names = {row[0] for row in self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN"
+            " ('flow_rollup', 'flow_rollup_span', 'flow_rollup_trunc',"
+            " 'flow_rollup_old', 'flow_rollup_span_old',"
+            " 'flow_rollup_trunc_old')")}
+        legacy = "flow_rollup" in names and "exporter" not in {
+            row[1] for row in self._conn.execute(
+                "PRAGMA table_info(flow_rollup)")}
+        if not legacy and not any(name.endswith("_old") for name in names):
+            return
+        copies = (("flow_rollup", "tier, dim, bucket, key, bytes, packets, flows"),
+                  ("flow_rollup_span", "tier, bucket, bytes, packets, flows"),
+                  ("flow_rollup_trunc", "tier, dim, bucket"))
+        copied = 0
+        self._conn.commit()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            if legacy:
+                for index in ("ix_flow_rollup_bucket", "ix_flow_rollup_span_bucket",
+                              "ix_flow_rollup_trunc_bucket"):
+                    self._conn.execute(f"DROP INDEX IF EXISTS {index}")
+                for table, _columns in copies:
+                    if table in names:
+                        self._conn.execute(
+                            f"ALTER TABLE {table} RENAME TO {table}_old")
+                        names.add(f"{table}_old")
+            for statement in _statements(ROLLUP_SCHEMA):
+                self._conn.execute(statement)
+            for table, columns in copies:
+                if f"{table}_old" not in names:
+                    continue
+                copied += self._conn.execute(
+                    f"INSERT OR IGNORE INTO {table}({columns})"
+                    f" SELECT {columns} FROM {table}_old").rowcount or 0
+                self._conn.execute(f"DROP TABLE {table}_old")
+            has_settings = self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table'"
+                " AND name = 'settings'").fetchone() is not None
+            for tier in ROLLUP_TIERS if has_settings else ():
+                watermark = self._private_setting(_WATERMARK % tier)
+                if watermark is None:
+                    continue
+                self._set_private_setting(_SCOPED_FLOOR % tier, watermark,
+                                          commit=False)
+                if tier in SCOPED_KEYS["interface"]:
+                    self._set_private_setting(_IFACE_FLOOR, watermark,
+                                              commit=False)
+            self._conn.commit()
+        except sqlite3.DatabaseError:
+            self._conn.rollback()
+            raise
+        log.info("netpath.flowdb: flow summaries rebuilt with a scope column"
+                 " (%d row(s) carried over as the global scope)", copied)
 
     def _migrate(self) -> None:
         # Existing rows keep the sampling factor baked into them at decode time.
@@ -488,100 +677,292 @@ class FlowDatabase(SqliteStore):
         return (floor is not None and watermark is not None
                 and bucket >= floor and bucket + tier <= watermark)
 
+    def _scope_floor(self, tier: int, kind: str) -> int | None:
+        """How far back a tier answers for a scope kind: the tier's floor,
+        raised by the scoped floor, and for interfaces by their own."""
+        floor, _watermark = self.rollup_bounds(tier)
+        marks = [floor]
+        if kind != "global":
+            marks.append(self._private_setting(_SCOPED_FLOOR % tier))
+        if kind == "interface" and tier in SCOPED_KEYS["interface"]:
+            marks.append(self._private_setting(_IFACE_FLOOR))
+        if any(mark is None for mark in marks):
+            return None
+        return max(int(mark) for mark in marks)
+
+    def _seed_scoped(self, tier: int, at: int) -> None:
+        """Start a tier's scoped floors where its scoped rows start, if unset."""
+        keys = [_SCOPED_FLOOR % tier]
+        if tier in SCOPED_KEYS["interface"]:
+            keys.append(_IFACE_FLOOR)
+        for key in keys:
+            if self._private_setting(key) is None:
+                self._set_private_setting(key, int(at))
+
+    def _raise_floors(self, tier: int, reached: int) -> None:
+        """Retention or the size cap removed every scope below `reached`."""
+        keys = [_FLOOR % tier, _SCOPED_FLOOR % tier]
+        if tier in SCOPED_KEYS["interface"]:
+            keys.append(_IFACE_FLOOR)
+        for key in keys:
+            current = self._private_setting(key)
+            if current is not None and reached > int(current):
+                self._set_private_setting(key, reached)
+
+    def _oldest_raw(self) -> float | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MIN(ts_end) AS oldest FROM flows").fetchone()
+        return row["oldest"] if row else None
+
+    def _raw_covers(self, tier: int, bucket: int, from_minutes: bool) -> bool:
+        """Whether the raw rows still hold everything the bucket's minute
+        rows counted: interface breakdowns can only be built from raw."""
+        if not from_minutes:
+            return True
+        with self._lock:
+            wanted = self._conn.execute(
+                f"SELECT COALESCE(SUM(flows), 0) AS n FROM flow_rollup_span"
+                f" WHERE tier = 60 AND {_GLOBAL_SQL} AND bucket >= ?"
+                f" AND bucket < ?", (bucket, bucket + tier)).fetchone()["n"]
+            held = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM flows WHERE ts_end >= ?"
+                " AND ts_end < ?", (bucket, bucket + tier)).fetchone()["n"]
+        return held >= wanted
+
     def _compact_bucket(self, tier: int, bucket: int) -> int:
-        """Rebuild one bucket of every dimension, and its span row.
+        """Rebuild one bucket of every dimension and scope, and its spans.
 
         Delete and insert rather than upsert: which keys make the top-K
         changes when a bucket is recomputed, so a key that has dropped out
         of the cap has to be cleared rather than left behind at its old
-        value. One transaction per dimension, so the write lock is never
-        held across more than one.
+        value. One transaction per dimension and scope, so the write lock is
+        never held across more than one.
         """
-        limit = ROLLUP_KEYS[tier]
         from_minutes = self._from_minute_tier(tier, bucket)
+        scoped_floor = self._private_setting(_SCOPED_FLOOR % 60)
+        scoped_minutes = (from_minutes and scoped_floor is not None
+                          and bucket >= int(scoped_floor))
+        exporters: list = []
+        if scoped_minutes:
+            with self._lock:
+                exporters = [row[0] for row in self._conn.execute(
+                    "SELECT DISTINCT exporter FROM flow_rollup_span"
+                    " WHERE tier = 60 AND bucket >= ? AND bucket < ?"
+                    " AND exporter != '' AND iface = -1",
+                    (bucket, bucket + tier))]
+        # Kept as built rather than rebuilt short once raw has been pruned.
+        interfaces = (tier in SCOPED_KEYS["interface"]
+                      and self._raw_covers(tier, bucket, from_minutes))
         written = 0
         for name, expr in DIMENSIONS.items():
             dim = DIMENSION_IDS[name]
-            with self._lock:
-                self._conn.execute(
-                    "DELETE FROM flow_rollup WHERE tier = ? AND dim = ?"
-                    " AND bucket = ?", (tier, dim, bucket))
-                # The flag goes with the rows it describes: a bucket rebuilt
-                # with fewer keys than the cap — late flows resampled away,
-                # say — stops being flagged rather than being repaired from
-                # raw for ever.
-                self._conn.execute(
-                    "DELETE FROM flow_rollup_trunc WHERE tier = ? AND dim = ?"
-                    " AND bucket = ?", (tier, dim, bucket))
-                if from_minutes:
-                    cursor = self._conn.execute(
-                        "INSERT INTO flow_rollup(tier, dim, bucket, key, bytes,"
-                        " packets, flows) SELECT ?, ?, ?, key, bytes, packets,"
-                        " flows FROM (SELECT key, SUM(bytes) AS bytes,"
-                        " SUM(packets) AS packets, SUM(flows) AS flows"
-                        " FROM flow_rollup WHERE tier = 60 AND dim = ?"
-                        " AND bucket >= ? AND bucket < ?"
-                        " GROUP BY key ORDER BY bytes DESC LIMIT ?)",
-                        (tier, dim, bucket, dim, bucket, bucket + tier, limit))
-                else:
-                    cursor = self._conn.execute(
-                        f"INSERT INTO flow_rollup(tier, dim, bucket, key, bytes,"
-                        f" packets, flows) SELECT ?, ?, ?, key, bytes, packets,"
-                        f" flows FROM (SELECT {expr} AS key,"
-                        f" COALESCE(SUM(bytes * sampling), 0) AS bytes,"
-                        f" COALESCE(SUM(packets * sampling), 0) AS packets,"
-                        f" COUNT(*) AS flows FROM flows"
-                        f" WHERE ts_end >= ? AND ts_end < ?"
-                        f" AND ({expr}) IS NOT NULL"
-                        f" GROUP BY key ORDER BY bytes DESC LIMIT ?)",
-                        (tier, dim, bucket, bucket, bucket + tier, limit))
-                stored = cursor.rowcount or 0
-                written += stored
-                # rowcount reaching the LIMIT is the only evidence there is
-                # that the cap bit — the query cannot say how many keys it
-                # did not keep without counting them, which is the scan the
-                # cap exists to avoid. A bucket holding exactly `limit` keys
-                # is flagged too: a false positive that costs one raw read
-                # and changes no number.
-                truncated = stored >= limit
-                if not truncated and from_minutes:
-                    # Built from minute rows that were themselves capped:
-                    # the hour's sums are short by whatever those minutes
-                    # lost, whether or not its own LIMIT was reached.
-                    truncated = self._conn.execute(
-                        "SELECT 1 FROM flow_rollup_trunc WHERE tier = 60"
-                        " AND dim = ? AND bucket >= ? AND bucket < ? LIMIT 1",
-                        (dim, bucket, bucket + tier)).fetchone() is not None
-                if truncated:
-                    self._conn.execute(
-                        "INSERT INTO flow_rollup_trunc(tier, dim, bucket)"
-                        " VALUES (?, ?, ?)", (tier, dim, bucket))
-                self._conn.commit()
+            written += self._compact_global(tier, bucket, dim, expr,
+                                            from_minutes)
             # The collector's writer is waiting on this lock and a Python lock
             # is not fair, the same reason sqlitebase.reclaim yields between
             # its steps.
             time.sleep(0)
+            if name == "Exporter":
+                continue   # one key per exporter scope: its span says it all
+            written += self._compact_exporters(tier, bucket, dim, expr,
+                                               scoped_minutes, exporters)
+            time.sleep(0)
+            if interfaces:
+                for side in _DIRECTIONS["both"]:
+                    written += self._compact_interfaces(tier, bucket, dim,
+                                                        expr, side)
+                    time.sleep(0)
+        self._compact_spans(tier, bucket, from_minutes, scoped_minutes,
+                            tier == 60 or scoped_minutes or interfaces)
+        if tier in SCOPED_KEYS["interface"]:
+            self._iface_built = bucket if interfaces else None
+        return written
+
+    def _compact_global(self, tier: int, bucket: int, dim: int, expr: str,
+                        from_minutes: bool) -> int:
+        limit = ROLLUP_KEYS[tier]
         with self._lock:
             self._conn.execute(
-                "DELETE FROM flow_rollup_span WHERE tier = ? AND bucket = ?",
-                (tier, bucket))
+                f"DELETE FROM flow_rollup WHERE tier = ? AND {_GLOBAL_SQL}"
+                f" AND dim = ? AND bucket = ?", (tier, dim, bucket))
+            # The flag goes with the rows it describes: a bucket rebuilt
+            # with fewer keys than the cap — late flows resampled away,
+            # say — stops being flagged rather than being repaired from
+            # raw for ever.
+            self._conn.execute(
+                f"DELETE FROM flow_rollup_trunc WHERE tier = ? AND {_GLOBAL_SQL}"
+                f" AND dim = ? AND bucket = ?", (tier, dim, bucket))
+            if from_minutes:
+                cursor = self._conn.execute(
+                    f"INSERT INTO flow_rollup(tier, dim, bucket, key, bytes,"
+                    f" packets, flows) SELECT ?, ?, ?, key, bytes, packets,"
+                    f" flows FROM (SELECT key, SUM(bytes) AS bytes,"
+                    f" SUM(packets) AS packets, SUM(flows) AS flows"
+                    f" FROM flow_rollup WHERE tier = 60 AND {_GLOBAL_SQL}"
+                    f" AND dim = ? AND bucket >= ? AND bucket < ?"
+                    f" GROUP BY key ORDER BY bytes DESC LIMIT ?)",
+                    (tier, dim, bucket, dim, bucket, bucket + tier, limit))
+            else:
+                cursor = self._conn.execute(
+                    f"INSERT INTO flow_rollup(tier, dim, bucket, key, bytes,"
+                    f" packets, flows) SELECT ?, ?, ?, key, bytes, packets,"
+                    f" flows FROM (SELECT {expr} AS key, {_RAW_SUMS} FROM flows"
+                    f" WHERE ts_end >= ? AND ts_end < ?"
+                    f" AND ({expr}) IS NOT NULL"
+                    f" GROUP BY key ORDER BY bytes DESC LIMIT ?)",
+                    (tier, dim, bucket, bucket, bucket + tier, limit))
+            stored = cursor.rowcount or 0
+            # rowcount reaching the LIMIT is the only evidence there is
+            # that the cap bit — the query cannot say how many keys it
+            # did not keep without counting them, which is the scan the
+            # cap exists to avoid. A bucket holding exactly `limit` keys
+            # is flagged too: a false positive that costs one raw read
+            # and changes no number.
+            truncated = stored >= limit
+            if not truncated and from_minutes:
+                # Built from minute rows that were themselves capped:
+                # the hour's sums are short by whatever those minutes
+                # lost, whether or not its own LIMIT was reached.
+                truncated = self._conn.execute(
+                    f"SELECT 1 FROM flow_rollup_trunc WHERE tier = 60"
+                    f" AND {_GLOBAL_SQL} AND dim = ? AND bucket >= ?"
+                    f" AND bucket < ? LIMIT 1",
+                    (dim, bucket, bucket + tier)).fetchone() is not None
+            if truncated:
+                self._conn.execute(
+                    "INSERT INTO flow_rollup_trunc(tier, dim, bucket)"
+                    " VALUES (?, ?, ?)", (tier, dim, bucket))
+            self._conn.commit()
+        return stored
+
+    def _compact_exporters(self, tier: int, bucket: int, dim: int, expr: str,
+                           from_minutes: bool, exporters: list) -> int:
+        """The exporter scope of one dimension: each exporter's top keys."""
+        limit = SCOPED_KEYS["exporter"][tier]
+        scope = "exporter != '' AND iface = -1"
+        stored = 0
+        with self._lock:
+            for table in ("flow_rollup", "flow_rollup_trunc"):
+                self._conn.execute(
+                    f"DELETE FROM {table} WHERE tier = ? AND bucket = ?"
+                    f" AND dim = ? AND {scope}", (tier, bucket, dim))
+            if from_minutes:
+                for chunk in id_chunks(exporters):
+                    source = (f"SELECT exporter, key, SUM(bytes) AS bytes,"
+                              f" SUM(packets) AS packets, SUM(flows) AS flows"
+                              f" FROM flow_rollup WHERE tier = 60"
+                              f" AND exporter IN ({marks_for(chunk)})"
+                              f" AND iface = -1 AND dir = '' AND dim = ?"
+                              f" AND bucket >= ? AND bucket < ?"
+                              f" GROUP BY exporter, key")
+                    stored += self._conn.execute(
+                        _top_k_sql("exporter, -1, ''", "exporter", source),
+                        (tier, dim, bucket, *chunk, dim, bucket, bucket + tier,
+                         limit)).rowcount or 0
+                self._conn.execute(
+                    f"INSERT OR IGNORE INTO flow_rollup_trunc(tier, exporter,"
+                    f" iface, dir, dim, bucket) SELECT DISTINCT ?, exporter,"
+                    f" -1, '', ?, ? FROM flow_rollup_trunc WHERE tier = 60"
+                    f" AND bucket >= ? AND bucket < ? AND dim = ? AND {scope}",
+                    (tier, dim, bucket, bucket, bucket + tier, dim))
+            else:
+                source = (f"SELECT exporter, {expr} AS key, {_RAW_SUMS}"
+                          f" FROM flows WHERE ts_end >= ? AND ts_end < ?"
+                          f" AND ({expr}) IS NOT NULL GROUP BY exporter, key")
+                stored = self._conn.execute(
+                    _top_k_sql("exporter, -1, ''", "exporter", source),
+                    (tier, dim, bucket, bucket, bucket + tier,
+                     limit)).rowcount or 0
+            self._flag_capped(tier, bucket, dim, scope, "exporter, -1, ''",
+                              "exporter", limit)
+            self._conn.commit()
+        return stored
+
+    def _compact_interfaces(self, tier: int, bucket: int, dim: int, expr: str,
+                            side: str) -> int:
+        """One direction of the interface scope of one dimension, from raw:
+        flows with in_if (or out_if) = N are interface N's."""
+        limit = SCOPED_KEYS["interface"][tier]
+        column = _IF_COLUMN[side]
+        scope = "iface >= 0 AND dir = ?"
+        with self._lock:
+            for table in ("flow_rollup", "flow_rollup_trunc"):
+                self._conn.execute(
+                    f"DELETE FROM {table} WHERE tier = ? AND bucket = ?"
+                    f" AND dim = ? AND {scope}", (tier, bucket, dim, side))
+            source = (f"SELECT exporter, {column} AS iface, {expr} AS key,"
+                      f" {_RAW_SUMS} FROM flows WHERE ts_end >= ?"
+                      f" AND ts_end < ? AND {column} >= 0"
+                      f" AND ({expr}) IS NOT NULL"
+                      f" GROUP BY exporter, {column}, key")
+            stored = self._conn.execute(
+                _top_k_sql(f"exporter, iface, '{side}'", "exporter, iface",
+                           source),
+                (tier, dim, bucket, bucket, bucket + tier,
+                 limit)).rowcount or 0
+            self._flag_capped(tier, bucket, dim, scope, "exporter, iface, dir",
+                              "exporter, iface, dir", limit, (side,))
+            self._conn.commit()
+        return stored
+
+    def _flag_capped(self, tier: int, bucket: int, dim: int, scope: str,
+                     columns: str, group: str, limit: int, extra=()) -> None:
+        """Flag every scope of the bucket whose stored keys reached the cap.
+        Lock held, no commit."""
+        self._conn.execute(
+            f"INSERT OR IGNORE INTO flow_rollup_trunc(tier, exporter, iface,"
+            f" dir, dim, bucket) SELECT ?, {columns}, ?, ? FROM flow_rollup"
+            f" WHERE tier = ? AND bucket = ? AND dim = ? AND {scope}"
+            f" GROUP BY {group} HAVING COUNT(*) >= ?",
+            (tier, dim, bucket, tier, bucket, dim, *extra, limit))
+
+    def _compact_spans(self, tier: int, bucket: int, from_minutes: bool,
+                       scoped_minutes: bool, interfaces: bool) -> None:
+        """Every scope's grand totals for the bucket, in one transaction.
+        Interface spans are left as they are when `interfaces` is false."""
+        upper = bucket + tier
+        raw_where = "ts_end >= ? AND ts_end < ?"
+        minute_where = "tier = 60 AND bucket >= ? AND bucket < ?"
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM flow_rollup_span WHERE tier = ? AND bucket = ?"
+                + ("" if interfaces else " AND iface = -1"), (tier, bucket))
             if from_minutes:
                 self._conn.execute(
-                    "INSERT INTO flow_rollup_span(tier, bucket, bytes, packets,"
-                    " flows) SELECT ?, ?, SUM(bytes), SUM(packets), SUM(flows)"
-                    " FROM flow_rollup_span WHERE tier = 60 AND bucket >= ?"
-                    " AND bucket < ? HAVING COUNT(*) > 0",
-                    (tier, bucket, bucket, bucket + tier))
+                    f"INSERT INTO flow_rollup_span(tier, bucket, bytes, packets,"
+                    f" flows) SELECT ?, ?, SUM(bytes), SUM(packets), SUM(flows)"
+                    f" FROM flow_rollup_span WHERE {minute_where}"
+                    f" AND {_GLOBAL_SQL} HAVING COUNT(*) > 0",
+                    (tier, bucket, bucket, upper))
             else:
                 self._conn.execute(
-                    "INSERT INTO flow_rollup_span(tier, bucket, bytes, packets,"
-                    " flows) SELECT ?, ?,"
-                    " COALESCE(SUM(bytes * sampling), 0),"
-                    " COALESCE(SUM(packets * sampling), 0), COUNT(*) FROM flows"
-                    " WHERE ts_end >= ? AND ts_end < ? HAVING COUNT(*) > 0",
-                    (tier, bucket, bucket, bucket + tier))
+                    f"INSERT INTO flow_rollup_span(tier, bucket, bytes, packets,"
+                    f" flows) SELECT ?, ?, {_RAW_SUMS} FROM flows"
+                    f" WHERE {raw_where} HAVING COUNT(*) > 0",
+                    (tier, bucket, bucket, upper))
+            insert = ("INSERT INTO flow_rollup_span(tier, exporter, iface, dir,"
+                      " bucket, bytes, packets, flows) ")
+            if scoped_minutes:
+                self._conn.execute(
+                    insert + f"SELECT ?, exporter, iface, dir, ?, SUM(bytes),"
+                    f" SUM(packets), SUM(flows) FROM flow_rollup_span"
+                    f" WHERE {minute_where} AND exporter != ''"
+                    + ("" if interfaces else " AND iface = -1")
+                    + " GROUP BY exporter, iface, dir",
+                    (tier, bucket, bucket, upper))
+            else:
+                self._conn.execute(
+                    insert + f"SELECT ?, exporter, -1, '', ?, {_RAW_SUMS}"
+                    f" FROM flows WHERE {raw_where} GROUP BY exporter",
+                    (tier, bucket, bucket, upper))
+                for side, column in _IF_COLUMN.items() if interfaces else ():
+                    self._conn.execute(
+                        insert + f"SELECT ?, exporter, {column}, '{side}', ?,"
+                        f" {_RAW_SUMS} FROM flows WHERE {raw_where}"
+                        f" AND {column} >= 0 GROUP BY exporter, {column}",
+                        (tier, bucket, bucket, upper))
             self._conn.commit()
-        return written
 
     def compact_rollup(self, tier: int, max_buckets: int | None = None,
                        budget_s: float = _ROLLUP_BUDGET_S) -> int:
@@ -613,8 +994,10 @@ class FlowDatabase(SqliteStore):
             # revisit it, because compaction only ever moves forward.
             self._set_private_setting(_WATERMARK % tier, sealed)
             self._set_private_setting(_FLOOR % tier, sealed)
+            self._seed_scoped(tier, sealed)
             self._compact_hit_limit[tier] = False
             return 0
+        self._seed_scoped(tier, watermark)
         limit = _ROLLUP_MAX_BUCKETS[tier] if max_buckets is None else max_buckets
         deadline = time.monotonic() + budget_s
         written = 0
@@ -682,20 +1065,11 @@ class FlowDatabase(SqliteStore):
         floor, _watermark = self.rollup_bounds(tier)
         if floor is None:
             return 0, False
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT MIN(ts_end) AS oldest FROM flows").fetchone()
-        oldest = row["oldest"] if row else None
-        if oldest is None:
+        stop = self._backfill_stop(tier)
+        if stop is None:
             # Nothing to summarise from. Walking on would build empty buckets
             # every sweep until the retention floor caught up with the cursor.
             return 0, False
-        setting = ROLLUP_DAYS_SETTING[tier]
-        days = float(self.settings().get(setting, DEFAULTS[setting]))
-        # Neither below the raw rows the summaries are built from, nor below
-        # what retention will delete on this same sweep.
-        stop = max(_align_down(time.time() - days * 86400, tier),
-                   _align_down(float(oldest), tier))
         limit = _ROLLUP_MAX_BUCKETS[tier] if max_buckets is None else max_buckets
         deadline = time.monotonic() + budget_s
         written = 0
@@ -705,10 +1079,39 @@ class FlowDatabase(SqliteStore):
                and time.monotonic() < deadline):
             written += self._compact_bucket(tier, bucket)
             self._set_private_setting(_FLOOR % tier, bucket)
+            # A gap in a scope's history (an upgraded store's) stays a gap.
+            scoped = self._private_setting(_SCOPED_FLOOR % tier)
+            if scoped is not None and int(scoped) == bucket + tier:
+                self._set_private_setting(_SCOPED_FLOOR % tier, bucket)
+            iface = (self._private_setting(_IFACE_FLOOR)
+                     if tier in SCOPED_KEYS["interface"] else None)
+            if (iface is not None and int(iface) == bucket + tier
+                    and self._iface_built == bucket):
+                self._set_private_setting(_IFACE_FLOOR, bucket)
             bucket -= tier
             processed += 1
         done = bucket < stop and processed > 0
         return written, done
+
+    def _backfill_stop(self, tier: int) -> int | None:
+        """The oldest bucket backfill may build, or None with no raw rows:
+        neither below the raw rows the summaries are built from, nor below
+        what retention will delete on this same sweep."""
+        oldest = self._oldest_raw()
+        if oldest is None:
+            return None
+        setting = ROLLUP_DAYS_SETTING[tier]
+        days = float(self.settings().get(setting, DEFAULTS[setting]))
+        return max(_align_down(time.time() - days * 86400, tier),
+                   _align_down(float(oldest), tier))
+
+    def backfill_pending(self, tier: int) -> bool:
+        """Whether backfill_rollup(tier) still has history to walk."""
+        floor, _watermark = self.rollup_bounds(tier)
+        if floor is None:
+            return False
+        stop = self._backfill_stop(tier)
+        return stop is not None and floor - tier >= stop
 
     # ------------------------------------------------------------- maintenance
 
@@ -732,23 +1135,25 @@ class FlowDatabase(SqliteStore):
         self._set_private_setting(self._DROPPED_EXPORTER_IX, True)
         return True
 
-    def _delete_rollup(self, tier: int, low: int, upper: int) -> int:
-        """All three rollup tables for buckets in [low, upper). Lock held,
-        no commit: _delete_batches owns each."""
+    def _delete_rollup(self, tier: int, low: int, upper: int,
+                       scope: str = "") -> int:
+        """All three rollup tables for buckets in [low, upper), every scope
+        unless `scope` narrows it. Lock held, no commit: _delete_batches
+        owns each."""
         cursor = self._conn.execute(
-            "DELETE FROM flow_rollup WHERE tier = ? AND bucket >= ?"
-            " AND bucket < ?", (tier, low, upper))
+            f"DELETE FROM flow_rollup WHERE tier = ? AND bucket >= ?"
+            f" AND bucket < ?{scope}", (tier, low, upper))
         removed = cursor.rowcount or 0
         cursor = self._conn.execute(
-            "DELETE FROM flow_rollup_span WHERE tier = ? AND bucket >= ?"
-            " AND bucket < ?", (tier, low, upper))
+            f"DELETE FROM flow_rollup_span WHERE tier = ? AND bucket >= ?"
+            f" AND bucket < ?{scope}", (tier, low, upper))
         removed += cursor.rowcount or 0
         # The flags describe rows that are now gone, and a flag with no
         # rollup behind it would otherwise outlive every retention there is.
         # Not counted: they are bookkeeping, not history.
         self._conn.execute(
-            "DELETE FROM flow_rollup_trunc WHERE tier = ? AND bucket >= ?"
-            " AND bucket < ?", (tier, low, upper))
+            f"DELETE FROM flow_rollup_trunc WHERE tier = ? AND bucket >= ?"
+            f" AND bucket < ?{scope}", (tier, low, upper))
         return removed
 
     def _prune_rollup(self, tier: int, days: float, deadline: float) -> int:
@@ -758,8 +1163,8 @@ class FlowDatabase(SqliteStore):
         cutoff = _align_down(time.time() - days * 86400, tier)
         with self._lock:
             row = self._conn.execute(
-                "SELECT MIN(bucket) AS lo FROM flow_rollup_span WHERE tier = ?"
-                " AND bucket < ?", (tier, cutoff)).fetchone()
+                f"SELECT MIN(bucket) AS lo FROM flow_rollup_span WHERE tier = ?"
+                f" AND {_GLOBAL_SQL} AND bucket < ?", (tier, cutoff)).fetchone()
         oldest = row["lo"] if row else None
         if oldest is None:
             return 0
@@ -769,13 +1174,41 @@ class FlowDatabase(SqliteStore):
             chunk=3600, chunk_min=60, chunk_max=7 * 86400)
         # Routing must stop trusting history that is no longer there, even
         # where the sweep only reached part of it.
-        floor, _watermark = self.rollup_bounds(tier)
-        if floor is not None and reached > floor:
-            self._set_private_setting(_FLOOR % tier, reached)
+        self._raise_floors(tier, reached)
         return removed
+
+    def _prune_interfaces(self, days: float, deadline: float) -> int:
+        """Age out the hourly interface scope on its own, shorter clock."""
+        tier = 3600
+        cutoff = _align_down(time.time() - days * 86400, tier)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MIN(bucket) AS lo FROM flow_rollup_span WHERE tier = ?"
+                " AND bucket < ? AND iface >= 0", (tier, cutoff)).fetchone()
+        oldest = row["lo"] if row else None
+        removed = 0
+        reached = cutoff
+        if oldest is not None:
+            removed, reached = self._delete_batches(
+                int(oldest), cutoff, deadline,
+                delete=lambda lo, up: self._delete_rollup(tier, lo, up,
+                                                          " AND iface >= 0"),
+                chunk=3600, chunk_min=3600, chunk_max=7 * 86400)
+        current = self._private_setting(_IFACE_FLOOR)
+        if current is not None and reached > int(current):
+            self._set_private_setting(_IFACE_FLOOR, reached)
+        return removed
+
+    def _summary_watermark(self) -> int | None:
+        """The oldest bucket some seeded tier has yet to build from raw: the
+        hourly interface breakdown is built from raw an hour after the fact."""
+        marks = [self.rollup_bounds(tier)[1] for tier in ROLLUP_TIERS]
+        marks = [mark for mark in marks if mark is not None]
+        return min(marks) if marks else None
 
     def prune(self, retention_days: float, max_flows: int, *,
               minute_days: float | None = None, rollup_days: float | None = None,
+              interface_days: float | None = None,
               budget_s: float = TRIM_BUDGET_S) -> int:
         """Age out raw flows, cap their row count, and age out the rollups.
 
@@ -786,9 +1219,10 @@ class FlowDatabase(SqliteStore):
         exporter with a wrong clock cannot make prune() drop the wrong rows;
         the row-cap stage chunks by id, which is arrival order.
 
-        `retention_days` and `max_flows` bound the raw table alone. Passing
-        0 for each of the four (the Settings page's maintenance button)
-        matches every existing row.
+        `retention_days` and `max_flows` bound the raw table alone;
+        `interface_days` bounds the hourly interface breakdowns. Passing 0
+        for the first four (the Settings page's maintenance button) matches
+        every existing row.
         """
         now = time.time()
         cutoff = now - retention_days * 86400
@@ -837,15 +1271,15 @@ class FlowDatabase(SqliteStore):
             over = 0 if low is None else (high - low + 1) - max_flows
             if over > 0:
                 cap_upper = low + over
-                # Never cap past what the minute rollup has summarised, so a slow compact_rollup cannot leave a permanent hole.
-                _minute_floor, minute_watermark = self.rollup_bounds(60)
-                if minute_watermark is not None:
+                # Never cap past what the summaries have built, so a slow compact_rollup cannot leave a permanent hole.
+                summary_watermark = self._summary_watermark()
+                if summary_watermark is not None:
                     # Upper-bounded at now+3600 (the decoders' own clamp) so a bad-clock row cannot pin this on itself forever.
                     with self._lock:
                         row = self._conn.execute(
                             "SELECT MIN(id) AS id FROM flows"
                             " WHERE ts_end >= ? AND ts_end < ?",
-                            (minute_watermark, time.time() + 3600)).fetchone()
+                            (summary_watermark, time.time() + 3600)).fetchone()
                     watermark_id = row["id"]
                     if watermark_id is not None and watermark_id < cap_upper:
                         held_back = cap_upper - watermark_id
@@ -859,14 +1293,17 @@ class FlowDatabase(SqliteStore):
         self.cap_held_back = held_back
         if held_back:
             log.warning("netpath.flowdb: row cap held back %d flow(s) not yet"
-                        " summarised by the minute rollup (watermark behind)",
-                        held_back)
+                        " summarised (summaries watermark behind)", held_back)
 
         for tier, days in ((60, minute_days), (3600, rollup_days)):
             if days is None:
                 setting = ROLLUP_DAYS_SETTING[tier]
                 days = float(self.settings().get(setting, DEFAULTS[setting]))
             removed += self._prune_rollup(tier, float(days), deadline)
+        if interface_days is None:
+            interface_days = float(self.settings().get(
+                "rollup_interface_days", DEFAULTS["rollup_interface_days"]))
+        removed += self._prune_interfaces(float(interface_days), deadline)
 
         self.last_prune_incomplete = incomplete
         if incomplete:
@@ -896,11 +1333,12 @@ class FlowDatabase(SqliteStore):
                 break
             with self._lock:
                 bounds = self._conn.execute(
-                    "SELECT MIN(bucket) AS lo, MAX(bucket) AS hi"
-                    " FROM flow_rollup_span WHERE tier = ?", (tier,)).fetchone()
+                    f"SELECT MIN(bucket) AS lo, MAX(bucket) AS hi"
+                    f" FROM flow_rollup_span WHERE tier = ? AND {_GLOBAL_SQL}",
+                    (tier,)).fetchone()
                 held = self._conn.execute(
-                    "SELECT COUNT(*) AS n FROM flow_rollup WHERE tier = ?",
-                    (tier,)).fetchone()["n"]
+                    f"SELECT COUNT(*) AS n FROM flow_rollup WHERE tier = ?"
+                    f" AND {_GLOBAL_SQL}", (tier,)).fetchone()["n"]
             if bounds["lo"] is None or held <= self.TRIM_ROLLUP_FLOOR:
                 continue
             size = self._trim_size()
@@ -911,30 +1349,27 @@ class FlowDatabase(SqliteStore):
                 delete=lambda lo, up, t=tier: self._delete_rollup(t, lo, up),
                 chunk=3600, chunk_min=60, chunk_max=7 * 86400)
             removed += batch_removed
-            floor, _watermark = self.rollup_bounds(tier)
-            if floor is not None and reached > floor:
-                self._set_private_setting(_FLOOR % tier, reached)
+            self._raise_floors(tier, reached)
             self._reclaim_until(deadline)
         return removed
 
     def _trim_id_ceiling(self, cut: int) -> int | None:
-        """Caps the size cap's first stage at the minute rollup's watermark,
-        the same protection prune()'s row-cap stage applies to its own cut."""
-        _minute_floor, minute_watermark = self.rollup_bounds(60)
-        if minute_watermark is None:
+        """Caps the size cap's first stage at the summaries' watermark, the
+        same protection prune()'s row-cap stage applies to its own cut."""
+        summary_watermark = self._summary_watermark()
+        if summary_watermark is None:
             return None
         with self._lock:
             ceiling_row = self._conn.execute(
                 "SELECT MIN(id) AS id FROM flows WHERE ts_end >= ? AND ts_end < ?",
-                (minute_watermark, time.time() + 3600)).fetchone()
+                (summary_watermark, time.time() + 3600)).fetchone()
         ceiling = ceiling_row["id"]
         if ceiling is None or ceiling >= cut:
             return ceiling
         held = cut - ceiling
         self.cap_held_back = held
         log.warning("netpath.flowdb: size cap held back %d flow(s) not yet"
-                    " summarised by the minute rollup (watermark behind)",
-                    held)
+                    " summarised (summaries watermark behind)", held)
         return ceiling
 
     def recent_endpoints(self, limit: int = 300, since_s: float = 3600) -> list[str]:
@@ -951,10 +1386,10 @@ class FlowDatabase(SqliteStore):
         if floor is not None and watermark is not None and cutoff >= floor:
             with self._lock:
                 rows = self._conn.execute(
-                    "SELECT key AS ip, SUM(bytes) AS bytes FROM flow_rollup"
-                    " WHERE tier = 60 AND dim IN (?,?) AND bucket >= ?"
-                    " AND bucket < ? AND key != ''"
-                    " GROUP BY ip ORDER BY bytes DESC LIMIT ?",
+                    f"SELECT key AS ip, SUM(bytes) AS bytes FROM flow_rollup"
+                    f" WHERE tier = 60 AND {_GLOBAL_SQL} AND dim IN (?,?)"
+                    f" AND bucket >= ? AND bucket < ? AND key != ''"
+                    f" GROUP BY ip ORDER BY bytes DESC LIMIT ?",
                     (DIMENSION_IDS["Source"], DIMENSION_IDS["Destination"],
                      _align_down(cutoff, 60), watermark, limit)).fetchall()
             return [row["ip"] for row in rows]
@@ -999,13 +1434,20 @@ class FlowDatabase(SqliteStore):
             "raw_oldest": row["oldest"], "raw_newest": row["newest"],
             "minute_floor": minute_floor, "minute_watermark": minute_watermark,
             "hourly_floor": hourly_floor, "hourly_watermark": hourly_watermark,
+            # Where an exporter filter, and an interface one, reach back to.
+            "scoped_minute_floor": self._scope_floor(60, "exporter"),
+            "scoped_hourly_floor": self._scope_floor(3600, "exporter"),
+            "iface_hourly_floor": self._scope_floor(3600, "interface"),
             "cap_held_back": self.cap_held_back,
             "prune_incomplete": self.last_prune_incomplete,
         }
 
     # ------------------------------------------------------------------ query
 
-    def _where(self, t0: float, t1: float, filters: dict) -> tuple[str, list]:
+    def _where(self, t0: float, t1: float, filters: dict,
+               side: str | None = None) -> tuple[str, list]:
+        """`side` pins an interface filter to one direction; without it
+        'both' matches either, which is what the record list wants."""
         clauses = ["ts_end >= ?", "ts_end <= ?"]
         params: list = [t0, t1]
         if filters.get("src_ip"):
@@ -1023,26 +1465,41 @@ class FlowDatabase(SqliteStore):
         if filters.get("exporter"):
             clauses.append("exporter = ?")
             params.append(filters["exporter"])
+        iface = _iface_filter(filters)
+        if iface is not None:
+            side = side or filters.get("direction") or "both"
+            if side in _IF_COLUMN:
+                clauses.append(f"{_IF_COLUMN[side]} = ?")
+                params.append(iface)
+            else:
+                clauses.append("(in_if = ? OR out_if = ?)")
+                params.extend([iface, iface])
         return " AND ".join(clauses), params
 
     def _rollup_plan(self, t0: float, t1: float, dimension: str | None,
                      filters: dict, bucket_s: float | None):
-        """Which rollup tier can answer this window, or None for raw.
+        """Which rollup tier and scopes can answer this window, or None for
+        raw.
 
-        Returns (tier, dim, seal_ts): buckets in [t0, seal_ts) come from the
-        rollup and flows from seal_ts to t1 from the raw table. seal_ts is a
-        multiple of the tier, so the two ranges are exactly complementary —
-        nothing is counted twice and nothing falls between them. `dim` is
-        None when only the spans are wanted.
+        Returns (tier, dim, seal_ts, scopes): buckets in [t0, seal_ts) come
+        from the rollup and flows from seal_ts to t1 from the raw table.
+        seal_ts is a multiple of the tier, so the two ranges are exactly
+        complementary — nothing is counted twice and nothing falls between
+        them. `dim` is None when only the spans are wanted; `scopes` are
+        the (exporter, iface, dir) summaries to read, two for an interface
+        in both directions.
 
-        A filtered query is never rollup-served: the rollup holds one row
-        per key, and the columns the filters select on are not in it.
+        An address, port or protocol filter is never rollup-served: no scope
+        holds those columns. An interface filter reads the hourly tier only.
         """
-        if filters and any(filters.values()):
+        kind, scopes = _scopes(filters)
+        if kind is None:
             return None
         if dimension is not None and dimension not in DIMENSION_IDS:
             return None
-        for tier in sorted(ROLLUP_TIERS, reverse=True):
+        tiers = (tuple(SCOPED_KEYS["interface"]) if kind == "interface"
+                 else sorted(ROLLUP_TIERS, reverse=True))
+        for tier in tiers:
             if bucket_s is None:
                 # One slot, so the coarsest tier that reaches t0 is the
                 # cheapest answer, not the finest — the loop is already in
@@ -1056,7 +1513,8 @@ class FlowDatabase(SqliteStore):
                 # A bucket lands wholly inside one slot only when every slot
                 # boundary is a multiple of the tier.
                 continue
-            floor, watermark = self.rollup_bounds(tier)
+            floor = self._scope_floor(tier, kind)
+            _floor, watermark = self.rollup_bounds(tier)
             if floor is None or watermark is None or t0 < floor:
                 continue
             # Never past t1: a bucket straddling the end of the window holds
@@ -1065,39 +1523,58 @@ class FlowDatabase(SqliteStore):
             if seal <= t0:
                 continue
             dim = None if dimension is None else DIMENSION_IDS[dimension]
-            return tier, dim, seal
+            return tier, dim, seal, scopes
         return None
 
-    def _repair_ranges(self, tier: int, dim: int, t0: float,
-                       seal: float) -> list[list[int]]:
+    def _widens(self, t0: float, kind: str) -> bool:
+        """A4: whether a sub-hour bucket should widen to the hourly tier,
+        because only it reaches t0 for this scope. An interface filter has
+        no minute tier, so what it is weighed against is the raw rows."""
+        hourly_floor = self._scope_floor(3600, kind)
+        _floor, hourly_watermark = self.rollup_bounds(3600)
+        if (hourly_floor is None or hourly_watermark is None
+                or _align_down(t0, 3600) < hourly_floor
+                or hourly_watermark <= t0):
+            return False
+        if kind == "interface":
+            oldest = self._oldest_raw()
+            return oldest is None or oldest > t0
+        minute_floor = self._scope_floor(60, kind)
+        return minute_floor is not None and t0 < minute_floor
+
+    def _repair_ranges(self, tier: int, scope, dim: int, t0: float,
+                       seal: float, max_buckets: int = _REPAIR_MAX_BUCKETS,
+                       max_flows: int = _REPAIR_MAX_FLOWS) -> list[list[int]]:
         """Which buckets of [t0, seal) the raw rows answer for instead of
         the rollup: the ones _compact_bucket flagged as cut short by the
-        cap, where the raw rows still hold everything the bucket was built
-        from.
+        cap in this scope, where the raw rows still hold everything the
+        bucket was built from.
 
         Returned as [low, upper) runs rather than buckets, adjacent flags
         merged: in the common case — an exporter over the cap in every
         minute — that is one run, and so one extra arm in the query. An
         empty list means "serve the rollup as stored", which is also the
-        answer past either _REPAIR_MAX bound.
+        answer past either bound.
 
         "Still hold everything" is checked, not assumed: a run is repaired
-        only if the raw rows in it number at least what its span rows
-        counted when the buckets were built. Retention ages the raw rows
-        out oldest first, but the row cap deletes by id — arrival order,
-        which an exporter with a skewed clock does not keep — and a rule
-        read off MIN(ts_end) mistook the first bucket of a store's history
-        for a pruned one. Late flows only ever push the raw count above the
-        span's, and a raw answer that is fresher than the rollup is the
-        better one. The count is an ix_flows_ts range walk, bounded by the
-        same _REPAIR_MAX_FLOWS the scan it precedes is.
+        only if the raw rows in it that belong to the scope number at least
+        what its span rows counted when the buckets were built. Retention
+        ages the raw rows out oldest first, but the row cap deletes by id —
+        arrival order, which an exporter with a skewed clock does not keep —
+        and a rule read off MIN(ts_end) mistook the first bucket of a
+        store's history for a pruned one. Late flows only ever push the raw
+        count above the span's, and a raw answer that is fresher than the
+        rollup is the better one. The work bound is the global span's count:
+        a scoped arm still walks every raw row in its range.
         """
+        scope_where, scope_params = _scope_where(scope)
         with self._lock:
             rows = self._conn.execute(
-                "SELECT bucket FROM flow_rollup_trunc WHERE tier = ? AND dim = ?"
+                "SELECT bucket FROM flow_rollup_trunc WHERE tier = ?"
+                " AND exporter = ? AND iface = ? AND dir = ? AND dim = ?"
                 " AND bucket >= ? AND bucket < ? ORDER BY bucket LIMIT ?",
-                (tier, dim, t0, seal, _REPAIR_MAX_BUCKETS + 1)).fetchall()
-            if not rows or len(rows) > _REPAIR_MAX_BUCKETS:
+                (tier, *scope, dim, t0, seal, max_buckets + 1)).fetchall()
+            if not rows or len(rows) > max_buckets:
                 return []
             runs: list[list[int]] = []
             for row in rows:
@@ -1106,25 +1583,31 @@ class FlowDatabase(SqliteStore):
                     runs[-1][1] = bucket + tier
                 else:
                     runs.append([bucket, bucket + tier])
-            expected = []
-            for low, upper in runs:
-                expected.append(self._conn.execute(
+
+            def span_flows(low: int, upper: int, span_scope) -> int:
+                return self._conn.execute(
                     "SELECT COALESCE(SUM(flows), 0) AS n FROM flow_rollup_span"
-                    " WHERE tier = ? AND bucket >= ? AND bucket < ?",
-                    (tier, low, upper)).fetchone()["n"])
-            if sum(expected) > _REPAIR_MAX_FLOWS:
+                    " WHERE tier = ? AND exporter = ? AND iface = ? AND dir = ?"
+                    " AND bucket >= ? AND bucket < ?",
+                    (tier, *span_scope, low, upper)).fetchone()["n"]
+
+            work = [span_flows(low, upper, GLOBAL_SCOPE) for low, upper in runs]
+            if sum(work) > max_flows:
                 return []
             kept = []
-            for (low, upper), wanted in zip(runs, expected):
+            for (low, upper), total in zip(runs, work):
+                wanted = (total if tuple(scope) == GLOBAL_SCOPE
+                          else span_flows(low, upper, scope))
                 held = self._conn.execute(
-                    "SELECT COUNT(*) AS n FROM flows WHERE ts_end >= ?"
-                    " AND ts_end < ?", (low, upper)).fetchone()["n"]
+                    f"SELECT COUNT(*) AS n FROM flows WHERE ts_end >= ?"
+                    f" AND ts_end < ?{scope_where}",
+                    (low, upper, *scope_params)).fetchone()["n"]
                 if held >= wanted:
                     kept.append([low, upper])
         return kept
 
     def _agg_rows(self, t0: float, t1: float, dimension: str | None,
-                  filters: dict, bucket_s: float | None):
+                  filters: dict, bucket_s: float | None, info: dict | None = None):
         """One window's aggregate: (t0, bucket_s, n_buckets, rows, spans).
 
         `rows` are (key, slot, bytes, packets, flows) per grouping key;
@@ -1132,7 +1615,8 @@ class FlowDatabase(SqliteStore):
         which the rows do not add up to on their own — a rollup keeps only
         the heaviest keys of each bucket, and the span is what the residual
         is measured against. `dimension` of None asks for the spans alone,
-        `bucket_s` of None puts the whole window in one slot.
+        `bucket_s` of None puts the whole window in one slot. `info`, when
+        given, is filled with how the window was answered (see overview).
 
         The returned `t0` is the aligned one, on the raw path as much as the
         rollup one: a bucket lands wholly inside one slot only when the
@@ -1140,21 +1624,17 @@ class FlowDatabase(SqliteStore):
         happened to be used would shift the window under the operator every
         time a filter was toggled.
         """
+        kind, _scope_list = _scopes(filters)
+        widened = False
         if bucket_s is None:
             align, n_buckets = float(min(ROLLUP_TIERS)), 1
         else:
             bucket_s = max(float(bucket_s), 1.0)
             # A4: widen to the hourly tier rather than falling back to raw when only it reaches t0 (see A4 in CHANGELOG).
-            if (bucket_s % 60 == 0 and bucket_s < 3600
-                    and not (filters and any(filters.values()))):
-                minute_floor, _minute_watermark = self.rollup_bounds(60)
-                hourly_floor, hourly_watermark = self.rollup_bounds(3600)
-                if (minute_floor is not None and t0 < minute_floor
-                        and hourly_floor is not None
-                        and hourly_watermark is not None
-                        and _align_down(t0, 3600) >= hourly_floor
-                        and hourly_watermark > t0):
-                    bucket_s = 3600.0
+            if (bucket_s % 60 == 0 and bucket_s < 3600 and kind is not None
+                    and self._widens(t0, kind)):
+                bucket_s = 3600.0
+                widened = True
             # Under a minute nothing is rollup-served anyway.
             align = bucket_s if bucket_s % 60 == 0 else 0.0
         if align:
@@ -1162,6 +1642,12 @@ class FlowDatabase(SqliteStore):
         if bucket_s is not None:
             n_buckets = max(1, int((t1 - t0) / bucket_s) + 1)
         plan = self._rollup_plan(t0, t1, dimension, filters, bucket_s)
+        if info is not None:
+            info.update(records_only=plan is None,
+                        tier=None if plan is None else plan[0],
+                        summaries_from=(None if plan is None
+                                        else self._scope_floor(plan[0], kind)),
+                        widened=widened)
 
         def slot(column: str) -> tuple[str, list]:
             if bucket_s is None:
@@ -1173,60 +1659,80 @@ class FlowDatabase(SqliteStore):
         span_sql: list[str] = []
         span_params: list = []
         raw_from = t0
-        repair: list[list[int]] = []
+        repairs: list = []
         if plan is not None:
-            tier, dim, raw_from = plan
+            tier, dim, raw_from, scopes = plan
             expr, expr_params = slot("bucket")
-            if dim is not None:
-                # The buckets the cap cut short leave the rollup arm here
-                # and join the raw arms below, so each is counted by exactly
-                # one of them. The spans are untouched either way: they were
-                # never capped, and the residual is measured against them.
-                repair = self._repair_ranges(tier, dim, t0, raw_from)
-                excluded = "".join(" AND NOT (bucket >= ? AND bucket < ?)"
-                                   for _ in repair)
-                key_sql.append(
-                    f"SELECT key, {expr} AS slot, bytes, packets, flows"
-                    f" FROM flow_rollup WHERE tier = ? AND dim = ?"
-                    f" AND bucket >= ? AND bucket < ?{excluded}")
-                key_params.extend([*expr_params, tier, dim, t0, raw_from,
-                                   *(edge for run in repair for edge in run)])
-            span_sql.append(
-                f"SELECT {expr} AS slot, bytes, packets, flows"
-                f" FROM flow_rollup_span WHERE tier = ? AND bucket >= ?"
-                f" AND bucket < ?")
-            span_params.extend([*expr_params, tier, t0, raw_from])
+            max_buckets, max_flows = _repair_budget(scopes)
+            scope_sql = "tier = ? AND exporter = ? AND iface = ? AND dir = ?"
+            for scope in scopes:
+                if dim == DIMENSION_IDS["Exporter"] and tuple(scope) != GLOBAL_SCOPE:
+                    # A scope holds one exporter, so its span is the only key.
+                    key_sql.append(
+                        f"SELECT ? AS key, {expr} AS slot, bytes, packets,"
+                        f" flows FROM flow_rollup_span WHERE {scope_sql}"
+                        f" AND bucket >= ? AND bucket < ?")
+                    key_params.extend([scope[0], *expr_params, tier, *scope,
+                                       t0, raw_from])
+                elif dim is not None:
+                    # The buckets the cap cut short leave the rollup arm here
+                    # and join the raw arms below, so each is counted by
+                    # exactly one of them. The spans are untouched either
+                    # way: they were never capped, and the residual is
+                    # measured against them.
+                    repair = self._repair_ranges(tier, scope, dim, t0, raw_from,
+                                                 max_buckets, max_flows)
+                    repairs.append((scope, repair))
+                    excluded = "".join(" AND NOT (bucket >= ? AND bucket < ?)"
+                                       for _ in repair)
+                    key_sql.append(
+                        f"SELECT key, {expr} AS slot, bytes, packets, flows"
+                        f" FROM flow_rollup WHERE {scope_sql} AND dim = ?"
+                        f" AND bucket >= ? AND bucket < ?{excluded}")
+                    key_params.extend([*expr_params, tier, *scope, dim, t0,
+                                       raw_from,
+                                       *(edge for run in repair for edge in run)])
+                span_sql.append(
+                    f"SELECT {expr} AS slot, bytes, packets, flows"
+                    f" FROM flow_rollup_span WHERE {scope_sql}"
+                    f" AND bucket >= ? AND bucket < ?")
+                span_params.extend([*expr_params, tier, *scope, t0, raw_from])
 
-        where, where_params = self._where(raw_from, t1, filters)
         expr, expr_params = slot("ts_end")
+        wheres = [self._where(raw_from, t1, filters, side)
+                  for side in _sides(filters)]
         if dimension is not None:
             key = DIMENSIONS.get(dimension, DIMENSIONS["Application"])
             # Where a rollup covers part of the window the raw tail drops its
             # NULL keys too, so traffic a rollup cannot store does not appear
             # as its own series for three minutes of an hour-wide chart.
             unstorable = f" AND ({key}) IS NOT NULL" if plan is not None else ""
-            key_sql.append(
-                f"SELECT {key} AS key, {expr} AS slot,"
-                f" bytes * sampling AS bytes, packets * sampling AS packets,"
-                f" 1 AS flows FROM flows WHERE {where}{unstorable}")
-            key_params.extend([*expr_params, *where_params])
-            # One arm per run of repaired buckets, each an ix_flows_ts range
-            # like the tail above — half-open, the way the rollup bucket it
-            # stands in for is. Filters are never in play here: a filtered
-            # query has no plan, and so nothing to repair.
-            for low, upper in repair:
+            for where, where_params in wheres:
                 key_sql.append(
                     f"SELECT {key} AS key, {expr} AS slot,"
                     f" bytes * sampling AS bytes, packets * sampling AS packets,"
-                    f" 1 AS flows FROM flows WHERE ts_end >= ? AND ts_end < ?"
-                    f"{unstorable}")
-                key_params.extend([*expr_params, low, upper])
+                    f" 1 AS flows FROM flows WHERE {where}{unstorable}")
+                key_params.extend([*expr_params, *where_params])
+            # One arm per run of repaired buckets, each an ix_flows_ts range
+            # like the tail above — half-open, the way the rollup bucket it
+            # stands in for is — narrowed to the scope it repairs. Other
+            # filters are never in play: they have no plan to repair.
+            for scope, repair in repairs:
+                scope_where, scope_params = _scope_where(scope)
+                for low, upper in repair:
+                    key_sql.append(
+                        f"SELECT {key} AS key, {expr} AS slot,"
+                        f" bytes * sampling AS bytes, packets * sampling AS packets,"
+                        f" 1 AS flows FROM flows WHERE ts_end >= ? AND ts_end < ?"
+                        f"{scope_where}{unstorable}")
+                    key_params.extend([*expr_params, low, upper, *scope_params])
         if plan is not None or dimension is None:
-            span_sql.append(
-                f"SELECT {expr} AS slot, bytes * sampling AS bytes,"
-                f" packets * sampling AS packets, 1 AS flows"
-                f" FROM flows WHERE {where}")
-            span_params.extend([*expr_params, *where_params])
+            for where, where_params in wheres:
+                span_sql.append(
+                    f"SELECT {expr} AS slot, bytes * sampling AS bytes,"
+                    f" packets * sampling AS packets, 1 AS flows"
+                    f" FROM flows WHERE {where}")
+                span_params.extend([*expr_params, *where_params])
 
         rows: list = []
         spans: dict[int, list] = {}
@@ -1257,6 +1763,83 @@ class FlowDatabase(SqliteStore):
             bucket_s = max(float(t1) - t0, 1.0)
         return t0, bucket_s, n_buckets, rows, spans
 
+    def _span_plan(self, t0: float, t1: float, kind: str):
+        """(tier, start, seal) for a totals read: the finest tier whose
+        scoped spans reach t0 serves [start, seal), whole buckets inside the
+        window, and raw the edges; tier None means raw throughout."""
+        for tier in sorted(ROLLUP_TIERS):
+            start = _align_up(t0, tier)
+            floor = self._scope_floor(tier, kind)
+            _floor, watermark = self.rollup_bounds(tier)
+            if floor is None or watermark is None or start < floor:
+                continue
+            seal = min(watermark, _align_down(t1, tier))
+            if seal > start:
+                return tier, start, seal
+        return None, t1, t1
+
+    def interface_totals(self, t0: float, t1: float,
+                         exporter: str | None = None) -> list[dict]:
+        """Traffic per (exporter, interface, direction) over the window:
+        'in' is flows with in_if = iface, 'out' those with out_if = iface.
+        `exporter` of None means every exporter."""
+        tier, start, seal = self._span_plan(t0, t1, "interface")
+        where = " AND exporter = ?" if exporter else ""
+        extra = [exporter] if exporter else []
+        sql = []
+        params: list = []
+        if tier is not None:
+            sql.append(f"SELECT exporter, iface, dir, bytes, packets, flows"
+                       f" FROM flow_rollup_span WHERE tier = ? AND bucket >= ?"
+                       f" AND bucket < ? AND iface >= 0{where}")
+            params.extend([tier, start, seal, *extra])
+        for low, upper, closed in ((t0, start, False), (seal, t1, True)):
+            if upper < low or (upper == low and not closed):
+                continue
+            for side, column in _IF_COLUMN.items():
+                sql.append(
+                    f"SELECT exporter, {column} AS iface, '{side}' AS dir,"
+                    f" {_RAW_SUMS} FROM flows WHERE ts_end >= ?"
+                    f" AND ts_end {'<=' if closed else '<'} ? AND {column} >= 0"
+                    f"{where} GROUP BY exporter, {column}")
+                params.extend([low, upper, *extra])
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT exporter, iface, dir, SUM(bytes) AS bytes,"
+                " SUM(packets) AS packets, SUM(flows) AS flows FROM ("
+                + " UNION ALL ".join(sql) + ") GROUP BY exporter, iface, dir"
+                " ORDER BY exporter, iface, dir", params).fetchall()
+        return [{"exporter": row["exporter"], "iface": row["iface"],
+                 "dir": row["dir"], "bytes": row["bytes"] or 0,
+                 "packets": row["packets"] or 0, "flows": row["flows"] or 0}
+                for row in rows]
+
+    def exporter_totals(self, t0: float, t1: float) -> dict:
+        """{exporter: {"bytes", "packets", "flows"}} over the window."""
+        tier, start, seal = self._span_plan(t0, t1, "exporter")
+        sql = []
+        params: list = []
+        if tier is not None:
+            sql.append("SELECT exporter, bytes, packets, flows"
+                       " FROM flow_rollup_span WHERE tier = ? AND bucket >= ?"
+                       " AND bucket < ? AND exporter != '' AND iface = -1")
+            params.extend([tier, start, seal])
+        for low, upper, closed in ((t0, start, False), (seal, t1, True)):
+            if upper < low or (upper == low and not closed):
+                continue
+            sql.append(f"SELECT exporter, {_RAW_SUMS} FROM flows"
+                       f" WHERE ts_end >= ? AND ts_end {'<=' if closed else '<'} ?"
+                       f" GROUP BY exporter")
+            params.extend([low, upper])
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT exporter, SUM(bytes) AS bytes, SUM(packets) AS packets,"
+                " SUM(flows) AS flows FROM (" + " UNION ALL ".join(sql)
+                + ") GROUP BY exporter", params).fetchall()
+        return {row["exporter"]: {"bytes": row["bytes"] or 0,
+                                  "packets": row["packets"] or 0,
+                                  "flows": row["flows"] or 0} for row in rows}
+
     def top(self, t0: float, t1: float, dimension: str, filters: dict,
             limit: int = 10) -> list[dict]:
         _times, _series, _bucket_s, top_rows, _totals = self.overview(
@@ -1272,17 +1855,21 @@ class FlowDatabase(SqliteStore):
         return times, series, bucket_s
 
     def overview(self, t0: float, t1: float, dimension: str, filters: dict,
-                 bucket_s: float, series_limit: int = 8, top_limit: int = 10):
+                 bucket_s: float, series_limit: int = 8, top_limit: int = 10,
+                 info: dict | None = None):
         """Everything the NetFlow overview needs, from one pass over the window.
 
         The `GROUP BY key, slot` scan holds two of the three answers: per key
         it is top(), by slot it is the series. The totals come from the
         per-slot grand totals instead, so they stay exact over a rollup that
         stored only the heaviest keys of each bucket.
-        Returns (times, series, bucket_s, top_rows, totals).
+        Returns (times, series, bucket_s, top_rows, totals). `info`, when a
+        dict, gets records_only (no summary answered), tier, summaries_from
+        (the floor of the scope that did) and widened (bucket_s raised to
+        the hourly tier).
         """
         t0, bucket_s, n_buckets, rows, spans = self._agg_rows(
-            t0, t1, dimension, filters, bucket_s)
+            t0, t1, dimension, filters, bucket_s, info)
 
         per_key: dict[object, dict] = {}
         for row in rows:

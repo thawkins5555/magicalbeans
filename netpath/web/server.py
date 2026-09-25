@@ -258,6 +258,8 @@ ROUTES = [
     ("GET", r"^/api/netpath/topology$", api.get_topology, ("netpath", R)),
     ("GET", r"^/api/netpath/https$", api.get_netpath_https, ("netpath", R)),
     ("GET", r"^/api/netflow/overview$", api.get_flow_overview, ("netflow", R)),
+    ("GET", r"^/api/netflow/exporters$", api.get_flow_exporters, ("netflow", R)),
+    ("GET", r"^/api/netflow/interfaces$", api.get_flow_interfaces, ("netflow", R)),
     ("GET", r"^/api/netflow/records$", api.get_flow_records, ("netflow", R)),
     ("GET", r"^/api/netflow/records/export\.csv$", api.get_flow_records_export, ("netflow", R)),
     ("POST", r"^/api/netflow/collector$", api.post_collector, ("netflow", W)),

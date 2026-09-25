@@ -139,8 +139,8 @@ def test_2_totals_survive_truncation() -> None:
     cover(db)
 
     stored = db._conn.execute(
-        "SELECT COUNT(*) AS n FROM flow_rollup WHERE tier = 60 AND dim = ?"
-        " AND bucket = ?",
+        f"SELECT COUNT(*) AS n FROM flow_rollup WHERE tier = 60"
+        f" AND {flowdb._GLOBAL_SQL} AND dim = ? AND bucket = ?",
         (flowdb.DIMENSION_IDS["Conversation"],
          flowdb._align_down(start + 30, 60))).fetchone()["n"]
     check(stored == cap,
@@ -252,12 +252,25 @@ def test_4_sampling_in_both_orders() -> None:
 
 def test_5_filters_never_touch_a_rollup() -> None:
     """Proven with a rollup deliberately holding the wrong numbers."""
-    print("5: a filtered query is answered from raw, whatever the rollup says")
+    print("5: src/dst/port/protocol never touch a rollup; exporter and "
+          "interface filters do, and agree with raw")
     db = store("filters.db")
     end = flowdb._align_down(time.time() - 300, 3600)
     start = end - 3600
     db.insert_flows([flow(i, start + i * 3.0) for i in range(600)])
     cover(db)
+    # Exporter 10.0.0.1 owns interface 4 both ways, hairpins included.
+    scoped = (("exporter", {**NO_FILTERS, "exporter": "10.0.0.1"}, 300),
+              *((f"exporter and interface ({side})",
+                 {**NO_FILTERS, "exporter": "10.0.0.1", "iface": 4,
+                  "direction": side}, 3600) for side in ("in", "out", "both")))
+    for name, filters, bucket in scoped:
+        plan = db._rollup_plan(start, end, "Source", filters, bucket)
+        got = db.overview(start, end, "Source", filters, bucket)
+        want = raw(db, "overview", start, end, "Source", filters, bucket)
+        check(plan is not None and got == want and got[4]["flows"] > 0,
+              f"a query filtered by {name} is summary-served (tier "
+              f"{plan and plan[0]}) and equals the raw answer")
     with db._lock:
         db._conn.execute("UPDATE flow_rollup_span SET bytes = bytes + 1000000")
         db._conn.commit()
@@ -269,13 +282,21 @@ def test_5_filters_never_touch_a_rollup() -> None:
           "checks below are actually exercising the routing rule")
     for name, filters in (
             ("source address", {**NO_FILTERS, "src_ip": "192.168.0.1"}),
+            ("destination address", {**NO_FILTERS, "dst_ip": "8.8.8.1"}),
             ("port", {**NO_FILTERS, "port": "443"}),
             ("protocol", {**NO_FILTERS, "protocol": 6}),
-            ("exporter", {**NO_FILTERS, "exporter": "10.0.0.1"})):
+            ("exporter and port", {**NO_FILTERS, "exporter": "10.0.0.1",
+                                   "port": "443"})):
         got = db.overview(start, end, "Source", filters, 300)
         want = raw(db, "overview", start, end, "Source", filters, 300)
-        check(got == want and got[4]["bytes"] < poisoned["bytes"],
+        check(db._rollup_plan(start, end, "Source", filters, 300) is None
+              and got == want and got[4]["bytes"] < poisoned["bytes"],
               f"a query filtered by {name} returns the exact raw answer")
+    for name, filters, bucket in scoped:
+        got = db.overview(start, end, "Source", filters, bucket)
+        want = raw(db, "overview", start, end, "Source", filters, bucket)
+        check(got[4]["bytes"] > want[4]["bytes"] + 900_000,
+              f"...while one filtered by {name} reads the (poisoned) summaries")
     db.close()
 
 
@@ -610,7 +631,8 @@ def test_14_a_named_series_is_whole_in_every_bucket() -> None:
     # First the fact the check below rests on: in a flooded minute the rollup
     # really did drop the regulars, so agreement is not for want of a cap.
     kept = {row["key"] for row in db._conn.execute(
-        "SELECT key FROM flow_rollup WHERE tier = 60 AND dim = ? AND bucket = ?",
+        f"SELECT key FROM flow_rollup WHERE tier = 60 AND {flowdb._GLOBAL_SQL}"
+        f" AND dim = ? AND bucket = ?",
         (flowdb.DIMENSION_IDS["Conversation"],
          start + flooded[0] * 60)).fetchall()}
     check(len(kept) == cap and not (kept & set(regulars)),
@@ -639,15 +661,17 @@ def test_14_a_named_series_is_whole_in_every_bucket() -> None:
 
     # The bookkeeping that makes that possible.
     dim = flowdb.DIMENSION_IDS["Conversation"]
+    flagged_sql = (f"SELECT bucket FROM flow_rollup_trunc WHERE tier = 60"
+                   f" AND {flowdb._GLOBAL_SQL} AND dim = ? ORDER BY bucket")
     flagged = [row["bucket"] for row in db._conn.execute(
-        "SELECT bucket FROM flow_rollup_trunc WHERE tier = 60 AND dim = ?"
-        " ORDER BY bucket", (dim,)).fetchall()]
+        flagged_sql, (dim,)).fetchall()]
     check(flagged == [start + m * 60 for m in flooded],
           f"exactly the flooded minutes are flagged for the dimension "
           f"({[(b - start) // 60 for b in flagged]})")
     check(db._conn.execute(
-        "SELECT COUNT(*) AS n FROM flow_rollup_trunc WHERE tier = 3600"
-        " AND dim = ? AND bucket = ?", (dim, start)).fetchone()["n"] == 1,
+        f"SELECT COUNT(*) AS n FROM flow_rollup_trunc WHERE tier = 3600"
+        f" AND {flowdb._GLOBAL_SQL} AND dim = ? AND bucket = ?",
+        (dim, start)).fetchone()["n"] == 1,
           "and the hour built from them is flagged as well, since its sums "
           "are short by what those minutes lost")
     check(db._conn.execute(
@@ -665,8 +689,7 @@ def test_14_a_named_series_is_whole_in_every_bucket() -> None:
         db._conn.commit()
     db._compact_bucket(60, start + flooded[1] * 60)
     flagged = [row["bucket"] for row in db._conn.execute(
-        "SELECT bucket FROM flow_rollup_trunc WHERE tier = 60 AND dim = ?"
-        " ORDER BY bucket", (dim,)).fetchall()]
+        flagged_sql, (dim,)).fetchall()]
     check(flagged == [start + m * 60 for m in (flooded[0], flooded[2])],
           f"a rebuilt bucket keeps one flag, and one rebuilt under the cap "
           f"drops its flag ({[(b - start) // 60 for b in flagged]})")
@@ -749,7 +772,8 @@ def test_15_the_repair_statement_fits_an_old_sqlite() -> None:
             " VALUES (60, ?, ?)", [(dim, b) for b in flagged])
         db._conn.commit()
     plan = db._rollup_plan(start, end, "Conversation", NO_FILTERS, 60)
-    runs = db._repair_ranges(60, dim, start, plan[2]) if plan else []
+    runs = (db._repair_ranges(60, flowdb.GLOBAL_SCOPE, dim, start, plan[2])
+            if plan else [])
     check(plan is not None and len(runs) == bound,
           f"the fixture is the worst case: {len(runs)} non-adjacent runs "
           f"at the bound of {bound}")
@@ -777,7 +801,7 @@ def test_15_the_repair_statement_fits_an_old_sqlite() -> None:
             "INSERT OR IGNORE INTO flow_rollup_trunc(tier, dim, bucket)"
             " VALUES (60, ?, ?)", (dim, start + bound * 2 * 60))
         db._conn.commit()
-    check(db._repair_ranges(60, dim, start, plan[2]) == [],
+    check(db._repair_ranges(60, flowdb.GLOBAL_SCOPE, dim, start, plan[2]) == [],
           "one run past the bound and the repair stands down")
     try:
         got = db.overview(start, end, "Conversation", NO_FILTERS, 60,
@@ -943,7 +967,8 @@ def test_19_coverage_returns_the_documented_keys() -> None:
     db = store("coverage_keys.db")
     cov = db.coverage()
     expected = {"raw_oldest", "raw_newest", "minute_floor", "minute_watermark",
-               "hourly_floor", "hourly_watermark", "cap_held_back",
+               "hourly_floor", "hourly_watermark", "scoped_minute_floor",
+               "scoped_hourly_floor", "iface_hourly_floor", "cap_held_back",
                "prune_incomplete"}
     check(set(cov) == expected, f"coverage() keys: {sorted(cov)}")
     check(cov["cap_held_back"] == 0 and cov["prune_incomplete"] is False,

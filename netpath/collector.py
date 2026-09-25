@@ -66,7 +66,7 @@ class Collector(udpsock.UdpReceiver):
     QUEUE_SIZE = 20000
     COUNTERS = {"packets": 0, "flows": 0, "dropped": 0, "rejected": 0,
                 "errors": 0, "resampled": 0, "truncated_flows": 0,
-                "first_seen_suppressed": 0,
+                "seq_missed": 0, "first_seen_suppressed": 0,
                 "last_packet": 0.0, "last_template": 0.0}
 
     def __init__(self, db: FlowDatabase, on_batch=None, log=None):
@@ -244,6 +244,7 @@ class Collector(udpsock.UdpReceiver):
                                                f"{data[:32].hex(' ')}")
         self._sync_error_counter()
         self.counters["truncated_flows"] = self.decoder.stats["truncated_flows"]
+        self.counters["seq_missed"] = self.decoder.stats["seq_missed"]
         if not flows:
             return
         try:
@@ -382,6 +383,8 @@ class Collector(udpsock.UdpReceiver):
         parts = []
         if self.counters["truncated_flows"]:
             parts.append(f"{self.counters['truncated_flows']} truncated")
+        if self.counters["seq_missed"]:
+            parts.append(f"{self.counters['seq_missed']} missed sequence")
         return parts
 
     def _listening_text(self) -> str:

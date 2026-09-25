@@ -59,6 +59,12 @@ MAX_FIELDS_PER_TEMPLATE = 128
 # ceiling (~9.2e18), so it costs no real deployment anything.
 MAX_PLAUSIBLE_SAMPLING = 1_000_000
 
+# A sequence jump past this, in either direction, is the exporter's counter
+# wrapping or restarting rather than a real run of dropped packets, so it
+# resets the baseline instead of being added to seq_missed. Wide enough that
+# no real gap this collector could plausibly witness is mistaken for a reset.
+MAX_SEQUENCE_JUMP = 1_000_000
+
 # How many flows one datagram may yield. Nothing in the wire format bounds
 # this: a template of a single short field gives a record length of a byte or
 # two, so one 64 KB datagram used to decode to ~65,000 Flow objects (~48 MB,
@@ -367,7 +373,16 @@ class Decoder:
         self.trust_exporter_sampling = trust_exporter_sampling
         self.stats = {"packets": 0, "flows": 0, "templates": 0, "errors": 0,
                       "no_template": 0, "bad_template": 0,
-                      "implausible_sampling": 0, "truncated_flows": 0}
+                      "implausible_sampling": 0, "truncated_flows": 0,
+                      "seq_missed": 0}
+        # (exporter, domain) -> the sequence value the exporter's next packet
+        # should carry. Bounded the same way self.sampling is: a flat LRU
+        # keyed on wire-controlled fields, capped at MAX_TEMPLATE_EXPORTERS so
+        # a source cycling `domain` cannot grow it without bound.
+        self._expected_seq: _Lru = _Lru(MAX_TEMPLATE_EXPORTERS)
+        # (exporter, domain) -> sequence numbers missed since the baseline
+        # was last reset, for sequence_gaps() to sum per exporter.
+        self._seq_missed_by_key: _Lru = _Lru(MAX_TEMPLATE_EXPORTERS)
         # (exporter, domain, template_id) -> {count, first_ts, last_ts, reason}
         # for data sets dropped since no template was cached for that key.
         self.missing: _Lru = _Lru(256)
@@ -422,6 +437,35 @@ class Decoder:
             while len(self.learned_rates) > MAX_SAMPLING:
                 self.learned_rates.pop(next(iter(self.learned_rates)))
 
+    def _note_sequence(self, exporter: str, domain: int, got: int, advance: int) -> None:
+        """Count sequence numbers an exporter's packet skipped since the
+        last one seen for this (exporter, domain).
+
+        `advance` is how far this packet's own sequence value moves the
+        baseline for the packet after it: v5 by its record count, v9 by one
+        packet, IPFIX by the records this packet carried. A decrease, or a
+        jump past MAX_SEQUENCE_JUMP either way, means the exporter restarted
+        or the counter wrapped rather than that many packets were lost, so it
+        resets the baseline instead of being counted.
+        """
+        key = (exporter, domain)
+        expected = self._expected_seq.get(key)
+        if expected is not None:
+            missed = got - expected
+            if 0 < missed <= MAX_SEQUENCE_JUMP:
+                self.stats["seq_missed"] += missed
+                self._seq_missed_by_key[key] = (
+                    self._seq_missed_by_key.get(key, 0) + missed)
+        self._expected_seq[key] = got + advance
+
+    def sequence_gaps(self) -> dict[str, int]:
+        """Missed sequence numbers so far, summed across domains, per
+        exporter -- for the Exporters table and /api/netflow/exporters."""
+        totals: dict[str, int] = {}
+        for (exporter, _domain), missed in self._seq_missed_by_key.items():
+            totals[exporter] = totals.get(exporter, 0) + missed
+        return totals
+
     def drain_learned_rates(self, limit: int | None = None) -> list[tuple[str, int, int, int]]:
         """Take up to `limit` announced rates, oldest first, leaving the rest
         for the next call. Taking them under the same lock _set_sampling
@@ -464,7 +508,7 @@ class Decoder:
     def _decode_v5(self, data: bytes, exporter: str) -> list[Flow]:
         if len(data) < 24:
             raise DecodeError("short v5 header")
-        (_, count, sys_uptime, unix_secs, _, _,
+        (_, count, sys_uptime, unix_secs, _, flow_sequence,
          _, _, sampling_raw) = struct.unpack_from("!HHIIIIBBH", data, 0)
 
         # Top two bits are the sampling mode, the rest is the interval.
@@ -472,6 +516,10 @@ class Decoder:
         if interval > 1:
             self._set_sampling(exporter, 0, 0, interval)
         sampling = self.sampling_for(exporter)
+        # v5 has no observation domain; flow_sequence counts records, so the
+        # next packet's own value is expected to be this one plus this
+        # packet's count.
+        self._note_sequence(exporter, 0, flow_sequence, count)
 
         boot = unix_secs - sys_uptime / 1000.0
         now = time.time()
@@ -505,7 +553,8 @@ class Decoder:
     def _decode_v9(self, data: bytes, exporter: str) -> list[Flow]:
         if len(data) < 20:
             raise DecodeError("short v9 header")
-        _, _, sys_uptime, unix_secs, _, domain = struct.unpack_from("!HHIIII", data, 0)
+        _, _, sys_uptime, unix_secs, sequence, domain = struct.unpack_from(
+            "!HHIIII", data, 0)
         boot = unix_secs - sys_uptime / 1000.0
         offset = 20
         flows: list[Flow] = []
@@ -520,10 +569,15 @@ class Decoder:
             elif set_id == 1:
                 self._read_options_template(body, exporter, domain, ipfix=False)
             elif set_id >= 256:
-                flows.extend(self._read_data(body, exporter, domain, set_id,
-                                             V9, boot, unix_secs,
-                                             MAX_FLOWS_PER_PACKET - len(flows)))
+                set_flows, _records = self._read_data(
+                    body, exporter, domain, set_id, V9, boot, unix_secs,
+                    MAX_FLOWS_PER_PACKET - len(flows))
+                flows.extend(set_flows)
             offset += set_len
+        # The v9 header's sequence counts export packets, not records, so
+        # the next one is expected to be this one plus one regardless of how
+        # many flow sets this packet carried.
+        self._note_sequence(exporter, domain, sequence, 1)
         return flows
 
     # ------------------------------------------------------------ ipfix
@@ -531,10 +585,12 @@ class Decoder:
     def _decode_ipfix(self, data: bytes, exporter: str) -> list[Flow]:
         if len(data) < 16:
             raise DecodeError("short ipfix header")
-        _, length, export_time, _, domain = struct.unpack_from("!HHIII", data, 0)
+        _, length, export_time, sequence, domain = struct.unpack_from(
+            "!HHIII", data, 0)
         length = min(length, len(data))
         offset = 16
         flows: list[Flow] = []
+        records_total = 0
 
         while offset + 4 <= length:
             set_id, set_len = struct.unpack_from("!HH", data, offset)
@@ -546,10 +602,16 @@ class Decoder:
             elif set_id == 3:
                 self._read_options_template(body, exporter, domain, ipfix=True)
             elif set_id >= 256:
-                flows.extend(self._read_data(body, exporter, domain, set_id,
-                                             IPFIX, 0.0, export_time,
-                                             MAX_FLOWS_PER_PACKET - len(flows)))
+                set_flows, set_records = self._read_data(
+                    body, exporter, domain, set_id, IPFIX, 0.0, export_time,
+                    MAX_FLOWS_PER_PACKET - len(flows))
+                flows.extend(set_flows)
+                records_total += set_records
             offset += set_len
+        # IPFIX's sequence counts Data Records (flow and options data sets
+        # both) sent so far, so the next packet's value is expected to be
+        # this one plus every record this packet actually carried.
+        self._note_sequence(exporter, domain, sequence, records_total)
         return flows
 
     # ------------------------------------------------------- templates
@@ -734,15 +796,19 @@ class Decoder:
 
     def _read_data(self, body: bytes, exporter: str, domain: int, template_id: int,
                    version: int, boot: float, export_time: float,
-                   budget: int = MAX_FLOWS_PER_PACKET) -> list[Flow]:
+                   budget: int = MAX_FLOWS_PER_PACKET) -> tuple[list[Flow], int]:
+        """Returns (flows, records read) -- the second is every record this
+        set actually carried, options and budget-truncated ones included,
+        for IPFIX's sequence number to count against."""
         key = (exporter, domain, template_id)
         template = self.templates.get(key)
         if template is None:
             self.stats["no_template"] += 1
             self._note_missing(key)
-            return []
+            return [], 0
 
         flows: list[Flow] = []
+        record_count = 0
         offset = 0
         fixed = template.length
         if fixed is not None and fixed < MIN_RECORD_BYTES:
@@ -753,7 +819,7 @@ class Decoder:
             self.stats["bad_template"] += 1
             self.stats["errors"] += 1
             self.templates.reject(key, "record shorter than 4 bytes")
-            return []
+            return [], 0
 
         while offset < len(body):
             if fixed is not None:
@@ -764,6 +830,7 @@ class Decoder:
                 values, offset, ok = self._read_variable(body, offset, template)
                 if not ok:
                     break
+            record_count += 1
 
             if template.is_options:
                 self._apply_options(values, exporter, domain)
@@ -781,7 +848,7 @@ class Decoder:
             # Padding: a run shorter than the record length is the set's tail.
             if fixed is not None and len(body) - offset < fixed:
                 break
-        return flows
+        return flows, record_count
 
     def _read_fixed(self, body: bytes, offset: int, template: Template):
         values: dict[int, bytes] = {}

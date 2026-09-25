@@ -281,6 +281,13 @@ def _check_netflow_settings(values: dict) -> None:
         text = str(values.get(key, ""))
         if "<" in text or ">" in text:
             raise ValueError(f"{key}: a name cannot contain < or >")
+    # Same bound as the other rollup-retention day settings (0 keeps no
+    # interface-scope summaries at all, a negative would put prune()'s
+    # cutoff in the future and delete every one of them on the next sweep).
+    if "rollup_interface_days" in values:
+        days = values["rollup_interface_days"]
+        if not (0 <= days <= 3650):
+            raise ValueError("rollup_interface_days must be between 0 and 3650")
 
 
 def _check_tacacs_settings(values: dict) -> None:

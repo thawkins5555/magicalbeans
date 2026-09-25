@@ -688,6 +688,13 @@
   </div>
   <p id="nf-missing" class="hint" hidden></p>
 
+  <nav class="subtabs">
+    <button class="subtab active" data-subtab="traffic">TRAFFIC</button>
+    <button class="subtab" data-subtab="exporters">EXPORTERS</button>
+    <button class="subtab" data-subtab="interfaces">INTERFACES</button>
+  </nav>
+
+  <div id="netflow-sub-traffic" class="subpage active">
   <div class="bar wrap">
     <label>Window <select id="nf-range"></select></label>
     <label>Group by <select id="nf-dimension"></select></label>
@@ -696,6 +703,8 @@
     <label>Port <input id="nf-port" size="5"></label>
     <select id="nf-protocol" aria-label="Protocol"></select>
     <select id="nf-exporter" aria-label="Exporter"></select>
+    <select id="nf-iface" aria-label="Interface"></select>
+    <select id="nf-direction" aria-label="Direction"></select>
     <button id="nf-apply">Search</button>
     <button id="nf-clear">Clear</button>
     <button id="nf-export-csv">Export CSV</button>
@@ -740,6 +749,23 @@
      </div>
     </div>
    </div>
+  </div>
+  </div>
+
+  <div id="netflow-sub-exporters" class="subpage">
+   <header class="bar">
+     <span class="section">EXPORTERS</span>
+     <span class="hint">Every device sending flows to this collector</span>
+   </header>
+   <div class="table-wrap"><table id="nf-exporters"></table></div>
+  </div>
+
+  <div id="netflow-sub-interfaces" class="subpage">
+   <div class="bar wrap">
+     <label>Window <select id="nf-if-range"></select></label>
+     <label>Exporter <select id="nf-if-exporter"></select></label>
+   </div>
+   <div class="table-wrap"><table id="nf-interfaces"></table></div>
   </div>
 </section>
 

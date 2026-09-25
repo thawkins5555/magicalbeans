@@ -503,6 +503,34 @@ def resolve_name(nodes_db, app_db, ip: str, device=None) -> str | None:
     return None
 
 
+def resolve_names(nodes_db, app_db, ips) -> dict:
+    """resolve_name, batched: {ip: name} for every address in `ips` that
+    resolves to something other than the address itself.
+
+    Same precedence as resolve_name -- a Nodes device name first, then the
+    DNS reverse-lookup cache -- but with one devices_by_addresses batch and
+    one app_db.hostnames batch across the whole set, rather than a query per
+    address. Used wherever a list of exporter (or other device) addresses
+    needs its names in one pass: the NetFlow overview's exporter list, the
+    Exporters and Interfaces views, and the flow record table.
+    """
+    wanted = [ip for ip in dict.fromkeys(str(ip or "").strip() for ip in ips) if ip]
+    if not wanted:
+        return {}
+    names: dict[str, str] = {}
+    if nodes_db is not None:
+        for ip, device in nodes_db.devices_by_addresses(wanted).items():
+            name = device_name(device)
+            if name and name != ip:
+                names[ip] = name
+    remaining = [ip for ip in wanted if ip not in names]
+    if remaining and app_db is not None:
+        for ip, name in app_db.hostnames(remaining).items():
+            if name and name != ip:
+                names[ip] = name
+    return names
+
+
 def fill_from_nodes(nodes_db, names: dict, ips) -> dict:
     """Adds a Nodes device name for every IP the DNS cache could not name.
 

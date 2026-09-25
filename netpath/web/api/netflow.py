@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import time
 
 from ... import namelookup
 from ...services import format_bytes, format_packets, format_rate, port_name, protocol_name
@@ -13,12 +14,22 @@ from ._shared import _csv_response, _csv_time, _num, _window
 # ------------------------------------------------------------------ netflow
 
 def _flow_filters(params) -> dict:
+    exporter = params.get("exporter") or None
+    direction = str(params.get("direction") or "both").lower()
+    if direction not in ("in", "out", "both"):
+        direction = "both"
     return {
         "src_ip": params.get("src", ""),
         "dst_ip": params.get("dst", ""),
         "port": params.get("port") or None,
         "protocol": _num(params, "protocol", None, int),
-        "exporter": params.get("exporter") or None,
+        "exporter": exporter,
+        "iface": _num(params, "iface", None, int),
+        # A direction only means something scoped to one exporter's own
+        # interface numbering; without one chosen it is forced back to
+        # "both" here, so every downstream reader agrees it is a no-op
+        # rather than each having to re-derive the same rule.
+        "direction": direction if exporter else "both",
     }
 
 
@@ -101,6 +112,30 @@ def _flow_bucket(service, span: float) -> float:
     return float(bucket)
 
 
+def _flow_coverage(service) -> dict:
+    """flow_db.coverage(), through service.cached_poll when the service has
+    one -- the same 10s cache /api/state's own coverage reads share, so an
+    overview poll never pays for a second scan of MIN/MAX(ts_end) a moment
+    after /api/state already ran one. A duck-typed test service that carries
+    no cached_poll gets the plain, uncached call instead."""
+    cached_poll = getattr(service, "cached_poll", None)
+    if cached_poll is None:
+        return service.flow_db.coverage()
+    return cached_poll("flow_coverage", 10.0, service.flow_db.coverage)
+
+
+def _exporter_rows(service) -> list[dict]:
+    """The overview's exporter dropdown list, named the way the Exporter
+    column and the chart label already are (Symptom 1 in the plan)."""
+    rows = service.flow_db.exporters()
+    names = namelookup.resolve_names(
+        service.nodes_db, service.app_db, [row["address"] for row in rows])
+    return [{"address": row["address"], "name": names.get(row["address"]),
+             "version": row["version"], "flows": row["flows"],
+             "last_seen": row["last_seen"]}
+            for row in rows]
+
+
 def get_flow_overview(service, params, body) -> dict:
     t0, t1 = _window(params)
     span = t1 - t0
@@ -109,13 +144,22 @@ def get_flow_overview(service, params, body) -> dict:
     bucket = _flow_bucket(service, span)
     top_n = int(service.flow_settings.get("top_n", 10))
 
+    # `info` is filled in by flowdb.overview with what actually answered the
+    # window (records_only/tier/summaries_from/widened), since only it knows
+    # whether a rollup tier or the raw table did the work.
+    info: dict = {}
     # One aggregate pass over the window feeds the chart, the top-N bars and
     # the totals line together, rather than a scan each.
     times, series, bucket_s, top_rows, totals = service.flow_db.overview(
-        t0, t1, dimension, filters, bucket, series_limit=8, top_limit=top_n)
+        t0, t1, dimension, filters, bucket, series_limit=8, top_limit=top_n,
+        info=info)
 
     names = _address_names(service, dimension,
                            list(series) + [row["key"] for row in top_rows])
+    total_bytes = totals["bytes"] or 0
+    # A5: the same coverage() /api/state polls, so records_from never
+    # disagrees with what the status strip says raw history reaches.
+    coverage = _flow_coverage(service)
 
     # times[0], not the t0 asked for: flowdb snaps the window start down to a
     # bucket boundary so a rollup bucket lands wholly inside one slot, and the
@@ -133,7 +177,9 @@ def get_flow_overview(service, params, body) -> dict:
                  "bytes_text": format_bytes(row["bytes"]),
                  "rate_text": format_rate(row["bytes"], span),
                  "packets": row["packets"] or 0,
-                 "flows": row["flows"]}
+                 "packets_text": format_packets(row["packets"] or 0),
+                 "flows": row["flows"],
+                 "share": (row["bytes"] or 0) / total_bytes if total_bytes else 0}
                 for row in top_rows],
         "totals": {
             "bytes": totals["bytes"], "packets": totals["packets"],
@@ -142,9 +188,14 @@ def get_flow_overview(service, params, body) -> dict:
             "rate_text": format_rate(totals["bytes"], span),
             "packets_text": format_packets(totals["packets"]),
         },
-        "exporters": [{"address": row["address"], "version": row["version"],
-                       "flows": row["flows"], "last_seen": row["last_seen"]}
-                      for row in service.flow_db.exporters()],
+        "exporters": _exporter_rows(service),
+        # Honest coverage: whether this answer only reached as far back as
+        # raw retention allows, and where the summaries would have reached
+        # instead -- the root cause the plan starts from.
+        "records_only": bool(info.get("records_only")),
+        "records_from": coverage.get("raw_oldest"),
+        "summaries_from": info.get("summaries_from"),
+        "widened": bool(info.get("widened")),
     }
 
 
@@ -179,15 +230,14 @@ def _flow_records_rows(service, params, limit: int) -> tuple[list[dict], bool, b
         names = {ip: name for ip, name
                  in service.app_db.hostnames(addresses).items() if name}
     interfaces = service.flow_db.interface_names()
-    # Resolved through the shared helper rather than a bespoke query, so the
-    # Exporter column agrees with Syslog's Host column and Alerts' Object
-    # column about what a device is called: SNMP sysName, then a manual name
-    # that is not just the address, then the reverse-DNS cache.
-    exporter_names = {}
-    for address in {r["exporter"] for r in rows if r["exporter"]}:
-        name = namelookup.resolve_name(service.nodes_db, service.app_db, address)
-        if name and name != address:
-            exporter_names[address] = name
+    # Resolved through the shared batched helper rather than one query per
+    # address, so the Exporter column agrees with Syslog's Host column and
+    # Alerts' Object column about what a device is called: SNMP sysName,
+    # then a manual name that is not just the address, then the reverse-DNS
+    # cache.
+    exporter_names = namelookup.resolve_names(
+        service.nodes_db, service.app_db,
+        {r["exporter"] for r in rows if r["exporter"]})
     # Flow-to-path correlation: which NetPath target (if any) last traced a
     # route ending at each address, so the frontend can offer a "view route"
     # link without a per-row round trip.
@@ -245,6 +295,142 @@ def get_flow_records_export(service, params, body) -> dict:
                 [r.get(key) for key in header[2:]] for r in records]
     return _csv_response("netflow", header, csv_rows, truncated=truncated,
                          cap=FLOW_EXPORT_CAP)
+
+
+# ----------------------------------------------------------- exporters view
+
+# The rates /api/netflow/exporters reports are over the last five minutes,
+# the same window "active" state is judged on, so a rate the operator sees
+# is a rate an "active" exporter earned it in.
+EXPORTER_RATE_WINDOW_S = 300.0
+# decoder.missing is itself bounded to 256 entries; this is a generous cap
+# on the call rather than a real limit, just enough to see all of them.
+MISSING_TEMPLATES_ALL = 1024
+
+
+def get_flow_exporters(service, params, body) -> dict:
+    now = time.time()
+    rows = service.flow_db.exporters()
+    addresses = [row["address"] for row in rows]
+    names = namelookup.resolve_names(service.nodes_db, service.app_db, addresses)
+    rates = service.flow_db.exporter_totals(now - EXPORTER_RATE_WINDOW_S, now)
+
+    iface_counts: dict[str, set] = {}
+    for row in service.flow_db.interface_totals(now - 3600, now):
+        iface_counts.setdefault(row["exporter"], set()).add(row["iface"])
+
+    seq_missed = service.collector.decoder.sequence_gaps()
+    missing_counts: dict[str, int] = {}
+    for entry in service.collector.decoder.missing_templates(MISSING_TEMPLATES_ALL):
+        missing_counts[entry["exporter"]] = missing_counts.get(entry["exporter"], 0) + 1
+
+    exporters = []
+    for row in rows:
+        address = row["address"]
+        rate = rates.get(address) or {}
+        rate_bytes = rate.get("bytes", 0) or 0
+        last_seen = row["last_seen"] or 0
+        age = now - last_seen if last_seen else None
+        if age is None:
+            state = "silent"
+        elif age < 300:
+            state = "active"
+        elif age < 3600:
+            state = "idle"
+        else:
+            state = "silent"
+        exporters.append({
+            "address": address,
+            "name": names.get(address),
+            "version": row["version"],
+            "first_seen": row["first_seen"],
+            "last_seen": row["last_seen"],
+            "state": state,
+            "flows_per_s": (rate.get("flows", 0) or 0) / EXPORTER_RATE_WINDOW_S,
+            "bits_per_s": rate_bytes * 8 / EXPORTER_RATE_WINDOW_S,
+            "rate_text": format_rate(rate_bytes, EXPORTER_RATE_WINDOW_S),
+            "packets": row["packets"],
+            "flows": row["flows"],
+            "sampling": row["sampling"],
+            "interfaces": len(iface_counts.get(address, ())),
+            "seq_missed": seq_missed.get(address, 0),
+            "missing_templates": missing_counts.get(address, 0),
+        })
+    exporters.sort(key=lambda e: (e["name"] or "", e["address"]))
+    return {"exporters": exporters}
+
+
+# ---------------------------------------------------------- interfaces view
+
+def _interface_label(setting_names: dict, exporter: str, if_index: int,
+                     device_ifaces: dict) -> str:
+    """interface_names setting -> Nodes alias/descr/name -> the bare index."""
+    key = f"{exporter}:{if_index}"
+    if key in setting_names:
+        return setting_names[key]
+    row = device_ifaces.get(if_index)
+    if row is not None:
+        if row["alias"]:
+            return row["alias"]
+        if row["descr"]:
+            return row["descr"]
+        if row["name"]:
+            return row["name"]
+    return str(if_index)
+
+
+def get_flow_interfaces(service, params, body) -> dict:
+    t0, t1 = _window(params)
+    span = max(t1 - t0, 1.0)
+    exporter = params.get("exporter") or None
+    rows = service.flow_db.interface_totals(t0, t1, exporter=exporter)
+
+    addresses = {row["exporter"] for row in rows}
+    exporter_names = namelookup.resolve_names(service.nodes_db, service.app_db, addresses)
+    devices = (service.nodes_db.devices_by_addresses(addresses)
+              if service.nodes_db is not None and addresses else {})
+    # {address: {if_index: interfaces row}}, one nodes_db.interfaces() call
+    # per device found rather than per interface row.
+    device_ifaces = {address: {r["if_index"]: r
+                               for r in service.nodes_db.interfaces(device["id"])}
+                     for address, device in devices.items()}
+    setting_names = service.flow_db.interface_names()
+
+    by_iface: dict[tuple[str, int], dict] = {}
+    for row in rows:
+        entry = by_iface.setdefault((row["exporter"], row["iface"]), {
+            "in_bytes": 0, "out_bytes": 0, "in_flows": 0, "out_flows": 0})
+        if row["dir"] == "in":
+            entry["in_bytes"] += row["bytes"] or 0
+            entry["in_flows"] += row["flows"] or 0
+        elif row["dir"] == "out":
+            entry["out_bytes"] += row["bytes"] or 0
+            entry["out_flows"] += row["flows"] or 0
+
+    interfaces = []
+    for (address, if_index), entry in by_iface.items():
+        ifaces = device_ifaces.get(address, {})
+        node_row = ifaces.get(if_index)
+        speed_bps = node_row["speed_bps"] if node_row is not None else None
+        in_bps = entry["in_bytes"] * 8 / span
+        out_bps = entry["out_bytes"] * 8 / span
+        interfaces.append({
+            "exporter": address,
+            "exporter_name": exporter_names.get(address),
+            "if_index": if_index,
+            "name": _interface_label(setting_names, address, if_index, ifaces),
+            "speed_bps": speed_bps,
+            "in_bytes": entry["in_bytes"], "out_bytes": entry["out_bytes"],
+            "in_bps": in_bps, "out_bps": out_bps,
+            "in_util": (in_bps / speed_bps) if speed_bps else None,
+            "out_util": (out_bps / speed_bps) if speed_bps else None,
+            "in_flows": entry["in_flows"], "out_flows": entry["out_flows"],
+            "in_text": format_rate(entry["in_bytes"], span),
+            "out_text": format_rate(entry["out_bytes"], span),
+        })
+    interfaces.sort(key=lambda r: (max(r["in_util"] or 0, r["out_util"] or 0),
+                                   max(r["in_bps"], r["out_bps"])), reverse=True)
+    return {"t0": t0, "t1": t1, "interfaces": interfaces}
 
 
 def post_collector(service, params, body) -> dict:

@@ -83,6 +83,16 @@
   const FAILED_TEXT = 'Could not load flows for this window. The next refresh '
     + 'will try again.';
 
+  // Records-only history (A: the operator's report): a source/destination/
+  // port/protocol filter is answered from the raw records alone, which do
+  // not reach back as far as the summaries do. A window that falls wholly
+  // before that reach is not "no flows match" — it is a question this
+  // filter cannot answer that far back at all.
+  const recordsOnlyEmptyText = (data) =>
+    `No records kept before ${App.stamp(data.records_from)}; this filter ` +
+    '(source, destination, port or protocol) is answered from records ' +
+    'only. Filter by exporter or interface for summary-backed history.';
+
   const view = {
     t0: Date.now() / 1000 - 3600,
     t1: Date.now() / 1000,
@@ -99,11 +109,30 @@
     // to decide whether the data underneath it is still worth showing --
     // showLoading has already taken that decision.
     failed: false,
+    // Which of the three subtabs is on screen (Plixer-style rebuild): only
+    // EXPORTERS/INTERFACES read this, to fetch on the poll while they are
+    // the one showing rather than on every tick regardless.
+    sub: 'traffic',
+    // The exporter nf-iface's options were last built for, so a poll tick
+    // that sees the same choice again does not refetch the interface list.
+    ifaceExporter: '',
+    exporters: [],
   };
 
-  // Which of the three sentences a pane with nothing to draw is telling.
-  const emptyMessage = () =>
-    (view.loading ? LOADING_TEXT : view.failed ? FAILED_TEXT : NO_FLOWS_TEXT);
+  // Which of the four sentences a pane with nothing to draw is telling: the
+  // fourth (recordsOnlyEmptyText) only when the window asked for lies
+  // wholly before the records this filter can reach — genuinely empty is
+  // still NO_FLOWS_TEXT.
+  const emptyMessage = () => {
+    if (view.loading) return LOADING_TEXT;
+    if (view.failed) return FAILED_TEXT;
+    const data = view.data;
+    if (data && data.records_only && data.records_from != null
+        && view.t1 <= data.records_from) {
+      return recordsOnlyEmptyText(data);
+    }
+    return NO_FLOWS_TEXT;
+  };
 
   const escape = App.escapeHtml;
 
@@ -240,7 +269,8 @@
 
   function filters() {
     return {
-      ...App.filterValues('nf', ['dimension', 'src', 'dst', 'port', 'protocol']),
+      ...App.filterValues('nf', ['dimension', 'src', 'dst', 'port', 'protocol',
+                                 'iface', 'direction']),
       // The exporter list is filled from the response below, so on the load
       // after a reload the restored choice is not on the element yet and the
       // first fetch would ignore it. Once the list exists the control answers
@@ -254,8 +284,77 @@
     const f = filters();
     App.exportCsv('/api/netflow/records/export.csv', {
       t0: view.t0, t1: view.t1, src: f.src, dst: f.dst, port: f.port,
-      protocol: f.protocol, exporter: f.exporter, order: App.el('nf-order').value,
+      protocol: f.protocol, exporter: f.exporter, iface: f.iface,
+      direction: f.direction, order: App.el('nf-order').value,
     });
+  }
+
+  /* -------------------------------------------------------- exporter label
+
+     The label every exporter picker on this page shows, named where
+     namelookup resolved one, address-only otherwise (Symptom 1 in the
+     plan): TRAFFIC's nf-exporter, INTERFACES' nf-if-exporter and the
+     EXPORTERS table all read it from here, so the three cannot disagree
+     about what a device is called. */
+  function exporterLabel(item) {
+    return item.name ? `${item.name} (${item.address}, v${item.version})`
+                      : `${item.address} (v${item.version})`;
+  }
+
+  function exporterOptionsHtml(items) {
+    const sorted = [...(items || [])].sort(
+      (a, b) => exporterLabel(a).localeCompare(exporterLabel(b)));
+    return '<option value="">All exporters</option>' + sorted.map((item) =>
+      `<option value="${escape(item.address)}">${escape(exporterLabel(item))}</option>`
+    ).join('');
+  }
+
+  /* --------------------------------------------------------- nf-iface/-direction
+
+     Both only mean anything scoped to one exporter -- an interface index is
+     only unique per device -- so both stay disabled and blank until
+     nf-exporter names one, and reset the same way the moment it is cleared
+     rather than going on filtering by an interface number nothing on screen
+     names any more. */
+  async function loadIfaceOptions(exporterAddress) {
+    const iface = App.el('nf-iface');
+    const direction = App.el('nf-direction');
+    iface.disabled = !exporterAddress;
+    direction.disabled = !exporterAddress;
+    if (!exporterAddress) {
+      iface.innerHTML = '<option value="">Any interface</option>';
+      iface.value = '';
+      App.rememberControl('netflow', 'nf-iface', '');
+      direction.value = 'both';
+      App.rememberControl('netflow', 'nf-direction', 'both');
+      return;
+    }
+    const now = Date.now() / 1000;
+    let data;
+    try {
+      data = await App.get('/api/netflow/interfaces',
+        { exporter: exporterAddress, t0: now - 86400, t1: now });
+    } catch (error) { return; }
+    // A restored/previous choice survives the rebuild if it is still among
+    // this exporter's interfaces; otherwise "Any interface" rather than a
+    // number that would silently keep filtering by an interface gone from
+    // the list.
+    const current = iface.value || App.savedControl('netflow', 'nf-iface') || '';
+    iface.innerHTML = '<option value="">Any interface</option>' +
+      (data.interfaces || []).map((row) =>
+        `<option value="${row.if_index}">${escape(row.name)}</option>`).join('');
+    iface.value = [...iface.options].some((o) => o.value === current) ? current : '';
+    if (iface.selectedIndex < 0) iface.value = '';
+  }
+
+  // Called on every nf-exporter change and on every refresh() poll; a no-op
+  // once the interface list already matches the exporter on screen, so a
+  // 2s poll tick does not refetch it every time.
+  async function syncIfaceControls() {
+    const exporterAddress = App.el('nf-exporter').value;
+    if (exporterAddress === view.ifaceExporter) return;
+    view.ifaceExporter = exporterAddress;
+    await loadIfaceOptions(exporterAddress);
   }
 
   /* ------------------------------------------------------------- chart */
@@ -486,6 +585,22 @@
       }));
     }
 
+    // Coverage honesty (the operator's report): a records-only answer whose
+    // records do not reach the whole way back to t0 is shaded rather than
+    // left to read as "nothing happened here" — the same reach the totals
+    // line and the empty-pane message below both say in words.
+    if (data.records_only && data.records_from != null && data.records_from > t0) {
+      const shadeEnd = Math.min(data.records_from, t1);
+      svg.appendChild(App.svgNode('rect', {
+        x: xOf(t0), y: plot.y, width: Math.max(xOf(shadeEnd) - xOf(t0), 0),
+        height: plot.h, fill: 'var(--data-neutral)', 'fill-opacity': 0.12,
+      }));
+      svg.appendChild(App.svgNode('text', {
+        x: plot.x + 4, y: plot.y + 12, fill: 'var(--dim)',
+        'font-family': 'var(--mono)', 'font-size': 'var(--fs-2xs)',
+      }, `no records kept before ${App.stamp(data.records_from, view.t1 - view.t0)}`));
+    }
+
     const span = view.t1 - view.t0;
     const tickEvery = Math.max(1, Math.floor(drawn / 7));
     for (let slot = 0; slot < drawn; slot += tickEvery) {
@@ -671,11 +786,16 @@
       div.id = barRowId(dimension, row.key);
       const valueId = `${div.id}-value`;
       const foldId = `${div.id}-fold`;
+      // share is a fraction of the window's own total (Plixer's Percent
+      // column) -- guarded, so a response from before it existed still
+      // draws the bar, just without the trailing percentage.
+      const shareText = row.share != null ? ` · ${Math.round(row.share * 100)}%` : '';
       div.innerHTML =
         `<div class="bar-fill" style="width:${(row.bytes / peak) * 100}%;` +
         `background:${color}"></div>` +
         `<span class="bar-label">${escape(row.label)}</span>` +
-        `<span class="bar-value" id="${valueId}">${row.bytes_text} · ${row.rate_text}</span>` +
+        `<span class="bar-value" id="${valueId}">${row.bytes_text} · ${row.rate_text}` +
+        `${shareText}</span>` +
         (folded ? `<span class="sr-only" id="${foldId}">${FOLDED_TEXT}</span>` : '');
       div.onclick = () => {
         // A bar picked with the mouse becomes the one the keyboard returns
@@ -692,8 +812,11 @@
       const tip = [
         { text: row.label, color },
         { text: `${row.bytes_text} · ${row.rate_text}` },
-        { text: `${row.flows} flow records` },
       ];
+      // Guarded the same way the value span above is: a response from
+      // before packets_text existed still draws a tooltip, just a shorter one.
+      if (row.packets_text) tip.push({ text: `${row.packets_text} packets` });
+      tip.push({ text: `${row.flows} flow records` });
       if (folded) tip.push({ text: FOLDED_TEXT });
       div.setAttribute('role', 'button');
       // The accessible NAME is what the row IS — this port, this address,
@@ -746,6 +869,220 @@
     else if (dimension === 'Exporter') App.el('nf-exporter').value = row.key;
     else return;
     App.refreshNow('netflow');
+  }
+
+  /* Mirrors the filters into the hash after filterBar's own refresh, so a
+     link into this view can be shared. src/dst are the round trip for
+     App.ipCell's "NetFlow from" / "NetFlow to" actions (see activate());
+     also called from EXPORTERS' Report action and INTERFACES' row click
+     below, so it is module-level rather than a local of init(). */
+  function syncNetflowRoute() {
+    App.syncFilterRoute('netflow', {
+      src: 'nf-src', dst: 'nf-dst', port: 'nf-port', protocol: 'nf-protocol',
+      exporter: 'nf-exporter', iface: 'nf-iface', direction: 'nf-direction',
+      window: 'nf-range',
+    });
+  }
+
+  /* ------------------------------------------------------- exporters / interfaces
+
+     The two Plixer-style report views: TRAFFIC's own subtab keeps its data
+     fresh on every poll regardless of which subtab is on screen (drawStatus
+     needs it live and switching back to TRAFFIC must not show a stale
+     chart); these two fetch only when they are the one showing, on
+     selectSub and on the module's own poll. */
+
+  function selectSub(name) {
+    view.sub = name;
+    App.selectSub('netflow', name);
+    if (name === 'exporters') refreshExporters();
+    else if (name === 'interfaces') refreshInterfaces();
+  }
+
+  // A device on TRAFFIC's own exporter and iface pickers, set from a report
+  // click below: iface/direction/dimension are optional so a caller can set
+  // only the exporter (the EXPORTERS Report action clears iface instead).
+  async function goToTrafficFiltered({ exporter, iface, direction, dimension }) {
+    if (exporter !== undefined) {
+      App.el('nf-exporter').value = exporter;
+      view.ifaceExporter = exporter;
+      await loadIfaceOptions(exporter);
+    }
+    if (iface !== undefined) App.el('nf-iface').value = String(iface);
+    if (direction !== undefined) App.el('nf-direction').value = direction;
+    if (dimension !== undefined) App.el('nf-dimension').value = dimension;
+    App.rememberSub('netflow', 'traffic');
+    selectSub('traffic');
+    App.refreshNow('netflow');
+    syncNetflowRoute();
+  }
+
+  function goToInterfaces(row) {
+    const select = App.el('nf-if-exporter');
+    // nf-if-exporter may never have been built yet (INTERFACES not opened
+    // this session) — a temporary option makes the value stick immediately;
+    // refreshInterfaces() below rebuilds the list for real and keeps it.
+    if (![...select.options].some((o) => o.value === row.address)) {
+      const option = document.createElement('option');
+      option.value = row.address;
+      option.textContent = exporterLabel(row);
+      select.appendChild(option);
+    }
+    select.value = row.address;
+    App.rememberSub('netflow', 'interfaces');
+    selectSub('interfaces');
+  }
+
+  const EXPORTER_STATE_COLOR = { active: 'var(--ok)', idle: 'var(--warn)', silent: 'var(--fail)' };
+
+  const EXPORTER_COLUMNS = [
+    { key: 'status', label: 'Status', width: 70, sortable: false,
+      cell: (r) => `<span class="dot" style="background:` +
+        `${EXPORTER_STATE_COLOR[r.state] || 'var(--line)'}" ` +
+        `title="${escape(r.state || '')}"></span>` },
+    { key: 'name', label: 'Exporter', width: 170,
+      value: (r) => (r.name || r.address || '').toLowerCase(),
+      cell: (r) => escape(r.name || r.address || '') },
+    { key: 'address', label: 'Address', width: 130, cell: (r) => escape(r.address) },
+    { key: 'version', label: 'Version', width: 70, numeric: true,
+      cell: (r) => escape(String(r.version)) },
+    { key: 'flows_per_s', label: 'Flows/s', width: 90, numeric: true, descendingFirst: true,
+      cell: (r) => (r.flows_per_s != null ? r.flows_per_s.toFixed(1) : '—') },
+    { key: 'bits_per_s', label: 'Bits/s', width: 100, numeric: true, descendingFirst: true,
+      value: (r) => r.bits_per_s, cell: (r) => escape(r.rate_text || '—') },
+    { key: 'interfaces', label: 'Interfaces', width: 90, numeric: true,
+      cell: (r) => String(r.interfaces || 0) },
+    { key: 'seq_missed', label: 'Missed seq', width: 100, numeric: true,
+      cell: (r) => (r.seq_missed || 0).toLocaleString() },
+    { key: 'sampling', label: 'Sampling', width: 90, numeric: true,
+      value: (r) => r.sampling || 0,
+      cell: (r) => (r.sampling ? escape(`1:${r.sampling}`) : '—') },
+    { key: 'last_seen', label: 'Last flow', width: 110, numeric: true, descendingFirst: true,
+      value: (r) => r.last_seen || 0,
+      cell: (r) => (r.last_seen ? escape(ago(r.last_seen)) : '—') },
+    { key: 'first_seen', label: 'First seen', width: 110, numeric: true,
+      value: (r) => r.first_seen || 0,
+      cell: (r) => (r.first_seen ? escape(ago(r.first_seen)) : '—') },
+    // A fixed column filled in the row callback below, the same pattern the
+    // flow table's own Route column uses.
+    { key: 'report', label: '', sortable: false, fixed: true, width: 84, cell: () => '' },
+  ];
+
+  let exportersSort = { key: 'flows_per_s', descending: true };
+  function onExportersSort(key, descending) {
+    exportersSort = { key, descending };
+    drawExportersTable(view.exporters);
+  }
+
+  function drawExportersTable(rows) {
+    const table = App.grid(App.el('nf-exporters'),
+      { name: 'nf-exporters', caption: 'NetFlow exporters',
+        columns: EXPORTER_COLUMNS, sort: exportersSort, onSort: onExportersSort });
+    const body = document.createElement('tbody');
+    const sorted = App.sortRows(rows, exportersSort.key, exportersSort.descending,
+                                EXPORTER_COLUMNS);
+    App.drawRows(body, sorted, EXPORTER_COLUMNS, (tr, row) => {
+      tr.className = 'clickable';
+      tr.title = `View ${row.name || row.address} on INTERFACES`;
+      tr.onclick = (event) => {
+        if (event.target.closest('.nf-exp-report')) return;
+        goToInterfaces(row);
+      };
+      const reportCell = tr.cells[EXPORTER_COLUMNS.findIndex((c) => c.key === 'report')];
+      if (!reportCell) return;
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'linkish nf-exp-report';
+      btn.textContent = 'Report';
+      btn.title = `Filter TRAFFIC to ${row.name || row.address}`;
+      btn.onclick = (event) => {
+        event.stopPropagation();
+        goToTrafficFiltered({ exporter: row.address, iface: '' });
+      };
+      reportCell.appendChild(btn);
+    }, 'No exporters have sent flows yet.');
+    table.appendChild(body);
+    App.wireRowKeyboard(body);
+  }
+
+  async function refreshExporters() {
+    let data;
+    try {
+      data = await App.get('/api/netflow/exporters', {});
+    } catch (error) { return; }
+    if (view.sub !== 'exporters') return;    // an operator moved on while this was in flight
+    view.exporters = data.exporters || [];
+    drawExportersTable(view.exporters);
+  }
+
+  // A utilisation bar reusing .bar-row/.bar-fill (the top-N bars' own
+  // classes), sized down to fit a table cell, beside the server's own
+  // formatted rate text; text alone when the interface's speed is unknown.
+  function utilCell(text, util) {
+    if (util == null) {
+      return escape(text || '—');
+    }
+    const pct = Math.round(Math.min(Math.max(util, 0), 1) * 100);
+    return `<div class="bar-row" style="display:inline-block;vertical-align:middle;` +
+      `width:64px;height:12px;margin-right:6px" title="${pct}%">` +
+      `<div class="bar-fill" style="width:${pct}%;background:var(--accent)"></div>` +
+      `</div>${escape(text || '—')}`;
+  }
+
+  const INTERFACE_COLUMNS = [
+    { key: 'exporter_name', label: 'Exporter', width: 160,
+      cell: (r) => escape(r.exporter_name || r.exporter || '') },
+    { key: 'name', label: 'Interface', width: 150,
+      cell: (r) => escape(r.name || String(r.if_index)) },
+    { key: 'speed', label: 'Speed', width: 90,
+      cell: (r) => (r.speed_bps ? App.rate(r.speed_bps / 8, 1) : '—') },
+    { key: 'in', label: 'In', width: 170, cell: (r) => utilCell(r.in_text, r.in_util) },
+    { key: 'out', label: 'Out', width: 170, cell: (r) => utilCell(r.out_text, r.out_util) },
+    { key: 'flows', label: 'Flows', width: 90,
+      cell: (r) => String((r.in_flows || 0) + (r.out_flows || 0)) },
+  ];
+
+  function drawInterfacesTable(rows) {
+    // No sort/onSort: the server's own order (busiest first) is the order
+    // shown, rather than a client re-sort that could disagree with it.
+    const table = App.grid(App.el('nf-interfaces'),
+      { name: 'nf-interfaces', caption: 'NetFlow interfaces', columns: INTERFACE_COLUMNS });
+    const body = document.createElement('tbody');
+    App.drawRows(body, rows, INTERFACE_COLUMNS, (tr, row) => {
+      tr.className = 'clickable';
+      tr.title = `View ${row.name || row.if_index} on TRAFFIC`;
+      tr.onclick = () => goToTrafficFiltered({
+        exporter: row.exporter, iface: row.if_index, direction: 'both',
+        dimension: 'Application',
+      });
+    }, 'No interfaces reported yet.');
+    table.appendChild(body);
+    App.wireRowKeyboard(body);
+  }
+
+  function ifaceRangeWindow() {
+    const seconds = Number(App.el('nf-if-range').value) || 3600;
+    const now = Date.now() / 1000;
+    return [now - seconds, now];
+  }
+
+  async function refreshInterfaces() {
+    const [t0, t1] = ifaceRangeWindow();
+    const exporterSelect = App.el('nf-if-exporter');
+    const exporter = exporterSelect.value;
+    let exportersData;
+    let data;
+    try {
+      [exportersData, data] = await Promise.all([
+        App.get('/api/netflow/exporters', {}),
+        App.get('/api/netflow/interfaces', { t0, t1, exporter }),
+      ]);
+    } catch (error) { return; }
+    if (view.sub !== 'interfaces') return;   // an operator moved on while this was in flight
+    const current = exporterSelect.value;
+    App.setHtml(exporterSelect, exporterOptionsHtml(exportersData.exporters || []));
+    exporterSelect.value = current;
+    drawInterfacesTable(data.interfaces || []);
   }
 
   /* ------------------------------------------------------------- table */
@@ -1051,12 +1388,15 @@
     const counters = collector.counters || {};
     const decoder = collector.decoder || {};
     const parts = [`${counters.packets || 0} packets`,
-      `${counters.flows || 0} flows stored`,
+      `${counters.flows || 0} flows received`,
       `${decoder.templates || 0} templates`];
     if (decoder.no_template) parts.push(`${decoder.no_template} awaiting template`);
     if (counters.dropped) parts.push(`${counters.dropped} dropped`);
     if (counters.errors) parts.push(`${counters.errors} decode errors`);
     if (counters.rejected) parts.push(`${counters.rejected} rejected`);
+    // Not one of App.extraCounterParts' fixed EXTRA_COUNTERS entries (that
+    // list is shared by every module's strip), so it is added here instead.
+    if (counters.seq_missed) parts.push(`${counters.seq_missed} missed sequence`);
     parts.push(...extraCounterParts(counters));
     // v9 and IPFIX stay undecodable until a template arrives, and exporters
     // resend them only every few minutes, so this is as useful as packet age.
@@ -1091,6 +1431,10 @@
   async function refresh() {
     if (App.state.tab !== 'netflow') return;
     drawStatus();
+    // EXPORTERS/INTERFACES fetch on the poll only while they are the pane
+    // on screen, independent of TRAFFIC's own window-change debounce below.
+    if (view.sub === 'exporters') refreshExporters();
+    else if (view.sub === 'interfaces') refreshInterfaces();
     /* A window change is still settling. The poll tick can see the window
        half way through the burst — the dropdown is on 6h on its way to 30d —
        and fetching that one is exactly the waste requestFetch() exists to
@@ -1142,22 +1486,25 @@
     view.data = data;
 
     const totals = view.data.totals;
-    App.el('nf-totals').textContent =
-      `${totals.bytes_text} · ${totals.rate_text} avg · ` +
+    let totalsText = `${totals.bytes_text} · ${totals.rate_text} avg · ` +
       `${totals.packets_text} packets · ${totals.flows} flow records`;
+    // Coverage honesty: a source/destination/port/protocol filter answers
+    // from the records alone, which reach back less far than the summaries
+    // that serve everything else — said in words here, not just implied by
+    // a chart that goes quiet before the window the operator asked for.
+    if (data.records_only && data.records_from != null) {
+      totalsText += ' · records only for this filter · records reach back '
+        + `to ${App.stamp(data.records_from)}`;
+    }
+    if (data.widened) totalsText += ' · hourly summary';
+    App.el('nf-totals').textContent = totalsText;
     showWindow();
     App.el('nf-top-title').textContent = `TOP ${f.dimension.toUpperCase()}`;
 
     const exporter = App.el('nf-exporter');
-    const known = new Set(Array.from(exporter.options).map((o) => o.value));
-    for (const item of view.data.exporters) {
-      if (!known.has(item.address)) {
-        const option = document.createElement('option');
-        option.value = item.address;
-        option.textContent = `${item.address} (v${item.version})`;
-        exporter.appendChild(option);
-      }
-    }
+    const currentExporter = exporter.value;
+    App.setHtml(exporter, exporterOptionsHtml(view.data.exporters));
+    exporter.value = currentExporter;
     // The one late-filled control on this page: a restored exporter can only
     // be selected once the option it names exists. An exporter that has
     // stopped sending never appears, and the filter stays on "All".
@@ -1170,6 +1517,9 @@
         App.rememberControl('netflow', 'nf-exporter', '');
       }
     }
+    // nf-iface/nf-direction follow whatever exporter just landed above,
+    // including the restore-on-reload path just above this line.
+    syncIfaceControls();
 
     App.el('nf-order').title =
       ORDER_TITLE + (records.scan_bounded ? SCAN_BOUNDED_NOTE : '');
@@ -1189,7 +1539,7 @@
        it assigns from script, which fires no event. Follow is deliberately
        not restored. */
     const CONTROLS = ['nf-range', 'nf-dimension', 'nf-src', 'nf-dst', 'nf-port',
-      'nf-protocol', 'nf-exporter', 'nf-order'];
+      'nf-protocol', 'nf-exporter', 'nf-iface', 'nf-direction', 'nf-order'];
     App.rememberControls('netflow', CONTROLS);
     App.fillRanges(App.el('nf-range'), 'Last hour', undefined, { custom: true });
     const dimension = App.el('nf-dimension');
@@ -1215,6 +1565,16 @@
     }
     const exporter = App.el('nf-exporter');
     exporter.innerHTML = '<option value="">All exporters</option>';
+    // Both mean nothing without an exporter chosen (an interface index is
+    // only unique per device); loadIfaceOptions() flips them live as
+    // nf-exporter changes.
+    App.el('nf-iface').innerHTML = '<option value="">Any interface</option>';
+    App.el('nf-iface').disabled = true;
+    App.el('nf-direction').innerHTML =
+      '<option value="both">Bidirectional</option>' +
+      '<option value="in">Inbound</option>' +
+      '<option value="out">Outbound</option>';
+    App.el('nf-direction').disabled = true;
 
     App.el('nf-range').onchange = async () => {
       const select = App.el('nf-range');
@@ -1281,16 +1641,10 @@
     // the old window.
     App.filterBar('netflow', {
       text: ['nf-src', 'nf-dst', 'nf-port'],
-      selects: ['nf-dimension', 'nf-protocol', 'nf-exporter'],
+      selects: ['nf-dimension', 'nf-protocol', 'nf-exporter', 'nf-iface', 'nf-direction'],
       apply: 'nf-apply', clear: 'nf-clear',
-      clears: ['nf-src', 'nf-dst', 'nf-port', 'nf-protocol', 'nf-exporter'],
-    });
-    // Mirrors the filters into the hash after filterBar's own refresh, so a
-    // link into this view can be shared. src/dst are the round trip for
-    // App.ipCell's "NetFlow from" / "NetFlow to" actions (see activate()).
-    const syncNetflowRoute = () => App.syncFilterRoute('netflow', {
-      src: 'nf-src', dst: 'nf-dst', port: 'nf-port', protocol: 'nf-protocol',
-      exporter: 'nf-exporter', window: 'nf-range',
+      clears: ['nf-src', 'nf-dst', 'nf-port', 'nf-protocol', 'nf-exporter',
+               'nf-iface', 'nf-direction'],
     });
     App.el('nf-apply').addEventListener('click', syncNetflowRoute);
     App.el('nf-clear').addEventListener('click', syncNetflowRoute);
@@ -1306,11 +1660,25 @@
     App.wireToggle('nf-toggle', 'collector', '/api/netflow/collector', refresh);
     App.onRelayout('netflow', drawChart);
 
+    // TRAFFIC / EXPORTERS / INTERFACES, wired the way every other module's
+    // subtabs are (alerts.js's own selectSub is the pattern this follows).
+    for (const btn of document.querySelectorAll('#page-netflow > .subtabs > .subtab')) {
+      btn.onclick = () => {
+        App.rememberSub('netflow', btn.dataset.subtab);
+        selectSub(btn.dataset.subtab);
+      };
+    }
+    App.fillRanges(App.el('nf-if-range'), 'Last hour');
+    App.el('nf-if-exporter').innerHTML = '<option value="">All exporters</option>';
+    App.el('nf-if-range').onchange = () => refreshInterfaces();
+    App.el('nf-if-exporter').onchange = () => refreshInterfaces();
+
     // Restored before the window is sized, which reads the range straight
     // off nf-range — after it, the window would be built from the markup
     // default and only correct itself on the next change.
     App.restoreControls('netflow', CONTROLS);
     applyWindow(...rangeWindow(), true);
+    selectSub(App.recallSub('netflow', 'traffic'));
   }
 
   /* #/netflow?ip=&t0=&t1=&window=: a link in from App.ipCell or another
@@ -1324,7 +1692,8 @@
     const query = opts.query || {};
     let filtered = false;
     for (const [key, id] of [['src', 'nf-src'], ['dst', 'nf-dst'], ['port', 'nf-port'],
-      ['protocol', 'nf-protocol'], ['exporter', 'nf-exporter']]) {
+      ['protocol', 'nf-protocol'], ['exporter', 'nf-exporter'], ['iface', 'nf-iface'],
+      ['direction', 'nf-direction']]) {
       if (query[key] !== undefined) {
         App.el(id).value = query[key];
         filtered = true;

@@ -1667,6 +1667,8 @@ class Service:
                      "behind sealed flows; wide charts may be served from an "
                      "older tier or raw until it catches up")
 
+    _ROLLUP_BACKFILL_PACE_S = 5.0   # per tier per minute while stored history is still unsummarised
+
     def _rollup_loop(self) -> None:
         while not self._stop.is_set():
             if self._stop.wait(ROLLUP_INTERVAL_S):
@@ -1678,6 +1680,19 @@ class Service:
                        and time.monotonic() < deadline
                        and not self._stop.is_set()):
                     self.compact_flow_rollups()
+                # Paced here as well as by the sweep: a week of history loaded
+                # at once summarises in minutes rather than 15-minute steps.
+                with self._rollup_lock:
+                    for tier in ROLLUP_TIERS:
+                        if self._stop.is_set() or not self.flow_db.backfill_pending(tier):
+                            continue
+                        written, done = self.flow_db.backfill_rollup(
+                            tier, budget_s=self._ROLLUP_BACKFILL_PACE_S)
+                        if done:
+                            self.log.add(SYSTEM,
+                                         f"NetFlow: summarised the stored history "
+                                         f"into the {ROLLUP_TIER_NAMES[tier]} rollups "
+                                         f"({written} row(s) on this pass)")
                 self._check_flow_coverage_lag()
             except Exception:
                 import traceback
@@ -1731,21 +1746,36 @@ class Service:
         self._trim_db("max_trace_db_mb", self.db, "Trace database",
                       "oldest traces", budget_s=prune_budget)
 
+    _BACKFILL_SWEEP_BUDGET_S = 20.0
+
     def _maintenance_flow_rollup(self) -> None:
         # Before the prune, not after: the backfill summarises raw flows, and
         # pruning first would delete a bucket before it had been summarised.
         # A chart wider than a quarter of an hour reads the rollups rather
         # than the raw rows. Forward compaction is not repeated here — the
         # 60-second timer has already done it, and a second pass over the
-        # same buckets doubles a sweep's rollup load for nothing.
+        # same buckets doubles a sweep's rollup load for nothing. Passes
+        # alternate between the tiers so neither starves the other.
+        deadline = time.monotonic() + self._BACKFILL_SWEEP_BUDGET_S
+        pending = list(ROLLUP_TIERS)
+        written = dict.fromkeys(ROLLUP_TIERS, 0)
         with self._rollup_lock:
-            for tier in ROLLUP_TIERS:
-                written, done = self.flow_db.backfill_rollup(tier)
-                if done:
-                    self.log.add(SYSTEM,
-                                 f"NetFlow: summarised the stored history "
-                                 f"into the {ROLLUP_TIER_NAMES[tier]} rollups "
-                                 f"({written} row(s) on this pass)")
+            while pending and not self._stop.is_set():
+                for tier in list(pending):
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        pending = []
+                        break
+                    rows, done = self.flow_db.backfill_rollup(
+                        tier, budget_s=min(self._ROLLUP_BACKFILL_PACE_S, left))
+                    written[tier] += rows
+                    if done:
+                        self.log.add(SYSTEM,
+                                     f"NetFlow: summarised the stored history "
+                                     f"into the {ROLLUP_TIER_NAMES[tier]} rollups "
+                                     f"({written[tier]} row(s) on this sweep)")
+                    if done or not rows:
+                        pending.remove(tier)
 
     def _maintenance_flow_prune(self) -> None:
         self.flow_db.drop_legacy_indexes()
@@ -1753,7 +1783,8 @@ class Service:
             float(self.flow_settings.get("retention_days", 14)),
             int(self.flow_settings.get("max_flows", 5_000_000)),
             minute_days=float(self.flow_settings.get("rollup_minute_days", 2)),
-            rollup_days=float(self.flow_settings.get("rollup_retention_days", 90)))
+            rollup_days=float(self.flow_settings.get("rollup_retention_days", 90)),
+            interface_days=float(self.flow_settings.get("rollup_interface_days", 30)))
         # Last of the flow stages, for the reason compaction runs before the
         # prune: the size cap deletes the same oldest raw rows the backfill
         # is still summarising, and running it first meant a store already at
