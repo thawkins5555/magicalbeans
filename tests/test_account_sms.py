@@ -309,12 +309,13 @@ try:
           sms_status(service.app_db.user_sms("ghost")))
 
     # ---------------------------------------------------- 10. engine _sms_numbers
+    # 5.63.0: no more admin default list — only each account's own opt-in.
     engine = service.alert_engine
     service.app_db.sms_start("grunt", "+15559990002", "x", time.time())
     service.app_db.sms_confirm("grunt", time.time())
-    numbers = engine._sms_numbers({"sms_to_default": ["+15550000000", "+15559990002"]})
-    check("_sms_numbers merges admin defaults with opted-in numbers, deduped",
-          numbers.count("+15559990002") == 1 and "+15550000000" in numbers, numbers)
+    numbers = engine._sms_numbers({"sms_to_default": ["+15550000000"]})
+    check("_sms_numbers is opted-in numbers only, an admin default ignored",
+          numbers == ["+15559990002"], numbers)
 
     # ---------------------------------------------------- 11. _sms_result / STOP
     service.app_db.sms_forget("grunt")

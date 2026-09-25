@@ -16,6 +16,7 @@ import time
 from urllib.parse import urlparse
 
 from . import alertmail, alertrules
+from .eventlog import ALERTS, NullLog
 from .sqlitebase import (LIKE_ESCAPE, SqliteStore, hist_add, hist_buckets,
                          id_chunks, like_contains, marks_for, reclaim)
 
@@ -50,7 +51,7 @@ CREATE TABLE IF NOT EXISTS rules (
     id              INTEGER PRIMARY KEY,
     key             TEXT NOT NULL UNIQUE,
     name            TEXT NOT NULL,
-    kind            TEXT NOT NULL,          -- 'device_event'|'interface_event'|'threshold'|'dhcp_threshold'|'netpath_threshold'|'netpath_event'|'trap'|'syslog'|'ipam'|'wireless_event'|'system'
+    kind            TEXT NOT NULL,          -- 'device_event'|'interface_event'|'threshold'|'dhcp_threshold'|'dhcp_event'|'netpath_threshold'|'netpath_event'|'trap'|'syslog'|'ipam'|'wireless_event'|'system'
     source_kind     TEXT,                   -- meaning depends on kind, see nodesdb/alertrules
     severity        INTEGER NOT NULL DEFAULT 4,   -- syslog 0-7 scale, shared across every module
     enabled         INTEGER NOT NULL DEFAULT 1,
@@ -299,16 +300,13 @@ DEFAULTS = {
     # sharing the email one, so turning webhooks on for a big fleet does not
     # eat into the mail quota an operator already tuned.
     "webhook_max_per_hour": 600,
-    # Text messages through Twilio: a per-rule notify_sms switch beside
-    # notify, one global number list, its own severity floor and hourly
-    # cap. The auth token lives in sms_credential, never here.
+    # Text messages through Twilio; recipients are each account's own opted-in number, not a setting here.
     "sms_enabled": False,
     "twilio_account_sid": "",
     "twilio_auth_mode": "auth_token",
     "twilio_api_key_sid": "",
     "twilio_from": "",
     "twilio_messaging_service_sid": "",
-    "sms_to_default": [],
     "sms_min_severity": 7,
     "sms_max_per_hour": 30,
     "sms_timeout_s": 10.0,
@@ -582,15 +580,7 @@ def validate_webhook_url(url: str) -> None:
 
 
 def validate_sms_settings(values: dict) -> None:
-    """Raise ValueError for a Twilio setting that must not be saved:
-    numbers not in E.164 form, or a malformed SID. Empty is fine."""
-    numbers = values.get("sms_to_default")
-    if isinstance(numbers, str):
-        numbers = [n.strip() for n in numbers.split(",") if n.strip()]
-    for number in numbers or []:
-        if not alertmail.is_e164(number):
-            raise ValueError(
-                f"SMS number {number!r} must be in E.164 form (+15551234567)")
+    """Raise ValueError for a malformed Twilio From number or SID. Empty is fine."""
     sender = str(values.get("twilio_from", "") or "").strip()
     if sender and not alertmail.is_e164(sender):
         raise ValueError(
@@ -686,10 +676,8 @@ _RULE_EDITABLE = ("name", "severity", "enabled", "device_filter", "threshold",
                   "auto_resolve_after_s", "notify", "notify_sms")
 _RULE_CUSTOM_EDITABLE = _RULE_EDITABLE + ("kind", "source_kind")
 
-# 74 built-in rules: 10 device_event + 6 interface_event + 38 threshold +
-# 4 trap + 1 syslog + 1 ipam + 4 wireless_event + 1 dhcp_threshold +
-# 3 netpath_threshold + 1 netpath_event + 5 system. Each `template` name is a
-# templates.key —
+# 75 built-in rules: 10 device_event + 6 interface_event + 38 threshold + 4 trap +
+# 1 syslog + 1 ipam + 4 wireless_event + 1 dhcp_threshold + 1 dhcp_event + 3 netpath_threshold + 1 netpath_event + 5 system. Each `template` name is a templates.key —
 # most non-primary rules reuse a generic template rather than a bespoke
 # one, since only 6 ship; an admin can point any rule at any template.
 _BUILTIN_RULES = [
@@ -910,6 +898,7 @@ _BUILTIN_RULES = [
     # 15 minutes by default), not engine ticks -- see
     # alertengine._evaluate_dhcp_thresholds.
     ("dhcp_scope_exhaustion", "DHCP scope running out of leases", "dhcp_threshold", "scope_utilization_pct", 3, "threshold_breach", 85.0, 75.0, 1),
+    ("dhcp_poll_failed", "DHCP server poll failing", "dhcp_event", "poll_failed", 4, "event_notice", None, None, 2),  # see alertengine._evaluate_dhcp_polls
     # NetPath destinations. Their own kind for the same reason DHCP has one:
     # the threshold evaluator reads Nodes' metrics table for a Nodes device,
     # and a traceroute destination is neither. for_polls counts that
@@ -1278,6 +1267,11 @@ class AlertsDatabase(SqliteStore):
     # Marker for the one-time SappiWhere-in-subject strip (see _migrate).
     _TEMPLATE_SUBJECTS_STRIP_5_58 = "template_subjects_strip_5_58"
 
+    def __init__(self, path: str, log=None):
+        # Optional; the 5.63.0 dropped-numbers migration logs to it.
+        self.log = log or NullLog()
+        super().__init__(path)
+
     def _after_open(self) -> None:
         # AlertEngine's per-tick change signals: see take_dirty_devices and
         # threshold_generation below. Reset per process, like its own state.
@@ -1423,6 +1417,7 @@ class AlertsDatabase(SqliteStore):
             # the operator experiences it.
             ("resolve_unpublished_optic_power_alerts_1",
              self._resolve_unpublished_optic_power_alerts),
+            ("drop_default_sms_numbers_1", self._drop_default_sms_numbers),
         )
 
     def _run_named_migrations(self) -> None:
@@ -1492,6 +1487,29 @@ class AlertsDatabase(SqliteStore):
                     " AND is_builtin = 1 AND template_id = ?",
                     (target, key, previous))
             self._conn.commit()
+
+    def _drop_default_sms_numbers(self) -> None:
+        """5.63.0: clears any old admin-set sms_to_default list, once, with
+        an Events line naming what was dropped."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM settings WHERE key = 'sms_to_default'").fetchone()
+            if row is None:
+                return
+            try:
+                numbers = json.loads(row["value"])
+            except (ValueError, TypeError):
+                numbers = None
+            if isinstance(numbers, str):
+                numbers = [n.strip() for n in numbers.split(",") if n.strip()]
+            if not numbers:
+                return
+            self._conn.execute(
+                "DELETE FROM settings WHERE key = 'sms_to_default'")
+            self._conn.commit()
+        self.log.add(ALERTS, f"Dropped {len(numbers)} default text-alert "
+                     f"number(s) ({', '.join(numbers)}): only numbers opted "
+                     "in from an account receive texts from 5.63.0")
 
     def _retire_temp_high(self) -> None:
         """Retire the single "Temperature high" rule over one "temp_c"

@@ -467,7 +467,7 @@ _CONFIG_MODULE_KEYS = {
     "nodes": ("nodes_settings",),
     "alerts": ("alerts_settings",),
     "wireless": ("wireless_settings",),
-    "configrx": ("configrx_settings", "configrx_vendors"),
+    "configrx": ("configrx_settings", "configrx_vendors", "configrx_global_credential"),
     "mapper": ("mapper_settings",),
 }
 _STATE_MODULE_KEYS = {
@@ -619,6 +619,16 @@ def _snmp_settings_json(service, params) -> dict:
     return {**settings, **flags, "accepted_communities": ""}
 
 
+def _configrx_global_credential_json(service) -> dict:
+    """The single global ConfigRX account's status, never the password itself."""
+    row = service.configrx_db.global_credential()
+    return {
+        "username": (row["username"] if row else "") or "",
+        "has_password": bool(row["password_enc"]) if row else False,
+        "stored_ts": row["stored_ts"] if row else None,
+    }
+
+
 def get_config(service, params, body) -> dict:
     """Everything the browser needs that only an operator can change.
 
@@ -656,6 +666,7 @@ def get_config(service, params, body) -> dict:
         "alerts_settings": _alerts_settings_json(service, params),
         "wireless_settings": service.wireless_settings,
         "configrx_settings": service.configrx_settings,
+        "configrx_global_credential": _configrx_global_credential_json(service),
         "mapper_settings": service.mapper_settings,
         # The vendor override <select> is built from this, not a JS copy of
         # configrx.VENDORS — label and key only, nothing a client

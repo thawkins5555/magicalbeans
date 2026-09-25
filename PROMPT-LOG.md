@@ -5,6 +5,100 @@ grouped by the version that carries it. This is a working record for the
 operator — the full story of each change is in `CHANGELOG.md`, and this file
 does not replace it.
 
+## 5.63.0 — Routes toolbar and Mapper legend reverted, centred SSH/WEB windows, DAF cables, user-only text alerts, a DHCP poll alert, and per-account SSH logins
+
+**Operator message, verbatim (nine lines):**
+
+"Routes Module appears the top bar that shows 'Print, Refresh, Settings' has
+moved to the left side of the page.
+Remove the Notes: VlanView: … FiberView: …
+Periodic IPAM polls appear to not use the stored credentials only the manual
+DHCP polls use the stored credentials.
+Add in re-try functionality to the SSH button.
+SSH and Web button should open the new window centered in the screen and
+not in the top left corner.
+SFP-10G-Active-Cable - Should be identified as a laser DAC
+Remove the ability for an admin to add a phone number to the text alerts -
+only a user should be able to add a number on their own account.
+Add an alert for DHCP polling failing.
+Need to separate out the ConfigRx account credentials and the SSH button
+credentials. The ConfigRx account can be global but the SSH button
+credentials need to be on a per account basis."
+
+**Dora's audit, before planning.** The Routes toolbar sits left because
+`#page-netpath.active { flex-direction: row }` (a rule written for that page
+alone) predates the strip and turns it into a narrow left column;
+`_DAC_TEXT` has no rule for "Active-Cable"/AOC so that cable read as an
+unproven optic and FiberView painted it the default (multimode) colour; the
+SSH button reads ConfigRX's per-device row; admin numbers live in one
+settings-table list read by both the settings page and the send path; a DHCP
+poll failure only ever set `dhcp_servers.last_status`, nothing counting
+consecutive misses. A side bug found along the way: the Account dialog's SMS
+**Resend code** posts without the `privacy: true` flag 5.59.0 added, and the
+server refuses it.
+
+**Planning answers, grouped by lane.**
+
+- **Lane A — credentials (Thing1).** ConfigRX gets one global account
+  (per-device rows stay as overrides); the SSH button uses a per-account SSH
+  login stored on the Account page, never falling back to ConfigRX; the
+  terminal's sign-in prompt gets a "Remember for my account" box, stored
+  only once the device accepts the login. **Withdrawn: SSH retry.** Operator:
+  "We will skip the SSH retry feature."
+- **Lane B — windows and DAF (Thing2).** SSH, WEB and AP-web windows open
+  centred, one shared helper. The active cable becomes a new media type,
+  "DAF" — badge and report both read "DAF," drawn plain in FiberView like a
+  twinax DAC, never called a "laser DAC" as first asked, since it needed its
+  own kind to get its own report row and FiberView treatment.
+- **Lane C — text alerts and DHCP poll alert (Thing3).** Admin default
+  numbers are dropped on upgrade, with an Events line recording exactly what
+  was cleared; the admin "Send a test text to" field goes too, since there
+  is nothing left it could usefully test that a real alert or the Account
+  dialog's own opt-in flow doesn't already exercise. The DHCP alert is a
+  notifying rule after 2 consecutive failed polls, editable per rule.
+- **Lane D — Routes toolbar and Mapper legend (Thing4).** The toolbar's row
+  exception is deleted outright rather than patched. Every Mapper legend
+  note goes — the FiberView checkbox's own tooltip stays, since it explains
+  the checkbox rather than repeating a colour key.
+- **Withdrawn: the IPAM credential item.** Operator: "I spoke too soon on
+  this and all appears well." No lane touched IPAM's own credential path.
+
+**Who built what.** Thing1 built lane A, Thing2 lane B, Thing3 lane C,
+Thing4 lane D (reading Thing2's report for the exact `daf` value before
+writing the demo cage). Stephen_King wrote the docs once all four landed.
+
+**Outcome.** Shipped as 5.63.0. Full suite 217 of 222 with only the three
+container-environmental failures (test_alert_sms, test_collectors_hardening,
+test_prune_lock_hold) plus two that were fixed and rerun green before the
+push (test_api_helpers: the secret-column scan wanted `bool(row[...]) if row
+else False`; test_web_gates: the three sign-in-only `/api/account/ssh`
+routes added to its audited sets). Javariius: no P1, four P2s (a
+`dhcp_event` rule could double-match a second rule with the same source,
+now pinned by `rule_key`; the typed SSH password lingered in the terminal's
+frame for the whole session, now dropped as soon as the connect resolves;
+a doc wording; comment density) and the P3s fixed (username-only global
+account save keeps the stored password, comma-string default-number
+migration, encrypt-failure notice, a DAF slot keeps its badge under a fibre
+MAU arc). Browser walk: first run 86 of 114 — a new Alerts check left the
+tab on its Rules subtab so the alert-selection check could not click and
+the next check navigated to a null hash, and Poll now never forced the
+neighbour walk (the real bug below); after the fixes, 113 of 114 with zero
+console or page errors on both accounts, the one miss being the manual
+Connect check's click on a map node that would not hold still under the
+250-device fleet (untouched code, passed on the first run).
+
+**Follow-up: a real bug found on Testy's pass, fixed by Fisty.**
+`_walk_now` (the code behind Poll now and its API,
+`POST /api/nodes/devices/<id>/poll`) forced the MAC-table, VLAN, ARP and
+per-VLAN STP walks ahead of their own schedule, but never the LLDP/CDP
+neighbour walk — so a freshly added device's Mapper links waited on that
+walk's own random first-due draw (up to `lldp_interval_s`, an hour by
+default) no matter how many times Poll now was pressed. Fisty added the
+neighbour walk to the forced set; on the demo fleet, the acc-sw-005
+uplink went from not appearing on the map within four minutes to
+appearing 0.29 seconds after one Poll now click. Documented in
+`CHANGELOG.md`, `FEATURES.md`, `INTERNALS.md` and `RUNBOOK.md`.
+
 ## 5.62.0 — Every STP-blocked link found, with the evidence to prove it; the in-flight set clears on stop
 
 **Operator message, verbatim:** "Fix the STP in-flight set not clearing on

@@ -41,6 +41,7 @@ def stub_walks(poller: NodePoller, calls: list) -> None:
             running.discard(device_id)
         return run
     poller._run_mac_table = make("mac", poller._mac_running)
+    poller._run_lldp_table = make("lldp", poller._lldp_running)
     poller._run_vlan_table = make("vlan", poller._vlan_running)
     poller._run_arp_table = make("arp", poller._arp_running)
     poller._run_stp_vlan_walk_job = make("stp_vlan", poller._stp_vlan_running)
@@ -115,20 +116,21 @@ check("a stopped poller (_mac_executor is None) returns all zeros and running Fa
       result3)
 db.close()
 
-# ---------------------------------------- _walk_now still queues all four
-db = new_db("walk_now_still_all_four")
+# ---------------------------------------- _walk_now still queues all five
+db = new_db("walk_now_still_all_five")
 gid = db.ensure_default_group()
-db.update_group(gid, mac_table_interval_s=3600, vlan_interval_s=3600,
-                arp_table_interval_s=3600)
+db.update_group(gid, mac_table_interval_s=3600, lldp_interval_s=3600,
+                vlan_interval_s=3600, arp_table_interval_s=3600)
 did = db.add_device("10.1.0.9", name="sw", group_id=gid)
 poller = new_poller(db)
 calls = []
 stub_walks(poller, calls)
 poller.poll_now(did, walks=True)
 poller._mac_executor.shutdown(wait=True)
-check("_walk_now still queues mac, vlan, arp and stp_vlan for a normal device "
-      "after the _queue_walk extraction",
-      sorted(calls) == [("arp", did), ("mac", did), ("stp_vlan", did), ("vlan", did)],
+check("_walk_now still queues mac, lldp, vlan, arp and stp_vlan for a normal "
+      "device after the _queue_walk extraction",
+      sorted(calls) == [("arp", did), ("lldp", did), ("mac", did),
+                        ("stp_vlan", did), ("vlan", did)],
       calls)
 db.close()
 

@@ -712,8 +712,9 @@ def post_alerts_rule(service, params, body) -> dict:
             "A rule key may use letters, digits, underscore, hyphen and dot "
             f"only, up to {ALERT_RULE_KEY_MAX} characters")
     if kind not in ("device_event", "interface_event", "threshold",
-                    "dhcp_threshold", "netpath_threshold", "netpath_event",
-                    "trap", "syslog", "ipam", "wireless_event", "system"):
+                    "dhcp_threshold", "dhcp_event", "netpath_threshold",
+                    "netpath_event", "trap", "syslog", "ipam",
+                    "wireless_event", "system"):
         raise ValueError("Unrecognized rule kind")
     if service.alerts_db.rule_by_key(key):
         raise ValueError(f"A rule with key '{key}' already exists")
@@ -1030,54 +1031,6 @@ def delete_alerts_sms_credential(service, params, body) -> dict:
         service, params, clear=service.alerts_db.clear_sms_credential,
         category=ALERTS_CATEGORY, message="Cleared the stored Twilio credential",
         target="sms")
-
-
-def post_alerts_sms_test(service, params, body) -> dict:
-    """Sends a real test text, the same "test what's typed before saving"
-    idiom as post_alerts_smtp_test, with the same saved-credential rule:
-    the saved credential is only ever sent with the settings it was saved
-    under (Account SID, API Key SID and authentication method).
-    """
-    from ... import alertmail, dpapi
-
-    to_number = str(body.get("to", "")).strip()
-    if not to_number or not alertmail.is_e164(to_number):
-        raise ValueError(
-            "A destination number in E.164 form (+15551234567) is required")
-    settings = dict(service.alerts_settings)
-    for key in ("twilio_account_sid", "twilio_auth_mode", "twilio_api_key_sid",
-               "twilio_from", "twilio_messaging_service_sid", "sms_timeout_s"):
-        if key in body:
-            settings[key] = body[key]
-    token = body.get("token")
-    blob = service.alerts_db.sms_token_enc() if token is None else None
-    wanted = alertmail.sms_binding(settings)
-    saved = service.alerts_db.sms_credential_binding()
-    binding_changed = bool(blob) and (
-        wanted != (saved["auth_mode"], saved["account_sid"], saved["api_key_sid"]))
-    if token is None and binding_changed:
-        raise ValueError(
-            "This test changes the Account SID, API Key SID or authentication "
-            "method, so it cannot use the saved credential: type the secret "
-            "for it into the test instead. The saved one is only ever sent "
-            "with the settings it was saved under.")
-    if token is None and blob:
-        try:
-            token = dpapi.unprotect(blob).decode("utf-8")
-        except Exception:
-            token = None
-    elif token is not None:
-        token = str(token)
-    text = "SappiWhere test text from the Alerts module"
-    try:
-        alertmail.send_sms(settings, token, to_number, text)
-        ok, error = True, ""
-    except Exception as exc:
-        ok, error = False, str(exc)
-    finally:
-        token = None
-    service.alerts_db.record_notification(None, "test", to_number, text, ok, error)
-    return {"ok": ok, "error": error} if not ok else {"ok": True}
 
 
 def post_alerts_engine(service, params, body) -> dict:

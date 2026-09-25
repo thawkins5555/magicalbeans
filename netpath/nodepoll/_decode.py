@@ -115,6 +115,12 @@ _DAC_TEXT = re.compile(
     r"|-a?cu\d+(?:[.-]\d+)?m\b|-ac\d+m\b"
     r"|-cr\d?\b", re.I)
 
+# Active optical cable / direct-attach fibre. Checked before _DAC_TEXT since
+# "Active-Cable" alone (no "copper") is optical, not twinax.
+_DAF_TEXT = re.compile(
+    r"\bactive[- ]?cable\b|\baoc\b|-aoc\d+(?:[.-]\d+)?m?\b|\bactive optical\b",
+    re.I)
+
 # Multimode (850 nm) and single-mode (1270-1610 nm) proof out of the same
 # transceiver text, built from _MEDIA_MODE. Copper/DAC/AOC text matches
 # neither; the wavelength arm catches a module that quotes no PMD at all.

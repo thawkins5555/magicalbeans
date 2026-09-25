@@ -60,6 +60,16 @@ CREATE TABLE IF NOT EXISTS device_config (
     store_secrets         INTEGER NOT NULL DEFAULT 0
 );
 
+-- The single global ConfigRX account, used for a backup when a device has no
+-- ssh_username/ssh_password_enc of its own. One row, same pattern as
+-- alertsdb.sms_credential.
+CREATE TABLE IF NOT EXISTS global_credential (
+    id           INTEGER PRIMARY KEY CHECK (id = 1),
+    username     TEXT,
+    password_enc BLOB,
+    stored_ts    REAL
+);
+
 CREATE TABLE IF NOT EXISTS backups (
     id           INTEGER PRIMARY KEY,
     device_id    INTEGER NOT NULL,
@@ -350,6 +360,30 @@ class ConfigRxDatabase(SqliteStore):
                 "UPDATE device_config SET ssh_password_enc = NULL, "
                 "enable_secret_enc = NULL WHERE device_id = ?",
                 (device_id,))
+            self._conn.commit()
+
+    def global_credential(self) -> sqlite3.Row | None:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM global_credential WHERE id = 1").fetchone()
+
+    def set_global_credential(self, username: str, password_enc: bytes | None) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO global_credential(id, username, password_enc, stored_ts)"
+                " VALUES (1, ?, ?, ?)"
+                " ON CONFLICT(id) DO UPDATE SET username=excluded.username,"
+                " password_enc=excluded.password_enc, stored_ts=excluded.stored_ts",
+                (username, password_enc, time.time()))
+            self._commit_durable()
+
+    def clear_global_credential(self) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO global_credential(id, username, password_enc, stored_ts)"
+                " VALUES (1, NULL, NULL, NULL)"
+                " ON CONFLICT(id) DO UPDATE SET username=NULL, password_enc=NULL,"
+                " stored_ts=NULL")
             self._conn.commit()
 
     def set_enable_secret(self, device_id: int, enable_secret_enc: bytes | None) -> None:

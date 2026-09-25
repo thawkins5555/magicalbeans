@@ -19,6 +19,7 @@ import _paths  # noqa: F401  (repo root + tests dir on sys.path)
 from netpath import alertmail, dpapi
 from netpath.alertsdb import AlertsDatabase, validate_sms_settings
 from netpath.alertengine import AlertEngine, DIGEST_THRESHOLD
+from netpath.appdb import AppDatabase
 from netpath.alertrules import SEVERITY_NAMES
 from netpath.ipamdb import IpamDatabase
 from netpath.nodesdb import NodesDatabase
@@ -275,9 +276,12 @@ finally:
     alertmail.send_sms = real_send_sms
 
 # --------------------------------------- 4. settings validation, storage
-for bad, name in (({"sms_to_default": ["5551234567"]}, "a bare number"),
-                  ({"sms_to_default": "+15551234567, 12"}, "a bad number in a comma string"),
-                  ({"twilio_from": "0800"}, "a bad From number"),
+# 5.63.0: sms_to_default is no longer a saved setting, so validate_sms_settings
+# no longer looks at it at all — a bad one in the dict is simply not its business.
+validate_sms_settings({"sms_to_default": ["5551234567"]})
+check("validate_sms_settings ignores sms_to_default entirely now", True)
+
+for bad, name in (({"twilio_from": "0800"}, "a bad From number"),
                   ({"twilio_account_sid": "AC12"}, "a short Account SID"),
                   ({"twilio_messaging_service_sid": "MG" + "z" * 32}, "a non-hex Messaging SID")):
     try:
@@ -285,10 +289,9 @@ for bad, name in (({"sms_to_default": ["5551234567"]}, "a bare number"),
         check(f"validate_sms_settings refuses {name}", False)
     except ValueError as exc:
         check(f"validate_sms_settings refuses {name}", bool(str(exc)))
-validate_sms_settings({"sms_to_default": ["+15551234567", "+442071234567"],
-                       "twilio_from": "", "twilio_account_sid": "",
+validate_sms_settings({"twilio_from": "", "twilio_account_sid": "",
                        "twilio_messaging_service_sid": ""})
-check("...and accepts good numbers with empty SIDs", True)
+check("...and accepts empty SIDs", True)
 
 for bad, name in (({"twilio_auth_mode": "bogus"}, "an unknown auth mode"),
                   ({"twilio_api_key_sid": "SKshort"}, "a malformed API Key SID")):
@@ -302,16 +305,13 @@ check("...and accepts a good API Key SID", True)
 
 db = AlertsDatabase(os.path.join(TMPDIR, "alerts.db"))
 s = db.settings()
-check("settings carry the SMS defaults: off, no numbers, 30/hour, floor 7",
-      s["sms_enabled"] is False and s["sms_to_default"] == [] and s["sms_max_per_hour"] == 30
+check("settings carry the SMS defaults: off, 30/hour, floor 7, no sms_to_default key",
+      s["sms_enabled"] is False and "sms_to_default" not in s and s["sms_max_per_hour"] == 30
       and s["sms_min_severity"] == 7 and s["has_sms_credential"] is False, s)
-try:
-    db.save_settings({"sms_to_default": ["nope"]})
-    check("save_settings refuses a bad SMS number", False)
-except ValueError:
-    check("save_settings refuses a bad SMS number", True)
-db.save_settings({"sms_to_default": ["+15551234567"], "sms_enabled": True})
-check("...and stores a good one", db.settings()["sms_to_default"] == ["+15551234567"])
+db.save_settings({"sms_to_default": ["nope"], "sms_enabled": True})
+check("save_settings ignores sms_to_default rather than refusing a bad number",
+      "sms_to_default" not in db.settings() and db.settings()["sms_enabled"] is True,
+      db.settings())
 db.set_sms_credential(b"blob", "AC" + "c" * 32)
 check("the token blob is stored in its own table and flagged in settings",
       db.sms_token_enc() == b"blob" and db.settings()["has_sms_credential"] is True)
@@ -347,6 +347,70 @@ check("an old-shape sms_credential table migrates: auth_mode defaults to auth_to
       old_db.sms_credential_binding())
 old_db.close()
 
+
+class CountingLog:
+    def __init__(self):
+        self.rows = []
+
+    def add(self, kind, message, detail=""):
+        self.rows.append(message)
+
+
+# --------------------- 4b. 5.63.0: the dropped-default-numbers migration
+migrate_path = os.path.join(TMPDIR, "migrate_numbers.db")
+migrate_conn = sqlite3.connect(migrate_path)
+migrate_conn.execute("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT)")
+migrate_conn.execute("INSERT INTO settings(key, value) VALUES ('sms_to_default', ?)",
+                     (json.dumps(["+15551111111", "+15552222222"]),))
+migrate_conn.commit()
+migrate_conn.close()
+migrate_log = CountingLog()
+migrate_db = AlertsDatabase(migrate_path, log=migrate_log)
+check("a stored sms_to_default list is cleared on open",
+      "sms_to_default" not in migrate_db.settings(), migrate_db.settings())
+migrated_lines = [m for m in migrate_log.rows if "Dropped" in m]
+check("...with one Events line naming the count and the numbers",
+      len(migrated_lines) == 1
+      and "Dropped 2 default text-alert number(s)" in migrated_lines[0]
+      and "+15551111111" in migrated_lines[0] and "+15552222222" in migrated_lines[0]
+      and "only numbers opted in from an account receive texts from "
+          "5.63.0" in migrated_lines[0],
+      migrated_lines)
+migrate_db.close()
+
+migrate_log2 = CountingLog()
+migrate_db2 = AlertsDatabase(migrate_path, log=migrate_log2)
+check("reopening an already-migrated database does not repeat the line",
+      not any("Dropped" in m for m in migrate_log2.rows), migrate_log2.rows)
+migrate_db2.close()
+
+# --------------------- 4c. an old comma-string sms_to_default row also migrates
+comma_path = os.path.join(TMPDIR, "migrate_numbers_comma.db")
+comma_conn = sqlite3.connect(comma_path)
+comma_conn.execute("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT)")
+comma_conn.execute("INSERT INTO settings(key, value) VALUES ('sms_to_default', ?)",
+                   (json.dumps("+15553333333,+15554444444"),))
+comma_conn.commit()
+comma_conn.close()
+comma_log = CountingLog()
+comma_db = AlertsDatabase(comma_path, log=comma_log)
+check("a comma-string sms_to_default (old install shape) is cleared too",
+      "sms_to_default" not in comma_db.settings(), comma_db.settings())
+comma_lines = [m for m in comma_log.rows if "Dropped" in m]
+check("...with the same Events line, split on commas",
+      len(comma_lines) == 1
+      and "Dropped 2 default text-alert number(s)" in comma_lines[0]
+      and "+15553333333" in comma_lines[0] and "+15554444444" in comma_lines[0],
+      comma_lines)
+comma_db.close()
+
+empty_path = os.path.join(TMPDIR, "no_numbers.db")
+empty_log = CountingLog()
+empty_db = AlertsDatabase(empty_path, log=empty_log)
+check("a fresh database with no stored list logs nothing",
+      not any("Dropped" in m for m in empty_log.rows), empty_log.rows)
+empty_db.close()
+
 rule = db.rule_by_key("device_down")
 check("every rule carries notify_sms, off by default", rule["notify_sms"] == 0)
 db.update_rule(rule["id"], notify_sms=True)
@@ -358,13 +422,14 @@ check("the sms_failing system rule is seeded with the smtp_failing template",
 db.close()
 
 # ------------------------------------------------------- 5. engine sections
+# 5.63.0: there is no admin default number any more, so the one number these
+# sections text is an account's own opted-in number (app_db), not a setting.
 _SEQ = [0]
 SMS_SETTINGS = {"email_enabled": False, "rollup_enabled": False,
                 "new_device_grace_s": 0, "notify_rollup_delay_s": 0,
                 "sms_enabled": True, "twilio_account_sid": "AC" + "a" * 32,
                 "twilio_from": "+15550001111",
-                "twilio_messaging_service_sid": "",
-                "sms_to_default": ["+15551234567"]}
+                "twilio_messaging_service_sid": ""}
 DEVICE_DOWN_TAG = "[{}]".format(SEVERITY_NAMES[1].upper())
 
 
@@ -382,8 +447,12 @@ def build_engine(**settings):
     syslog = SyslogDatabase(os.path.join(folder, "syslog.db"))
     ipam = IpamDatabase(os.path.join(folder, "ipam.db"))
     netpath_db = NetpathDatabase(os.path.join(folder, "netpath.db"))
+    app_db = AppDatabase(os.path.join(folder, "app.db"))
+    app_db.sms_start("opuser", "+15551234567", "x", time.time())
+    app_db.sms_confirm("opuser", time.time())
     engine = AlertEngine(alerts, nodes_db=nodes, snmp_db=snmp,
-                         syslog_db=syslog, ipam_db=ipam, netpath_db=netpath_db)
+                         syslog_db=syslog, ipam_db=ipam, netpath_db=netpath_db,
+                         app_db=app_db)
     return nodes, alerts, engine
 
 

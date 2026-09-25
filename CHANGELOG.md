@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.63.0 — Routes toolbar and Mapper legend reverted, centred SSH/WEB windows, DAF active-optical cables, text alerts are opt-in only, a DHCP poll-failure alert, and a per-account SSH login separate from ConfigRX](#5630--routes-toolbar-and-mapper-legend-reverted-centred-sshweb-windows-daf-active-optical-cables-text-alerts-are-opt-in-only-a-dhcp-poll-failure-alert-and-a-per-account-ssh-login-separate-from-configrx)
 - [5.62.0 — Every STP-blocked link is now found: a trunk without VLAN 1 was invisible on every VLAN, the scan runs every five minutes, and an undotted link names its own cause](#5620--every-stp-blocked-link-is-now-found-a-trunk-without-vlan-1-was-invisible-on-every-vlan-the-scan-runs-every-five-minutes-and-an-undotted-link-names-its-own-cause)
 - [5.61.0 — VlanView glows a link only when the picked VLAN is on both ends; Nodes gets a fleet-wide VLAN scan button](#5610--vlanview-glows-a-link-only-when-the-picked-vlan-is-on-both-ends-nodes-gets-a-fleet-wide-vlan-scan-button)
 - [5.60.0 — Every STP-blocked link on Mapper is now found: EtherChannel bundles, a per-VLAN scan that finishes, and a bridge-port fallback](#5600--every-stp-blocked-link-on-mapper-is-now-found-etherchannel-bundles-a-per-vlan-scan-that-finishes-and-a-bridge-port-fallback)
@@ -196,6 +197,106 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.63.0 — Routes toolbar and Mapper legend reverted, centred SSH/WEB windows, DAF active-optical cables, text alerts are opt-in only, a DHCP poll-failure alert, and a per-account SSH login separate from ConfigRX
+
+One operator message, nine asks; two were withdrawn during planning — the
+IPAM credential item ("I spoke too soon on this and all appears well") and
+a retry button on the SSH terminal ("We will skip the SSH retry feature")
+— leaving seven.
+
+**The Routes toolbar is back above the sidebar, not beside it.** The strip
+carrying Print, Refresh and Settings had been pinned into a narrow left-hand
+column by a CSS rule written for that page only; it is now a normal top row,
+full width, the same as every other module, with the destination sidebar and
+the path canvas still sitting side by side underneath it.
+
+**Every note the Mapper legend used to print above the map is gone** —
+the FiberView colour key, the VlanView "glows in its colour" line, the
+"Dotted = STP blocked" line, and the "no CDP/LLDP adjacency" message for an
+empty map. Nothing else changes: FiberView still colours links the same
+way, VlanView still glows the same links, STP-blocked links still draw
+dotted, and a link's own tooltip and detail pane still explain all of it —
+the legend was a second place saying the same thing, in words, above the
+canvas. The FiberView checkbox's own tooltip is untouched.
+
+**SSH, WEB and AP-web windows now open centred over the browser window**
+instead of pinned to the screen's top-left corner — one change, in one
+place, that all three share.
+
+**A transceiver reporting "Active-Cable", "AOC" or "active optical" now
+reads as its own type, DAF, rather than an unproven optic.** It carries a
+DAF badge on the interface list, a DAF row (medium Laser) in the SFP
+inventory report, and draws as a plain, uncoloured cable in FiberView —
+exactly the way a twinax DAC already does, since it carries no light
+levels to read either. The demo fleet's Cisco access switch persona now
+seats one, so the badge, the report row and the plain FiberView link are
+all visible without touching a live device.
+
+**An administrator can no longer add a phone number for someone else's
+text alerts.** The "Default numbers" list, its Add button and the consent
+notice under it are gone from Alerts → Settings, along with the "Send a
+test text to" field beside the test-email one — the only way a number now
+receives alert texts is by opting itself in from its own Account dialog.
+**An install upgrading into 5.63.0 with a stored default-numbers list has
+it cleared automatically**, once, with a line in Events naming how many
+numbers were dropped and the fact that only account opt-ins receive texts
+from this version on — nothing is silently lost without a record of it.
+A side bug found along the way is fixed in the same release: the Account
+dialog's **Resend code** button for text-alert sign-up was refusing every
+click for a missing privacy-policy flag; it now sends.
+
+**A DHCP server that stops answering its scheduled poll now raises its
+own alert**, "DHCP server poll failing," after two consecutive failed
+polls by default (edit "Consecutive failed polls before firing" on the
+rule like any other threshold count) — naming the server and its last
+error, and clearing itself the moment a poll succeeds again. It emails
+and texts exactly like every other rule.
+
+**Poll now now also refreshes CDP/LLDP neighbours, so a new device's
+map links appear on demand instead of within the hour.** The button
+(and the API behind it, `POST /api/nodes/devices/<id>/poll`) already
+forced the MAC-table, VLAN, ARP and per-VLAN STP walks ahead of their
+own schedule; the neighbour walk was left out, so a freshly added
+device's Mapper links waited on that walk's own randomised first-due
+draw — up to `lldp_interval_s`, one hour by default — no matter how
+many times Poll now was pressed. It now forces the neighbour walk too:
+on the demo fleet, the acc-sw-005 uplink appeared on Mapper 0.29
+seconds after one Poll now click, where before it had not appeared
+within four minutes.
+
+**ConfigRX and the SSH button no longer share a credential, and each is
+easier to run at scale for it.** ConfigRX gains one **global SSH account**
+(ConfigRX → Settings), used for a backup on any device that carries no
+credential of its own — a per-device credential still wins over it, and a
+device with neither now fails with a clearer reason ("No SSH credential
+stored for this device and no global ConfigRX account"). The SSH
+button, separately, now signs in with a login stored on the signed-in
+operator's own **Account** page and *never* with ConfigRX's credential,
+device or global — the terminal's sign-in prompt gains a "Remember for my
+account" box that only stores the pair once the device has actually
+accepted it, never on a wrong password. **This is an upgrade-affecting
+change**: any operator who relied on the SSH button picking up a device's
+ConfigRX credential will need to store their own SSH login under Account
+before the button works again.
+
+Files: `netpath/web/static/app.css`, `netpath/web/static/mapper.js`,
+`netpath/web/static/index.html`, `netpath/web/static/app.js`,
+`netpath/web/static/wireless.js`, `netpath/nodepoll/_decode.py`,
+`netpath/nodepoll/environment_mixin.py`, `netpath/nodepoll/poller.py`,
+`netpath/mapper.py`,
+`netpath/report.py`, `netpath/reportsched.py`, `netpath/nodesdb.py`,
+`netpath/web/static/nodes.js`, `netpath/alertsdb.py`, `netpath/alertengine.py`,
+`netpath/alertrules.py`, `netpath/web/api/alerts.py`, `netpath/ipamdb.py`,
+`netpath/web/api/ipam.py`, `netpath/web/static/alerts.js`,
+`netpath/configrxdb.py`, `netpath/configrx.py`, `netpath/web/api/configrx.py`,
+`netpath/web/static/configrx.js`, `netpath/appdb.py`, `netpath/web/api/auth.py`,
+`netpath/web/server.py`, `netpath/web/api/relays.py`, `netpath/web/service.py`,
+`netpath/web/api/_shared.py`, `netpath/sshterm.py`,
+`netpath/web/static/ssh.html`, `netpath/web/static/ssh.js`,
+`demo/personas.py`, `CREDENTIAL-SECURITY.md`, `tests/test_poll_now_walks.py`,
+`tests/test_vlan_scan_now.py`, `tests/test_web_gates.py`, plus the
+accompanying tests.
 
 ### 5.62.0 — Every STP-blocked link is now found: a trunk without VLAN 1 was invisible on every VLAN, the scan runs every five minutes, and an undotted link names its own cause
 

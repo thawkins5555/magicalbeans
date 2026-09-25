@@ -273,6 +273,7 @@ def _dhcp_server_json(row) -> dict:
     return {"id": row["id"], "address": row["address"], "label": row["label"],
             "enabled": bool(row["enabled"]), "last_poll": row["last_poll_ts"],
             "last_status": row["last_status"], "last_error": row["last_error"],
+            "poll_failures": row["poll_failures"],
             # The username is not sensitive on its own and is shown so the
             # form can be prefilled; the password never appears in any
             # response, encrypted or not — only whether one is stored.

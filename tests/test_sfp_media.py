@@ -52,7 +52,9 @@ PORTS = [{"if_index": 1, "descr": "GigabitEthernet1/0/1"},
          {"if_index": 19, "descr": "GigabitEthernet1/0/19"},
          {"if_index": 20, "descr": "GigabitEthernet1/0/20"},
          {"if_index": 21, "descr": "GigabitEthernet1/0/21"},
-         {"if_index": 22, "descr": "GigabitEthernet1/0/22"}]
+         {"if_index": 22, "descr": "GigabitEthernet1/0/22"},
+         {"if_index": 23, "descr": "GigabitEthernet1/0/23"},
+         {"if_index": 24, "descr": "GigabitEthernet1/0/24"}]
 
 IF_MAU_TYPE = "1.3.6.1.2.1.26.2.1.1.3"
 
@@ -187,6 +189,12 @@ try:
     check("the same DAC text vetoed to 'sfp' by a fiber ifMauType arc (36), "
           "same as copper text under a fiber arc",
           media.get(22) == "sfp", media)
+    check("an active-cable module named by text alone ('10GBase-AOC SFP+' / "
+          "SFP-10G-Active-Cable), no sensor at all, is 'daf'",
+          media.get(23) == "daf", media)
+    check("the same DAF text under a fiber ifMauType arc (36) stays 'daf' "
+          "-- unlike DAC/copper, a fiber arc must not veto it (P3)",
+          media.get(24) == "daf", media)
 
     optic_mode = {r["if_index"]: r["optic_mode"] for r in db.interfaces(did)}
     check("if 2's module text (10Gbase-LR SFP+ / SFP-10G-LR) reads 'sm' "
@@ -205,6 +213,8 @@ try:
     check("DAC ports never carry an optic_mode either",
           optic_mode.get(20) is None and optic_mode.get(21) is None,
           optic_mode)
+    check("a DAF port never carries an optic_mode either",
+          optic_mode.get(23) is None, optic_mode)
     check("a DOM-lit port whose parent chain carries a chassis model name "
           "(N9K-C93180YC-EX) reads 'mm' off its transceiver child "
           "(SFP-10G-SR), not 'sm' off the chassis -- the fallback scan's "
@@ -298,7 +308,8 @@ try:
     db.replace_interfaces(did, PORTS)
     db.update_interface_media(did, [
         {"if_index": 2, "media": "sfp", "optic_mode": "sm"},
-        {"if_index": 3, "media": "sfp_empty"}])
+        {"if_index": 3, "media": "sfp_empty"},
+        {"if_index": 23, "media": "daf"}])
     poller = NodePoller(db)
     device = db.device(did)
     poller._poll_environment(did, device, db.effective_config(device), set(),
@@ -313,6 +324,9 @@ try:
     check("...while the ports this poll's sensors did answer for are badged "
           "from it as usual: a cut-short walk stops nothing else",
           media.get(1) == "optic", media)
+    check("a stored 'daf' badge also survives a truncated entPhysicalClass "
+          "walk",
+          media.get(23) == "daf", media)
     db.close()
 finally:
     stub.kill()
@@ -604,6 +618,18 @@ for text in DAC_POSITIVES:
     check(f"_DAC_TEXT matches {text!r}", bool(_DAC_TEXT.search(text)))
 for text in DAC_NEGATIVES:
     check(f"_DAC_TEXT does not match {text!r}", not _DAC_TEXT.search(text))
+
+# ------------------------------------- § 5c _DAF_TEXT, regex-only (5.63.0)
+_DAF_TEXT = nodepoll_mod._DAF_TEXT
+DAF_POSITIVES = ["SFP-10G-Active-Cable", "SFP-10G-AOC3M", "QSFP-100G-AOC5M",
+                 "10GBase-AOC", "Active Optical Cable"]
+for text in DAF_POSITIVES:
+    check(f"_DAF_TEXT matches {text!r}", bool(_DAF_TEXT.search(text)))
+    check(f"...and {text!r} does not also read as _DAC_TEXT",
+          not _DAC_TEXT.search(text))
+for text in DAC_POSITIVES:
+    check(f"_DAC_TEXT positive {text!r} does not also read as _DAF_TEXT",
+          not _DAF_TEXT.search(text))
 
 # --------------------------------- § 6 _optic_mode, real Cisco part numbers
 _optic_mode = nodepoll_mod._optic_mode

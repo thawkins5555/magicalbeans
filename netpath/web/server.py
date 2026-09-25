@@ -226,6 +226,9 @@ ROUTES = [
     ("POST", r"^/api/account/sms/start$", api.post_account_sms_start, None),
     ("POST", r"^/api/account/sms/confirm$", api.post_account_sms_confirm, None),
     ("DELETE", r"^/api/account/sms$", api.delete_account_sms, None),
+    ("GET", r"^/api/account/ssh$", api.get_account_ssh, None),
+    ("PUT", r"^/api/account/ssh$", api.put_account_ssh, None),
+    ("DELETE", r"^/api/account/ssh$", api.delete_account_ssh, None),
     # An API token is a service-account credential, not a person's:
     # issuing or revoking one is as administrative an act as creating or
     # deleting the account it authenticates as, so it sits behind the same
@@ -544,7 +547,6 @@ ROUTES = [
     ("POST", r"^/api/alerts/smtp/test$", api.post_alerts_smtp_test, ("alerts", W)),
     ("POST", r"^/api/alerts/sms/credential$", api.post_alerts_sms_credential, ("alerts", W)),
     ("DELETE", r"^/api/alerts/sms/credential$", api.delete_alerts_sms_credential, ("alerts", W)),
-    ("POST", r"^/api/alerts/sms/test$", api.post_alerts_sms_test, ("alerts", W)),
     ("POST", r"^/api/alerts/engine$", api.post_alerts_engine, ("alerts", W)),
     # Per-device chassis-temperature (and future threshold-rule) overrides —
     # an Alerts concern even though the device dialog that edits one is most
@@ -577,6 +579,9 @@ ROUTES = [
     ("POST", r"^/api/ipam/worker$", api.post_ipam_worker, ("ipam", W)),
     ("GET", r"^/api/configrx/overview$", api.get_configrx_overview, ("configrx", R)),
     ("GET", r"^/api/configrx/devices$", api.get_configrx_devices, ("configrx", R)),
+    # The single global ConfigRX account, used when a device has none of its own.
+    ("POST", r"^/api/configrx/credential$", api.post_configrx_credential, ("configrx", W)),
+    ("DELETE", r"^/api/configrx/credential$", api.delete_configrx_credential, ("configrx", W)),
     ("POST", r"^/api/configrx/devices/bulk-config$", api.post_configrx_devices_bulk_config, ("configrx", W)),
     ("POST", r"^/api/configrx/devices/bulk-credential$", api.post_configrx_devices_bulk_credential, ("configrx", W)),
     ("POST", r"^/api/configrx/devices/bulk-backup$", api.post_configrx_devices_bulk_backup, ("configrx", W)),

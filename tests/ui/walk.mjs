@@ -285,6 +285,39 @@ async function waitForOpticModeClassification(page, name) {
   }
 }
 
+async function waitForDafClassification(page, name) {
+  // Same deterministic wait as waitForCopperClassification, for a
+  // media='daf' interface -- every cisco_access persona's DAF cage
+  // (demo/personas.py's _build_cisco_access, 5.63.0).
+  const origin = new URL(page.url()).origin;
+  const list = await page.request.get(
+    `${origin}/api/nodes/devices?q=${encodeURIComponent(name)}`);
+  const devices = list.ok() ? (await list.json()).devices || [] : [];
+  const device = devices.find((d) => d.name === name);
+  if (!device) return { present: false };
+  const started = Date.now();
+  const deadline = started + 150000;
+  let polled = false;
+  for (;;) {
+    const res = await page.request.get(
+      `${origin}/api/nodes/devices/${device.id}/interfaces`);
+    const interfaces = res.ok() ? (await res.json()).interfaces || [] : [];
+    if (interfaces.some((row) => row.media === 'daf')) {
+      return { present: true, id: device.id, classified: true };
+    }
+    if (!polled) {
+      polled = true;
+      await page.request.post(`${origin}/api/nodes/devices/${device.id}/poll`,
+        { data: {} }).catch(() => {});
+    }
+    if (Date.now() >= deadline) {
+      return { present: true, id: device.id, classified: false,
+               waited_s: Math.round((Date.now() - started) / 1000) };
+    }
+    await sleep(3000);
+  }
+}
+
 async function waitForFiberViewLinks(page, mapId) {
   // Deterministic replacement for racing nodepoll's environment/STP poll
   // cadences: wait, via the API, until the map's own links carry the
@@ -1193,6 +1226,167 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       return 'COP badge present';
     });
 
+  await check('the Nodes interface list shows a DAF badge for an active '
+    + 'optical cable (5.63.0)',
+    async () => {
+      await page.keyboard.press('Escape').catch(() => {});
+      await page.waitForSelector('#modal[hidden]', { state: 'attached', timeout: 5000 }).catch(() => {});
+      await selectTab(page, 'nodes');
+      await settle(page, 800);
+      await page.click('#page-nodes > .subtabs > .subtab[data-subtab="devices"]').catch(() => {});
+      const row = page.locator('#nodes-table tbody tr', { hasText: 'acc-sw-001' }).first();
+      const found = await row.count() > 0;
+      if (!found) return 'skipped: acc-sw-001 is not in this fleet';
+      const daf = await waitForDafClassification(page, 'acc-sw-001');
+      if (!daf.present) return 'skipped: acc-sw-001 is not in this fleet';
+      assert(daf.classified,
+        `acc-sw-001 had no DAF interface after ${daf.waited_s}s, poll-now included`);
+      await row.click();
+      const hasRow = await page.waitForSelector('#nd-if-table tbody tr', { timeout: 20000 })
+        .then(() => true).catch(() => false);
+      if (!hasRow) return 'skipped: acc-sw-001 lists no interfaces';
+      await page.waitForResponse((res) => new URL(res.url()).pathname.endsWith('/interfaces')
+        && res.request().method() === 'GET', { timeout: 5000 }).catch(() => {});
+      await sleep(500);
+
+      const cell = await page.$('#nd-if-table .badge-daf');
+      assert(cell, 'expected #nd-if-table to carry a .badge-daf cell for acc-sw-001');
+      return 'DAF badge present';
+    });
+
+  await check('the SSH button opens its window centred on screen, not the '
+    + 'top-left corner (5.63.0)',
+    async () => {
+      await page.keyboard.press('Escape').catch(() => {});
+      await selectTab(page, 'nodes');
+      await settle(page, 800);
+      await page.click('#page-nodes > .subtabs > .subtab[data-subtab="devices"]').catch(() => {});
+      const row = page.locator('#nodes-table tbody tr', { hasText: 'acc-sw-001' }).first();
+      const found = await row.count() > 0;
+      if (!found) return 'skipped: acc-sw-001 is not in this fleet';
+      await row.click();
+      await page.waitForSelector('#nd-detail:not([hidden])', { timeout: 10000 });
+      const sshVisible = await page.isVisible('#nd-ssh-device');
+      if (!sshVisible) return 'skipped: this walk account has no ssh write access';
+      await page.evaluate(() => {
+        window.__sshOpenFeatures = null;
+        window.__realOpen = window.open;
+        window.open = (url, name, feats) => { window.__sshOpenFeatures = feats || ''; return null; };
+      });
+      await page.click('#nd-ssh-device');
+      const features = await page.evaluate(() => {
+        const f = window.__sshOpenFeatures;
+        window.open = window.__realOpen;
+        return f;
+      });
+      assert(features !== null, 'clicking #nd-ssh-device did not call window.open');
+      assert(features.includes('left='),
+        `expected the SSH window's feature string to include left=, got: ${features}`);
+      return `features "${features}"`;
+    });
+
+  await check('Alerts settings: no default text-alert numbers list, no '
+    + 'test-text field (5.63.0)',
+    async () => {
+      await page.keyboard.press('Escape').catch(() => {});
+      await selectTab(page, 'alerts');
+      await settle(page, 800);
+      await page.click('#alerts-settings');
+      await page.waitForSelector('#modal:not([hidden])', { timeout: 10000 });
+      const html = await page.locator('#modal-box').innerHTML();
+      assert(!/as-sms-to-list|as-sms-to-add|as-testsms/.test(html),
+        'expected no default-numbers list, add input or test-text field id in Alerts settings');
+      assert(!/Send a test text to/i.test(html),
+        'expected no "Send a test text to" field in Alerts settings');
+      await page.keyboard.press('Escape');
+      await sleep(300);
+      return 'no default-numbers list or test-text field present';
+    });
+
+  await check('Alerts rules: the built-in dhcp_poll_failed rule is listed; '
+    + 'Add rule offers the dhcp_event kind (5.63.0)',
+    async () => {
+      await page.keyboard.press('Escape').catch(() => {});
+      await selectTab(page, 'alerts');
+      await settle(page, 800);
+      try {
+        await page.click('#page-alerts > .subtabs > .subtab[data-subtab="rules"]');
+        await page.waitForSelector('#alerts-rules-table tbody tr', { timeout: 20000 });
+        const ruleText = await page.locator('#alerts-rules-table').innerText();
+        assert(/DHCP server poll failing/.test(ruleText),
+          `expected the built-in "DHCP server poll failing" rule listed, got: ${ruleText}`);
+        await page.click('#alerts-add-rule');
+        await page.waitForSelector('#modal:not([hidden]) #ar-kind', { timeout: 10000 });
+        const kindOptions = await page.locator('#ar-kind option').allTextContents();
+        assert(kindOptions.includes('dhcp_event'),
+          `expected dhcp_event in the kind picker, got: ${kindOptions.join(', ')}`);
+        return `rule listed; kind picker has ${kindOptions.length} options including dhcp_event`;
+      } finally {
+        // Restore Alerts' list subtab with no modal open (checks 82/83 rely on this).
+        await page.keyboard.press('Escape').catch(() => {});
+        await sleep(300);
+        await page.click('#page-alerts > .subtabs > .subtab[data-subtab="current"]').catch(() => {});
+        await sleep(300);
+      }
+    });
+
+  await check('Alerts: two consecutive failed DHCP polls open a '
+    + 'dhcp_poll_failed alert, a good poll resolves it (5.63.0)',
+    async () => {
+      const origin = new URL(page.url()).origin;
+      const config = await (await page.request.get(`${origin}/api/config`)).json();
+      const originalInterval = (config.ipam_settings || {}).dhcp_poll_interval_minutes ?? 15;
+      let serverId = null;
+      try {
+        // Fast cadence so two consecutive failed polls land inside the wait below.
+        await page.request.post(`${origin}/api/settings`,
+          { data: { scope: 'ipam', values: { dhcp_poll_interval_minutes: 1 } } });
+        const created = await page.request.post(`${origin}/api/ipam/dhcp/servers`,
+          { data: { address: '203.0.113.253', label: 'walk-unreachable-dhcp' } });
+        assert(created.ok(), `adding the DHCP server answered ${created.status()}`);
+        serverId = (await created.json()).id;
+
+        const rulesRes = await page.request.get(`${origin}/api/alerts/rules`);
+        const rules = rulesRes.ok() ? (await rulesRes.json()).rules || [] : [];
+        const rule = rules.find((r) => r.key === 'dhcp_poll_failed');
+        assert(rule, 'expected a built-in dhcp_poll_failed rule');
+
+        // No PowerShell in this container, so every poll of this unreachable
+        // server fails fast (DhcpUnavailable) -- exactly the failure this
+        // check needs counted.
+        const started = Date.now();
+        const deadline = started + 200000;
+        let failures = 0, openAlert = null;
+        for (;;) {
+          const serversRes = await page.request.get(`${origin}/api/ipam/dhcp/servers`);
+          const servers = serversRes.ok() ? (await serversRes.json()).servers || [] : [];
+          const server = servers.find((s) => s.id === serverId);
+          failures = server ? server.poll_failures : 0;
+          if (failures >= 2) {
+            const alertsRes = await page.request.get(
+              `${origin}/api/alerts?rule_id=${rule.id}&state=open`);
+            const alerts = alertsRes.ok() ? (await alertsRes.json()).alerts || [] : [];
+            openAlert = alerts.find((a) => a.entity_id === String(serverId));
+            if (openAlert) break;
+          }
+          if (Date.now() >= deadline) break;
+          await sleep(3000);
+        }
+        assert(failures >= 2, `expected poll_failures >= 2 within 200s, got ${failures}`);
+        assert(openAlert,
+          `expected an open dhcp_poll_failed alert within 200s, poll_failures=${failures}`);
+        assert(openAlert.rule_name === rule.name,
+          `expected the open alert's rule_name to be "${rule.name}", got: ${openAlert.rule_name}`);
+        return `poll_failures=${failures}, alert #${openAlert.id} open ("${openAlert.rule_name}")`;
+      } finally {
+        await page.request.post(`${origin}/api/settings`,
+          { data: { scope: 'ipam', values: { dhcp_poll_interval_minutes: originalInterval } } });
+        if (serverId !== null) {
+          await page.request.delete(`${origin}/api/ipam/dhcp/servers/${serverId}`).catch(() => {});
+        }
+      }
+    });
+
   await check('the Nodes interface list shows a ·MM badge for a multimode '
     + 'optic (5.36.0)',
     async () => {
@@ -1644,6 +1838,15 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
         + `${drawnForPair} link(s) drawn for the parallel pair`;
     });
 
+  await check('Mapper: the legend span is gone from every mode (5.63.0)',
+    async () => {
+      await selectTab(page, 'mapper');
+      await settle(page, 500);
+      const legendPresent = await page.evaluate(() => !!document.getElementById('mp-legend'));
+      assert(!legendPresent, 'expected #mp-legend removed from the DOM');
+      return 'no #mp-legend element found';
+    });
+
   await check('Mapper: a per-VLAN STP read draws acc-sw-005\'s second uplink '
     + 'blocking though its default-context state forwards (5.37.0)',
     async () => {
@@ -2027,10 +2230,6 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
         `VLAN 20 per-link mismatch(es): ${JSON.stringify(snap20.mismatches)}`);
       assert(snap20.glowing >= 1,
         `expected at least one link to glow for VLAN 20, compared ${snap20.compared} link(s)`);
-      const legendText20 = await page.evaluate(() =>
-        (document.getElementById('mp-legend') || {}).textContent || '');
-      assert(legendText20.includes('on both ends'),
-        `expected the legend to mention "on both ends", got: ${legendText20}`);
 
       // Clear the VlanView selection and confirm the glow underlay is gone.
       await clickVlanRow(20);
@@ -2668,6 +2867,93 @@ async function checkDialog(page, dir, tag) {
     return `"${before.title}" had Cancel, Escape closed it`;
   });
 
+  await check('Account: the SSH login fieldset renders, and saves/clears or '
+    + 'refuses per DPAPI availability (5.63.0)',
+    async () => {
+      const origin = new URL(page.url()).origin;
+      await page.click('#account-btn');
+      await page.waitForSelector('#modal:not([hidden])', { timeout: 10000 });
+      await page.waitForSelector('#am-ssh-body', { timeout: 10000 });
+      await page.waitForFunction(() =>
+        (document.getElementById('am-ssh-body') || {}).textContent !== 'Loading…',
+        null, { timeout: 10000 });
+      const infoRes = await page.request.get(`${origin}/api/account/ssh`);
+      const info = infoRes.ok() ? await infoRes.json() : { available: false };
+      if (!info.available) {
+        const html = await page.locator('#am-ssh-body').innerHTML();
+        assert(/cannot be stored on this host/.test(html),
+          `expected the DPAPI-unavailable notice in #am-ssh-body, got: ${html}`);
+        // The form is hidden, but the route itself must refuse the same way.
+        const refused = await page.request.put(`${origin}/api/account/ssh`,
+          { data: { ssh_username: 'walk-ssh-user', ssh_password: 'walk-ssh-password' } });
+        const refusedBody = await refused.json().catch(() => ({}));
+        assert(!refused.ok(), 'PUT /api/account/ssh unexpectedly succeeded with no DPAPI');
+        assert(/DPAPI/.test(refusedBody.error || ''),
+          `expected a DPAPI refusal from PUT /api/account/ssh, got: ${refusedBody.error}`);
+        await page.keyboard.press('Escape');
+        await sleep(300);
+        return 'DPAPI unavailable: UI notice and API refusal both confirmed';
+      }
+      await page.fill('#am-ssh-username', 'walk-ssh-user');
+      await page.fill('#am-ssh-password', 'walk-ssh-password');
+      await page.click('#am-ssh-save');
+      await page.waitForFunction(() =>
+        /Stored as/.test((document.getElementById('am-ssh-status-line') || {}).textContent || ''),
+        null, { timeout: 10000 });
+      await page.click('#am-ssh-clear');
+      await page.waitForFunction(() =>
+        /No SSH login stored/.test((document.getElementById('am-ssh-status-line') || {}).textContent || ''),
+        null, { timeout: 10000 });
+      await page.keyboard.press('Escape');
+      await sleep(300);
+      return 'DPAPI available: saved then cleared';
+    });
+
+  await check('ConfigRX settings: the Global SSH account fieldset renders; '
+    + 'store/clear refuses or succeeds per DPAPI availability (5.63.0)',
+    async () => {
+      const origin = new URL(page.url()).origin;
+      await selectTab(page, 'configrx');
+      await settle(page, 800);
+      await page.click('#cx-settings');
+      await page.waitForSelector('#modal:not([hidden])', { timeout: 10000 });
+      await page.waitForSelector('#cxs-global-username', { timeout: 10000 });
+      const canStore = await page.evaluate(() => App.canStoreSecrets());
+      const fieldset = page.locator('fieldset', { hasText: 'GLOBAL SSH ACCOUNT' });
+      if (!canStore) {
+        const html = await fieldset.innerHTML();
+        assert(/cannot be stored on this host/.test(html),
+          `expected the DPAPI-unavailable notice in the Global SSH account fieldset, got: ${html}`);
+        assert(!(await page.$('#cxs-global-password')),
+          'expected no #cxs-global-password field with DPAPI unavailable');
+        await page.keyboard.press('Escape');
+        await sleep(300);
+        // The form is hidden, but the route itself must refuse the same way.
+        const refused = await page.request.post(`${origin}/api/configrx/credential`,
+          { data: { ssh_username: 'walk-cx-user', ssh_password: 'walk-cx-password' } });
+        const refusedBody = await refused.json().catch(() => ({}));
+        assert(!refused.ok(), 'POST /api/configrx/credential unexpectedly succeeded with no DPAPI');
+        assert(/DPAPI/.test(refusedBody.error || ''),
+          `expected a DPAPI refusal from POST /api/configrx/credential, got: ${refusedBody.error}`);
+        return 'DPAPI unavailable: UI notice and API refusal both confirmed';
+      }
+      await page.fill('#cxs-global-username', 'walk-cx-user');
+      await page.fill('#cxs-global-password', 'walk-cx-password');
+      await page.click('.modal-buttons button.primary');
+      await page.waitForSelector('#modal[hidden]', { timeout: 15000 });
+      await page.click('#cx-settings');
+      await page.waitForSelector('#modal:not([hidden])', { timeout: 10000 });
+      const stored = await page.locator('fieldset', { hasText: 'GLOBAL SSH ACCOUNT' }).innerHTML();
+      assert(/Stored as/.test(stored), `expected a "Stored as" line, got: ${stored}`);
+      const clearButton = page.locator('.modal-buttons button', { hasText: 'Clear global SSH account' });
+      assert(await clearButton.count() > 0, 'expected a Clear global SSH account button once stored');
+      await clearButton.click();
+      await page.waitForSelector('#modal:not([hidden]) .modal-buttons button.danger', { timeout: 10000 });
+      await page.click('#modal:not([hidden]) .modal-buttons button.danger');
+      await page.waitForSelector('#modal[hidden]', { timeout: 15000 });
+      return 'DPAPI available: saved then cleared via the settings dialog';
+    });
+
   await closeAnything(page);
 
   await check('the WEB button on a selected device is shown and gated on web', async () => {
@@ -2935,6 +3221,7 @@ async function checkRouting(page, base, dir, tag) {
   });
 
   await check('a cold navigation to an alert route opens that alert', async () => {
+    assert(alertHash, 'no alert hash from the previous check');
     await page.goto(`${base}/${alertHash}`, { waitUntil: 'domcontentloaded' });
     await ready(page);
     await sleep(4000);
@@ -3442,6 +3729,32 @@ async function checkMisc(page, watcher) {
     assert(netpath === 'false' || netpath === 'true', `#netpath-print aria-pressed is "${netpath}"`);
     assert(mapper === 'false' || mapper === 'true', `#mp-print aria-pressed is "${mapper}"`);
     return `netpath=${netpath} mapper=${mapper}`;
+  });
+
+  await check('Routes: the toolbar sits at the right of a full-width strip, '
+    + 'sidebar still beside the canvas (5.63.0)', async () => {
+    await selectTab(page, 'netpath');
+    await settle(page, 500);
+    const layout = await page.evaluate(() => {
+      const printBox = document.getElementById('netpath-print').getBoundingClientRect();
+      const sidebar = document.querySelector('#page-netpath .sidebar').getBoundingClientRect();
+      const canvas = document.querySelector('#page-netpath .cols > :not(.sidebar):not(.divider)')
+        .getBoundingClientRect();
+      return {
+        printCenterX: printBox.x + printBox.width / 2,
+        viewportWidth: window.innerWidth,
+        sidebarLeft: sidebar.x,
+        canvasLeft: canvas.x,
+      };
+    });
+    assert(layout.printCenterX > layout.viewportWidth / 2,
+      `#netpath-print centre (${layout.printCenterX}) is not in the right half `
+      + `of the viewport (${layout.viewportWidth})`);
+    assert(layout.sidebarLeft < layout.canvasLeft,
+      `expected the Routes sidebar (x=${layout.sidebarLeft}) beside, not below, `
+      + `the canvas (x=${layout.canvasLeft})`);
+    return `print centre x=${Math.round(layout.printCenterX)} of ${layout.viewportWidth}, `
+      + 'sidebar beside canvas';
   });
 
   // App.ipCell's actions button: an empty table on a fresh demo run is not

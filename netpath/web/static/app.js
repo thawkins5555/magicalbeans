@@ -126,6 +126,10 @@ const App = (() => {
       </fieldset>
       ${appearanceHtml}
       ${forced ? '' : `
+      <fieldset id="am-ssh"><legend>SSH login (used by the SSH button)</legend>
+        <div id="am-ssh-body"><p class="hint">Loading…</p></div>
+      </fieldset>`}
+      ${forced ? '' : `
       <fieldset id="am-sms"><legend>Text alerts (SMS)</legend>
         <div id="am-sms-body"><p class="hint">Loading…</p></div>
       </fieldset>`}
@@ -220,6 +224,57 @@ const App = (() => {
           window.open(`${window.location.origin}/?${params}#/${first}`, '_blank', 'noopener');
         };
       }
+      // Renders the SSH-login fieldset from GET/PUT/DELETE /api/account/ssh,
+      // the same re-render-from-response shape renderSms below uses. This is
+      // the only credential the SSH button ever reads (sshterm.py) — ConfigRX
+      // keeps its own, separate, device-scoped one.
+      const renderSsh = (info) => {
+        const sshBody = box.querySelector('#am-ssh-body');
+        if (!sshBody) return;
+        const hadFocus = sshBody.contains(document.activeElement);
+        if (!info.available) {
+          sshBody.innerHTML = credentialUnavailableHtml('An SSH login');
+        } else {
+          const statusLine = info.has_password
+            ? `Stored as <b>${escapeHtml(info.username || '')}</b>, saved ${escapeHtml(when(info.stored_ts))}.`
+            : 'No SSH login stored.';
+          sshBody.innerHTML = `
+            <p class="hint" id="am-ssh-status-line">${statusLine}</p>
+            <label>Username <input id="am-ssh-username" value="${escapeHtml(info.username || '')}"></label>
+            <label>Password <input id="am-ssh-password" type="password"
+              placeholder="${info.has_password ? 'stored — leave blank to keep' : ''}"></label>
+            <div class="row"><button type="button" id="am-ssh-save">Save</button>
+              ${info.has_password ? '<button type="button" id="am-ssh-clear">Clear</button>' : ''}</div>`;
+          sshBody.querySelector('#am-ssh-save').onclick = async () => {
+            const username = sshBody.querySelector('#am-ssh-username').value.trim();
+            const password = sshBody.querySelector('#am-ssh-password').value;
+            if (!username || !password) {
+              showModalError(box, 'A username and password are both required');
+              return;
+            }
+            try {
+              renderSsh(await put('/api/account/ssh',
+                { ssh_username: username, ssh_password: password }));
+              announce('SSH login saved');
+            } catch (error) { showModalError(box, error.message); }
+          };
+          const clearButton = sshBody.querySelector('#am-ssh-clear');
+          if (clearButton) {
+            clearButton.onclick = async () => {
+              try { renderSsh(await del('/api/account/ssh')); announce('SSH login cleared'); }
+              catch (error) { showModalError(box, error.message); }
+            };
+          }
+        }
+        if (hadFocus) {
+          const toFocus = sshBody.querySelector('input, button');
+          if (toFocus) toFocus.focus();
+        }
+      };
+      get('/api/account/ssh').then(renderSsh).catch((error) => {
+        const sshBody = box.querySelector('#am-ssh-body');
+        if (sshBody) sshBody.innerHTML = `<p class="hint">${escapeHtml(error.message || 'Failed to load')}</p>`;
+      });
       // Renders the SMS fieldset by status; each button wires its own
       // handler and re-renders from the response rather than the whole
       // modal reopening. Focus is only restored into the fieldset if it
@@ -250,7 +305,7 @@ const App = (() => {
           };
           smsBody.querySelector('#am-sms-resend').onclick = async () => {
             try {
-              const result = await post('/api/account/sms/start', { number: info.number, consent: true, terms: true });
+              const result = await post('/api/account/sms/start', { number: info.number, consent: true, terms: true, privacy: true });
               renderSms(result);
               announce('Verification code sent');
             } catch (error) { showModalError(box, error.message); }
@@ -653,6 +708,14 @@ const App = (() => {
       ' CREDENTIAL-SECURITY.md), and neither is set up here.</p>';
   }
 
+  /* Feature string for a popup centred over the current window, so SSH/WEB/AP
+     windows stop landing in the top-left corner. */
+  function windowFeatures(width, height) {
+    const left = window.screenX + Math.max(0, (window.outerWidth - width) / 2);
+    const top = window.screenY + Math.max(0, (window.outerHeight - height) / 2);
+    return `width=${width},height=${height},left=${left},top=${top}`;
+  }
+
   /* A shell is not a dialog: it is kept open beside the product, resized
      and lived in. The name keys the window to the device, so a second
      click raises the session it already has. `noopener` cannot be in the feature string for that — a window
@@ -662,7 +725,7 @@ const App = (() => {
   function openSshWindow(deviceId, name) {
     const w = window.open(
       `/ssh.html?device=${deviceId}&name=${encodeURIComponent(name)}`,
-      `ssh-${deviceId}`, 'width=1000,height=640');
+      `ssh-${deviceId}`, windowFeatures(1000, 640));
     if (w) {
       w.opener = null;
       w.focus();
@@ -673,7 +736,7 @@ const App = (() => {
      a `window.open` after an `await` is no longer inside the click that
      caused it, and every browser's popup blocker eats it. */
   async function openWebTunnel(deviceId) {
-    const w = window.open('', `web-${deviceId}`, 'width=1200,height=800');
+    const w = window.open('', `web-${deviceId}`, windowFeatures(1200, 800));
     if (w) w.opener = null;
     try {
       const relay = await post(`/api/web/devices/${deviceId}/relay`, {});
@@ -6274,6 +6337,7 @@ const App = (() => {
     state.alertsSettings = config.alerts_settings;
     state.wirelessSettings = config.wireless_settings;
     state.configrxSettings = config.configrx_settings;
+    state.configrxGlobalCredential = config.configrx_global_credential;
     state.dimensions = config.dimensions;
     state.categories = config.categories;
     state.severities = config.severities;
@@ -6892,7 +6956,7 @@ const App = (() => {
     bulkToggle, bulkClear,
     announce, desktopNotifyEnabled, setDesktopNotify, titleForAlerts,
     canStoreSecrets, credentialUnavailableHtml,
-    openSshWindow, openWebTunnel,
+    windowFeatures, openSshWindow, openWebTunnel,
     registerHelp, helpLink,
     resetLayout, onRelayout, setTheme, currentTheme, tile, figure, figures, comboBox,
     drawSeriesChart, formatMetricValue, sparkline, RANGES, rangeDialog, rangeLabel,

@@ -3116,10 +3116,14 @@ check(_ar_notify_sms_count >= 2,
       "the checkbox is offered in both the edit and the create rule forms")
 check("values.notify_sms = box.querySelector('#ar-notify-sms').checked;" in NODES62,
       "both forms' Save handlers send notify_sms")
-for _id in ("as-sms-minsev", "as-twilio-token", "as-sms-to-list",
-           "as-sms-to-add", "as-testsms"):
+for _id in ("as-sms-minsev", "as-twilio-token"):
     check('id="%s"' % _id in NODES62,
           "the alerts settings dialog has the %s control for Twilio SMS" % _id)
+# 5.63.0: only an account can opt its own number in — the admin default
+# number list, its Add control and the test-text field are gone.
+for _id in ("as-sms-to-list", "as-sms-to-add", "as-testsms"):
+    check('id="%s"' % _id not in NODES62,
+          "the alerts settings dialog no longer has the %s control" % _id)
 # These ids are handed to App.form.check/text/number as the first argument
 # rather than written as literal id="..." markup, so the id itself is the
 # quoted string those helpers are called with.
@@ -3127,8 +3131,8 @@ for _id in ("as-sms", "as-twilio-sid", "as-twilio-from", "as-twilio-msid",
            "as-sms-maxhour"):
     check("'%s'" % _id in NODES62,
           "the alerts settings dialog has the %s control for Twilio SMS" % _id)
-check("App.post('/api/alerts/sms/test'" in NODES62,
-      "Send test text posts to the SMS test route")
+check("App.post('/api/alerts/sms/test'" not in NODES62,
+      "the SMS test route is no longer posted to")
 check("label: 'Send test email'" in NODES62,
       "the SMTP test button says what it sends")
 check("App.post('/api/alerts/sms/credential'" in NODES62,
@@ -3151,10 +3155,15 @@ check("twilio_auth_mode:" in NODES63,
       "Save sends twilio_auth_mode in the /api/settings values")
 check("for the selected method before saving" in NODES63,
       "Save refuses to silently switch auth mode without a new secret")
-check('id="as-sms-consent"' in NODES63, "the SMS number list carries the A2P consent notice")
-check("Reply STOP to unsubscribe" in NODES63, "...with STOP/HELP wording carriers expect")
-check('href="/sms-terms"' in NODES63 and 'href="/sms-privacy"' in NODES63,
-      "...and links to the SMS Terms and SMS Privacy pages (5.53.1)")
+# 5.63.0: the admin default-number list (and its A2P consent hint) is gone
+# along with it — only an account's own opt-in carries this wording now,
+# in app.js's Account dialog, not here.
+check('id="as-sms-consent"' not in NODES63,
+      "the admin SMS number list's A2P consent notice is gone")
+check("Reply STOP to unsubscribe" not in NODES63,
+      "...its STOP/HELP wording with it")
+check('href="/sms-terms"' not in NODES63 and 'href="/sms-privacy"' not in NODES63,
+      "...and its SMS Terms/Privacy links with it")
 
 # --- 64. 5.21.0: the modular Dashboard --------------------------------------
 DASH64 = read("dashboard.js")
@@ -3684,9 +3693,9 @@ check(".badge-cop" in APP_CSS,
       "app.css styles the COP badge, or it inherits the amber warning fill "
       "every other badge uses")
 _DEV_DIALOG80 = js_function(NODES80, "deviceDialog")
-check("r.media !== 'copper' && r.media !== 'dac' && dialogOptics.has(r.if_index)"
+check("r.media !== 'copper' && r.media !== 'dac' && r.media !== 'daf' && dialogOptics.has(r.if_index)"
       in _DEV_DIALOG80,
-      "a stored COP/DAC row is never upgraded to DOM by the live /dom read, "
+      "a stored COP/DAC/DAF row is never upgraded to DOM by the live /dom read, "
       "whatever it carries for that port")
 check("dialogOptics = new Set(rows.filter((s) => s.unit === 'dBm')" in _DEV_DIALOG80,
       "the live read only counts an optical-power (dBm) row toward DOM -- "
@@ -4484,16 +4493,12 @@ check("'wireless.ap.web': {" in APP95,
 MAPPER96 = read("mapper.js")
 CSS96 = read("app.css")
 
-# 96a. The VLAN/dash/dot note is removed; the FiberView key and the
-#      no-adjacency message stay.
-_LEGEND96 = js_function(MAPPER96, "drawLegend")
-check("draw as one thick line" not in _LEGEND96
-      and "A dashed line means" not in _LEGEND96
-      and "spanning-tree-blocked port" not in _LEGEND96,
-      "drawLegend no longer explains the VLAN line styles")
-check("FiberView: dark orange = multimode" in _LEGEND96
-      and "No CDP/LLDP adjacency was found" in _LEGEND96,
-      "the FiberView key and the empty-map message survive that removal")
+# 96a. The whole legend note is removed (5.63.0): no drawLegend function
+#      and no #mp-legend span; the FiberView checkbox's own tooltip in the
+#      markup is the only explanation of FiberView left.
+check("function drawLegend(" not in MAPPER96, "drawLegend no longer exists")
+check('id="mp-legend"' not in INDEX95,
+      "the #mp-legend span is gone from the Mapper header")
 
 # 96b. The blocked dots are their own unglowed path, not a dasharray on the
 #      glowing one -- the glow's blur was smearing them into a solid line.
@@ -5028,6 +5033,9 @@ check("/api/account/sms/start" in ACCOUNT_MODAL103,
       "accountModal calls the SMS start route")
 check("/api/account/sms/confirm" in ACCOUNT_MODAL103,
       "accountModal calls the SMS confirm route")
+check("consent: true, terms: true, privacy: true" in ACCOUNT_MODAL103,
+      "Resend code posts privacy: true too, or the server refuses it "
+      "(api/auth.py's post_account_sms_start)")
 check("const number = escapeHtml(" in ACCOUNT_MODAL103,
       "the SMS number is escaped before it is interpolated")
 check('href="/sms-terms"' in ACCOUNT_MODAL103 and 'href="/sms-privacy"' in ACCOUNT_MODAL103,
@@ -5105,6 +5113,18 @@ check("dac_count" in _REPORT106,
 _NODEPOLL106 = python_text("nodepoll")
 check("_DAC_TEXT" in _NODEPOLL106,
       "nodepoll's _decode.py defines the twinax/direct-attach regex")
+check("badge badge-daf" in NODES106 and "r.media === 'daf'" in NODES106,
+      "sfpBadge renders the DAF case off the stored media column too (5.63.0)")
+check(".badge-daf { background: var(--muted)" in CSS106,
+      "app.css styles the DAF badge in the same grey as the other media badges")
+check("result.daf_count" in NODES106,
+      "the SFP report summary line counts DAF ports alongside DAC")
+check("daf_count" in _REPORT106,
+      "report.py's SfpReport carries daf_count through to_dict/sfp_inventory")
+check("_DAF_TEXT" in _NODEPOLL106,
+      "nodepoll's _decode.py defines the active optical (direct-attach fibre) regex")
+check("r.media !== 'daf'" in NODES106,
+      "the SFP dialog's DOM-upgrade guard never overwrites a stored 'daf' row either")
 
 
 # ---------------------------------------------------------------------------
@@ -5885,12 +5905,11 @@ check("mp-vlan-view" in _DRAWLINK126 and "'pointer-events': 'none'" in _DRAWLINK
 _APPCSS126 = read("app.css")
 check(".mp-link.mp-vlan-view" in _APPCSS126 and "--mp-vlan-glow" in _APPCSS126,
       "app.css carries the VlanView glow rule and its colour custom property")
-_DRAWLEGEND126 = js_function(read("mapper.js"), "drawLegend")
-check("VlanView:" in _DRAWLEGEND126,
-      "the legend spells out the VlanView glow/dim behaviour when a VLAN is picked")
+# 5.63.0: the legend (and its VlanView glow/dim explanation) is removed;
+# picking a VLAN in the table now only redraws the canvas.
 _DRAWVLANTABLE126 = js_function(read("mapper.js"), "drawVlanTable")
-check("drawLegend()" in _DRAWVLANTABLE126,
-      "picking a VLAN in the table also redraws the legend, not just the canvas")
+check("drawLegend" not in _DRAWVLANTABLE126,
+      "picking a VLAN in the table no longer redraws a legend that is gone")
 _APP126 = read("app.js")
 check("GAP_BREAK_FACTOR = 4" in _APP126,
       "the chart's gap-break factor is a named constant, not a magic number")
@@ -5946,9 +5965,6 @@ _MAPPER128 = read("mapper.js")
 _DRAWLINK128 = js_function(_MAPPER128, "drawLink")
 check("vlanOnBothEnds(link, view.selectedVlan)" in _DRAWLINK128,
       "drawLink's glow only fires when the picked VLAN is on both ends")
-_DRAWLEGEND128 = js_function(_MAPPER128, "drawLegend")
-check("on both ends" in _DRAWLEGEND128,
-      "the VlanView legend explains the both-ends rule")
 _LINKTOOLTIP128 = js_function(_MAPPER128, "linkTooltip")
 check("vlanEndsText(" in _LINKTOOLTIP128,
       "linkTooltip shows where the picked VLAN sits on this link's ends")
@@ -6052,6 +6068,89 @@ check('id="nd-f-stpinterval" type="number"' in NODES131
 NODES_CRED131 = read("nodes_credentials.js")
 check('id="nd-p-stpinterval" type="number" min="30"' in NODES_CRED131,
       "the group settings form's STP interval floors at 30s too")
+
+# ---------------------------------------------------------------------------
+# 132. Centred SSH/WEB/AP windows (5.63.0): one app.js helper, used at all
+#      three window.open call sites, so none of them opens top-left any more.
+_WINDOWFEATURES132 = js_function(APP, "windowFeatures")
+check("left=" in _WINDOWFEATURES132 and "top=" in _WINDOWFEATURES132,
+      "windowFeatures centres the popup with left=/top= computed off the "
+      "current window's own screen position and size")
+_SSHCLICK132 = js_function(APP, "openSshWindow")
+check("windowFeatures(1000, 640)" in _SSHCLICK132,
+      "openSshWindow opens its window through the shared centring helper")
+_WEBCLICK132 = js_function(APP, "openWebTunnel")
+check("windowFeatures(1200, 800)" in _WEBCLICK132,
+      "openWebTunnel opens its window through the shared centring helper too")
+check("windowFeatures, openSshWindow, openWebTunnel" in APP,
+      "app.js exports windowFeatures alongside the two window openers")
+WIRELESS132 = read("wireless.js")
+_WEBAP132 = js_function(WIRELESS132, "webAp")
+check("App.windowFeatures(1200, 800)" in _WEBAP132,
+      "the wireless AP's WEB button uses app.js's centring helper instead "
+      "of its own literal feature string")
+
+# ---------------------------------------------------------------------------
+# 133. DHCP poll alert (5.63.0): the new dhcp_event rule kind reaches the
+#      Add-rule picker and the mute-reason label map.
+NODES133 = read("alerts.js")
+check('<option value="dhcp_event">dhcp_event</option>' in NODES133,
+      "the Add-rule Kind picker offers dhcp_event")
+check("dhcp_server: 'a DHCP server'" in NODES133,
+      "KIND_LABELS names a dhcp_server entity for the mute-reason text")
+_EDITRULE133 = js_function(NODES133, "editRule")
+check("r.kind === 'dhcp_event'" in _EDITRULE133
+      and "Consecutive failed polls before firing" in _EDITRULE133
+      and 'id="ar-forpolls"' in _EDITRULE133,
+      "editRule shows #ar-forpolls, labelled for the DHCP sense, for a "
+      "dhcp_event rule -- saved through the same PUT as every other kind")
+
+
+# ---------------------------------------------------------------------------
+# 134. ConfigRX global account, per-account SSH login (5.63.0): the two
+#      credentials stay separate, and w.opener = null from block 40 is
+#      unaffected by any of it.
+_ACCOUNTMODAL134 = js_function(APP, "accountModal")
+check('fieldset id="am-ssh"' in _ACCOUNTMODAL134,
+      "the Account dialog gains the #am-ssh SSH-login fieldset")
+check(_ACCOUNTMODAL134.count("forced ? '' : `") >= 2,
+      "#am-ssh is hidden when forced, the same way #am-sms already is")
+check("/api/account/ssh" in _ACCOUNTMODAL134,
+      "accountModal reads and writes GET/PUT/DELETE /api/account/ssh")
+
+SSHHTML134 = read("ssh.html")
+check('id="ssh-remember"' in SSHHTML134,
+      "the terminal's sign-in panel gains the Remember checkbox")
+check("Kept only if Remember is ticked" in SSHHTML134,
+      "and its hint says exactly when a login is kept")
+
+SSHJS134 = read("ssh.js")
+check("el('ssh-remember').checked" in SSHJS134,
+      "the submit handler reads the Remember checkbox")
+check("password: pass.value, remember" in SSHJS134,
+      "and sends it on the auth message")
+check("No SSH login is stored for your account" in SSHJS134,
+      "CRED_REASONS['none-stored'] no longer blames ConfigRX for a login "
+      "this account never had")
+
+_SSHTERM134 = python_text("sshterm")
+check("The SSH login stored for your account was refused." in _SSHTERM134,
+      "a refused stored login is described as the account's own, not "
+      "ConfigRX's")
+check("app_db.user_ssh(self.app_user)" in _SSHTERM134,
+      "_load_stored_credential reads the account's own login, never "
+      "ConfigRX's device-scoped one")
+
+CONFIGRXJS134 = read("configrx.js")
+check('id="cxs-global-username"' in CONFIGRXJS134
+      and 'id="cxs-global-password"' in CONFIGRXJS134,
+      "settingsDialog gains the global ConfigRX SSH account fields")
+check("/api/configrx/credential" in CONFIGRXJS134,
+      "the global account is stored/cleared through its own route, apart "
+      "from the settings save")
+
+check("w.opener = null" in _WEB_CLICK,
+      "block 40's WEB relay window handling is unaffected by this block")
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))

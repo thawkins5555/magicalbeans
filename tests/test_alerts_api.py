@@ -635,6 +635,13 @@ try:
     check("an ordinary key — letters, digits, dot, hyphen, underscore — is "
           "still accepted", status == 200, (status, payload))
 
+    status, payload = call("POST", "/api/alerts/rules",
+                           {"key": "site-a.dhcp_event_rule", "name": "DHCP event rule",
+                            "kind": "dhcp_event", "source_kind": "poll_failed"},
+                           token=admin)
+    check("dhcp_event is an accepted rule kind",
+          status == 200, (status, payload))
+
     # ------------------------------- the webhook URL is a bearer credential
     service.apply_settings("alerts", {
         "webhook_url": "https://hooks.example.com/services/T000/B000/XXXsecret",
@@ -685,12 +692,17 @@ try:
           by_key["site-a.sms_rule"]["notify_sms"] is False, by_key["site-a.sms_rule"])
 
     # ---------------------------------------- 8. SMS settings validation
+    # 5.63.0: only an account can opt its own number in, so sms_to_default
+    # is no longer a saved setting at all — an incoming one, good or bad,
+    # is silently ignored rather than validated or rejected.
     status, payload = call("POST", "/api/settings",
                            {"scope": "alerts",
                             "values": {"sms_to_default": ["bad"]}}, token=admin)
-    check("a bad SMS number is a 400 naming E.164",
-          status == 400 and "E.164" in str(payload.get("error", "")),
-          (status, payload))
+    check("sms_to_default is ignored rather than rejected, even when malformed",
+          status == 200, (status, payload))
+    check("...and nothing is saved under that key",
+          "sms_to_default" not in service.alerts_db.settings(),
+          service.alerts_db.settings())
 
     status, payload = call("POST", "/api/settings",
                            {"scope": "alerts",
@@ -699,7 +711,8 @@ try:
                                           "AC" + "0" * 32,
                                       "twilio_from": "+15557654321"}},
                            token=admin)
-    check("a good SMS number list saves", status == 200, (status, payload))
+    check("the rest of the SMS settings in the same request still save",
+          status == 200, (status, payload))
 
     # ---------------------------------------- 9. SMS credential and test
     from netpath import dpapi
@@ -710,14 +723,6 @@ try:
         check("storing a token with no account_sid in the body binds it to the saved SID",
               status == 200 and service.alerts_db.sms_credential_sid() == "AC" + "0" * 32,
               (status, payload, service.alerts_db.sms_credential_sid()))
-        status, payload = call("POST", "/api/alerts/sms/test",
-                               {"to": "+15550001111",
-                                "twilio_account_sid": "AC" + "1" * 32},
-                               token=admin)
-        check("changing the Account SID without a typed token is refused",
-              status == 400
-              and "cannot use the saved" in str(payload.get("error", "")),
-              (status, payload))
         status, payload = call("POST", "/api/alerts/sms/credential",
                                {"token": "AuthToken123", "account_sid": "AC" + "a" * 32},
                                token=admin)
@@ -785,10 +790,6 @@ try:
               status == 400 and "API Key SID" in str(payload.get("error", "")),
               (status, payload))
 
-        # Bind the saved settings to the same (mode, Account SID, API Key SID)
-        # as the API key credential stored above, so the test-send calls
-        # below actually exercise the API Key SID element of the binding
-        # instead of tripping over a stale auth_mode/Account SID mismatch.
         status, payload = call("POST", "/api/settings",
                                {"scope": "alerts",
                                 "values": {"twilio_auth_mode": "api_key",
@@ -796,28 +797,6 @@ try:
                                           "twilio_api_key_sid": sk_sid}}, token=admin)
         check("settings can be bound to the stored API key credential's SID",
               status == 200, (status, payload))
-
-        from netpath import alertmail as alertmail_mod
-        real_send_sms = alertmail_mod.send_sms
-        alertmail_mod.send_sms = lambda *a, **kw: None
-        try:
-            status, payload = call("POST", "/api/alerts/sms/test",
-                                   {"to": "+15550001111", "twilio_auth_mode": "api_key",
-                                    "twilio_account_sid": "AC" + "a" * 32,
-                                    "twilio_api_key_sid": sk_sid}, token=admin)
-            check("a test body matching the saved API key credential's binding "
-                  "is not refused",
-                  status == 200 and payload.get("ok") is True, (status, payload))
-        finally:
-            alertmail_mod.send_sms = real_send_sms
-
-        status, payload = call("POST", "/api/alerts/sms/test",
-                               {"to": "+15550001111", "twilio_api_key_sid": "SK" + "9" * 32},
-                               token=admin)
-        check("a saved API key credential with a changed API Key SID in the test body "
-              "is refused, naming the API Key SID",
-              status == 400 and "API Key SID" in str(payload.get("error", "")),
-              (status, payload))
 
         log_mark = service.log.last_seq
         status, payload = call("DELETE", "/api/alerts/sms/credential", {}, token=admin)
@@ -834,45 +813,11 @@ try:
         check("DPAPI is unavailable on this machine, so credential storage "
               "is skipped rather than faked here", True)
 
-    status, payload = call("POST", "/api/alerts/sms/test", {}, token=admin)
-    check("a missing destination number is a 400",
-          status == 400, (status, payload))
-
+    # 5.63.0 dropped "Send a test text to": an admin can no longer send a
+    # text to an arbitrary number, only an account can opt its own in.
     status, payload = call("POST", "/api/alerts/sms/test",
-                           {"to": "not-a-number"}, token=admin)
-    check("a badly formed destination number is a 400",
-          status == 400 and "E.164" in str(payload.get("error", "")),
-          (status, payload))
-
-    from netpath import alertmail as alertmail_mod
-
-    real_send_sms = alertmail_mod.send_sms
-    alertmail_mod.send_sms = lambda *a, **kw: None
-    try:
-        status, payload = call("POST", "/api/alerts/sms/test",
-                               {"to": "+15550001111"}, token=admin)
-        check("a faked successful send reports ok",
-              status == 200 and payload.get("ok") is True, (status, payload))
-    finally:
-        alertmail_mod.send_sms = real_send_sms
-
-    def _boom(*a, **kw):
-        raise ValueError("Twilio said no")
-    alertmail_mod.send_sms = _boom
-    try:
-        status, payload = call("POST", "/api/alerts/sms/test",
-                               {"to": "+15550001111"}, token=admin)
-        check("a faked failing send reports ok:false with the error",
-              status == 200 and payload.get("ok") is False
-              and "Twilio said no" in payload.get("error", ""), (status, payload))
-    finally:
-        alertmail_mod.send_sms = real_send_sms
-
-    test_rows = service.alerts_db._conn.execute(
-        "SELECT kind, to_addr, ok FROM notifications WHERE alert_id IS NULL "
-        "AND to_addr = ? ORDER BY ts DESC", ("+15550001111",)).fetchall()
-    check("the test send is recorded as a notification row",
-          len(test_rows) >= 2 and test_rows[0]["kind"] == "test", list(test_rows))
+                           {"to": "+15550001111"}, token=admin)
+    check("the test-text route is gone", status == 404, (status, payload))
 
     actions = [row["action"] for row in audit_since_mark()]
     check("the audit trail records maintenance being turned on",

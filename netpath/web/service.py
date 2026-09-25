@@ -430,7 +430,7 @@ class Service:
         self.ipam_db = IpamDatabase(ipam_db_path)
         self.snmp_db = SnmpTrapDatabase(snmp_db_path)
         self.nodes_db = NodesDatabase(nodes_db_path)
-        self.alerts_db = AlertsDatabase(alerts_db_path)
+        self.alerts_db = AlertsDatabase(alerts_db_path, log=self.log)
         self.wireless_db = WirelessDatabase(wireless_db_path)
         self.configrx_db = ConfigRxDatabase(configrx_db_path)
         # No mapper_db_path constructor parameter: Service.__init__ is called

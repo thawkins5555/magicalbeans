@@ -19,7 +19,7 @@ from ._shared import NotFound, _UNSET, _audit, _audit_diff, _bulk_device_ids, _b
 # ----------------------------------------------------------------- configrx
 
 def _configrx_device_json(service, device_row, worker_state=None,
-                          config=_UNSET) -> dict:
+                          config=_UNSET, global_has_cred=_UNSET) -> dict:
     # `config` pre-read by a list caller that fetched every row in one query
     # (all_device_configs); _UNSET rather than None so "this device has no
     # config row" stays distinguishable from "nobody looked it up yet".
@@ -38,6 +38,11 @@ def _configrx_device_json(service, device_row, worker_state=None,
     name = ((device_row["name"] if device_row["display_name_source"] == "manual" else None)
            or device_row["sys_name"] or device_row["name"] or device_row["ip"])
     override = (config["vendor_override"] if config else "") or ""
+    own_credential = bool(config["ssh_password_enc"]) if config else False
+    if global_has_cred is _UNSET:
+        glob = service.configrx_db.global_credential()
+        global_has_cred = bool(glob and glob["password_enc"])
+    credential_source = "stored" if own_credential else ("global" if global_has_cred else "")
     return {
         "id": device_row["id"], "ip": device_row["ip"],
         "name": name,
@@ -57,7 +62,8 @@ def _configrx_device_json(service, device_row, worker_state=None,
         "ssh_username": (config["ssh_username"] if config else "") or "",
         # Same has_credential convention as every other stored password in
         # this app — the encrypted blob itself never reaches the browser.
-        "has_credential": bool(config["ssh_password_enc"]) if config else False,
+        "has_credential": own_credential,
+        "credential_source": credential_source,
         # Same convention again, for the separate enable secret a vendor like
         # cisco-asa needs to reach privileged EXEC (see _do_enable).
         "has_enable_secret": bool(config["enable_secret_enc"]) if config else False,
@@ -134,8 +140,10 @@ def get_configrx_devices(service, params, body) -> dict:
     # uses: a device_config() per device was one configrx.db lock
     # acquisition per device on every refresh tick.
     configs = {c["device_id"]: c for c in service.configrx_db.all_device_configs()}
+    glob = service.configrx_db.global_credential()
+    global_has_cred = bool(glob and glob["password_enc"])
     devices = [_configrx_device_json(service, r, worker_state,
-                                     configs.get(r["id"]))
+                                     configs.get(r["id"]), global_has_cred)
                for r in rows]
     if params.get("enabled_only") is not None:
         devices = [d for d in devices if d["backup_enabled"]]
@@ -239,6 +247,49 @@ def post_configrx_devices_bulk_backup(service, params, body) -> dict:
                         f"Backup now requested for {len(queued)} device(s)")
     return {"ok": True, "queued": queued, "already_queued": busy,
             "missing": missing, "not_enabled": not_enabled}
+
+
+def post_configrx_credential(service, params, body) -> dict:
+    """Stores the single global ConfigRX account, used for a backup when a
+    device carries no ssh_username/ssh_password of its own."""
+    username = str(body.get("ssh_username", "")).strip()
+    password = str(body.get("ssh_password", ""))
+    if not username:
+        raise ValueError("A username is required")
+    if password:
+        try:
+            encrypted = _encrypt_secret(password, (
+                "This machine cannot encrypt a stored credential — DPAPI is "
+                "Windows-only, so ConfigRX refuses to store an SSH password "
+                "here rather than keep it in plain text."))
+        finally:
+            password = None
+    else:
+        # Username-only update: keep the stored password, refusing only
+        # when there is none to keep.
+        existing = service.configrx_db.global_credential()
+        if not existing or not existing["password_enc"]:
+            raise ValueError("A username and password are both required")
+        encrypted = bytes(existing["password_enc"])
+    service.configrx_db.set_global_credential(username, encrypted)
+    service.log.add(CONFIGRX_CATEGORY, "Stored the global ConfigRX SSH account")
+    _audit(service, params, "credential.store", target="configrx:global",
+           detail=f"username {username}")
+    # Served from /api/config (configrx_global_credential) — refetched only
+    # when config_version moves, the same reason post_configrx_worker bumps it.
+    service.bump_config()
+    return {"ok": True}
+
+
+def delete_configrx_credential(service, params, body) -> dict:
+    result = _clear_credential(
+        service, params,
+        clear=service.configrx_db.clear_global_credential,
+        category=CONFIGRX_CATEGORY,
+        message="Cleared the global ConfigRX SSH account",
+        target="configrx:global")
+    service.bump_config()
+    return result
 
 
 def post_configrx_devices_bulk_credential(service, params, body) -> dict:

@@ -7,7 +7,7 @@ from ..alertrules import DARK_OPTIC_DBM, is_dark_optic
 from ..eventlog import ERROR, NODES
 from ..nodesdb import detected_vendor, is_cisco
 from ..snmppoll import SnmpError
-from ._decode import _COPPER_MAU_ARCS, _COPPER_TEXT, _DAC_TEXT, _FIBER_MAU_ARCS, _SFP_METRICS, _TRANSCEIVER_TEXT, _canonical_if_name, _envmon_rows, _int_keyed, _optic_mode, _optical_direction
+from ._decode import _COPPER_MAU_ARCS, _COPPER_TEXT, _DAC_TEXT, _DAF_TEXT, _FIBER_MAU_ARCS, _SFP_METRICS, _TRANSCEIVER_TEXT, _canonical_if_name, _envmon_rows, _int_keyed, _optic_mode, _optical_direction
 from ._session import snmp_version_of
 
 
@@ -427,6 +427,10 @@ class EnvironmentMixin:
             return any(_DAC_TEXT.search(str(column.get(entity) or ""))
                        for column in (by_descr, models))
 
+        def names_daf(entity: int) -> bool:
+            return any(_DAF_TEXT.search(str(column.get(entity) or ""))
+                       for column in (by_descr, models))
+
         def descendants(root: int) -> list[int]:
             found: list[int] = []
             queue, depth = list(children.get(root, ())), 0
@@ -452,6 +456,7 @@ class EnvironmentMixin:
                 if names_transceiver(entity) and entity in port_map:
                     if_index = port_map[entity]
                     media[if_index] = (
+                        "daf" if names_daf(entity) else
                         "dac" if names_dac(entity) else
                         "copper" if names_copper(entity) else "sfp")
                     found_mode = _optic_mode(*entity_texts(entity))
@@ -469,11 +474,14 @@ class EnvironmentMixin:
             occupants = [child for child in descendants(entity)
                         if names_transceiver(child)]
             if occupants:
+                daf = names_daf(entity) or any(
+                    names_daf(child) for child in occupants)
                 dac = names_dac(entity) or any(
                     names_dac(child) for child in occupants)
                 copper = names_copper(entity) or any(
                     names_copper(child) for child in occupants)
-                media[if_index] = "dac" if dac else "copper" if copper else "sfp"
+                media[if_index] = ("daf" if daf else "dac" if dac else
+                                    "copper" if copper else "sfp")
                 occupant_texts = [text for child in occupants
                                   for text in entity_texts(child)]
                 found_mode = _optic_mode(*entity_texts(entity), *occupant_texts)
@@ -1056,11 +1064,12 @@ class EnvironmentMixin:
         chassis has no one true Rx power. The same mapping writes
         interfaces.media, rewritten only when the walk answered, so a
         timeout never strips the badge. interfaces.media also gains
-        'copper' (5.25.0) for a BASE-T transceiver, and 'dac' (5.55.0) for a
-        twinax/direct-attach copper one — module text (_sfp_slot_media) or
-        MAU-MIB ifMauType (this method, below) — which outranks a DOM
-        reading: a copper or DAC module's own temperature sensor is still
-        recorded, it just does not make the port read as optical.
+        'copper' (5.25.0) for a BASE-T transceiver, 'dac' (5.55.0) for a
+        twinax/direct-attach copper one, and 'daf' (5.63.0) for an active
+        optical (direct-attach fibre) cable — module text (_sfp_slot_media)
+        or MAU-MIB ifMauType (this method, below) — which outranks a DOM
+        reading: a copper, DAC or DAF module's own temperature sensor is
+        still recorded, it just does not make the port read as optical.
 
         Best-effort, gated twice: nothing runs inside the cadence window
         (_SENSOR_REFRESH_S normally, _SENSOR_REPROBE_S — a cheap hourly
@@ -1300,17 +1309,18 @@ class EnvironmentMixin:
         # A MAU copper arc only confirms a cage the entity scan found
         # occupied: a Catalyst answers 1000BASE-T for every fixed port too.
         mau_copper_ports &= ({i for i, m in sfp_slots.items()
-                              if m in ("sfp", "copper", "dac")} | optic_ports)
+                              if m in ("sfp", "copper", "dac", "daf")} | optic_ports)
         # Precedence: a fiber arc or a lit optic beats copper text; copper
         # beats optic (any port-mapped sensor); both beat the cage scan.
         copper_ports = ((
             {if_index for if_index, media in sfp_slots.items()
-             if media in ("copper", "dac")} | mau_copper_ports)
+             if media in ("copper", "dac", "daf")} | mau_copper_ports)
             - mau_fiber_ports - dbm_ports)
         media_by_if = {i: ("sfp" if m in ("copper", "dac") and i in mau_fiber_ports else m)
                        for i, m in sfp_slots.items()}
         media_by_if.update({if_index: "optic" for if_index in optic_ports})
-        media_by_if.update({if_index: ("dac" if sfp_slots.get(if_index) == "dac" else "copper")
+        media_by_if.update({if_index: ("dac" if sfp_slots.get(if_index) == "dac" else
+                                        "daf" if sfp_slots.get(if_index) == "daf" else "copper")
                             for if_index in copper_ports})
         # optic_mode from _sfp_slot_media's cage/occupant scan covers most
         # ports; a DOM-lit port the cage scan never classified as a
@@ -1363,7 +1373,7 @@ class EnvironmentMixin:
             for row in interfaces:
                 stored = row["media"] if "media" in row.keys() else None
                 if_index = row["if_index"]
-                if (stored in ("sfp", "sfp_empty", "copper", "optic", "dac")
+                if (stored in ("sfp", "sfp_empty", "copper", "optic", "dac", "daf")
                         and if_index not in optic_ports
                         and if_index not in copper_ports):
                     media_by_if[if_index] = stored

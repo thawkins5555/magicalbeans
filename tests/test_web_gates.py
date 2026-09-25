@@ -460,6 +460,12 @@ try:
                                    "account.sms.confirm; the send itself is "
                                    "rate-limited by the 60 s resend guard and "
                                    "code TTL",
+        "put_account_ssh": "same self-service shape: per-account, the "
+                          "caller's OWN users row only, keyed on the "
+                          "session username, sign-in only",
+        "delete_account_ssh": "same self-service shape: per-account, the "
+                             "caller's OWN users row only, keyed on the "
+                             "session username, sign-in only",
     }
 
     missing_handlers = [(m, p, h) for m, p, h, r in ROUTES_PARSED if h not in API_FUNCS]
@@ -540,14 +546,14 @@ try:
           server_mod.PUBLIC_API == PUBLIC_API_EXPECTED,
           server_mod.PUBLIC_API ^ PUBLIC_API_EXPECTED)
 
-    # The 16 routes with no gate at all, each justified in server.py's own
+    # The 19 routes with no gate at all, each justified in server.py's own
     # comments (pre-auth, a property of the host, or — state/config/dashboard
     # — filtered per-module inside the handler, which the /api/state and
     # /api/config checks earlier in this suite already exercise; the theme
-    # PUT, the three dashboard-layout routes, and the four account/sms
-    # routes are self-service, own account only, see KNOWN_NOT_WRITES). A
-    # 17th route reaching this set is a deliberate act with this test to
-    # update, not an omission nobody notices.
+    # PUT, the three dashboard-layout routes, the four account/sms routes,
+    # and the three account/ssh routes are self-service, own account only,
+    # see KNOWN_NOT_WRITES). A 20th route reaching this set is a deliberate
+    # act with this test to update, not an omission nobody notices.
     UNGATED_EXPECTED = {
         ("POST", r"^/api/login$"), ("POST", r"^/api/logout$"),
         ("POST", r"^/api/heartbeat$"), ("GET", r"^/api/session$"),
@@ -558,6 +564,8 @@ try:
         ("DELETE", r"^/api/dashboard/layout$"),
         ("GET", r"^/api/account/sms$"), ("POST", r"^/api/account/sms/start$"),
         ("POST", r"^/api/account/sms/confirm$"), ("DELETE", r"^/api/account/sms$"),
+        ("GET", r"^/api/account/ssh$"), ("PUT", r"^/api/account/ssh$"),
+        ("DELETE", r"^/api/account/ssh$"),
     }
     ungated_actual = {(m, p) for m, p, h, r in ROUTES_PARSED if r is None}
     check("the ungated route set is exactly what it was when this was audited",

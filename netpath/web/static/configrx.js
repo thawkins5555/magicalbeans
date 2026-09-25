@@ -216,7 +216,8 @@
     { key: 'ssh_port', label: 'Port', width: 70, numeric: true, on: true },
     { key: 'has_credential', label: 'Credential', width: 90, on: true,
       value: (r) => (r.has_credential ? 1 : 0),
-      cell: (r) => (r.has_credential ? 'stored' : '\u2014') },
+      cell: (r) => (r.credential_source === 'global' ? 'global'
+        : r.has_credential ? 'stored' : '\u2014') },
   ];
 
   const deviceColumns = () => App.visibleColumns(
@@ -940,6 +941,7 @@
 
   function settingsDialog() {
     const s = App.state.configrxSettings || {};
+    const g = App.state.configrxGlobalCredential || {};
     const settingsBox = App.modal('ConfigRX settings', `
       <fieldset><legend>SCHEDULE</legend>
         <label class="check"><input type="checkbox" id="cxs-enabled"
@@ -981,6 +983,18 @@
           paramiko still implements those algorithms: paramiko 5 removed them
           outright, which is why this app pins paramiko below 5.</p>
       </fieldset>
+      <fieldset><legend>GLOBAL SSH ACCOUNT</legend>
+        <p class="hint">Used for a backup on any device with no SSH credential of
+          its own; a device's own credential still wins over this one.</p>
+        <label>Username <input id="cxs-global-username"
+          value="${escape(g.username || '')}"></label>
+        ${App.canStoreSecrets()
+          ? `<label>Password <input id="cxs-global-password" type="password"
+              placeholder="${g.has_password ? 'stored — leave blank to keep' : ''}"></label>`
+          : App.credentialUnavailableHtml('An SSH password')}
+        ${g.has_password ? `<p class="hint">Stored as <b>${escape(g.username || '')}</b>,
+          saved ${App.agoCell(g.stored_ts)}.</p>` : ''}
+      </fieldset>
       <fieldset><legend>CHANGE DETECTION</legend>
         <label>Extra lines to ignore (one regex per line) <textarea id="cxs-ignore"
           rows="4">${escape(s.ignore_line_patterns || '')}</textarea></label>
@@ -1001,6 +1015,19 @@
       ${App.columnPickerFieldset('BACKUP LIST COLUMNS', 'cxbackups', BACKUP_COLUMNS,
                                  s.table_columns_backups)}`, [
       { label: 'Cancel', onClick: App.closeModal },
+      ...(g.has_password ? [{ label: 'Clear global SSH account', danger: true, onClick: () => {
+        const snap = App.modalFormSnapshot();
+        App.confirmDestructive('Clear global SSH account',
+          '<p>Clear the global ConfigRX SSH account?</p>' +
+          '<p class="hint">Any device with no credential of its own can no ' +
+          'longer be backed up until it has one, or this is set again. The ' +
+          'stored password cannot be recovered.</p>',
+          'Clear', async () => {
+            await App.del('/api/configrx/credential');
+            await App.loadState();
+            App.refreshNow('configrx');
+          }, (confirmed) => { if (!confirmed) { settingsDialog(); App.modalFormRestore(snap); } });
+      } }] : []),
       { label: 'Save', primary: true, onClick: (m, button) => App.runJob(button,
         { queued: 'Saving…', done: 'Saved' }, (async () => {
         await App.post('/api/settings', { scope: 'configrx', values: {
@@ -1017,6 +1044,12 @@
           table_columns_backups: App.readColumnPicker(
             m.querySelector('#cols-cxbackups'), BACKUP_COLUMNS),
         } });
+        const globalUsername = m.querySelector('#cxs-global-username').value.trim();
+        const globalPassword = (m.querySelector('#cxs-global-password') || {}).value || '';
+        if (globalUsername && (globalPassword || globalUsername !== (g.username || ''))) {
+          await App.post('/api/configrx/credential',
+            { ssh_username: globalUsername, ssh_password: globalPassword });
+        }
         await App.loadState();
         App.closeModal();
         App.refreshNow('configrx');

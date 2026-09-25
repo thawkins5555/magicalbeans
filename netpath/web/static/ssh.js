@@ -355,6 +355,10 @@
         askForCredentials(message);
         break;
 
+      case 'notice':
+        writeMessage(message.message, 'warn');
+        break;
+
       case 'hostkey':
         if (message.event === 'changed') {
           showHostKeyWarning(message);
@@ -393,7 +397,8 @@
   }
 
   const CRED_REASONS = {
-    'none-stored': 'No SSH credential is stored for this device in ConfigRX.',
+    'none-stored': 'No SSH login is stored for your account. Tick Remember below ' +
+      'to keep this one, or set it under Account.',
     'auth-failed': 'The stored credential was refused by the device.',
     'decrypt-failed': 'The stored password could not be decrypted on this machine.',
   };
@@ -420,7 +425,8 @@
       user.focus();
       return;
     }
-    send({ type: 'auth', username: user.value.trim(), password: pass.value });
+    const remember = el('ssh-remember').checked;
+    send({ type: 'auth', username: user.value.trim(), password: pass.value, remember });
     // Nothing typed here is kept: the field is emptied the moment it is sent.
     pass.value = '';
     show(credsBox, false);

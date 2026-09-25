@@ -744,7 +744,7 @@ class NodePoller(Worker, DiscoveryMixin, PollMixin, VendorIdentifyMixin, Environ
             return False
         return True
 
-    # Same in-flight guard/executor as the scheduled MAC/VLAN/ARP walks.
+    # Same in-flight guard/executor as the scheduled MAC/LLDP/VLAN/ARP walks.
     def _walk_now(self, device_id: int) -> None:
         device = self.db.device(device_id)
         if device is None:
@@ -758,6 +758,8 @@ class NodePoller(Worker, DiscoveryMixin, PollMixin, VendorIdentifyMixin, Environ
         for interval_key, running, next_walk, run_fn in (
             ("mac_table_interval_s", self._mac_running,
              self._next_mac_walk, self._run_mac_table),
+            ("lldp_interval_s", self._lldp_running,
+             self._next_lldp_walk, self._run_lldp_table),
             ("vlan_interval_s", self._vlan_running,
              self._next_vlan_walk, self._run_vlan_table),
             ("arp_table_interval_s", self._arp_running,

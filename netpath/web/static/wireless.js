@@ -256,7 +256,7 @@
   async function webAp() {
     const ap = selectedAp();
     if (!ap || !App.canWrite('web')) return;
-    const w = window.open('', `web-ap-${ap.id}`, 'width=1200,height=800');
+    const w = window.open('', `web-ap-${ap.id}`, App.windowFeatures(1200, 800));
     if (w) w.opener = null;
     try {
       const relay = await App.post(`/api/wireless/aps/${ap.id}/relay`, {});

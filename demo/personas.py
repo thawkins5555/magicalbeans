@@ -1336,6 +1336,9 @@ def _build_cisco_access(wrap32: bool, ports: int, vlan: str | None) -> dict:
     entries.update(sfp_cages(populated={
         access - 3: (names[access - 4], "10GBase-CU SFP+", "SFP-H10GB-CU3M"),
     }))
+    entries.update(sfp_cages(populated={
+        access - 5: (names[access - 6], "10GBase-AOC SFP+", "SFP-10G-Active-Cable"),
+    }))
     # A 100Base-FX module (5.38.0): a multimode optic whose media code is
     # neither SX nor SR, so the badge it gets proves the classifier reads
     # the PMD suffix rather than a list of part numbers.

@@ -454,6 +454,7 @@ PREDICATES: dict[str, callable] = {
     "netpath_event": _source_kind_matches,
     "system": _source_kind_matches,
     "dhcp_threshold": _source_kind_matches,
+    "dhcp_event": _both(_source_kind_matches, _threshold_rule_matches),
     "netpath_threshold": _source_kind_matches,
     "threshold": _both(_source_kind_matches, _threshold_rule_matches),
     "trap": _both(_source_kind_matches, _severity_floor),

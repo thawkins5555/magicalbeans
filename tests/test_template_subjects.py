@@ -13,6 +13,7 @@ import _paths  # noqa: F401  (repo root + tests dir on sys.path)
 from netpath import alertmail
 from netpath.alertengine import AlertEngine
 from netpath.alertsdb import AlertsDatabase
+from netpath.appdb import AppDatabase
 from netpath.ipamdb import IpamDatabase
 from netpath.nodesdb import NodesDatabase
 from netpath.snmptrapdb import SnmpTrapDatabase
@@ -162,8 +163,14 @@ def build_engine():
     syslog = SyslogDatabase(os.path.join(folder, "syslog.db"))
     ipam = IpamDatabase(os.path.join(folder, "ipam.db"))
     netpath_db = NetpathDatabase(os.path.join(folder, "netpath.db"))
+    # An opted-in account number for section 6's SMS digest: 5.63.0 sends
+    # only to app_db.sms_opted_in_numbers(), never a saved setting.
+    app_db = AppDatabase(os.path.join(folder, "app.db"))
+    app_db.sms_start("opuser", "+15005550001", "x", time.time())
+    app_db.sms_confirm("opuser", time.time())
     return AlertEngine(alerts, nodes_db=nodes, snmp_db=snmp,
-                       syslog_db=syslog, ipam_db=ipam, netpath_db=netpath_db)
+                       syslog_db=syslog, ipam_db=ipam, netpath_db=netpath_db,
+                       app_db=app_db)
 
 
 def alert(id, label, severity, message="down"):
@@ -220,8 +227,7 @@ sms_sendable = [
     (alert(102, "sw2", 2), rule(notify_sms=True), None),
 ]
 engine._sms_digest(sms_sendable, {"sms_enabled": True, "twilio_account_sid": "ACxxx",
-                                 "twilio_from": "+15005550006",
-                                 "sms_to_default": ["+15005550001"]}, 300)
+                                 "twilio_from": "+15005550006"}, 300)
 check("one text digest was built", len(captured) == 1, captured)
 if captured:
     check("the text leads with the worst severity's tag",

@@ -1568,6 +1568,39 @@ gained the `DAC` case (`.badge-dac`), and the device dialog's live-DOM
 guard quoted above now reads `r.media !== 'copper' && r.media !== 'dac'`
 so a DAC row is never promoted to `'optic'` either.
 
+**5.63.0 adds a fifth medium, `'daf'`, checked ahead of `'dac'` on the same
+text.** `_DAF_TEXT` (`nodepoll/_decode.py`) matches "Active-Cable"/"AOC"/
+"active optical" — Cisco's `SFP-10G-Active-Cable` among them — inside the
+same `_TRANSCEIVER_TEXT` gate. `names_daf` (`environment_mixin.py`) runs
+*before* `names_dac` in both branches of `_sfp_slot_media`, since a bare
+"Active-Cable" (no "copper" anywhere in it) is optical, not twinax, and
+would otherwise fall through to `_COPPER_TEXT`/`_DAC_TEXT`'s more general
+wording. `'daf'` joins `'dac'` in every membership test `'dac'` was added
+to in 5.55.0 — the sensor/cage merge, the cut-short preservation
+whitelist, `interfaces_with_media`, `update_interface_media`'s
+docstring — so it is copper's/DAC's twin in most mechanical ways except
+the label: no DOM light levels, no MAU-MIB fiber vote, survives a partial
+walk the same way. The MAU-MIB fiber veto is the one membership test it
+does *not* join: only `'copper'`/`'dac'` slots are demoted to `'sfp'`
+under a fibre `ifMauType` arc there, so a DAF slot keeps its badge even
+when the wire answers a fiber MAU arc. The other place it is
+*not* DAC's twin is `mapper.link_is_fiber` and `report.py`'s
+`MEDIA_MEDIUM`: DAF is fibre, so `report._MEDIA_KIND["daf"] = "DAF"` and
+`MEDIA_MEDIUM["daf"] = "Laser"` (DAC's own entries stay `"DAC"`/`"Copper"`),
+while `link_is_fiber` still puts `"daf"` beside `"copper"`/`"dac"` in the
+"drawn plain, not coloured" set — DAF is fibre by kind and medium, but it
+carries no light to prove single-mode from multimode, exactly the reason
+DAC draws plain rather than fiber-coloured. `SfpReport.daf_count` sits
+beside `dac_count` the same way; `reportsched._render_sfp`'s subject line
+and `nodes.js`'s SFP report summary both grew a "N DAF" clause to match.
+On the page, `sfpBadge` gained the `DAF` case (`.badge-daf`, styled
+identically to `.badge-dac`), and the live-DOM guard now reads
+`r.media !== 'copper' && r.media !== 'dac' && r.media !== 'daf'`.
+`demo/personas.py`'s Cisco access persona seats a
+`SFP-10G-Active-Cable` module in its own cage, the same shape as the
+existing DAC cage, so the badge, the report row and the plain FiberView
+link are all exercised against the demo fleet.
+
 ### The cage scan runs without a sensor answer, and says why a port stayed unbadged: `_cage_capable`/`_cage_read`, `_log_media_diag` (`nodepoll/environment_mixin.py`) — 5.35.0
 
 **Decoupling the cage scan from the sensor gate.** `_poll_environment`
@@ -4800,7 +4833,7 @@ isn't in this backup" reads differently on screen from "the dialog
 never had a name to search with in the first place" — the two used to
 look identical.
 
-### `nodepoll.NodePoller.poll_now` / `_walk_now`: MAC, VLAN and ARP walks on a manual poll — 5.33.0
+### `nodepoll.NodePoller.poll_now` / `_walk_now`: MAC, VLAN and ARP walks on a manual poll — 5.33.0 (LLDP/CDP joins them in 5.63.0)
 
 `poll_now`'s existing job — invalidate cached engines, submit the base
 counters/status poll — is unchanged; it gains a `walks: bool = False`
@@ -4912,8 +4945,10 @@ down device both `skipped`, a device pre-seeded into `_vlan_running`
 read as `already_running`, a disabled device counted nowhere at all, a
 second call straight after queuing nothing new, and `_mac_executor is
 None` giving all zeros with `running: False`; a separate case confirms
-`_walk_now` still queues all four of its walks (mac, vlan, arp,
-stp_vlan) after the `_queue_walk` extraction. `tests/
+`_walk_now` still queues all five of its walks (mac, vlan, arp,
+stp_vlan, lldp — the neighbour walk joined the set in 5.63.0) after
+the `_queue_walk` extraction; `tests/test_poll_now_walks.py` itself
+now counts five walks fired, not four. `tests/
 test_vlan_scan_api.py` (fixture copied from `tests/test_bulk_import.py`)
 spies on `walk_vlans_now`, checking the admin POST returns 200 with the
 spy's counts, the spy is called exactly once, the Events log carries
@@ -6570,11 +6605,12 @@ touched, so Mapper stays the active tab underneath the dialog.
 
 **The verdict is a pure function.** `mapper.link_is_fiber(a_media,
 b_media)` takes each end's `interfaces.media` value — `"optic"`,
-`"copper"`, `"sfp"`, `"sfp_empty"`, `"dac"` (5.55.0) or `None`, the same
-column the DOM/SFP/COP/DAC badge (5.24.0/5.25.0/5.55.0) already reads —
-and returns a bool: `optic` on either end wins outright, else `copper`
-or `dac` on either end reads copper, else `sfp` on either end (with
-neither end copper) reads fiber, else `False`. It touches no database
+`"copper"`, `"sfp"`, `"sfp_empty"`, `"dac"` (5.55.0), `"daf"` (5.63.0) or
+`None`, the same column the DOM/SFP/COP/DAC/DAF badge already reads —
+and returns a bool: `optic` on either end wins outright, else `copper`,
+`dac` or `daf` on either end reads copper (drawn plain, not coloured),
+else `sfp` on either end (with neither end one of those three) reads
+fiber, else `False`. It touches no database
 and takes no device id, so `tests/test_mapper_links.py` exercises the
 whole precedence table with plain strings.
 
@@ -6744,13 +6780,12 @@ toggle only changes what CSS does with it" pattern 5.34.0 used for
 share two new helpers, `fiberModeText(link, a, b)` and
 `stpBlockingText(link, a, b, esc)`, so the same "Fiber: single-mode (A
 end known)" / "SM on X, MM on Y — mismatched" and "STP: blocking on X
-(port)" lines appear identically in all three surfaces.
-`drawLegend()` appends a sentence for blocking whenever any on-map link
-is blocking, and — only when `view.fiberView` is on and at least one
-link is fiber — a second sentence naming the three FiberView colours;
-the FiberView checkbox's `onchange` now calls `drawLegend()` after
-`applyFiberView()` so ticking it updates the legend text immediately
-rather than waiting for the next full redraw.
+(port)" lines appear identically in all three surfaces. (A fourth
+surface, `drawLegend()`, used to repeat both facts as a sentence above the
+canvas whenever any on-map link was blocking or fiber; `drawLegend` and
+the `#mp-legend` span it wrote to were removed in 5.63.0 — see "The Mapper
+legend is removed entirely," below — leaving the tooltip, aria-label and
+detail pane as the only three places either fact is said.)
 
 **Parallel cables fan apart via `fanOffsets()`, called once per
 `draw()` before the link loop**, filling `view.linkFan: Map<link.id,
@@ -7644,8 +7679,9 @@ so the count is named rather than claiming a specific match; otherwise →
 "interface not yet polled". An unmanaged end (`*_device_id === null`)
 bypasses `stpNoStateCause` entirely and reads "`<peer>` is not polled".
 Every name and number reaching this text passes through `esc()`.
-`drawLegend` appends "Dotted = STP blocked on the named end." whenever
-`view.links.some((l) => l.blocking)`.
+(`drawLegend` used to append "Dotted = STP blocked on the named end."
+above the canvas whenever `view.links.some((l) => l.blocking)`; it was
+removed in 5.63.0 — see "The Mapper legend is removed entirely," below.)
 
 **Demo.** `demo/personas.py`'s SPECIALS[6] persona (acc-sw-005, the
 `toobig` GETBULK-fragmentation case) gains `chassis_ports:
@@ -7747,8 +7783,9 @@ picked VLAN. `drawLink`'s `glow` becomes `view.selectedVlan !== null &&
 !dimmed && vlanOnBothEnds(link, view.selectedVlan)` — `!dimmed` already
 guarantees at least one end lists the VLAN, so a one-sided link (one
 end lists it, the other doesn't) is neither glowed nor dimmed: it draws
-plain, which is the point. `drawLegend` states the rule in the VlanView
-line. `vlanEndsText(link, vlan, esc)`, called from `linkTooltip` and
+plain, which is the point. (`drawLegend` used to state the rule in a
+VlanView line above the canvas; removed in 5.63.0, see below.)
+`vlanEndsText(link, vlan, esc)`, called from `linkTooltip` and
 `linkDetailHtml` only once the link is known not to be dimmed, works out
 which of the three lines applies — both ends list it, one end only (and
 names the other end's own reported list to say so), or one end only
@@ -7763,7 +7800,8 @@ a reciprocal sysName-only fold (both ends' own lists survive the merge).
 discovered link and checks `a_vlans`/`b_vlans` independently of the
 union; the manual-link key-pin check gains both keys. `tests/
 test_frontend_contracts.py` section 128 pins `vlanOnBothEnds` in
-`drawLink`, `"on both ends"` in `drawLegend`, `vlanEndsText` in
+`drawLink` (its `"on both ends"` pin against `drawLegend` was dropped in
+5.63.0 with the legend itself), `vlanEndsText` in
 `linkTooltip`/`linkDetailHtml`, and `"a_vlans"` in both `mapper.py` and
 the manual-link dict in `web/api/mapper.py`. `tests/ui/walk.mjs`'s
 "Mapper: VlanView glows only when the picked VLAN is on both ends,
@@ -7931,7 +7969,8 @@ themed blocks of `tokens.css` — dark orange (`#C2560A`, lightened to
 `#E07B2A` on Contrast's dark canvas) in place of the old blue, and a
 brighter yellow (`#D4A017`, lightened to `#F2D648`) in place of the old
 dark yellow — plus the one hard-coded `app.css` comment describing the
-pulse colour and the two `drawLegend()` strings in `mapper.js` that spell
+pulse colour and (until their 5.63.0 removal) the two `drawLegend()`
+strings in `mapper.js` that spelled
 the key out in words. Every rule that reads the two custom properties —
 the glow, the `.selected` brightness multiplier, `.fiber-mismatch`'s own
 override — is unchanged; only what the two tokens resolve to moved.
@@ -8178,7 +8217,9 @@ rule changed, not `.mp-frame-label`'s.
 `#mp-canvas`'s `data-fiberview` attribute; the fix is at the call site,
 not in the function. `App.el('mp-fiberview').onchange` already called
 `applyFiberView()` then `drawLegend()`; it now also calls `requestDraw()`
-after both. This matters because `overlaidBlocking` — the flag `drawLink`
+after both (the `drawLegend()` call was itself dropped in 5.63.0, leaving
+`applyFiberView()` then `requestDraw()`). This matters because
+`overlaidBlocking` — the flag `drawLink`
 reads to decide whether a blocked fiber link's dots belong on the
 glowing path or on the separate unglowed overlay (5.39.0) — is computed
 fresh on every draw from `view.fiberView`, not stored on the link or
@@ -8439,15 +8480,17 @@ existing `inlineComputedColors` (5.23.0) already copies computed
 serialising, the same mechanism that carries FiberView's own glow into
 the PNG, so the VlanView glow needed no export-path change of its own.
 
-**The legend and the VLAN table both redraw on a pick.** `drawLegend()`
-prepends a "VlanView: links carrying VLAN `<n>` (`<name>`) glow in its
-colour; the rest are dimmed." sentence whenever `view.selectedVlan !==
-null`, ahead of the existing FiberView colour-key sentence (both can show
-at once). `drawVlanTable`'s row-click handler, which already toggled
-`view.selectedVlan` and called `requestDraw()`, now also calls
-`drawLegend()` in the same handler — before 5.59.0 the legend only ever
-changed when the map's own data changed (5.0.0's `fastTick` fix), and a
-VLAN pick is a view choice, not new data, so nothing was redrawing it.
+**The VLAN table redraws on a pick.** `drawVlanTable`'s row-click handler,
+which already toggled
+`view.selectedVlan` and called `requestDraw()`, gained a matching
+`drawLegend()` call in the same handler — before 5.59.0 the legend only
+ever changed when the map's own data changed (5.0.0's `fastTick` fix), and
+a VLAN pick is a view choice, not new data, so nothing was redrawing it.
+(`drawLegend()` itself, and its "VlanView: links carrying VLAN `<n>`
+(`<name>`) glow in its colour; the rest are dimmed." sentence, were
+removed in 5.63.0 along with the rest of the legend — see below; the VLAN
+table's `requestDraw()` call still runs on a pick, since the glow itself
+is unaffected.)
 
 **`App.openSshWindow(deviceId, name)` and `App.openWebTunnel(deviceId)`
 move the window mechanics `nodes.js`'s `sshDevice()`/`webDevice()` used to
@@ -8488,12 +8531,49 @@ braces reasoning `nodes.js`'s own SSH/WEB buttons already use.
 
 `tests/test_frontend_contracts.py` section 126 pins the `mp-vlan-view`
 underlay and its `pointer-events: none`, the `app.css` glow rule and its
-`--mp-vlan-glow` custom property, the legend's "VlanView:" sentence, the
-VLAN-table click handler's `drawLegend()` call, `GAP_BREAK_FACTOR = 4`
+`--mp-vlan-glow` custom property, `GAP_BREAK_FACTOR = 4`
 and `drawSeriesChart`'s `splitAtGaps` call (chart internals, above), the
 markup's `data-requires-write="ssh"`/`"web"` on the two new buttons, and
 that `mapper.js` calls `App.openSshWindow`/`App.openWebTunnel` rather
-than carrying its own window code.
+than carrying its own window code. (Its pins on the legend's "VlanView:"
+sentence and the VLAN-table click handler's `drawLegend()` call were
+dropped in 5.63.0 along with the legend itself — see below.)
+
+### The Mapper legend is removed entirely (`mapper.js`, `index.html`, `app.css`) — 5.63.0
+
+**Six call sites, one function, one span, all gone.** `drawLegend()`
+itself, its calls from `selectMap`'s cache-hit and normal paths, from the
+VLAN table's row-click handler, from the FiberView checkbox's `onchange`,
+and from `activate()`'s two branches (the already-on-this-map case and the
+`selectMap(...).then(drawLegend, ...)` success callback, now a bare
+`.catch`), and the `<span id="mp-legend">` in `index.html`'s MAP header it
+wrote into, are all deleted rather than emptied out — there is no dead
+function left behind for a future call site to resurrect by accident. The
+`app.css` comment on `.mp-link.unknown` that pointed a reader at
+`#mp-legend` for the dash pattern's meaning is trimmed to describe only
+the dash itself.
+
+**Nothing the legend described changed — only the second place it was
+said.** FiberView's colours, VlanView's glow rule, and the STP dotted
+overlay are unchanged; each was already explained a second time, in
+words, by the link's own tooltip (`linkTooltip`), aria-label
+(`linkAriaLabel`) and detail pane (`linkDetailHtml`) — `fiberModeText`,
+`stpBlockingText` and `vlanEndsText` (5.36.0/5.61.0) — which is what made
+the legend removable rather than a loss of information: a viewer who
+wants the fact still gets it, from the one link it is actually about,
+instead of a floating sentence above the whole canvas that had to be
+re-read to work out which link it currently applied to. The empty-map "no
+CDP/LLDP adjacency" notice the legend also carried is not replaced
+anywhere — an empty map's own placeholder state already says there is
+nothing on it. The FiberView checkbox's own tooltip, which explains what
+ticking it does rather than repeating a colour key, is unchanged.
+
+`tests/test_frontend_contracts.py` sections 96a, 126 and 128 drop their
+`drawLegend`/`#mp-legend` pins (126 and 128 invert them to assert the
+call/span is absent, rather than being deleted outright, so a
+regression that reintroduces either is still caught); `tests/ui/walk.mjs`
+drops its own legend-text assertion and its Mapper check now asserts
+`#mp-legend` is absent from the DOM instead.
 
 ---
 
@@ -8511,15 +8591,16 @@ occurrence increments one alert instead of opening a duplicate" behavior
 lives in the database's own conflict resolution, not in application code
 that could race between a read and a write.
 
-74 built-in rules (5.10.0 adds `wireless_ap_rebooted`,
+75 built-in rules (5.10.0 adds `wireless_ap_rebooted`,
 `wireless_radio_channel_changed` and `netpath_https_down`; the middle one
-ships disabled via `_BUILTIN_DISABLED` and is the only rule of the 74 that
+ships disabled via `_BUILTIN_DISABLED` and is the only rule of the 75 that
 does — every other built-in ships enabled; 5.23.0 adds
 `priority_interface_down`, sharing `interface_down`'s `(kind,
 source_kind)` and gated by `PRIORITY_ONLY_RULES` — see Priority ports,
 under Nodes; 5.33.0 adds `fan_warning`/`fan_failed` — see Cisco fan state,
 under Nodes; 5.38.0 adds `stp_blocking`/`stp_unblocked` — see Spanning-tree
-blocking alerts, below) and 6 built-in templates are
+blocking alerts, below; 5.63.0 adds `dhcp_poll_failed` — see DHCP poll
+failures, below) and 6 built-in templates are
 seeded via `INSERT OR IGNORE` keyed on each row's unique `key`, run on
 every open — idempotent,
 so a re-open never duplicates, and an admin's edit to a built-in rule's
@@ -8616,6 +8697,67 @@ streak when the scope's `polled_ts` actually moves, so `for_polls` means
 DHCP polls rather than engine ticks — which matters because DHCP is polled
 every 15 minutes while the engine ticks every `TICK_S` (5 s). As of 4.31.0
 `_evaluate_thresholds` does the same thing; see below for why it had to.
+
+### DHCP poll failures (`alertengine._evaluate_dhcp_polls`, `ipamdb.py`) — 5.63.0
+
+**A poll that gets no answer at all is a different failure from a scope
+running low, and reads its own counter rather than a computed
+percentage.** `ipamdb`'s `dhcp_servers` table gains `poll_failures
+INTEGER NOT NULL DEFAULT 0` (via `ensure_columns`); `set_dhcp_poll_result`
+now does `poll_failures = 0` on a good poll and `poll_failures =
+poll_failures + 1` on a failed one, in the same `UPDATE` that already set
+`last_status`/`last_error`, so the count and the status it explains can
+never drift apart. `_dhcp_server_json` exposes it as `poll_failures`
+alongside the existing status fields.
+
+**The evaluator is a stage of its own, run right after
+`_evaluate_dhcp_thresholds`, and reads the counter directly rather than
+tracking a streak itself** — `_dhcp_streaks` above exists because a scope's
+*utilization* is a value that has to be watched for a run of bad readings;
+a poll either got an answer or it didn't, and `ipamdb` has already done
+the counting. `_evaluate_dhcp_polls` walks every enabled `dhcp_event` rule
+against every enabled DHCP server; `_dhcp_poll_failures_seen[(rule id,
+server id)]` holds the count last acted on, so a tick that finds the same
+count again (the common case — DHCP polls run far less often than the
+five-second tick) does nothing, and only a genuine poll changing the
+count is acted on — the identical "poll, not tick" guard
+`_evaluate_dhcp_thresholds`'s own `_dhcp_streaks` enforces, applied to a
+plain counter instead of a rolling streak. `poll_failures == 0` resolves
+the alert through `resolve_by_dedup(f"{rule['key']}:dhcp_server:{id}",
+by="")`, the same dedup-key shape `_drain_system_occurrences` resolves by;
+`poll_failures < rule["for_polls"]` (the rule's own "Consecutive failed
+polls before firing," default 2) does nothing further; at or past it, an
+`Occurrence` fires with `kind="dhcp_event"`,
+`entity_kind="dhcp_server"`, `entity_id=str(server_id)`, and a message
+naming the server, the failure count and its last error
+(`server["last_error"] or "no error given"`).
+
+**The built-in rule, `dhcp_poll_failed`, is its own kind rather than a
+`dhcp_threshold` for the same reason `dhcp_scope_exhaustion` is not a
+`threshold`** — there is no percentage to compare against a breach/clear
+pair here, only a streak of failures, so `PREDICATES["dhcp_event"] =
+_both(_source_kind_matches, _threshold_rule_matches)`, the shape
+`threshold` uses. `_source_kind_matches` compares the occurrence's
+`source_kind` ("poll_failed") against the rule's own, so a second
+`dhcp_event` rule with a different `source_kind` could be added later
+without this evaluator changing; the `Occurrence` also carries the firing
+rule's `rule_key`, and `_threshold_rule_matches` pins the match to that
+same `rule_key`, so two `dhcp_event` rules sharing a `source_kind` cannot
+double-match each other's occurrences. `web/api/alerts.py`'s kind
+whitelist and `alerts.js`'s Add-rule kind picker both gain `dhcp_event`;
+`KIND_LABELS.dhcp_server = 'a DHCP server'` is read only at `alerts.js`
+~568, for the "Mute is for device alerts; this one is about …" reason
+text on a muted `dhcp_event` alert — not by the alert list's Object
+column or the rule editor's device-filter hint.
+Because it is an ordinary rule (not a system alert), it emails and texts
+through the same path as every other rule — no special-casing needed
+anywhere in the notification code.
+
+`alertengine._device_ip_for` gains an `entity_kind == "dhcp_server"`
+branch reading `ipam_db.dhcp_server(int(entity_id))["address"]` for
+`{{device_ip}}` — distinct from the existing `dhcp_scope` branch, whose
+`entity_id` is a compound `"{server_id}:{scope_id}"` string this one does
+not need to split.
 
 ### NetPath destination thresholds (`alertengine._evaluate_netpath_thresholds`)
 
@@ -10348,8 +10490,8 @@ trial-account destination number reads as Twilio's own words in the
 notification row, not a bare "HTTP 400".
 
 **Validation lives in `alertsdb.validate_sms_settings()`, called from the
-same settings-save path `validate_webhook_url` already hooks.** Every
-number in `sms_to_default` and the `twilio_from` sender are checked against
+same settings-save path `validate_webhook_url` already hooks.** The
+`twilio_from` sender is checked against
 `alertmail.is_e164()` (`^\+[1-9][0-9]{7,14}$` — a leading `+`, no leading
 zero, 8–15 digits total); `twilio_account_sid` against `_ACCOUNT_SID`
 (`AC` + 32 hex) and `twilio_messaging_service_sid` against `_MESSAGING_SID`
@@ -10357,7 +10499,10 @@ zero, 8–15 digits total); `twilio_account_sid` against `_ACCOUNT_SID`
 out is not the case this function exists to catch. A malformed value raises
 `ValueError` before anything is written, the same "refuse at the settings
 boundary, not at send time" discipline `validate_webhook_url` already
-established for the webhook URL.
+established for the webhook URL. (Before 5.63.0 this function also
+E.164-validated every number in `sms_to_default`; that key, and the
+per-number check, were removed along with the admin-set recipient list —
+see "Only account opt-ins receive texts," below.)
 
 **The Auth Token gets its own single-row table, `sms_credential`
 (`id INTEGER PRIMARY KEY CHECK (id = 1)`, `token_enc BLOB`), the identical
@@ -10412,7 +10557,8 @@ api_key_sid)`, with `api_key_sid` forced to `''` outside `api_key` mode
 so a value left sitting in the hidden field can never mismatch an
 Auth Token send. `AlertsDatabase.sms_credential_binding()` reads the row
 back as the same shape; `AlertEngine._sms_token()` and
-`post_alerts_sms_test()` both compare `wanted != saved` on that tuple
+`web/api/auth.py`'s `_sms_send()` (the Account dialog's own send path,
+below) both compare `wanted != saved` on that tuple
 rather than the old bare SID equality; `sms_credential_sid()` remains
 for callers that only want the Account SID.
 
@@ -10436,7 +10582,8 @@ the self-updater and the HTTPS monitor all clear that one flag from one
 place.
 
 **From 5.52.0, `appdb.py` gains a `user_sms` table and a per-account
-opt-in flow, distinct from the admin-set `sms_to_default` list above.**
+opt-in flow — from 5.63.0 the only source of a text recipient at all (see
+below).**
 `user_sms(username PRIMARY KEY, number, consent_ts, verified_ts,
 stopped_ts, stopped_by, code_hash, code_sent_ts, code_attempts)` holds at
 most one row per account, created only once that account starts the
@@ -10473,13 +10620,14 @@ canceling and restarting can't be used to dodge the guard; the row itself
 is only forgotten once that window has passed. Starting the flow while
 texts are already on for the account is refused, telling the caller to
 press Stop texts first. Each is audited as `account.sms.start` / `.confirm` /
-`.stop` / `.cancel`. `_sms_available()` mirrors the checks
-`post_alerts_sms_test` already makes (SMS on, a credential on file, a
+`.stop` / `.cancel`. `_sms_available()` checks
+that Alerts is actually set up to send at all (SMS on, a credential on file, a
 From number or Messaging Service SID, the right fields for the
 configured auth mode) so the Account dialog can tell a genuinely
 unconfigured server from a user error, and `_sms_send()` sends one text
-through the same credential-binding and `record_notification` path
-`post_alerts_sms_test` uses, with a `record_text` override so the
+through its own credential-binding and `record_notification` path
+(the same shape the removed `post_alerts_sms_test` used to share it
+with — see below), with a `record_text` override so the
 verification text's row stores the code masked (`123456` → `******`)
 while the text actually sent carries the real code.
 
@@ -10497,14 +10645,16 @@ number can't be turned into a way to spam an arbitrary phone with texts
 on demand; past that window it behaves exactly like a first attempt,
 including sending a fresh code to a possibly-different number.
 
-**`AlertEngine._sms_numbers` merges the admin list with this table.**
-Beyond its existing `sms_to_default` handling, it now appends every
-number `appdb.sms_opted_in_numbers()` returns — verified, not stopped,
-non-empty — skipping any already in the admin list, so a number entered
-in both places is only ever texted once. Both `_sms_notify` and
-`_sms_digest` read numbers through this one method, so an opted-in
-account receives the same alert and digest texts a Default number does,
-on the same timing and against the same `sms_max_per_hour` budget.
+**`AlertEngine._sms_numbers` reads this table, and from 5.63.0 nothing
+else.** Through 5.62.x it merged an admin-set `sms_to_default` list with
+`appdb.sms_opted_in_numbers()`, skipping any number already in the admin
+list so one entered in both places was only ever texted once; from
+5.63.0 there is no admin list to merge, so it is simply `list(app_db.
+sms_opted_in_numbers())`, unchanged if `app_db` is `None`. Both
+`_sms_notify` and `_sms_digest` read numbers through this one method, so
+an opted-in account is the only way a number ever receives an alert or
+digest text, on the same timing and against the same `sms_max_per_hour`
+budget a Default number used to.
 
 **A Twilio 21610 reply now closes the loop back into `user_sms`.**
 `alertmail.twilio_error_code()` pulls the numeric code out of a
@@ -10517,10 +10667,56 @@ built. After a send, `AlertEngine` walks
 `appdb.sms_stop_number(number, now)` (marks `stopped_by='stop'`, but only
 on a row that was `on`, so a number a Twilio filter or typo rejects
 outright is not mistaken for a real STOP) and logs an ERROR line naming
-the number, appending a note to remove it from Alerts → Settings →
-Default numbers when that same number sits in `sms_to_default` — Twilio
-will keep refusing it there too, so a mixed admin/opt-in number is not
-left silently retried forever.
+the number. (Through 5.62.x the same ERROR line also told an operator to
+remove the number from Alerts → Settings → Default numbers when it sat in
+`sms_to_default` too, since Twilio would keep refusing it there; from
+5.63.0 there is no admin list left for a number to also sit in, so that
+clause is gone from the log line.)
+
+### Only account opt-ins receive texts; the admin recipient list is dropped on upgrade (`alertsdb.py`, `alertengine.py`, `web/api/alerts.py`, `web/server.py`, `alerts.js`) — 5.63.0
+
+**The operator's ask was direct: an administrator should not be able to
+add a phone number for somebody else.** Through 5.62.x, Alerts → Settings
+held its own `sms_to_default` list — add a number, remove a number — which
+`_sms_numbers` merged with each account's own opt-in (above).
+5.63.0 removes the setting, the list UI, `validate_sms_settings`'s
+per-number E.164 check, and the merge: `_sms_numbers` now returns
+`app_db.sms_opted_in_numbers()` alone, so the *only* way a number is ever
+added is that account completing its own opt-in flow. `alerts.js`'s
+`smsNumbersListHtml`, the "Default numbers" list, the **Add number**
+button and the `#as-sms-consent` hint are deleted outright, along with
+`smsNumbers`/`sms_to_default` in the settings save body — sending
+`sms_to_default` in a `POST /api/settings` body is now silently ignored,
+since the key is no longer in `alertsdb.DEFAULTS` or the validated-keys
+set. The **Send a test text to** field, its `runJob` handler,
+`post_alerts_sms_test` and the `POST /api/alerts/sms/test` route are all
+removed together — the "type it in and see if it sends" idiom now exists
+only for email (**Send test email**); a real alert, or the Account
+dialog's own opt-in text and **Resend code**, are what a text is actually
+tested against.
+
+**An install upgrading into 5.63.0 with a stored `sms_to_default` list has
+it cleared once, on the database's next open, by a named migration
+(`drop_default_sms_numbers_1`, in `_named_migrations`).**
+`AlertsDatabase._drop_default_sms_numbers` reads the `settings` row for
+`sms_to_default` directly (the ordinary settings-read path is not
+available yet at migration time), and if it decodes to a non-empty list,
+deletes the row and writes one line to Events: "Dropped N default
+text-alert number(s) (`+1555…`, ...): only numbers opted in from an
+account receive texts from 5.63.0" — through the `log` `AlertsDatabase`
+now takes as a constructor argument (`Service` passes its own `self.log`,
+matching the pattern `SyslogDatabase` already uses) so the drop is visible
+without opening the database file by hand. An empty or absent list writes
+nothing — there is nothing to report dropping. Like every other named
+migration, it is idempotent by name: it runs once, ever, per database.
+
+**A side bug found investigating this is fixed in the same release: the
+Account dialog's Resend code button was refusing every click.** `app.js`'s
+resend handler posted to `/api/account/sms/start` with `consent: true,
+terms: true` but not `privacy: true` — the third checkbox 5.59.0 added —
+so `post_account_sms_start` refused it exactly as it would refuse a fresh
+sign-up missing that flag. The fix is one field: the resend POST now
+carries `privacy: true` as well.
 
 **From 5.53.0, `/sms-terms` and `/sms-privacy` are static files, not
 rendered pages, gated only by `PUBLIC_PATHS` membership.** `server.py`'s
@@ -15854,20 +16050,31 @@ default before the parser physically reached it.
 **The actual fix moves the decision into `<head>`, before `<body>` has a
 single byte of content to mis-paint in the first place.** A tiny script
 there (`boot.js`) sets `document.documentElement.dataset.tab` (defaulting
-to `'netpath'` if nothing is stored or `localStorage` throws) — reading
+to `'dashboard'` if nothing is stored or `localStorage` throws) — reading
 `localStorage` is all it does, and `<html>` already exists the moment any
-`<head>` script runs, so this has nothing to wait on. `app.css` — loaded
-by the `<link>` just above it, and render-blocking by the same browser
-behavior that prevents FOUC generally — carries one `html[data-tab="X"]`
-rule per tab, each duplicating what `.tab.active`/`.page.active` already
-do (`color`/`border-bottom-color` for the tab button, `display:flex` for
-the page, with `#page-netpath` alone getting `flex-direction: row` to
-match its `.active` counterpart). The static `active` classes are gone
-from `index.html`'s NetPath button and section entirely — there is no
-default left to flash, only whichever `html[data-tab]` rule matches. By
-the time `<body>` has anything to paint, the attribute the CSS keys off
-is already sitting on `<html>`, set in `<head>`, before that paint could
-possibly have happened.
+`<head>` script runs, so this has nothing to wait on. `boot.js` itself
+then appends one `<style>` block generating the `html[data-tab="X"]`
+pair for that one tab — `color`/`border-bottom-color` for the tab button,
+`display:flex;flex-direction:column` for the page — which duplicates what
+`.tab.active`/`.page.active` already do. The static `active` classes are
+gone from `index.html`'s NetPath button and section entirely — there is no
+default left to flash, only whichever `html[data-tab]` rule `boot.js` just
+wrote. By the time `<body>` has anything to paint, the attribute the CSS
+keys off is already sitting on `<html>`, set in `<head>`, before that
+paint could possibly have happened.
+
+**Until 5.63.0, one exception rode on top of this.** `app.css` carried its
+own `html[data-tab="netpath"] #page-netpath.page { flex-direction: row }`,
+a higher-specificity rule (its extra `.page` class selector beats
+`boot.js`'s two-selector one) that overrode `boot.js`'s own generated
+`flex-direction: column` for the NetPath tab alone, so the Routes strip's
+sidebar and canvas would stand up beside each other before any script had
+run. That override — and the matching `#page-netpath.active {
+flex-direction: row }` for every load after the first — is gone in
+5.63.0: the Routes strip is a normal column-flow page like every other
+tab now, and the destination sidebar sits beside the canvas through
+`.cols`'s own flex row instead (see MAPPER/Nodes' shared `.cols` layout,
+above), which is what actually needs to be side by side.
 
 It is `<script src="/boot.js">` rather than an inline block, and that is
 load-bearing rather than stylistic: `server.py` sends `default-src
@@ -15881,7 +16088,7 @@ request, already in flight alongside `app.css`. Note that *restoring* the
 tab was never affected either way — `start()` in `app.js` reads the same
 `TAB_KEY` on load regardless — so the symptom was purely a flash of the
 default tab, which is exactly why it went unnoticed. Keep `boot.js`'s key
-and `'netpath'` fallback in step with `app.js`'s `TAB_KEY` and default.
+and `'dashboard'` fallback in step with `app.js`'s `TAB_KEY` and default.
 
 Any future `<head>` bootstrapping belongs in `boot.js` for the same
 reason; an inline `<script>` anywhere in this app is dead code unless the
@@ -16332,8 +16539,11 @@ Ctrl+C apparently doing nothing while the poller and the databases wait; the
 grace is for sockets shut down by force, which takes no lock, to let go of
 their slots — and `MAX_OUTPUT_BYTES = 64 * 1024`, the size of one channel
 read so a device dumping a huge `show tech-support` streams rather than being
-buffered whole. The credential — ConfigRX's, decrypted at connect, or one
-typed into the page — lives in a local for the length of the connect and is
+buffered whole. The credential — from 5.63.0, the account's own SSH login
+(`appdb.user_ssh`, never ConfigRX's device-scoped one — see "One credential
+for ConfigRX, a separate one for the SSH button," below), decrypted at
+connect, or one typed into the page — lives in a local for the length of
+the connect and is
 dropped in its `finally`; the one case where it is held longer is between a
 `hostkey changed` and the operator's answer, so that Trust reconnects
 without asking again. Sessions are audited as `ssh` device events (who,
@@ -16486,6 +16696,72 @@ nobody holds by default, and it neither uses the vendor table, the enable
 secret, nor `_pull_config` — a person at the terminal who needs privileged
 mode types `enable` themselves. The two features share exactly one thing,
 the host-key store.
+
+### One credential for ConfigRX, a separate one for the SSH button (`configrxdb.py`, `configrx.py`, `appdb.py`, `web/api/auth.py`, `web/api/configrx.py`, `sshterm.py`, `web/api/relays.py`, `ssh.html`, `ssh.js`) — 5.63.0
+
+**Before this release `sshterm._load_stored_credential` read
+`configrx_db.device_config(device_id)`** — the same per-device
+`ssh_username`/`ssh_password_enc` columns a ConfigRX backup uses — so a
+device with a ConfigRX credential stored for backups had the SSH terminal
+sign in with it too, with no way to keep the two apart. The operator's ask
+split them into two credentials with two different scopes: ConfigRX's
+stays per-device with one new global fallback, and the SSH button's
+becomes per-*account*, global by nature (an operator's own login, usable
+against any device), and never falls back to ConfigRX's.
+
+**ConfigRX's own global account** is `configrxdb.global_credential`, a
+single-row table (`id INTEGER PRIMARY KEY CHECK (id = 1)`, `username`,
+`password_enc`, `stored_ts`) — the same one-row pattern
+`alertsdb.sms_credential` already uses — with `global_credential()`,
+`set_global_credential()` and `clear_global_credential()`.
+`configrx.ConfigRxWorker._backup` reads a device's own `ssh_username`/
+`ssh_password_enc` first; only when *either* is empty does it read the
+global row, and only when the global row also has nothing stored does it
+give up with "No SSH credential stored for this device and no global
+ConfigRX account" — the device's own row, when it has one, always wins.
+`POST /api/configrx/credential` (`ssh_username`, `ssh_password`, encrypted
+through `_encrypt_secret`, audited `credential.store` target
+`configrx:global`) and `DELETE /api/configrx/credential` manage it;
+`GET /api/config`'s `configrx` scope gains `configrx_global_credential:
+{username, has_password, stored_ts}` (`_configrx_global_credential_json`)
+so the settings dialog can render its status without a dedicated fetch.
+`_configrx_device_json`'s `credential_source` (`"stored"`/`"global"`/`""`)
+is what the device list's Credential column reads, computed once per list
+call against one `global_credential()` read rather than once per device.
+
+**The SSH button's login is `appdb.user_ssh`, one row per account**
+(`username PRIMARY KEY`, `ssh_username`, `ssh_password_enc`, `stored_ts`),
+managed by `GET`/`PUT`/`DELETE /api/account/ssh` — gated on sign-in only,
+the same self-service shape `/api/account/sms` already has, with no
+module permission of its own. `sshterm.SshSession._load_stored_credential`
+now reads this table keyed on `self.app_user` and never touches
+`configrx_db` at all; a stored pair that the device refuses now reports
+"The SSH login stored for your account was refused" rather than naming
+ConfigRX. `relays.get_ssh_device`'s `has_credential` reads the same row.
+`remove_user` deletes it alongside `user_sms`.
+
+**Remembering a typed-in login is deliberately sequenced so a wrong
+password can never be stored.** The `auth` WebSocket message carries a new
+`remember` boolean (`ssh.html` adds a "Remember for my account" checkbox
+beside the password field); `_run` captures `(username, password)` into a
+local *before* calling `_connect`, but only actually stores it —
+`_remember_credential`, DPAPI-encrypting and calling
+`app_db.set_user_ssh`, audited `account.ssh.store` — from inside
+`_connect` itself, after `AuthenticationException` has had its chance to
+fire and only on the path that reaches `"connected"`; a wrong password
+never runs that line. A host with no DPAPI available sends a `notice`
+frame ("SSH login not remembered: this host cannot encrypt a stored
+credential") instead of storing anything, so the session still connects.
+`ssh.js`'s `none-stored` message changed to match: "No SSH login is stored
+for your account. Tick Remember below to keep this one, or set it under
+Account."
+
+**The Account dialog's own `#am-ssh` fieldset** (`app.js`) is a fourth
+credential-status fieldset alongside SMS, laid out the same way: a status
+line ("Stored as `<user>`, saved `<when>`" or "No SSH login stored"),
+Save and Clear, re-rendered from each call's own response rather than the
+whole dialog reopening, and `credentialUnavailableHtml` in place of the
+form on a host with no DPAPI.
 
 ### Front-end tidy-up: three more extras, one copy of shared helpers (`nodes.js`, `nodes_settings.js`, `nodes_oid_browser.js`, `nodes_credentials.js`, `app.js`) — 5.45.0
 
@@ -16791,13 +17067,22 @@ polling immediately either way.
 
 ### Opening the window, and Remove's new home (`nodes.js`)
 
-`sshDevice()` is the application's only `window.open`. A shell is not a
+A shell is not a
 dialog — it is kept open beside the rest of the product, resized and lived
 in — so it gets a window: `window.open('/ssh.html?device=<id>&name=<encoded
-display name>', 'ssh-<id>', 'width=1000,height=640,noopener')`. The window
+display name>', 'ssh-<id>', App.windowFeatures(1000, 640))` (via
+`App.openSshWindow`, shared with Mapper's own SSH button since 5.59.0 —
+see "VlanView's glow, and shared SSH/WEB window helpers," below). The
+feature string never carried `noopener` — that flag also discards the
+window name, which would turn every click into a rival window rather than
+raising the one already open — so `w.opener = null` is set on the handle
+instead. `windowFeatures()`, from 5.63.0, centres that string
+(`left=`/`top=` computed from the current screen and window position) so
+the terminal opens over the browser window rather than pinned to the
+screen's top-left corner. The window
 name is keyed to the device, so a second SSH click on the same device
-raises the window it already has rather than starting a rival session;
-`noopener` keeps the popup from reaching back into the opener. The display
+raises the window it already has rather than starting a rival session.
+The display
 name rides in the query string because `displayName()`'s precedence is
 private to `nodes.js`; it only has to hold until the API answers. The
 button is `data-requires-write="ssh"` in the markup and `sshDevice()`

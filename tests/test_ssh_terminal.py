@@ -294,8 +294,22 @@ try:
                                          group_id=group_id)
     service.configrx_db.update_device_config(device, ssh_port=stub.port,
                                              ssh_username="operator")
+    # ConfigRX's own row — kept only for the SSH port, and to prove the
+    # terminal no longer reads its credential at all.
     service.configrx_db.set_credential(device, "operator",
                                        dpapi_mod.protect(PASSWORD.encode()))
+
+    probe = WsClient(web_port, f"/api/ssh/devices/{device}/socket", token)
+    probe.send_json({"type": "open", "cols": 80, "rows": 24})
+    probed = probe.next_control("need-credentials")
+    assert probed["reason"] == "none-stored", probed
+    probe.close()
+    print("PASS: a ConfigRX credential alone is not enough — the terminal "
+          "never reads it")
+
+    service.app_db.set_user_ssh(DEFAULT_USER, "operator",
+                                dpapi_mod.protect(PASSWORD.encode()))
+    wait_idle()
 
     # -------------------------------------------------- the page's own GET
 
@@ -367,7 +381,7 @@ try:
     assert keys[0]["fingerprint"].startswith("SHA256:"), keys[0]
     first_fingerprint = keys[0]["fingerprint"]
     print("PASS: the first connection stores the device's host key and says so")
-    print("PASS: the session reaches 'connected' using ConfigRX's stored credential")
+    print("PASS: the session reaches 'connected' using the account's stored SSH login")
 
     ws.read_until(b"stub-switch#")
     print("PASS: the device's banner and prompt arrive as binary frames")
@@ -464,14 +478,16 @@ try:
         [dict(e) for e in service.nodes_db.device_events(device, kinds=["ssh"])]
     print("PASS: trusting a new host key is audited as a device event")
 
-    # ------------------------------------------- a device with no credential
+    # --------------------------------------- an account with no login stored
 
-    # Its own listener, on another loopback address, because the device row
-    # is keyed by IP and this one must not have ConfigRX's credential.
+    # Its own listener, on another loopback address — the credential is
+    # account-scoped now, not device-scoped, so what makes this one bare is
+    # clearing DEFAULT_USER's own stored login for the duration of the check.
     stub2 = StubDevice(mode="slow", pause_s=0.05, host="127.0.0.2")
     plain_device = service.nodes_db.add_device("127.0.0.2", name="no-credential",
                                                group_id=group_id)
     service.configrx_db.update_device_config(plain_device, ssh_port=stub2.port)
+    service.app_db.clear_user_ssh(DEFAULT_USER)
     status, payload = call("GET", f"/api/ssh/devices/{plain_device}", token=token)
     assert payload["has_credential"] is False, payload
 
@@ -480,7 +496,7 @@ try:
     message = ws.next_control()
     assert message["type"] == "need-credentials", message
     assert message["reason"] == "none-stored", message
-    print("PASS: a device with no stored credential asks the page for one")
+    print("PASS: an account with no SSH login stored asks the page for one")
 
     ws.send_json({"type": "auth", "username": "typed-in", "password": "typed"})
     until_connected(ws)
@@ -491,6 +507,12 @@ try:
         assert "typed" not in event["detail"], event["detail"]
     print("PASS: the typed password appears in no device event")
     ws.close()
+    assert service.app_db.user_ssh(DEFAULT_USER) is None, \
+        "an unticked Remember must not store anything"
+    print("PASS: credentials typed with Remember left unticked are not stored")
+    service.app_db.set_user_ssh(DEFAULT_USER, "operator",
+                                dpapi_mod.protect(PASSWORD.encode()))
+    wait_idle()
 
     # --------------------------------------------------------- the limits
 
@@ -647,6 +669,9 @@ try:
             time.sleep(0.05)
 
     wait_idle()
+    # Bare again for this account, through the brute-force checks below —
+    # a stored login would auto-connect instead of prompting for one.
+    service.app_db.clear_user_ssh(DEFAULT_USER)
     import stubs.stub_ssh_device as stub_module
     accept_password = stub_module._Server.check_auth_password
     stub_module._Server.check_auth_password = \
@@ -834,6 +859,53 @@ try:
         stub5.close()
     wait_idle()
 
+    # ------------------------------------------------ the Remember checkbox
+
+    # A wrong password with Remember ticked must store nothing; the device
+    # accepting the pair is what earns it a place in appdb.user_ssh.
+    stub6 = StubDevice(mode="slow", pause_s=0.05, host="127.0.0.6")
+    remember_device = service.nodes_db.add_device("127.0.0.6", name="remember-target",
+                                                  group_id=group_id)
+    service.configrx_db.update_device_config(remember_device, ssh_port=stub6.port)
+    stub_module._Server.check_auth_password = (
+        lambda self, username, password: paramiko.AUTH_SUCCESSFUL
+        if password == "right-one" else paramiko.AUTH_FAILED)
+    try:
+        audit_before = service.app_db.audit_last_id()
+        ws = WsClient(web_port, f"/api/ssh/devices/{remember_device}/socket", token)
+        ws.send_json({"type": "open", "cols": 80, "rows": 24})
+        assert ws.next_control("need-credentials")["reason"] == "none-stored"
+        ws.send_json({"type": "auth", "username": "remembered",
+                      "password": "wrong-one", "remember": True})
+        assert ws.next_control("need-credentials")["reason"] == "auth-failed"
+        assert service.app_db.user_ssh(DEFAULT_USER) is None, \
+            "a wrong password must never be remembered"
+        print("PASS: Remember ticked on a refused login stores nothing")
+
+        ws.send_json({"type": "auth", "username": "remembered",
+                      "password": "right-one", "remember": True})
+        until_connected(ws)
+        row = service.app_db.user_ssh(DEFAULT_USER)
+        assert row is not None and row["ssh_username"] == "remembered", row
+        assert dpapi_mod.unprotect(bytes(row["ssh_password_enc"])) == b"right-one", row
+        ws.close()
+        wait_idle()
+        print("PASS: Remember ticked on a login the device accepts stores it, "
+              "encrypted, as this account's SSH login")
+
+        stored_audit = [e for e in service.app_db.audit_events(audit_before)
+                        if e["action"] == "account.ssh.store"
+                        and e["username"] == DEFAULT_USER]
+        assert stored_audit, "no account.ssh.store audit row for the remembered login"
+        print("PASS: remembering a login from the terminal is audited as "
+              "account.ssh.store")
+    finally:
+        stub_module._Server.check_auth_password = accept_password
+        stub6.close()
+    wait_idle()
+    service.app_db.set_user_ssh(DEFAULT_USER, "operator",
+                                dpapi_mod.protect(PASSWORD.encode()))
+
     # ------------------------- a permission read that cannot answer is not forever
 
     # The watchdog fails open when app.db raises — "a database that cannot
@@ -845,6 +917,8 @@ try:
                             "password": "Corr3ct-Horse-B7t",
                             "grants": {"ssh": "write"}}, token=token)
     assert status == 200, (status, payload)
+    service.app_db.set_user_ssh("blindeduser", "operator",
+                                dpapi_mod.protect(PASSWORD.encode()))
     blinded_token = login("blindeduser", "Corr3ct-Horse-B7t")
     blinded = WsClient(web_port, f"/api/ssh/devices/{device}/socket",
                        blinded_token)
@@ -889,6 +963,8 @@ try:
                            {"username": "shelluser", "password": "Corr3ct-Horse-B4t",
                             "grants": {"ssh": "write"}}, token=token)
     assert status == 200, (status, payload)
+    service.app_db.set_user_ssh("shelluser", "operator",
+                                dpapi_mod.protect(PASSWORD.encode()))
     shell_token = login("shelluser", "Corr3ct-Horse-B4t")
     signed_out = WsClient(web_port, f"/api/ssh/devices/{device}/socket", shell_token)
     signed_out.send_json({"type": "open", "cols": 80, "rows": 24})
@@ -954,6 +1030,8 @@ try:
                            {"username": "flakyuser", "password": "Corr3ct-Horse-B6t",
                             "grants": {"ssh": "write"}}, token=token)
     assert status == 200, (status, payload)
+    service.app_db.set_user_ssh("flakyuser", "operator",
+                                dpapi_mod.protect(PASSWORD.encode()))
     flaky_token = login("flakyuser", "Corr3ct-Horse-B6t")
     flaky = WsClient(web_port, f"/api/ssh/devices/{device}/socket", flaky_token)
     flaky.send_json({"type": "open", "cols": 80, "rows": 24})

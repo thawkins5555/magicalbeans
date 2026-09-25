@@ -19,7 +19,6 @@ def get_ssh_device(service, params, body, device_id) -> dict:
     about the device's host key. Gated on ("ssh", W) like the socket itself
     — there is no read-only half of "open a shell"."""
     device, host, port = _ssh_device_host(service, device_id)
-    config = service.configrx_db.device_config(device_id)
     # nodes.js's displayName() precedence, the same one ConfigRX's device
     # list uses: the SNMP hostname wins unless the device is pinned to its
     # manual name, with the IP as the last resort. Resolved here, once — the
@@ -27,10 +26,11 @@ def get_ssh_device(service, params, body, device_id) -> dict:
     name = ((device["name"] if device["display_name_source"] == "manual" else None)
             or device["sys_name"] or device["name"] or device["ip"])
     available = configrx.paramiko_available()
+    user_ssh = service.app_db.user_ssh(params.get("_username", ""))
     return {
         "device": {"id": device["id"], "ip": host, "name": name},
-        "has_credential": bool(config and config["ssh_username"]
-                               and config["ssh_password_enc"]),
+        "has_credential": bool(user_ssh and user_ssh["ssh_username"]
+                               and user_ssh["ssh_password_enc"]),
         "ssh_port": port,
         "paramiko": {"available": available,
                      "message": "" if available else configrx.PARAMIKO_MISSING},

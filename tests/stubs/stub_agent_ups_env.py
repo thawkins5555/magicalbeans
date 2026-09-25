@@ -105,7 +105,9 @@ Modes:
              -> 'dac'; if 21, the same text plus an ifMauType arc 41
              (10GBASE-CX4) -> still 'dac'; if 22, the same text plus a
              fiber ifMauType arc (36) -> vetoed down to 'sfp', same as
-             copper text under a fiber arc.
+             copper text under a fiber arc. Plus, DAF (5.63.0): if 23,
+             active-cable text alone is 'daf'; if 24, the same text under
+             a fiber arc still stays 'daf', unlike DAC/copper (P3 fix).
   sfp_media_no_class
              `sfp_media`, except that every request into the
              entPhysicalClass column goes unanswered -- the flaky device
@@ -843,6 +845,30 @@ SFP_MEDIA_TABLE = {
     "1.3.6.1.2.1.47.1.1.1.1.5.322": ("int", 9),
     "1.3.6.1.2.1.47.1.1.1.1.4.322": ("int", 222),
     "1.3.6.1.2.1.47.1.1.1.1.13.322": ("str", "SFP-H10GB-CU3M"),
+
+    # --- if 23: DAF (active optical cable) module text, no sensor at all
+    "1.3.6.1.2.1.47.1.1.1.1.2.223": ("str", "SFP+ container"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.223": ("int", 5),
+    "1.3.6.1.2.1.47.1.1.1.1.2.273": ("str", "GigabitEthernet1/0/23"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.273": ("int", 10),
+    "1.3.6.1.2.1.47.1.1.1.1.4.273": ("int", 223),
+    "1.3.6.1.2.1.47.1.3.2.1.2.273.1": ("str", "1.3.6.1.2.1.2.2.1.1.23"),
+    "1.3.6.1.2.1.47.1.1.1.1.2.323": ("str", "10GBase-AOC SFP+"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.323": ("int", 9),
+    "1.3.6.1.2.1.47.1.1.1.1.4.323": ("int", 223),
+    "1.3.6.1.2.1.47.1.1.1.1.13.323": ("str", "SFP-10G-Active-Cable"),
+
+    # --- if 24: same DAF text, plus a fiber ifMauType arc (36) (5.63.0 P3)
+    "1.3.6.1.2.1.47.1.1.1.1.2.224": ("str", "SFP+ container"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.224": ("int", 5),
+    "1.3.6.1.2.1.47.1.1.1.1.2.274": ("str", "GigabitEthernet1/0/24"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.274": ("int", 10),
+    "1.3.6.1.2.1.47.1.1.1.1.4.274": ("int", 224),
+    "1.3.6.1.2.1.47.1.3.2.1.2.274.1": ("str", "1.3.6.1.2.1.2.2.1.1.24"),
+    "1.3.6.1.2.1.47.1.1.1.1.2.324": ("str", "10GBase-AOC SFP+"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.324": ("int", 9),
+    "1.3.6.1.2.1.47.1.1.1.1.4.324": ("int", 224),
+    "1.3.6.1.2.1.47.1.1.1.1.13.324": ("str", "SFP-10G-Active-Cable"),
 }
 
 # MAU-MIB ifMauType rows (ifIndex.mauIndex -> an OID whose last arc is a
@@ -864,6 +890,7 @@ SFP_MAU_TABLE = {
     f"{IF_MAU_TYPE}.14.1": ("oid", "1.3.6.1.4.1.9.9.99.30"),
     f"{IF_MAU_TYPE}.21.1": ("oid", "1.3.6.1.2.1.26.4.41"),   # 10GBASE-CX4
     f"{IF_MAU_TYPE}.22.1": ("oid", "1.3.6.1.2.1.26.4.36"),   # 10GBASE-SR: fiber veto
+    f"{IF_MAU_TYPE}.24.1": ("oid", "1.3.6.1.2.1.26.4.36"),
 }
 
 # sfp_media_no_sensors (5.35.0, F1): the cage/alias/containment rows, with

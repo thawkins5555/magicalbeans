@@ -525,15 +525,16 @@ def firmware_inventory(nodesdb, device_ids: list[int] | None = None,
 
 
 _MEDIA_KIND = {"optic": "DOM", "sfp": "SFP", "copper": "COP", "dac": "DAC",
-              "sfp_empty": "Empty cage"}
+              "daf": "DAF", "sfp_empty": "Empty cage"}
 
 # The "what does the light do" column beside kind's "what did we prove it
 # with": DOM and SFP are both laser transceivers (they differ only in
-# whether DOM sensors answered), copper is BASE-T, DAC is twinax copper, and
-# an empty cage is neither yet. api.py and reportsched.py both read this
-# rather than repeating the mapping.
+# whether DOM sensors answered), copper is BASE-T, DAC is twinax copper, DAF
+# is an active optical (direct-attach fibre) cable, and an empty cage is
+# neither yet. api.py and reportsched.py both read this rather than
+# repeating the mapping.
 MEDIA_MEDIUM = {"optic": "Laser", "sfp": "Laser", "copper": "Copper",
-                "dac": "Copper", "sfp_empty": ""}
+                "dac": "Copper", "daf": "Laser", "sfp_empty": ""}
 
 
 @dataclass
@@ -572,6 +573,7 @@ class SfpReport:
     sfp_count: int
     copper_count: int
     dac_count: int
+    daf_count: int
     empty_count: int
     rows: list[SfpRow]
 
@@ -583,6 +585,7 @@ class SfpReport:
                 "sfp_count": self.sfp_count,
                 "copper_count": self.copper_count,
                 "dac_count": self.dac_count,
+                "daf_count": self.daf_count,
                 "empty_count": self.empty_count,
                 "rows": [r.to_dict() for r in self.rows]}
 
@@ -592,7 +595,8 @@ def sfp_inventory(nodesdb, device_ids: list[int] | None = None,
                   include_empty: bool = False) -> SfpReport:
     """Every switch port holding a transceiver: DOM (optic, with sensors),
     SFP (named by ENTITY-MIB, no DOM), COP (copper, module text or
-    MAU-MIB), DAC (twinax/direct-attach copper) and, when `include_empty`,
+    MAU-MIB), DAC (twinax/direct-attach copper), DAF (active optical
+    direct-attach fibre) and, when `include_empty`,
     empty cages. `dns_names`/
     `hostnames` name a device the same way firmware_inventory does when it
     has neither a manual name nor a sysName."""
@@ -627,6 +631,7 @@ def sfp_inventory(nodesdb, device_ids: list[int] | None = None,
         sfp_count=sum(1 for r in rows if r.media == "sfp"),
         copper_count=sum(1 for r in rows if r.media == "copper"),
         dac_count=sum(1 for r in rows if r.media == "dac"),
+        daf_count=sum(1 for r in rows if r.media == "daf"),
         empty_count=sum(1 for r in rows if r.media == "sfp_empty"),
         rows=rows)
 

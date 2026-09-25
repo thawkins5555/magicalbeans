@@ -44,8 +44,9 @@ check(".login-box { width: min(" in narrow, "the sign-in card is fluid below 120
 stacked = css.split("@media (max-width: 900px)")[1]
 check("[data-splitter].cols { flex-direction: column; }" in stacked,
       "side-by-side splitters stack below 900 px")
-check('html[data-tab="netpath"] #page-netpath.page { flex-direction: column; }' in stacked,
-      "the NetPath sidebar moves above the canvas below 900 px")
+check('#page-netpath.active { flex-direction: row; }' not in css
+      and 'html[data-tab="netpath"] #page-netpath.page { flex-direction: row; }' not in css,
+      "Routes no longer forces a row layout; its toolbar sits above .cols like every other module")
 check("innerWidth < 900" in app and "'narrow'" in app,
       "applyDensity() answers the same 900 px question the stylesheet does")
 

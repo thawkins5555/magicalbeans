@@ -62,6 +62,17 @@ CREATE TABLE IF NOT EXISTS user_sms (
     code_attempts INTEGER NOT NULL DEFAULT 0
 );
 
+-- The per-account SSH login the SSH button uses, kept separate from
+-- ConfigRX's own device-scoped credential (configrxdb.py): the terminal
+-- never falls back to that one. One row per account, DPAPI-encrypted the
+-- same way as every other stored password in this app.
+CREATE TABLE IF NOT EXISTS user_ssh (
+    username         TEXT PRIMARY KEY,
+    ssh_username     TEXT,
+    ssh_password_enc BLOB,
+    stored_ts        REAL
+);
+
 CREATE TABLE IF NOT EXISTS hostnames (
     ip          TEXT PRIMARY KEY,
     hostname    TEXT,
@@ -667,6 +678,37 @@ class AppDatabase(SqliteStore):
                 (username,))
             self._conn.execute(
                 "DELETE FROM user_sms WHERE username = ? COLLATE NOCASE",
+                (username,))
+            self._conn.execute(
+                "DELETE FROM user_ssh WHERE username = ? COLLATE NOCASE",
+                (username,))
+            self._conn.commit()
+
+    # ------------------------------------------------------------- user ssh
+
+    def user_ssh(self, username: str) -> sqlite3.Row | None:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM user_ssh WHERE username = ? COLLATE NOCASE",
+                (username,)).fetchone()
+
+    def set_user_ssh(self, username: str, ssh_username: str,
+                     ssh_password_enc: bytes) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO user_ssh(username, ssh_username, ssh_password_enc,"
+                " stored_ts) VALUES (?, ?, ?, ?)"
+                " ON CONFLICT(username) DO UPDATE SET"
+                " ssh_username=excluded.ssh_username,"
+                " ssh_password_enc=excluded.ssh_password_enc,"
+                " stored_ts=excluded.stored_ts",
+                (username, ssh_username, ssh_password_enc, time.time()))
+            self._commit_durable()
+
+    def clear_user_ssh(self, username: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM user_ssh WHERE username = ? COLLATE NOCASE",
                 (username,))
             self._conn.commit()
 

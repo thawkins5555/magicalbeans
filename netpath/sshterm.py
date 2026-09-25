@@ -382,6 +382,8 @@ class SshSession:
         self._username = ""
         self._password: str | None = None
         self._credential_from_store = False
+        # Set from the auth message; acted on only after the device accepts the pair.
+        self._remember = False
 
     # ------------------------------------------------------------ messaging
 
@@ -474,7 +476,7 @@ class SshSession:
 
         config = self.service.configrx_db.device_config(self.device_id)
         self.port = _int_in(config["ssh_port"] if config else 22, 1, 65535, 22)
-        reason = self._load_stored_credential(config)
+        reason = self._load_stored_credential()
 
         while not self._stopped.is_set():
             # Checked before the credentials are even asked for, so a socket
@@ -489,7 +491,10 @@ class SshSession:
                 if not self._ask_for_credentials(reason):
                     return
 
-            outcome, detail = self._connect()
+            to_remember = (self._username, self._password) \
+                if (self._remember and not self._credential_from_store) else None
+            outcome, detail = self._connect(remember=to_remember)
+            to_remember = None
             if outcome == "connected":
                 self._shell()
                 return
@@ -541,33 +546,57 @@ class SshSession:
             self._username = username
             self._password = str(message.get("password", "") or "")
             self._credential_from_store = False
+            self._remember = bool(message.get("remember"))
             return True
 
-    def _load_stored_credential(self, config) -> str:
-        """ConfigRX's credential for this device, if it has one. Returns the
-        `need-credentials` reason when there is nothing usable — the page
-        then asks the operator."""
-        if not config or not config["ssh_username"] or not config["ssh_password_enc"]:
-            self._username = (config["ssh_username"] if config else "") or ""
+    def _load_stored_credential(self) -> str:
+        """The SSH login stored on this account (appdb.user_ssh), if any.
+        ConfigRX's own device-scoped credential is never consulted here — the
+        two are deliberately separate. Returns the `need-credentials` reason
+        when there is nothing usable, so the page asks the operator."""
+        row = self.service.app_db.user_ssh(self.app_user)
+        if not row or not row["ssh_username"] or not row["ssh_password_enc"]:
+            self._username = (row["ssh_username"] if row else "") or ""
             return "none-stored"
-        self._username = config["ssh_username"]
+        self._username = row["ssh_username"]
         from . import dpapi
         try:
             self._password = dpapi.unprotect(
-                bytes(config["ssh_password_enc"])).decode("utf-8")
+                bytes(row["ssh_password_enc"])).decode("utf-8")
         except Exception:
             self._password = None
             return "decrypt-failed"
         self._credential_from_store = True
         return ""
 
+    def _remember_credential(self, username: str, password: str) -> None:
+        """Stores the pair as this account's SSH login, once accepted."""
+        from . import dpapi
+        if not dpapi.available():
+            self._send({"type": "notice", "message": "SSH login not "
+                        "remembered: this host cannot encrypt a stored "
+                        "credential."})
+            return
+        try:
+            encrypted = dpapi.protect(password.encode("utf-8"))
+        except Exception:
+            self._send({"type": "notice", "message": "SSH login not "
+                        "remembered: it could not be encrypted on this "
+                        "machine."})
+            return
+        self.service.app_db.set_user_ssh(self.app_user, username, encrypted)
+        self.service.app_db.audit(self.app_user, self.client_ip,
+                                  "account.ssh.store", self.app_user,
+                                  f"username {username}, remembered from the SSH terminal")
+
     # ------------------------------------------------------------- connect
 
-    def _connect(self) -> tuple[str, object]:
+    def _connect(self, remember: tuple[str, str] | None = None) -> tuple[str, object]:
         """One connect attempt. Returns (outcome, detail) where outcome is
         'connected', 'auth-failed', 'changed' (detail is a
         `hostkeys.HostKeyChanged`) or 'failed' (already reported to the
-        page)."""
+        page). `remember`, when given, is stored before the page is told
+        the session is connected."""
         import paramiko
 
         from . import webrelay
@@ -618,8 +647,7 @@ class SshSession:
             self._password = None
             self._audit_auth_failure()
             if self._credential_from_store:
-                self._error("The SSH credential stored in ConfigRX for this "
-                            "device was refused.")
+                self._error("The SSH login stored for your account was refused.")
             else:
                 self._error("Authentication failed.")
             self._credential_from_store = False
@@ -666,6 +694,8 @@ class SshSession:
         # fumbled four passwords and then got in must not be locked out an
         # hour later by the count they left behind.
         self.registry.clear_auth_failures(self.app_user, self.device_id)
+        if remember is not None:
+            self._remember_credential(*remember)
         self._status("connected", f"Connected to {self.host}:{self.port}")
         self._audit_open()
         return "connected", None

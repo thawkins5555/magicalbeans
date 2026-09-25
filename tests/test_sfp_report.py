@@ -124,6 +124,17 @@ check("dac_count counts it, copper_count is unaffected",
       dac_result.dac_count == 1 and dac_result.copper_count == result.copper_count,
       dac_result.to_dict())
 
+sw4 = db.add_device("10.60.0.4", "acc-sw-04", group_id=gid)
+db.replace_interfaces(sw4, PORTS[:1])
+db.update_interface_media(sw4, [{"if_index": 1, "media": "daf"}])
+daf_result = report.sfp_inventory(db)
+daf_row = next(r for r in daf_result.rows if r.device_id == sw4)
+check("a daf port is a row with kind 'DAF', medium 'Laser'",
+      daf_row.kind == "DAF" and daf_row.medium == "Laser", daf_row)
+check("daf_count counts it, dac_count is unaffected",
+      daf_result.daf_count == 1 and daf_result.dac_count == dac_result.dac_count,
+      daf_result.to_dict())
+
 db.request_device_removal([sw1])
 purged = report.sfp_inventory(db)
 check("a purged device's ports drop out of the report",

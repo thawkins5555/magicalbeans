@@ -1029,15 +1029,26 @@ class ConfigRxWorker(Worker):
                       f"vendor override in this device's ConfigRX settings")
             return
 
-        if not config["ssh_username"] or not config["ssh_password_enc"]:
-            self.db.record_backup_attempt(device_id, ok=False, status="error",
-                                          error="No SSH credential stored")
-            return
+        ssh_username = config["ssh_username"]
+        ssh_password_enc = config["ssh_password_enc"]
+        if not ssh_username or not ssh_password_enc:
+            # No per-device override: fall back to the global ConfigRX
+            # account before giving up on the backup.
+            glob = self.db.global_credential()
+            if glob and glob["username"] and glob["password_enc"]:
+                ssh_username = glob["username"]
+                ssh_password_enc = glob["password_enc"]
+            else:
+                self.db.record_backup_attempt(
+                    device_id, ok=False, status="error",
+                    error="No SSH credential stored for this device and no "
+                          "global ConfigRX account")
+                return
 
         from . import dpapi
         password = None
         try:
-            password = dpapi.unprotect(bytes(config["ssh_password_enc"])).decode("utf-8")
+            password = dpapi.unprotect(bytes(ssh_password_enc)).decode("utf-8")
         except Exception:
             self.db.record_backup_attempt(device_id, ok=False, status="error",
                                           error="Stored SSH credential could not be decrypted")
@@ -1076,7 +1087,7 @@ class ConfigRxWorker(Worker):
         client.set_missing_host_key_policy(policy)
         try:
             client.connect(
-                host, port=port, username=config["ssh_username"],
+                host, port=port, username=ssh_username,
                 password=password, timeout=CONNECT_TIMEOUT_S, banner_timeout=CONNECT_TIMEOUT_S,
                 auth_timeout=CONNECT_TIMEOUT_S, look_for_keys=False, allow_agent=False)
         except (HostKeyChanged, paramiko.BadHostKeyException) as exc:

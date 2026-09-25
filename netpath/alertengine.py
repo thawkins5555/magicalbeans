@@ -160,6 +160,8 @@ class AlertEngine(Worker):
         # the next, so a scope alert an operator resolved by hand stays
         # resolved while the scope stays full.
         self._dhcp_streaks: dict[tuple, tuple[float | None, int, float | None]] = {}
+        # (rule id, server id) -> poll_failures last seen, so a tick with no new poll is a no-op.
+        self._dhcp_poll_failures_seen: dict[tuple, int] = {}
         # (read at, the roots asked for, the rows) for the fleet-wide read of
         # the limits transceivers publish about themselves. The poller
         # rewrites those once an hour per device, so re-reading them every
@@ -351,6 +353,7 @@ class AlertEngine(Worker):
         occurrences += self._stage("drain_system_occurrences", self._drain_system_occurrences)
         occurrences += self._stage("evaluate_thresholds", self._evaluate_thresholds, settings)
         occurrences += self._stage("evaluate_dhcp_thresholds", self._evaluate_dhcp_thresholds, settings)
+        occurrences += self._stage("evaluate_dhcp_polls", self._evaluate_dhcp_polls, settings)
         occurrences += self._stage("evaluate_netpath_thresholds", self._evaluate_netpath_thresholds, settings)
         occurrences += self._stage("evaluate_netpath_https", self._evaluate_netpath_https, settings)
         rules = [r for r in self.db.rules() if r["enabled"]]
@@ -550,20 +553,13 @@ class AlertEngine(Worker):
         # never receive another text until it re-opts in with Twilio
         # directly, so a per-user opt-in is turned off right away rather
         # than failing silently on every future send.
-        raw_to_default = job.settings.get("sms_to_default", [])
-        if isinstance(raw_to_default, str):
-            sms_to_default = [a.strip() for a in raw_to_default.split(",") if a.strip()]
-        else:
-            sms_to_default = [str(a).strip() for a in raw_to_default if str(a).strip()]
         for number, err in getattr(job, "number_errors", []):
             if alertmail.twilio_error_code(err) != alertmail.TWILIO_STOP_CODE:
                 continue
             if self.app_db is not None:
                 self.app_db.sms_stop_number(number, time.time())
             self.log.add(ERROR, f"{number} replied STOP to Twilio; alert texts "
-                                f"to it are off" + (
-                                    " (remove it from Alerts → Settings → "
-                                    "Default numbers)" if number in sms_to_default else ""))
+                                f"to it are off")
 
     def _sms_breaker(self, is_open: bool, error: str) -> None:
         """The SMS path itself became (un)usable — same reasoning as
@@ -1937,6 +1933,48 @@ class AlertEngine(Worker):
                     if resolved:
                         self.counters["resolved"] += 1
                         self._notify_clear(resolved, rule, settings)
+        return occurrences
+
+    def _evaluate_dhcp_polls(self, settings) -> list[Occurrence]:
+        """DHCP servers gone quiet, from dhcp_servers.poll_failures. Only
+        acts once per real poll, same "poll, not tick" guard as
+        _evaluate_dhcp_thresholds."""
+        if self.ipam_db is None:
+            return []
+        rules = [r for r in self.db.rules()
+                 if r["enabled"] and r["kind"] == "dhcp_event"]
+        if not rules:
+            return []
+        occurrences = []
+        for server in self.ipam_db.dhcp_servers():
+            if not server["enabled"]:
+                continue
+            server_id = str(server["id"])
+            failures = server["poll_failures"] or 0
+            label = server["label"] or server["address"]
+            for rule in rules:
+                seen_key = (rule["id"], server_id)
+                previous = self._dhcp_poll_failures_seen.get(seen_key)
+                self._dhcp_poll_failures_seen[seen_key] = failures
+                if failures == previous:
+                    continue
+                if failures == 0:
+                    if self.db.resolve_by_dedup(
+                            f"{rule['key']}:dhcp_server:{server_id}", by=""):
+                        self.counters["resolved"] += 1
+                    continue
+                if failures < (rule["for_polls"] or 1):
+                    continue
+                occurrences.append(Occurrence(
+                    kind="dhcp_event", source_kind=rule["source_kind"],
+                    rule_key=rule["key"] or "",
+                    entity_kind="dhcp_server", entity_id=server_id,
+                    entity_label=label, ts=time.time(),
+                    message=f"DHCP poll of {label} has failed {failures} "
+                            f"times in a row: {server['last_error'] or 'no error given'}",
+                    device_name=label, device_ip=server["address"],
+                    extra={"failures": str(failures),
+                           "error": server["last_error"] or ""}))
         return occurrences
 
     # The metrics a NetPath rule can be about, and what each one is called
@@ -3350,19 +3388,12 @@ class AlertEngine(Worker):
                                         text, False, "send queue full")
 
     def _sms_numbers(self, settings) -> list:
-        """sms_to_default, tolerant of a comma string like smtp_to_default's
-        own upgrade fallback in _notify, plus every account's own opted-in
-        number, de-duplicated."""
-        raw_to = settings.get("sms_to_default", [])
-        if isinstance(raw_to, str):
-            numbers = [a.strip() for a in raw_to.split(",") if a.strip()]
-        else:
-            numbers = [str(a).strip() for a in raw_to if str(a).strip()]
-        if self.app_db is not None:
-            for number in self.app_db.sms_opted_in_numbers():
-                if number not in numbers:
-                    numbers.append(number)
-        return numbers
+        """Every account's own opted-in number, and nothing else: 5.63.0
+        dropped the admin-set default list. `settings` is unused now but
+        kept so both call sites need no change."""
+        if self.app_db is None:
+            return []
+        return list(self.app_db.sms_opted_in_numbers())
 
     def _sms_token(self, settings) -> str | None:
         """The stored secret, only when the configured Account SID, API Key
@@ -3410,6 +3441,11 @@ class AlertEngine(Worker):
                     return ""
                 server = self.ipam_db.dhcp_server(
                     int(str(alert_row["entity_id"]).split(":")[0]))
+                return server["address"] if server else ""
+            elif alert_row["entity_kind"] == "dhcp_server":
+                if self.ipam_db is None:
+                    return ""
+                server = self.ipam_db.dhcp_server(int(alert_row["entity_id"]))
                 return server["address"] if server else ""
             elif alert_row["entity_kind"] == "netpath_target":
                 # A NetPath alert's entity_id is the destination's row id.

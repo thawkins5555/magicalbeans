@@ -275,6 +275,13 @@ below 900 px side-by-side panes stack and the NetPath destination list moves
 above the route. The layout is measured down to 768 px (a tablet); below
 that nothing is clipped, but nothing is designed for a phone either.
 
+**From 5.63.0, the ROUTES strip carrying Print, Refresh and Settings sits
+in a normal row above the destination list and route canvas**, the same
+way every other module's own strip does — a leftover rule had pinned it
+into a narrow column down the left edge of the page instead. The
+destination list and canvas still sit side by side above 900 px and stack
+the same way below it.
+
 ### Touch, pen and keyboard
 
 Every drag — pane splitters, column grips, panning the route, brushing a
@@ -750,6 +757,14 @@ NetFlow filtered to it.
   as a BASE-T copper module. **From 5.56.0, DAC's badge is the same
   grey as DOM, SFP and COP** — all four are one neutral colour, not a
   severity, so none of them reads as more urgent than another.
+- **From 5.63.0, an active optical (direct-attach fibre) cable gets its
+  own DAF badge**, the same grey as the other four. A module whose own
+  text reads "Active-Cable", "AOC" or "active optical" — Cisco's
+  `SFP-10G-Active-Cable` among them — is checked before DAC and copper,
+  since it is neither: it carries no light levels to read, exactly like a
+  DAC twinax cable, but it is fibre, not copper, so FiberView draws it
+  plain (uncoloured) the same way it already draws a DAC link, rather than
+  as a coloured single/multimode strand.
 - **From 5.35.0, the cage scan runs even on a switch that answers no DOM
   or sensor rows at all.** A switch whose optics carry no light-level
   data to read used to skip the whole badge scan along with the sensor
@@ -1308,13 +1323,21 @@ Selecting a device opens its identity, live status, a status timeline,
 its current interface table, and a combined device/interface event
 history.
 
-**SSH opens a terminal to the device in a new window.** The pane's SSH
+**SSH opens a terminal to the device in a new window, centred over the
+browser window from 5.63.0** (it used to land pinned to the screen's
+top-left corner). The pane's SSH
 button (shown only to accounts with the SSH permission, see Permissions)
 opens a real terminal — cursor keys, colours, pagers, `vi` — sized to the
-window and refitted when it is resized. It signs in with the SSH credential
-ConfigRX holds for the device, and asks for a username and password when
-there is none or the device refuses it; a typed credential is used for that
-connection only and never stored. The first connection stores the device's
+window and refitted when it is resized. **From 5.63.0 it signs in only
+with the SSH login stored on your own Account dialog** — never with
+ConfigRX's credential for the device, which is now a wholly separate thing
+(see ConfigRX, below) kept for backups alone. With nothing stored, or the
+device refusing it, the sign-in prompt asks for a username and password
+and offers a **Remember for my account** box; ticking it keeps the pair as
+your account's own SSH login, but only once the device has actually
+accepted it — a wrong password is never remembered. Left unticked, or on a
+machine that cannot encrypt a stored credential at all, the pair is used
+for that connection only. The first connection stores the device's
 host key; a later connection presenting a different key is refused with a
 warning that names both fingerprints and when the old key was first seen,
 and a **Trust the new key** button for a device that really was replaced.
@@ -1334,7 +1357,8 @@ was created from — if that address changes mid-session it closes the same
 way it does when the sign-in itself ends.
 
 **A WEB button sits beside SSH**, styled to match it, opening the device's
-own web interface in a new window. Until 5.1.0 it pointed the browser
+own web interface in a new window, centred over the browser window like
+the SSH one from 5.63.0. Until 5.1.0 it pointed the browser
 straight at `http://<ip>/`, which only works from a machine with a route to
 the management plane; it now opens a short-lived **tunnel** on this server
 instead, so the browser talks to this machine and this machine talks to the
@@ -1680,8 +1704,11 @@ power-fault trap forces on its own device, do not trigger the three
 walks. A device already failing or with SNMP switched off is
 skipped, exactly as the scheduled walks skip it, and a walk turned off for
 the device (its interval set to 0) is not started. A walk already running
-for the device is never started a second time. Neighbour discovery (LLDP/
-CDP) is unaffected — a manual poll did not ask for neighbours.
+for the device is never started a second time. **From 5.63.0, Poll now
+also forces a fresh CDP/LLDP neighbour read**, so a newly added
+device's Mapper links no longer wait on that walk's own randomised
+first-due draw (up to `lldp_interval_s`, one hour by default) — Poll
+now brings the links in on demand instead.
 
 **Double-clicking a row opens that device in a dialog** — its identity
 line, its interface table and its event log — without moving what the
@@ -2221,18 +2248,20 @@ port, alias, a **Kind**, a **Medium** (from 5.25.0), oper status, speed
 and last seen. **Kind** is **DOM** for an optic that reports light
 levels and so can be alerted on, **COP** for a copper (BASE-T)
 transceiver, **DAC** (from 5.55.0) for a direct-attach copper/twinax
-cable such as SFP-H10GB-CU or 10GBASE-CR, plain **SFP** for a laser
-transceiver the switch identifies by ENTITY-MIB but that publishes no
-sensors of its own, and — only with **Include empty cages** ticked
-(off by default) — **Empty cage** for a slot with nothing plugged in.
-**Medium** spells the same distinction out in one word — **Copper**
-(DAC included) or **Laser** — blank for an empty cage, since nothing
-is proven either way until something is plugged in. The summary line
-carries COP and DAC counts alongside the DOM/SFP ones; both CSV
-exports carry the **Medium** column instead, not a count. Nothing new
-is polled for this: every row comes from the same per-port media read
-behind the DOM/SFP/COP/DAC badge already on the interface list (see
-*Drill-down*, below), so the report is free. **From 5.36.0, Medium**
+cable such as SFP-H10GB-CU or 10GBASE-CR, **DAF** (from 5.63.0) for an
+active optical (direct-attach fibre) cable such as SFP-10G-Active-Cable,
+plain **SFP** for a laser transceiver the switch identifies by ENTITY-MIB
+but that publishes no sensors of its own, and — only with **Include empty
+cages** ticked (off by default) — **Empty cage** for a slot with nothing
+plugged in. **Medium** spells the same distinction out in one word —
+**Copper** (DAC included), **Laser** (DAF included, alongside DOM/SFP) —
+blank for an empty cage, since nothing is proven either way until
+something is plugged in. The summary line carries COP, DAC and DAF counts
+alongside the DOM/SFP ones; both CSV exports carry the **Medium** column
+instead, not a count. Nothing new is polled for this: every row comes
+from the same per-port media read behind the DOM/SFP/COP/DAC/DAF badge
+already on the interface list (see *Drill-down*, below), so the report is
+free. **From 5.36.0, Medium**
 also spells out single-mode
 versus multimode once the transceiver's own type text says which —
 "Laser · SM" or "Laser · MM" in place of plain "Laser" — and both CSV
@@ -2572,7 +2601,7 @@ alerts and optionally emailing about them.
 
 ### Rules
 
-- **74 built-in rules ship, 73 of them enabled**: a device not responding, a
+- **75 built-in rules ship, 74 of them enabled**: a device not responding, a
   device recovering, a device rebooting, SNMP authentication failing, a
   device needing unsupported SNMPv3 privacy, a poll running longer than its
   own interval, a device whose vendor MIB is missing, an interface going
@@ -2584,7 +2613,8 @@ alerts and optionally emailing about them.
   linkDown trap from a device Nodes is not itself polling, a critical
   syslog line, a new IPAM address conflict, an access point removed from
   its controller or gone offline, an access point rebooting, a DHCP scope
-  running out of leases, and four NetPath path rules (below), the newest of
+  running out of leases, a DHCP server failing to answer its poll (from
+  5.63.0, below), and four NetPath path rules (below), the newest of
   which watches a destination's web page (see NetPath and Alerts → NetPath
   destinations). The one rule that ships **disabled** rather than enabled is
   **Access point radio changed channel**, from 5.10.0: a
@@ -2946,6 +2976,13 @@ alerts and optionally emailing about them.
   Its consecutive-polls count means DHCP polls: on the default
   15-minute DHCP cycle, 3 means three quarters of an hour, not the 15
   seconds three alert-engine ticks would take.
+- **"DHCP server poll failing", from 5.63.0, is a separate rule for a
+  separate failure: the poll itself not getting an answer, not a scope
+  running low.** It counts a DHCP server's own consecutive failed polls —
+  editable on the rule as **Consecutive failed polls before firing**, 2 by
+  default — and names the server and its last error; the count resets and
+  the alert clears the moment a poll succeeds again. It emails and texts
+  like any other rule, the same as every alert in this list.
 - **Repeated occurrences increment one open alert** rather than opening a
   duplicate — enforced by the database itself (an alert's dedup key can
   only be open or acknowledged once at a time), not by application logic
@@ -3194,8 +3231,8 @@ hard to trip — a path monitor that cries wolf gets turned off.
   `[RECOVER]` only when previewing the recovery template itself
   (`device_up`); every other template still previews as the opening alert
   it is.
-- **Send test email** (renamed from plain **Send test**, from 5.56.0, to
-  read the same way **Send test text** beside it does) sends a real email
+- **Send test email** (renamed from plain **Send test**, from 5.56.0)
+  sends a real email
   to an address typed in, using whatever SMTP settings are currently in
   the form before they are saved — the same "test what's typed" idiom as
   IPAM's DHCP test.
@@ -3211,10 +3248,10 @@ hard to trip — a path monitor that cries wolf gets turned off.
   same idea as the email floor above and independent of it), and holds
   the Twilio **Account SID**, **Auth Token**, **From number**, an
   optional **Messaging Service SID** (used in place of the From number
-  when set), the list of **destination numbers** (`sms_to_default`,
-  each validated as E.164 on save), a **Max texts per hour**
-  (`sms_max_per_hour`, default 30) and a **Send test text** button.
-  Texting follows the same timing as email — the roll-up hold, one
+  when set) and a **Max texts per hour**
+  (`sms_max_per_hour`, default 30). **From 5.63.0 there is no recipient
+  list here at all** — see "Only an account can add its own number"
+  below. Texting follows the same timing as email — the roll-up hold, one
   digest text for a mass outage (from 5.30.0, also leading with the
   batch's worst severity tag, same as the email and webhook digest),
   re-notify while an alert stays open, and a recovery text tagged
@@ -3225,9 +3262,9 @@ hard to trip — a path monitor that cries wolf gets turned off.
 - **The Auth Token is stored encrypted, never in Alerts settings** — the
   same discipline as the SMTP password (see Credential Security below):
   it lives in its own table alongside the Account SID it was saved
-  with, is used only together with that SID, and **Send test text**
-  refuses to send against a different SID than the one the token was
-  saved for rather than silently reusing it.
+  with, is used only together with that SID, and every send refuses to
+  go out against a different SID than the one the token was saved for
+  rather than silently reusing it.
 - **A text is one line, cut to fit.** `[CRITICAL] Rule name - device:
   message` is truncated to 160 characters — one SMS segment, so a long
   device or rule name does not silently turn one text into several and
@@ -3253,28 +3290,31 @@ hard to trip — a path monitor that cries wolf gets turned off.
   Storing one secret replaces whichever was stored before — Auth Token
   and API key secret are never both kept at once — and a stored secret
   is only ever used with the Account SID, API Key SID and
-  authentication method it was saved under; **Send test text** refuses
-  a mismatch the same way it already refused a changed Account SID.
-- **From 5.20.1, a consent notice sits under the Default numbers
-  list**, beside **Add number** — Twilio's A2P 10DLC campaign review
-  wants the exact wording and a screenshot of where it is collected,
-  and since numbers are only ever entered here by an authenticated
-  administrator, this is that opt-in evidence. Twilio's own Advanced
-  Opt-Out still blocks a number that has texted STOP, and from 5.52.0
-  below that same reply is also recorded inside the app, turning that
-  account's own opt-in off. From 5.53.1 it links to the SMS Terms and
-  SMS Privacy pages.
-- **From 5.52.0, any signed-in account can opt its own phone in from the
-  Account dialog** (see **Text alerts (SMS)** under Permissions, below),
-  rather than an administrator entering every number on this settings
-  page. A number opted in this way is texted alongside the Default
-  numbers list above — merged in, de-duplicated — for every alert this
-  section already covers, on the same timing and the same hourly cap.
-  From 5.54.0 that dialog has required checkboxes, all unchecked by
-  default — from 5.59.0, three: one to accept the SMS Terms of Service,
-  one to accept the SMS Privacy Policy, one to agree to receive the
-  alert texts — and a **Yes, sign me up** button; the server refuses to
-  start the opt-in unless all boxes were ticked.
+  authentication method it was saved under; every send refuses a
+  mismatch the same way it already refused a changed Account SID.
+- **Only an account can add its own number — from 5.63.0, this is the
+  only way a number is ever added.** An administrator could previously
+  type a "Default numbers" list into this settings page directly, with a
+  consent notice underneath standing in for the fact that only an
+  authenticated administrator could add one; that list, the **Add
+  number** control and the consent notice are gone. **Any signed-in
+  account can still opt its own phone in from the Account dialog** (see
+  **Text alerts (SMS)** under Permissions, below) — this was already the
+  self-service route from 5.52.0, and it is now the *only* route: a
+  number is texted only once that account has itself completed the
+  opt-in flow. From 5.54.0 that dialog has required checkboxes, all
+  unchecked by default — from 5.59.0, three: one to accept the SMS Terms
+  of Service, one to accept the SMS Privacy Policy, one to agree to
+  receive the alert texts — and a **Yes, sign me up** button; the server
+  refuses to start the opt-in unless all boxes were ticked. Twilio's own
+  Advanced Opt-Out still blocks a number that has texted STOP, and that
+  same reply is also recorded inside the app, turning that account's own
+  opt-in off.
+- **An install upgrading into 5.63.0 with a stored Default numbers list
+  has it cleared automatically, once, on the next start.** Events gains a
+  line naming how many numbers were dropped and stating plainly that only
+  numbers opted in from an account receive texts from this version on —
+  nothing is silently lost without a record of exactly what and how many.
 - **From 5.53.0, two pages describing the program are public — no
   sign-in needed — at `/sms-terms` and `/sms-privacy`.** Twilio's
   campaign review wants a terms-of-service and privacy-policy URL it
@@ -4607,6 +4647,23 @@ to a manual name in Nodes.
   and is never returned by any API response — only whether one is stored.
   It is decrypted only in memory, immediately before connecting, and
   discarded the moment the connection attempt finishes.
+- **A single global SSH account, from 5.63.0, backs up any device that
+  carries none of its own.** ConfigRX → Settings gains a **GLOBAL SSH
+  ACCOUNT** fieldset — username and password (leave blank to keep the
+  stored one), saved with the dialog's own **Save**, plus a **Clear
+  global SSH account** button — encrypted and cleared exactly like a
+  per-device credential — for a
+  fleet where most devices share one login and only a handful need their
+  own override. A device's own stored credential still wins whenever it
+  has one; only a device with neither its own credential nor a global
+  account fails, now with a clearer reason: "No SSH credential stored for
+  this device and no global ConfigRX account." The device list's
+  **Credential** column shows *stored* for a device's own credential,
+  *global* for one falling back to the account above, or *—* for
+  neither. **This account is never used by the SSH button** (see
+  Drill-down, under Nodes, above, and the Account dialog under
+  Permissions, below) — the two credentials are kept deliberately
+  separate.
 - **An enable secret can be stored per device**, beside the SSH username
   and password in the same single-device credential dialog, with a hint
   that it is only needed on a platform whose login lands in user EXEC
@@ -4753,23 +4810,17 @@ like any other module.
   whether FiberView is ticked or not, and is carried through in **Export
   PNG**. Click the same row again, or any other VLAN row, to change or
   clear the pick.
-- **The legend above the canvas.** If two placed devices have no CDP/LLDP
-  adjacency between them at all, it says so plainly rather than leaving an
-  operator to wonder whether the link is missing by mistake or because
-  nothing has been seen. With FiberView ticked and a fiber link on the
-  map, it spells out FiberView's own colour key: dark orange for
-  multimode, bright yellow for single-mode, dotted red for a single/
-  multimode mismatch. **From 5.59.0, a picked VLAN adds its own line**,
-  naming the VLAN so a colour-blind viewer or a screen reader gets the
-  same fact a sighted viewer reads off the glow; **from 5.61.0 it also
-  spells out the both-ends rule** — "VlanView: links carrying VLAN 20 on
-  both ends glow in its colour; a link carrying it on one end only draws
-  plain; the rest are dimmed."
-  **From 5.39.0, the legend no longer explains what a
-  dashed or dotted line means** — the "Trunks of N+ VLANs draw as one
-  thick line… / a dashed line means no VLAN data… / a dotted line means
-  spanning-tree blocked…" note that used to sit above the canvas is gone;
-  the adjacency message and the FiberView colour key are unchanged.
+- **From 5.63.0, there is no legend above the canvas any more.** Every
+  sentence it used to print — the "no CDP/LLDP adjacency between these two"
+  notice, FiberView's colour key (dark orange for multimode, bright yellow
+  for single-mode, dotted red for a mismatch), the VlanView both-ends rule,
+  and "Dotted = STP blocked on the named end" — is gone along with it.
+  Nothing it described changed: FiberView still colours links the same
+  way, a picked VLAN still glows the same links, and a blocked link still
+  dots the same way; a link's own tooltip and its detail pane already say
+  all of the same things once you point at or open it, so the legend was a
+  second place repeating them above the map rather than the only place
+  they were said. The FiberView checkbox's own tooltip is unchanged.
 - **What CDP and LLDP contribute, and what they cannot.** A link only ever
   draws between two devices (or a device and an unmanaged peer) that Nodes'
   own neighbour walk has actually reported adjacent to each other, folded
@@ -5052,10 +5103,10 @@ like any other module.
   preference only, remembered per browser like Drag pans — nothing is
   written to the map, and toggling it never refetches or redraws the
   data underneath. The glow is included in **Export PNG**. The call is
-  made from the same port media already behind the DOM/SFP/COP/DAC
+  made from the same port media already behind the DOM/SFP/COP/DAC/DAF
   badges (see Nodes, above): a lit optic on either end of a link is fiber;
-  failing that, proven copper (DAC included) on either end is copper;
-  failing that, a
+  failing that, proven copper (DAC or, from 5.63.0, DAF included) on
+  either end is copper, drawn plain rather than coloured; failing that, a
   transceiver present on either end with nothing proving it copper is
   still called fiber; an empty cage, a fixed port with no transceiver
   data, or nothing known at all is not fiber. A link is judged on
@@ -5178,9 +5229,9 @@ like any other module.
   scan (named as a count, since it cannot always point at this exact port),
   no scan has run yet (due within five minutes), or the interface simply
   hasn't been polled — an unmanaged peer reads "`<name>` is not polled"
-  instead. The legend
-  adds "Dotted = STP blocked on the named end" whenever a blocked link is
-  on the map. **A `broken` port is now treated as blocked everywhere a
+  instead — said in the link's own tooltip and detail pane; the legend that
+  used to add "Dotted = STP blocked on the named end" above the canvas is
+  gone from 5.63.0 (see MAPPER, above). **A `broken` port is now treated as blocked everywhere a
   `blocking` one is** — the dots, the pane, and the CSV export — worded
   "broken" rather than "blocking" so the distinction is never lost. **The
   scan now runs every five minutes**, on its own setting independent of
@@ -5565,8 +5616,15 @@ gathers **Appearance · this browser** — theme and the kiosk launcher (see
 being on a page of settings the server stores for everyone. From 5.52.0
 it also gathers **Text alerts (SMS)**, an account's own opt-in for alert
 texts to its own phone (see **Text messages (Twilio)**, above, for the
-opt-in flow and what it does to the send list); from 5.53.0 its consent
-notice links to the SMS terms and privacy pages. Resetting a
+opt-in flow — from 5.63.0 the only way a number is ever added); from
+5.53.0 its consent notice links to the SMS terms and privacy pages. **From
+5.63.0 the dialog also gathers "SSH login (used by the SSH button)"** —
+a username, a password, **Save** and **Clear**, and a status line reading
+"Stored as `<user>`, saved `<when>`" or "No SSH login stored" — the one
+credential the SSH terminal reads (see **Drill-down**, under Nodes,
+above); it is entirely separate from ConfigRX's own credential for the
+same device (see ConfigRX, above), and is hidden for a forced sign-in.
+Resetting a
 *different* account's password requires Admin write, same as adding,
 editing or removing an account.
 

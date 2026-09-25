@@ -464,6 +464,7 @@ body.tiny .brand span { display: none; }
 .badge-dom { background: var(--muted); color: var(--bg); letter-spacing: 0.04em; }
 .badge-cop { background: var(--muted); color: var(--bg); letter-spacing: 0.04em; }
 .badge-dac { background: var(--muted); color: var(--bg); letter-spacing: 0.04em; }
+.badge-daf { background: var(--muted); color: var(--bg); letter-spacing: 0.04em; }
 .conn { color: var(--dim); font: var(--fs-xs) var(--mono); padding-right: var(--space-xs); }
 .conn.user { color: var(--muted); }
 /* Reaches both <a> and <button>, or an anchor renders as browser-default
@@ -511,20 +512,8 @@ body.stale .page { opacity: 0.42; filter: grayscale(0.4); }
 
 .page { display: none; flex: 1; min-height: 0; position: relative; }
 /* Column by default, so a new module cannot be forgotten here and end up
-   laying its panels out side by side. NetPath is the one that wants a row,
-   because its destination list sits beside the content. */
+   laying its panels out side by side. */
 .page.active { display: flex; flex-direction: column; }
-#page-netpath.active { flex-direction: row; }
-
-/* First paint only. boot.js sets data-tab on <html> synchronously and
-   generates the matching rule pair itself, so a reload paints from that
-   rather than from the .active classes above, which only exist once
-   app.js's selectTab() has run. NetPath is the one page laid out in a row,
-   and it has to say so before the scripts run; the extra .page is not
-   decoration — it outweighs boot.js's generated rule, which is appended
-   after this stylesheet and would otherwise stand the page up in a
-   column. */
-html[data-tab="netpath"] #page-netpath.page { flex-direction: row; }
 
 /* --------------------------------------------------------------- widgets */
 /* Vertical padding matches input/select/textarea's below (--space-xs) —
@@ -1936,9 +1925,7 @@ body.kiosk .card.strip > .hint { overflow: visible; white-space: normal; }
 .mp-link { fill: none; stroke-linecap: round; }
 .mp-link.selected { filter: brightness(1.35); }
 /* known:false ("no VLAN data at all") must read differently from "one
-   VLAN, drawn as a single strand" — this dash is that difference;
-   #mp-legend spells it out in words for a viewer who cannot rely on the
-   visual alone. */
+   VLAN, drawn as a single strand" — this dash is that difference. */
 .mp-link.unknown { stroke-dasharray: 5 4; }
 /* STP-blocked port, either view: round caps turn this tight dash into dots,
    distinct from .unknown's own dash -- comes after .unknown so a link that
@@ -2181,9 +2168,6 @@ body.kiosk .card.strip > .hint { overflow: visible; white-space: normal; }
   fieldset label input { max-width: 100%; }
 }
 @media (max-width: 900px) {
-  /* Both selectors the row rule uses, so the stack wins whichever one
-     painted the page (boot.js's first frame or app.js's .active). */
-  #page-netpath.active, html[data-tab="netpath"] #page-netpath.page { flex-direction: column; }
   #page-netpath .sidebar { width: auto; max-height: 40vh; }
   [data-splitter].cols { flex-direction: column; }
   .cols > .divider { width: auto; height: 8px; cursor: row-resize; }

@@ -1385,9 +1385,10 @@ class NodesDatabase(SqliteStore):
         # and refreshed by the same poll cycle rather than a table of its own.
         # media: 'optic' once a port-mapped ENTITY-SENSOR row proves a
         # transceiver with DOM, 'sfp' for a transceiver the ENTITY-MIB names
-        # but that reports no DOM, 'copper' for a BASE-T transceiver or 'dac'
-        # for a twinax/direct-attach one (module text or MAU-MIB proves it,
-        # and that proof outranks a DOM reading),
+        # but that reports no DOM, 'copper' for a BASE-T transceiver, 'dac'
+        # for a twinax/direct-attach copper one or 'daf' for an active
+        # optical (direct-attach fibre) one (module text or MAU-MIB proves
+        # it, and that proof outranks a DOM reading),
         # 'sfp_empty' for a cage with nothing in it, else NULL. Written by
         # _poll_environment — IF-MIB has no media column of its own.
         # optic_mode: 'sm'/'mm' from the transceiver's own type text for an
@@ -3378,11 +3379,12 @@ class NodesDatabase(SqliteStore):
     def interfaces_with_media(self, device_ids=None,
                               include_empty: bool = False) -> list[sqlite3.Row]:
         """Every interface row carrying a transceiver (media = 'optic',
-        'sfp', 'copper' or 'dac'; also 'sfp_empty' cages when `include_empty`),
-        joined to the device columns a report needs to label and export it
-        by. Excludes purged devices the way device() does. `device_ids`
-        narrows the fleet; omitted, every device is considered."""
-        media_values = ["optic", "sfp", "copper", "dac"]
+        'sfp', 'copper', 'dac' or 'daf'; also 'sfp_empty' cages when
+        `include_empty`), joined to the device columns a report needs to
+        label and export it by. Excludes purged devices the way device()
+        does. `device_ids` narrows the fleet; omitted, every device is
+        considered."""
+        media_values = ["optic", "sfp", "copper", "dac", "daf"]
         if include_empty:
             media_values.append("sfp_empty")
         clauses = ["i.media IN ({})".format(",".join("?" * len(media_values))),
@@ -4532,8 +4534,9 @@ class NodesDatabase(SqliteStore):
                 raise
 
     def update_interface_media(self, device_id: int, rows: list[dict]) -> None:
-        """Per-port media kind ('optic', 'sfp', 'copper', 'dac', 'sfp_empty' or
-        None) and optic mode ('sm'/'mm' or None), batched like update_interface_poe."""
+        """Per-port media kind ('optic', 'sfp', 'copper', 'dac', 'daf',
+        'sfp_empty' or None) and optic mode ('sm'/'mm' or None), batched
+        like update_interface_poe."""
         if not rows:
             return
         params = [(row.get("media"), row.get("optic_mode"), device_id, row["if_index"])

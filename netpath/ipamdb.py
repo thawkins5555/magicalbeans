@@ -307,7 +307,8 @@ class IpamDatabase(SqliteStore):
 
     def _migrate(self) -> None:
         self.ensure_columns("dhcp_servers",
-                            {"username": "TEXT", "password_enc": "BLOB"})
+                            {"username": "TEXT", "password_enc": "BLOB",
+                             "poll_failures": "INTEGER NOT NULL DEFAULT 0"})
         self.ensure_columns("dhcp_scopes", {"router": "TEXT"})
         self.ensure_columns("hosts",
                             {"seen_source": "TEXT", "seen_detail": "TEXT",
@@ -856,7 +857,9 @@ class IpamDatabase(SqliteStore):
         with self._lock:
             self._conn.execute(
                 "UPDATE dhcp_servers SET last_poll_ts=?, last_status=?,"
-                " last_error=? WHERE id=?",
+                " last_error=?,"
+                " poll_failures=" + ("0" if ok else "poll_failures + 1") +
+                " WHERE id=?",
                 (time.time(), "ok" if ok else "error", error, server_id))
             self._conn.commit()
 

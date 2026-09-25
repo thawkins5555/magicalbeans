@@ -1475,6 +1475,10 @@
       return '<span class="badge badge-dac" title="Direct-attach copper ' +
         '(twinax) cable; no light levels">DAC</span> ';
     }
+    if (r.media === 'daf') {
+      return '<span class="badge badge-daf" title="Active optical ' +
+        '(direct-attach fibre) cable; no light levels">DAF</span> ';
+    }
     return '';
   }
 
@@ -1889,9 +1893,9 @@
     function paintDialogIfaces() {
       if (!dialogIfaces || !current()) return;
       if (dialogOptics) {
-        // Only ever an upgrade: a live dBm read can promote a port to 'optic' but never downgrades 'sfp', and never touches a stored 'copper'/'dac' row.
+        // Only ever an upgrade: a live dBm read can promote a port to 'optic' but never downgrades 'sfp', and never touches a stored 'copper'/'dac'/'daf' row.
         dialogIfaces.forEach((r) => {
-          if (r.media !== 'copper' && r.media !== 'dac' && dialogOptics.has(r.if_index)) r.media = 'optic';
+          if (r.media !== 'copper' && r.media !== 'dac' && r.media !== 'daf' && dialogOptics.has(r.if_index)) r.media = 'optic';
         });
       }
       // Opening a port from here replaces this dialog — there is only one
@@ -4534,7 +4538,7 @@
       App.setText(App.el('nd-rep-sfp-summary'),
         `${result.port_count} port(s) on ${result.device_count} device(s) · ` +
         `${result.dom_count} DOM · ${result.sfp_count} SFP · ${result.copper_count} COP` +
-        ` · ${result.dac_count} DAC` +
+        ` · ${result.dac_count} DAC · ${result.daf_count} DAF` +
         (result.empty_count ? ` · ${result.empty_count} empty` : ''));
       return result;
     })());

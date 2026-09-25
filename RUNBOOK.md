@@ -20,7 +20,10 @@ backup, `INTERNALS.md` is why any of this works the way it does.
 - [Charts are empty, or history has vanished](#charts-are-empty-or-history-has-vanished)
 - [The disk is filling up](#the-disk-is-filling-up)
 - [Alert email has stopped](#alert-email-has-stopped)
+- [Alert texts are not arriving](#alert-texts-are-not-arriving)
+- [A DHCP server shows "poll failing"](#a-dhcp-server-shows-poll-failing)
 - [A ConfigRX backup says the host key changed](#a-configrx-backup-says-the-host-key-changed)
+- [The SSH button says "No SSH login is stored for your account"](#the-ssh-button-says-no-ssh-login-is-stored-for-your-account)
 - [The poll pool is saturated](#the-poll-pool-is-saturated)
 - [Nodes shows "purging history for N device(s)"](#nodes-shows-purging-history-for-n-devices)
 - [A NetPath web page check stays red](#a-netpath-web-page-check-stays-red)
@@ -380,6 +383,69 @@ raised in the application instead.
 
 ---
 
+## Alert texts are not arriving
+
+**Symptom.** No text messages, with or without an `sms_failing` alert on the
+Alerts tab, even though email for the same alerts is arriving fine.
+
+**Checks, in order.**
+
+1. **Who is actually opted in?** From 5.63.0 there is no administrator-set
+   recipient list any more — a number receives texts only once that account
+   has opted itself in from its own **Account** dialog (**Text alerts
+   (SMS)**), ticked all three consent boxes, and confirmed the code sent to
+   it. If nobody has done that yet on this install, there is nowhere for a
+   text to go: point the person who needs the alert at their own Account
+   dialog rather than looking for a settings page to add their number to.
+2. **Upgraded from before 5.63.0 and expecting an old Default number to still
+   work?** It will not. Check Events for a line reading "Dropped N default
+   text-alert number(s) (...): only numbers opted in from an account receive
+   texts from 5.63.0" — that number needs to opt itself in from Account
+   the same as any other, once.
+3. **Twilio and the credential itself** — sms_enabled, the Twilio Account
+   SID/Auth Token or API key, a From number or Messaging Service SID, and
+   the severity floor — are unchanged by the above and still worth checking
+   the ordinary way: **Alerts → Settings → Text messages (Twilio)**.
+4. **The hourly cap and the breaker** work exactly as email's do (above):
+   `sms_max_per_hour` is its own budget, and five consecutive failures open
+   a fifteen-minute breaker and raise **Alert texts are not being
+   delivered** (`sms_failing`).
+5. **A number that replied STOP to Twilio is off for good** until it opts
+   back in through the Account dialog — Twilio's own Advanced Opt-Out
+   blocks it either way.
+
+---
+
+## A DHCP server shows "poll failing"
+
+**Symptom.** An open alert titled "DHCP server poll failing," naming a
+server and its last error.
+
+**What it means.** From 5.63.0, two consecutive failed polls of that DHCP
+server (edit "Consecutive failed polls before firing" on the rule to
+change the count) raise this — distinct from **DHCP scope running out of
+leases**, which is about a scope's own utilization, not whether the server
+answered at all. It reads `dhcp_servers.poll_failures`, a count that resets
+to zero the moment a poll succeeds, so the alert clears itself on the next
+good poll with no action needed here.
+
+**Checks, in order.**
+
+1. **The server's own last error**, in the alert's message and on IPAM's DHCP
+   servers list, names the actual failure — timeout, refused connection, bad
+   credential.
+2. **If it is a credential failure**, check that server's own stored
+   username/password on the DHCP servers list — separate from, and
+   unaffected by, the ConfigRX/SSH-button credential split described
+   elsewhere in this release.
+3. **Reachability** — the same network path a manual "Test connection" from
+   the DHCP servers list already exercises; if that fails too, the fault is
+   upstream of this application.
+4. **It emails and texts like any other rule**, so a muted rule or a
+   maintenance window on the device suppresses it the same way.
+
+---
+
 ## A ConfigRX backup says the host key changed
 
 **Symptom.** A backup fails with "host key changed — accept in the device's
@@ -413,6 +479,42 @@ this connection would send is one it wants.
 The host-key store is shared by ConfigRX and the SSH terminal, so forgetting a
 key affects both. It lives in `configrx.db` and survives a restore, which is
 what you want.
+
+---
+
+## The SSH button says "No SSH login is stored for your account"
+
+**Symptom.** Clicking **SSH** on a device asks for a username and password,
+where before an upgrade it used to sign straight in. The sign-in prompt reads
+"No SSH login is stored for your account. Tick Remember below to keep this
+one, or set it under Account."
+
+**Cause, not a fault.** From 5.63.0 the SSH button no longer reads ConfigRX's
+own SSH credential for the device — the two are deliberately separate, so
+that ConfigRX can run one shared account across a fleet while the terminal
+still knows exactly which operator typed what. Every account now needs its
+own SSH login on file; nothing carries over automatically from what ConfigRX
+already had stored for that device or globally.
+
+**Fix, in order.**
+
+1. **Store it once, under Account → SSH login (used by the SSH button).**
+   Username, password, **Save** — this is the login the SSH button will use
+   for every device from then on, for this account only.
+2. **Or type it once and tick Remember for my account** at the terminal's own
+   sign-in prompt. It is written only after the device actually accepts it —
+   a wrong password is never stored — so a refused login leaves nothing
+   behind to clean up.
+3. **If the box for "Remember" does nothing and a notice appears in the
+   terminal** saying the login was not remembered, this host cannot encrypt a
+   stored credential at all (no DPAPI, and on Linux/macOS/BSD no passphrase
+   configured for the portable secret store — see `CREDENTIAL-SECURITY.md`
+   §10). The connection itself still works; only the "remember it" part is
+   unavailable, and it stays that way until the host is set up to encrypt
+   secrets.
+
+Every account signs in with its own login this way — there is no shared or
+administrator-set SSH login for the button, by design.
 
 ---
 
@@ -724,6 +826,11 @@ VLAN's name follows its number when the switch reports one, as in
   too, only on its VLAN walk). Press **VLAN scan** on Nodes to read it
   now, or check that switch's VLAN interval and SNMP settings if the
   scan keeps coming back empty.
+
+**A newly added device has no links on Mapper at all yet, not just no
+glow?** From 5.63.0, Poll now on that device forces its CDP/LLDP
+neighbour walk immediately, instead of waiting for its own random
+first-due draw within `lldp_interval_s` (one hour by default).
 
 **A link to an unmanaged peer still glows correctly** on the managed
 switch end's word alone — a device Nodes has no polling for cannot report

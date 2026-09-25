@@ -664,8 +664,8 @@ def _sms_available(service) -> bool:
 
 
 def _sms_send(service, number, text, kind: str, record_text: str | None = None) -> None:
-    """One text, sent with the stored Twilio credential the same way
-    post_alerts_sms_test resolves it, and recorded to notifications either
+    """One text, sent with the stored Twilio credential (bound to the
+    settings it was saved under) and recorded to notifications either
     way. `record_text` overrides what is stored for the notification row
     (sms_verify masks its code); raises with the send error on failure."""
     from ... import alertmail, dpapi
@@ -809,6 +809,56 @@ def delete_account_sms(service, params, body) -> dict:
             service.app_db.sms_forget(me)
         _audit(service, params, "account.sms.cancel", target=me)
     return _account_sms(service, service.app_db.user_sms(me))
+
+
+# ------------------------------------------------------------- account SSH
+#
+# The per-account SSH login the SSH button uses (sshterm.py), kept entirely
+# separate from ConfigRX's own device-scoped credential: the terminal never
+# falls back to that one, so every operator stores their own login here.
+
+def _account_ssh(service, row) -> dict:
+    from ... import dpapi
+
+    return {
+        "username": row["ssh_username"] if row else "",
+        "has_password": bool(row["ssh_password_enc"]) if row else False,
+        "stored_ts": row["stored_ts"] if row else None,
+        "available": dpapi.available(),
+    }
+
+
+def get_account_ssh(service, params, body) -> dict:
+    me = params.get("_username", "")
+    return _account_ssh(service, service.app_db.user_ssh(me))
+
+
+def put_account_ssh(service, params, body) -> dict:
+    from ._shared import _encrypt_secret
+
+    me = params.get("_username", "")
+    username = str(body.get("ssh_username", "")).strip()
+    password = str(body.get("ssh_password", ""))
+    if not username or not password:
+        raise ValueError("A username and password are both required")
+    try:
+        encrypted = _encrypt_secret(password, (
+            "This machine cannot encrypt a stored credential — DPAPI is "
+            "Windows-only, so the SSH login cannot be stored here rather "
+            "than kept in plain text."))
+    finally:
+        password = None
+    service.app_db.set_user_ssh(me, username, encrypted)
+    _audit(service, params, "account.ssh.store", target=me,
+          detail=f"username {username}")
+    return _account_ssh(service, service.app_db.user_ssh(me))
+
+
+def delete_account_ssh(service, params, body) -> dict:
+    me = params.get("_username", "")
+    service.app_db.clear_user_ssh(me)
+    _audit(service, params, "account.ssh.clear", target=me)
+    return _account_ssh(service, service.app_db.user_ssh(me))
 
 
 # ------------------------------------------------------------- API tokens

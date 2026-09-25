@@ -538,7 +538,7 @@
 
   // Fingerprint of the last drawn payload's body: a poll that comes back
   // byte-for-byte the same has nothing to redraw, so draw()/drawDetail()/
-  // drawVlanTable()/drawLegend() are skipped and the in-flight drag (if any)
+  // drawVlanTable() are skipped and the in-flight drag (if any)
   // that draw() would otherwise cancel survives the poll.
   let lastMapPayloadJson = null;
 
@@ -550,7 +550,7 @@
       view.frames = []; view.notes = [];
       rebuildLookups();
       rebuildFindList();
-      drawStatus(); draw(); drawDetail(); drawVlanTable(); drawLegend();
+      drawStatus(); draw(); drawDetail(); drawVlanTable();
       return;
     }
     const payload = await App.get(`/api/mapper/maps/${view.mapId}`);
@@ -589,7 +589,6 @@
     draw();
     drawDetail();
     drawVlanTable();
-    drawLegend();
   }
 
   /* ---------------------------------------------------------- candidates */
@@ -2453,30 +2452,6 @@
     if (empty) empty.remove();
   }
 
-  /* -------------------------------------------------------------- legend */
-
-  function drawLegend() {
-    const hasFiber = view.links.some((l) => l.fiber);
-    const hasLinks = view.links.length > 0;
-    let text = '';
-    if (view.selectedVlan !== null) {
-      text = `VlanView: links carrying VLAN ${vlanDisplay(view.selectedVlan)} on both ends glow in ` +
-        'its colour; a link carrying it on one end only draws plain; the rest are dimmed. ';
-    }
-    if (view.fiberView && hasFiber) {
-      text += 'FiberView: dark orange = multimode, bright yellow = single-mode, ' +
-        'dotted red = single/multimode mismatch.';
-    }
-    if (view.links.some((l) => l.blocking)) {
-      text += 'Dotted = STP blocked on the named end. ';
-    }
-    if (view.nodes.length && !hasLinks) {
-      text = 'No CDP/LLDP adjacency was found between the devices placed here — ' +
-        'that is information, not an error; add neighbours once they report one.';
-    }
-    App.el('mp-legend').textContent = text;
-  }
-
   /* ------------------------------------------------------------ selection */
 
   function setSelection(ids) {
@@ -3714,7 +3689,6 @@
         if (event.target.closest('[data-vlan-swatch]')) return;
         view.selectedVlan = view.selectedVlan === row.vlan ? null : row.vlan;
         requestDraw();
-        drawLegend();
         drawVlanTable();
       };
     }, 'No VLAN data has been seen on this map yet.');
@@ -4069,7 +4043,6 @@
       view.fiberView = event.target.checked;
       try { localStorage.setItem('mapper.fiberView', view.fiberView ? '1' : '0'); } catch (error) { /* per-browser convenience only */ }
       applyFiberView();
-      drawLegend();
       requestDraw();
     };
     App.el('mp-snap').onchange = async (event) => {
@@ -4110,9 +4083,9 @@
   function activate(opts) {
     const routed = opts && opts.parts && opts.parts[0] !== undefined ? Number(opts.parts[0]) : null;
     if (!Number.isFinite(routed)) return;
-    if (routed === view.mapId && view.map) { drawLegend(); return; }
+    if (routed === view.mapId && view.map) return;
     if (!view.maps.find((m) => m.id === routed)) return;   // an id nothing on this account can see
-    selectMap(routed).then(drawLegend, (error) => {
+    selectMap(routed).catch((error) => {
       App.toast(`Could not open that map: ${error.message}`, 'fail');
     });
   }

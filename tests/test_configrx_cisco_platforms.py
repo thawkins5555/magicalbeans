@@ -294,6 +294,123 @@ finally:
     asa.close()
 
 
+# ---- The global ConfigRX account: falls back to it only when a device
+# carries no username/password of its own, and a per-device credential still
+# wins over it once one is set.
+print()
+print("configrxdb: the global ConfigRX account, its fallback in _backup, and "
+      "credential_source")
+generic = stub_ssh_device.StubDevice(mode="slow", pause_s=0.02, host="127.0.0.9")
+default_check_auth = stub_ssh_device._Server.check_auth_password
+stub_ssh_device._Server.check_auth_password = (
+    lambda self, username, password: paramiko.AUTH_SUCCESSFUL
+    if (username, password) == ("globaluser", "global-secret")
+    else paramiko.AUTH_FAILED)
+try:
+    from netpath.web.api import configrx as configrx_api
+
+    service.configrx_db.save_settings({"enabled": False})
+    service.configrx.start()
+    try:
+        gid = service.nodes_db.add_device("127.0.0.9", name="e2e-generic")
+        service.configrx_db.update_device_config(
+            gid, backup_enabled=True, ssh_port=generic.port, vendor_override="cisco")
+
+        row = service.nodes_db.device(gid)
+        check("credential_source is '' with neither a device nor a global credential",
+             configrx_api._configrx_device_json(service, row)["credential_source"] == "",
+             configrx_api._configrx_device_json(service, row))
+
+        service.configrx.backup_now(gid)
+        deadline = time.time() + 15
+        config = service.configrx_db.device_config(gid)
+        while config["last_backup_status"] is None and time.time() < deadline:
+            time.sleep(0.1)
+            config = service.configrx_db.device_config(gid)
+        check("with no credential at all the backup fails naming both",
+             config["last_backup_status"] == "error"
+             and "no global ConfigRX account" in (config["last_backup_error"] or ""),
+             config["last_backup_error"])
+
+        service.configrx_db.set_global_credential(
+            "globaluser", dpapi.protect(b"global-secret"))
+        row = service.nodes_db.device(gid)
+        check("credential_source is 'global' once only the global account is set",
+             configrx_api._configrx_device_json(service, row)["credential_source"] == "global",
+             configrx_api._configrx_device_json(service, row))
+
+        service.configrx.backup_now(gid)
+        deadline = time.time() + 15
+        config = service.configrx_db.device_config(gid)
+        while config["last_backup_status"] == "error" and time.time() < deadline:
+            time.sleep(0.1)
+            config = service.configrx_db.device_config(gid)
+        check("the global account backs up a device with no credential of its own",
+             (config["last_backup_status"] or "").startswith("changed"),
+             f"{config['last_backup_status']} / {config['last_backup_error']}")
+
+        # A per-device credential the stub refuses — proving the device's own
+        # row is what gets tried, not silently skipped in favour of the
+        # global one that would have succeeded.
+        service.configrx_db.set_credential(
+            gid, "deviceuser", dpapi.protect(b"wrong-for-device"))
+        row = service.nodes_db.device(gid)
+        check("credential_source is 'stored' once the device has its own row",
+             configrx_api._configrx_device_json(service, row)["credential_source"] == "stored",
+             configrx_api._configrx_device_json(service, row))
+
+        service.configrx.backup_now(gid)
+        deadline = time.time() + 15
+        seen_error = False
+        while time.time() < deadline:
+            config = service.configrx_db.device_config(gid)
+            if config["last_backup_status"] == "error":
+                seen_error = True
+                break
+            time.sleep(0.1)
+        check("a device's own (wrong) credential wins over a working global one",
+             seen_error, config["last_backup_error"] if seen_error else None)
+    finally:
+        service.configrx.stop()
+finally:
+    stub_ssh_device._Server.check_auth_password = default_check_auth
+    generic.close()
+
+
+# ---- POST /api/configrx/credential: a username-only save (password left
+# blank) keeps the stored password rather than dropping it, and is refused
+# only when there is no password stored at all.
+print()
+print("POST /api/configrx/credential: username-only update keeps the stored password")
+service.configrx_db.clear_global_credential()
+try:
+    configrx_api.post_configrx_credential(
+        service, {}, {"ssh_username": "gcred1", "ssh_password": "secret1"})
+    row = service.configrx_db.global_credential()
+    check("the username and password were both stored",
+         row["username"] == "gcred1"
+         and dpapi.unprotect(bytes(row["password_enc"])) == b"secret1")
+
+    configrx_api.post_configrx_credential(
+        service, {}, {"ssh_username": "gcred2", "ssh_password": ""})
+    row = service.configrx_db.global_credential()
+    check("a username-only save updates the username",
+         row["username"] == "gcred2", row["username"])
+    check("a username-only save keeps the previously stored password",
+         dpapi.unprotect(bytes(row["password_enc"])) == b"secret1")
+
+    service.configrx_db.clear_global_credential()
+    raised = False
+    try:
+        configrx_api.post_configrx_credential(
+            service, {}, {"ssh_username": "gcred3", "ssh_password": ""})
+    except ValueError:
+        raised = True
+    check("a username-only save is refused when no password is stored at all", raised)
+finally:
+    service.configrx_db.clear_global_credential()
+
+
 # ---- The read loop itself: only the tail of the stream can end a read, so
 # only the tail is examined. Re-joining the whole capture on every 64 KB recv
 # made a large config (a FortiGate `show full-configuration`, an IOS-XR

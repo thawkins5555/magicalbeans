@@ -80,6 +80,7 @@
   const KIND_LABELS = {
     trap: 'an SNMP trap', syslog: 'a syslog source', ipam: 'an IPAM address',
     ap: 'a wireless access point', dhcp_scope: 'a DHCP scope',
+    dhcp_server: 'a DHCP server',
     netpath_target: 'a NetPath destination', sensor: 'a chassis sensor or power supply',
   };
 
@@ -1278,6 +1279,13 @@
           ' reached the destination.',
       }[r.source_kind] || 'Evaluated once per completed trace to this' +
         ' destination, so "consecutive traces" means what it says.'}</p>` : ''}` : ''}
+      ${r.kind === 'dhcp_event' ? `
+      <label>Consecutive failed polls before firing <input id="ar-forpolls"
+        type="number" min="1" value="${r.for_polls || 1}"></label>
+      <p class="hint">Counts consecutive DHCP polls of the server that came
+        back an error, read straight off the server's own poll_failures
+        counter. A poll that succeeds resets the count and clears the
+        alert.</p>` : ''}
       ${r.kind === 'netpath_event' ? `
       <label>Consecutive ${pollNoun} before firing <input id="ar-forpolls"
         type="number" min="1" value="${r.for_polls || 1}"></label>
@@ -1370,6 +1378,7 @@
         <option value="interface_event">interface_event</option>
         <option value="threshold">threshold</option>
         <option value="dhcp_threshold">dhcp_threshold</option>
+        <option value="dhcp_event">dhcp_event</option>
         <option value="netpath_threshold">netpath_threshold</option>
         <option value="netpath_event">netpath_event</option>
         <option value="wireless_event">wireless_event</option>
@@ -1633,20 +1642,9 @@
     return `<table><caption class="sr-only">Alert details</caption><tbody>${rows}</tbody></table>`;
   }
 
-  function smsNumbersListHtml(list) {
-    if (!list.length) return App.emptyState('No numbers yet.');
-    const rows = list.map((num, index) => `
-      <tr>
-        <td>${escape(num)}</td>
-        <td><button type="button" class="as-sms-to-remove" data-index="${index}">Remove</button></td>
-      </tr>`).join('');
-    return `<table><caption class="sr-only">Text message numbers</caption><tbody>${rows}</tbody></table>`;
-  }
-
   function settingsDialog() {
     const s = App.state.alertsSettings || {};
     const recipients = normalizeRecipients(s.smtp_to_default);
-    const smsNumbers = normalizeRecipients(s.sms_to_default);
     const { check, number } = App.form;
     const box = App.modal('Alerts settings', `
       <fieldset><legend>ENGINE</legend>
@@ -1728,16 +1726,6 @@
         <p class="hint" id="as-sms-cred-status"></p>
         ${App.form.text('as-twilio-from', 'From number', escape(s.twilio_from || ''), 'placeholder="+15551234567"')}
         ${App.form.text('as-twilio-msid', 'Messaging Service SID (optional, replaces From)', escape(s.twilio_messaging_service_sid || ''))}
-        <p class="hint">Default numbers</p>
-        <div id="as-sms-to-list">${smsNumbersListHtml(smsNumbers)}</div>
-        <label>Add number <input id="as-sms-to-add" placeholder="+15551234567"></label>
-        <button type="button" id="as-sms-to-add-btn">Add</button>
-        <p class="hint" id="as-sms-consent">By adding a number you confirm the person at that
-          number has agreed to receive network alert text messages from SappiWhere. Message
-          frequency varies by network activity. Message and data rates may apply.
-          Reply STOP to unsubscribe, HELP for help. Full terms:
-          <a href="/sms-terms" target="_blank" rel="noopener">SMS Terms</a> ·
-          <a href="/sms-privacy" target="_blank" rel="noopener">SMS Privacy</a>.</p>
         ${number('as-sms-maxhour', 'Max texts per hour', s.sms_max_per_hour ?? 30, 'min=1')}
         <p class="hint">One text per number per notification, cut to 160
           characters, with its own hourly budget apart from email's.</p>
@@ -1793,7 +1781,6 @@
                                  s.table_columns)}
       <fieldset><legend>TEST</legend>
         <label>Send a test email to <input id="as-testto" placeholder="you@example.com"></label>
-        <label>Send a test text to <input id="as-testsms" placeholder="+15551234567"></label>
       </fieldset>`, [
       { label: 'Cancel', onClick: App.closeModal },
       // The one control in the product whose only purpose is to report an
@@ -1807,27 +1794,6 @@
         const to = box.querySelector('#as-testto').value.trim();
         return App.runJob(button, { queued: 'Sending…', done: 'Sent' },
           App.post('/api/alerts/smtp/test', { to }).then((result) => {
-            if (!result.ok) throw new Error(result.error || 'not sent');
-            return result;
-          }));
-      } },
-      { label: 'Send test text', onClick: (box, button) => {
-        if (!App.requireFields(box, [['#as-testsms', 'A destination number']])) return;
-        const to = box.querySelector('#as-testsms').value.trim();
-        const payload = { to };
-        const mode = box.querySelector('#as-twilio-auth').value;
-        const token = mode === 'api_key'
-          ? (box.querySelector('#as-twilio-apikey-secret') || {}).value || ''
-          : (box.querySelector('#as-twilio-token') || {}).value || '';
-        if (token) payload.token = token;
-        payload.twilio_account_sid = box.querySelector('#as-twilio-sid').value.trim();
-        payload.twilio_auth_mode = mode;
-        payload.twilio_api_key_sid = box.querySelector('#as-twilio-apikey-sid').value.trim();
-        payload.twilio_from = box.querySelector('#as-twilio-from').value.trim();
-        payload.twilio_messaging_service_sid =
-          box.querySelector('#as-twilio-msid').value.trim();
-        return App.runJob(button, { queued: 'Sending…', done: 'Sent' },
-          App.post('/api/alerts/sms/test', payload).then((result) => {
             if (!result.ok) throw new Error(result.error || 'not sent');
             return result;
           }));
@@ -1904,7 +1870,6 @@
           twilio_api_key_sid: text('#as-twilio-apikey-sid'),
           twilio_from: text('#as-twilio-from'),
           twilio_messaging_service_sid: text('#as-twilio-msid'),
-          sms_to_default: smsNumbers,
           sms_max_per_hour: num('#as-sms-maxhour'),
           table_columns: App.readColumnPicker(
             box.querySelector('#cols-alerts'), COLUMNS),
@@ -1957,25 +1922,6 @@
       recipients.push(addr);
       input.value = '';
       renderRecipients();
-    };
-
-    function renderSmsNumbers() {
-      box.querySelector('#as-sms-to-list').innerHTML = smsNumbersListHtml(smsNumbers);
-      for (const btn of box.querySelectorAll('.as-sms-to-remove')) {
-        btn.onclick = () => {
-          smsNumbers.splice(Number(btn.dataset.index), 1);
-          renderSmsNumbers();
-        };
-      }
-    }
-    renderSmsNumbers();
-    box.querySelector('#as-sms-to-add-btn').onclick = () => {
-      const input = box.querySelector('#as-sms-to-add');
-      const num = input.value.trim();
-      if (!num || !/^\+[1-9][0-9]{7,14}$/.test(num)) return;
-      smsNumbers.push(num);
-      input.value = '';
-      renderSmsNumbers();
     };
   }
 
