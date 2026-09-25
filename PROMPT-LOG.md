@@ -5,6 +5,78 @@ grouped by the version that carries it. This is a working record for the
 operator — the full story of each change is in `CHANGELOG.md`, and this file
 does not replace it.
 
+## 5.67.0 — NetFlow overhaul: scoped summaries, named exporters, EXPORTERS/INTERFACES views
+
+**Operator message, verbatim:**
+
+"Netflow 'Exporters' Drop down selection should show both the IP address
+and the name of the exporter not just the IP address."
+
+**Follow-up, verbatim** — with a screenshot of a **Last 3 days** chart for
+exporter 10.199.17.1 showing essentially nothing but the last few hours,
+under a strip reading `history: raw 1.7h · minute 7.3d (4m behind) ·
+hourly 17.5d`:
+
+"Netflow has been collecting data for DAYS now yet look at this 3 day
+graph for a specific exporter - essentially nothing showing except the
+last few hours. You need to do a COMPLETE deep dive and review of the
+netflow module along with EXTENSIVE testing to ensure proper
+functionality. You need to simulate netflow data from multiple sources
+from an extended time frame and then test the manipulations of the time
+windows, zooms, unexpected server restarts etc to ensure proper
+functioning. This module has been performing the worst out of all the
+modules in the application and needs some type of complete overhaul to
+actually function properly and provide useful information. DO EXTENSIVE
+research on other netflow offerings ESPECIALLY PLIXER Netflow and do
+everything in your power to create a complete recreation of that netflow
+platform while keeping the graphical styling of the current SappiWhere.
+Keep it all in the Netflow module tab."
+
+**Dora's map, before any planning.** The root cause sat at
+`flowdb._rollup_plan`: it refused the summaries for *any* filter, exporter
+included, so a filtered chart was always answered from raw `flows` alone.
+On the operator's box the row cap had shrunk raw to the 1.7 hours the
+strip already showed, while the minute summary held 7.3 days and the
+hourly summary 17.5 days — neither was ever read for a filtered view, and
+the Settings hint claimed the opposite. Separately, the exporter dropdown
+built its label from the address alone while the flow table and chart
+label already resolved a name. No test or demo seeded multi-day,
+multi-exporter flows to catch either one.
+
+**Planning questions Bob asked, and the operator's answers** — every one
+the recommended option:
+
+- Summary depth: global-only, add per-exporter, or add per-exporter-and-
+  interface? — **"Exporter + interface (Recommended)."**
+- Raise the 5,000,000-row cap, or leave it? — **keep the existing cap**;
+  filtered history comes from the new summaries instead of a bigger raw
+  table.
+- Exporter dropdown format — **`NAME (10.199.17.1, v9)`**.
+- Where the Plixer-style views live — **subtabs inside the existing
+  NetFlow tab** (TRAFFIC / EXPORTERS / INTERFACES), nothing moved to a
+  separate tab.
+
+**Follow-up, verbatim: "remove the 10 min loop."** The operator cancelled
+Bob's standing ten-minute team check-in for the length of this job; Bob
+worked the four lanes straight through instead of pausing to report in.
+
+**Who built what.** SuperThing1: the scoped-summary storage
+(`flowdb.py`) and its new suites (`test_netflow_scoped.py`,
+`test_netflow_history.py`, `test_netflow_restart.py`). Thing2: the two new
+API routes, the `records_only`/`iface`/`direction` additions to the
+existing overview, the missed-sequence counter (`nfdecode.py`,
+`collector.py`), and `test_netflow_exporters_api.py`. Thing3: the
+TRAFFIC/EXPORTERS/INTERFACES subtabs, the named dropdown, the
+coverage-honesty shading and settings hint, and the walk's new NetFlow
+checks. Thing4: `demo/flows.py` and `test_flows_simulator.py`, catching
+two bugs in the simulator itself (an exporter boot time not always ahead
+of every flow a long `--burst` would generate; the exit summary not
+counting live-phase records) before it was ever pointed at the collector.
+
+**Outcome.** Testy, Fisty and Javariius's phases are in progress as this
+entry is written — Bob will amend this line once review and the push to
+`main` are done. See `CHANGELOG.md`'s 5.67.0 entry for the shipped result.
+
 ## 5.66.0 — A stored DHCP credential now runs the poll locally, not over WinRM
 
 **Operator message, verbatim:**

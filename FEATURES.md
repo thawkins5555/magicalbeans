@@ -3653,7 +3653,49 @@ Where that bound is reached the selector's tooltip says so; *most recent*
 never reaches it.
 
 Filters for source, destination, port, protocol and exporter apply to all three
-at once. Clicking a bar filters to it.
+at once. **From 5.67.0, choosing an exporter also enables Interface and
+Direction** (Bidirectional / Inbound / Outbound) filters, blank and disabled
+until an exporter is chosen since an interface number only means anything on
+one device. Clicking a bar filters to it.
+
+### EXPORTERS and INTERFACES — 5.67.0
+
+Two more subtabs sit beside TRAFFIC (which is unchanged): **EXPORTERS**, a
+table of every device that has sent flows, and **INTERFACES**, a table of
+each exporter's interfaces — the exporter → interface → report shape
+Plixer Scrutinizer uses, built inside this same tab rather than a separate
+module.
+
+**EXPORTERS** lists status (a coloured dot: active within the last 5
+minutes, idle within the last hour, otherwise silent), name, address,
+version, flows/s, bits/s, how many interfaces it has reported traffic on in
+the last hour, missed sequence numbers, sampling rate, last flow and first
+seen. Clicking a row opens INTERFACES for that device; a **Report** button
+jumps straight to TRAFFIC filtered to it.
+
+**INTERFACES** lists each exporter's interfaces for the chosen window —
+named from the same **Interface names** setting, then a Nodes-inventory
+alias or description, then the bare index — with an inbound and an
+outbound utilisation bar measured against the interface speed Nodes polled
+for that port (a plain rate, no bar, when no speed is known), sorted
+busiest first. Clicking a row lands on TRAFFIC with that exporter,
+interface and direction already filtered and **Group by** set to
+Application.
+
+**The exporter picker is named everywhere it appears** — TRAFFIC's filter,
+INTERFACES' filter and the EXPORTERS table — as `NAME (10.199.17.1, v9)`
+when a name is known (the same Nodes-inventory-then-reverse-DNS precedence
+the flow table's Exporter column already used) or `10.199.17.1 (v9)` when
+it is not, sorted by that label. Before 5.67.0 the dropdown showed only the
+address.
+
+**Missed sequence numbers**, the same idea Plixer calls a vitals check,
+count on the status strip and per exporter on the EXPORTERS table: v5
+counts records, v9 counts packets, IPFIX counts records, and a gap between
+what an exporter's next packet should carry and what it did adds to the
+total. A sequence that runs backward, or jumps by more than a million,
+means the exporter restarted or its counter wrapped, not that a million
+records went missing, so it resets the count instead of adding it.
 
 ### Flow-to-path correlation
 
@@ -3760,17 +3802,26 @@ out from under it before they are counted into the rollup.
 
 Beside the individual records the collector keeps **summaries**: every minute
 and every hour, the heaviest keys of each Group by dimension, plus that
-period's grand total. The charts and the top-talkers bars are drawn from
-those wherever they cover the window asked for, which is what makes a 7- or
-30-day view answer in the same time a one-hour view does however many flows
-are behind it. The 15-minute view, and any filtered view, reads the records
-themselves.
+period's grand total. **From 5.67.0 the summaries are scoped as well as
+global** — one set per exporter at both tiers, one per (exporter, interface,
+direction) at the hourly tier, and a per-interface total at both tiers — so
+the charts, the EXPORTERS and INTERFACES views and the top-talkers bars are
+drawn from those wherever they cover the window asked for, filtered to one
+exporter or one interface included. That is what makes a 7- or 30-day view
+filtered to a single device answer in the same time an unfiltered one does,
+however many flows are behind it. The 15-minute view, and a source,
+destination, port or protocol filter — none of which any summary is scoped
+by — still read the records themselves; the page says so on screen when it
+does.
 
 The summaries have their own retentions — *Keep minute summaries for* and
 *Keep hourly summaries for* — and they are deliberately longer than the flow
 retention. A store keeping a fortnight of individual flows and 90 days of
 hourly summaries still draws a 30-day chart; what it cannot do is show the
-records behind it. Deleting all flow records from **Settings → Maintenance**
+records behind it. **From 5.67.0, a fourth retention, *Keep per-interface
+summaries for (days)*, defaults to 30** and bounds the hourly interface
+breakdowns behind the INTERFACES view on their own, separately from the
+other two. Deleting all flow records from **Settings → Maintenance**
 deletes the summaries with them, so the charts empty too.
 
 Two things about the summarised figures are worth knowing. Totals — the
@@ -3778,8 +3829,11 @@ bytes, packets and flow count under the chart — are exact whichever source
 answered. A named series is exact for any key heavy enough to be among the
 heaviest in every period it appears in; a key that drops below that line in
 some periods is short by what it lost there, and that traffic appears in
-*— other —* rather than going missing. Filtered views are read from the
-records and are exact throughout.
+*— other —* rather than going missing. **From 5.67.0, an exporter or
+interface filter is summary-served like everything else** and carries the
+same two guarantees; only a source, destination, port or protocol filter —
+which has no summary scope to read — is exact throughout because it is
+always reading the records.
 
 **From 5.7.0, a summary period that dropped a key is repaired from the
 individual records where they are still there to repair it from.** Every

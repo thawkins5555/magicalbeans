@@ -12167,10 +12167,13 @@ quietly losing history. `coverage()` (below) exposes the same figure to
 the UI as `cap_held_back`. **From 5.35.0 the *size* cap
 (`max_flow_db_mb`, `trim_to_size`) shares this exact protection** —
 `FlowDatabase._trim_id_ceiling()` clamps its own delete range to the
-same minute watermark, since a stalled rollup pass could otherwise let
+same watermark, since a stalled rollup pass could otherwise let
 the size cap delete an unsummarised block the row cap was never asked
-to touch. See **A subclass can cap how far `trim_to_size` is allowed to
-delete**, under Data layer.
+to touch. **From 5.67.0 both stages clamp to `_summary_watermark()`, the
+*older* of the minute and hourly watermarks, not the minute one alone**
+— see **Scoped summaries** below for why the hourly tier now needs the
+same protection. See **A subclass can cap how far `trim_to_size` is
+allowed to delete**, under Data layer.
 
 **A rollup pass that used its whole bucket budget now triggers
 immediate catch-up passes, not just a longer wait.** `compact_rollup(tier)`
@@ -12200,12 +12203,15 @@ behind rather than actually empty. The fix adds one more branch, tried
 first: if the window's start is older than the minute tier's own floor
 *and* the hourly tier's floor/watermark actually cover the window, the
 bucket size is silently widened to 3600 (hourly) instead of falling
-through to raw. It only fires for an unfiltered query — `filters and
-any(filters.values())` disqualifies it, since a filtered query cannot be
-answered from the rollup tiers at all and has always read raw. The
-response's own `bucket_s` says what was actually used, which is what the
-chart's existing hover-shows-the-bucket-size behaviour already surfaces
-to an operator without a separate flag.
+through to raw. At the time this only fired for an unfiltered query,
+since a filtered query could not be answered from the rollup tiers at
+all and had always read raw. **From 5.67.0, `_widens()` (see Scoped
+summaries below) fires for an exporter or interface filter too, now that
+those have their own scoped rollups to widen into** — it is still refused
+for a source, destination, port or protocol filter, which still has no
+scope to read. The response's own `bucket_s` says what was actually used,
+which is what the chart's existing hover-shows-the-bucket-size behaviour
+already surfaces to an operator without a separate flag.
 
 ### `coverage()` and the lag warning (`flowdb.py`, `web/api/netflow.py`, `netflow.js`, `web/service.py`) — 5.23.0
 
@@ -12214,7 +12220,9 @@ the `ix_flows_ts` index, not `stats()`'s full scan) plus both tiers'
 `rollup_bounds()` and the two prune-bookkeeping fields above, returned as
 one dict: `raw_oldest`/`raw_newest`, `minute_floor`/`minute_watermark`,
 `hourly_floor`/`hourly_watermark`, `cap_held_back`, `prune_incomplete`.
-`minute_lag_s()` is the one further figure it doesn't carry directly —
+**From 5.67.0 it also carries `scoped_minute_floor`, `scoped_hourly_floor`
+and `iface_hourly_floor`** — see Scoped summaries below. `minute_lag_s()`
+is the one further figure it doesn't carry directly —
 seconds sealed time is ahead of the minute watermark — read separately
 since only the service's own SYSTEM-log throttle needs it, not the UI.
 `GET /api/state` serves `coverage()` as `collector.coverage`, through
@@ -12236,6 +12244,148 @@ it writes one SYSTEM event-log line, throttled to at most one every
 `_FLOW_COVERAGE_WARN_INTERVAL_S` (also 900s) via `self._flow_coverage_warned_ts`
 — so a store stuck behind says so once every 15 minutes rather than
 filling the log on every rollup wake while it stays behind.
+
+### Scoped summaries (`flowdb.py`) — 5.67.0
+
+Root cause of the operator's report: `_rollup_plan` refused the rollups
+for *any* filter, exporter included, so a chart filtered to one exporter
+was always answered from raw `flows` — which the row cap can hold to a
+couple of hours on a busy store, no matter how much history the
+(unfiltered-only) summaries actually covered. The fix gives the summaries
+a scope.
+
+**Schema.** `flow_rollup`, `flow_rollup_span` and `flow_rollup_trunc` each
+gain three leading key columns after `tier` — `exporter TEXT`,
+`iface INTEGER`, `dir TEXT` — defaulting to `GLOBAL_SCOPE`
+(`("", -1, "")`, tested as `_GLOBAL_SQL`), so every pre-existing global row
+and query keeps working unchanged. `flow_rollup`'s primary key becomes
+`(tier, exporter, iface, dir, dim, bucket, key)`; the other two follow the
+same leading order without `dim`/`key`. A scope tuple is one of three
+shapes: `GLOBAL_SCOPE` itself; `(exporter, -1, "")` for that exporter
+alone; or `(exporter, iface, "in"|"out")` for one interface in one
+direction — `iface`/`dir` are always paired, never one without the other.
+
+**Caps.** Global stays `ROLLUP_KEYS = {60: 48, 3600: 64}`. `SCOPED_KEYS =
+{"exporter": {60: 32, 3600: 48}, "interface": {3600: 16}}` — an interface
+breakdown exists at the hourly tier only, there is no per-minute one.
+
+**Migration (`_before_schema`).** Detected two ways at open, before
+`SCHEMA` can create the new indexed tables: a legacy `flow_rollup` with no
+`exporter` column, or a `*_old` table left behind by an interrupted
+attempt. Either way, the three tables are (if not already) renamed to
+`*_old`, `ROLLUP_SCHEMA` is run fresh, `INSERT OR IGNORE ... SELECT` copies
+every old row back in bound to `GLOBAL_SCOPE`, and the `*_old` tables are
+dropped — one transaction, and idempotent: `INSERT OR IGNORE` against the
+new primary key means a migration resumed after a crash mid-way re-copies
+harmlessly rather than double-counting or losing the old tables. On the
+bench this cost about 6 seconds for 2 million summary rows; a 5-million-row
+store should budget roughly 15–20 seconds on its first start after the
+upgrade. Once done, `_SCOPED_FLOOR % tier` (and, for the hourly tier,
+`_IFACE_FLOOR`) is seeded at that tier's *existing* watermark — no scoped
+row exists below where the store already stood, so an upgraded store's
+exporter and interface views read raw records, and the overview says
+`records_only`, back to the point of the upgrade until compaction and
+`backfill_rollup` fill the new scopes in from there.
+
+**Floors and the contiguity rule.** `_scope_floor(tier, kind)` is the
+*highest* (most restrictive) of: the tier's own `_FLOOR % tier`; for any
+non-global `kind`, `_SCOPED_FLOOR % tier`; and for `kind == "interface"`
+at the hourly tier, `_IFACE_FLOOR` as well — a scope never claims to
+reach further back than any of the marks that bound it. `backfill_rollup`
+only lowers `_SCOPED_FLOOR`/`_IFACE_FLOOR` when it finds them sitting
+exactly at `bucket + tier` — contiguous with the bucket just walked —
+so a gap already below an upgraded store's old watermark is never
+silently bridged from the wrong side; only a walk that reaches it in
+strict order (backfill always proceeds newest-to-oldest) lowers it.
+`_raise_floors`, called by both `_prune_rollup` (retention) and
+`_trim_more` (the size cap), raises `_FLOOR`, `_SCOPED_FLOOR` and (hourly)
+`_IFACE_FLOOR` together as old buckets age out, so a scope stops trusting
+history no longer there exactly as the global floor already did.
+`_delete_rollup` deletes across every scope for a bucket range unless
+narrowed, which is what lets retention and the size cap reach the scoped
+rows at all.
+
+**Compaction order (`_compact_bucket`).** Per dimension: `_compact_global`
+first (unconditional, as before); then, skipping the Exporter dimension
+itself (a scope already holds one exporter — its own span row is the
+whole answer a per-key breakdown would give), `_compact_exporters` for
+both tiers; then, hourly tier only and only while `_raw_covers` says raw
+still holds everything the bucket needs, `_compact_interfaces` once per
+side (`in`/`out`) so a hairpin flow gets a row each way. `_compact_spans`
+writes every scope's grand total last: global always, the exporter spans
+from the minute tier where compaction can reach them or from raw
+otherwise, and the interface spans only when this bucket's interface
+breakdown was actually built. Each dimension/scope commits its own
+transaction (`time.sleep(0)` between them), so the collector's writer is
+never blocked longer than one.
+
+**Hold-back.** `prune()`'s row-cap stage and `_trim_id_ceiling` (the size
+cap) now clamp to `_summary_watermark()` — the *older* of the minute and
+hourly tiers' own watermarks — rather than the minute watermark alone
+(see The row cap stops at the minute watermark, above): the hourly tier
+now carries exporter- and interface-scoped rows too, and those are just
+as vulnerable to being capped out from under an unfinished compaction as
+the global ones always were. In practice this holds raw back to whichever
+tier is running slower, typically an hour or two behind real time.
+
+**Backfill pacing.** `_rollup_loop` (`web/service.py`) runs one
+`backfill_rollup(tier, budget_s=5.0)` per tier on every once-a-minute
+wake while `backfill_pending(tier)` is true, instead of relying solely on
+the maintenance sweep; `_maintenance_flow_rollup` loops the same paced
+calls across both tiers under one 20-second budget (`_BACKFILL_SWEEP_BUDGET_S`)
+per sweep instead of one unbounded pass. Scoped rows are written by the
+same `_compact_bucket` backfill already calls, so lowering the floor
+lowers the scoped floors with it (subject to the contiguity rule above).
+Together, a week of freshly loaded or simulated history now summarises in
+minutes rather than trickling in over many 15-minute maintenance cycles.
+
+**Query routing.** `_scopes(filters)` decides the `kind`: `None` — raw
+only, no scope exists to read — for a source, destination, port or
+protocol filter; otherwise `"global"` (no exporter chosen), `"exporter"`
+(an exporter, no interface), or `"interface"` (exporter and interface,
+one scope tuple per direction `_DIRECTIONS` resolves — two for `both`, so
+a hairpin flow is counted once per direction on both the rollup and the
+raw path). `_rollup_plan` walks only the hourly tier for `"interface"`
+(there is no minute-tier interface breakdown) or both tiers, coarsest
+first, otherwise, and returns `(tier, dim, seal, scopes)` once
+`_scope_floor` and `rollup_bounds` both reach `t0`. `_widens` (the A4
+sub-hour-widens-to-hourly fallback) now takes the `kind` and fires for an
+exporter or interface scope exactly as it already did for the global one
+— weighed against `_oldest_raw()` in the interface case, which has no
+minute tier of its own to compare against. `_agg_rows` reads one rollup
+arm — key rows and span rows — per scope `_rollup_plan` returned, and
+repairs each scope's own flagged buckets independently through
+`_repair_ranges(tier, scope, dim, t0, seal)`; `_repair_budget(scopes)`
+halves the global bounds per scope in play: the global scope alone keeps
+`_REPAIR_MAX_BUCKETS` (120) and `_REPAIR_MAX_FLOWS` (100,000) outright, a
+single scoped query gets `120 * 3 // 4 = 90` buckets and half the flow
+budget, and a two-scope `direction=both` interface query splits that once
+more to 45 buckets each — the same bound-parameter arithmetic as the
+global case (see Repairing a truncated rollup bucket, above), just spent
+across more scopes.
+
+**New reads.** `interface_totals(t0, t1, exporter=None)` and
+`exporter_totals(t0, t1)` both route through `_span_plan(t0, t1, kind)` —
+a read-only counterpart to `_rollup_plan` for span rows alone, picking the
+finest tier whose scoped floor reaches `t0` and reading the two raw edges
+outside it. `coverage()` gained `scoped_minute_floor`/`scoped_hourly_floor`
+(`_scope_floor(tier, "exporter")`) and `iface_hourly_floor`
+(`_scope_floor(3600, "interface")`), which `netflow.js`'s
+`coverageSettingsLine()` reads for the Settings-dialog hint. `recent_endpoints`
+is unchanged, still bound to `GLOBAL_SCOPE`/`_GLOBAL_SQL` — it only ever
+read the global minute-tier rollup.
+
+**API routes (`web/server.py`, `web/api/netflow.py`).** `GET
+/api/netflow/exporters` and `GET /api/netflow/interfaces`, both gated
+`("netflow", R)` like the module's other reads. `get_flow_exporters`
+combines `flow_db.exporters()`, the batched `namelookup.resolve_names()`
+(new alongside the existing single-address `resolve_name`), `exporter_totals()`
+for rates over the last `EXPORTER_RATE_WINDOW_S` (300 s), `interface_totals()`
+for each exporter's interface count over the last hour, and
+`decoder.sequence_gaps()`. `get_flow_interfaces` combines
+`interface_totals()` with `nodes_db.devices_by_addresses()`/`interfaces()`
+for the speed and label Nodes already polled, so the utilisation bar is
+never a second, separate poll.
 
 ---
 

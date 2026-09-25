@@ -447,7 +447,7 @@ Collector configuration is under **Settings**, top right of the NetFlow tab.
 | Collector | Enable, bind address, UDP port, receive buffer, accepted versions |
 | Sampling | Assumed rate, and whether to trust the rate the exporter reports |
 | Exporters | Accept-any or an allow list, plus ifIndex-to-name mapping |
-| Storage and Display | Retention, row cap, top N, chart interval, name resolution |
+| Storage and Display | Retention, row cap, summary retention (minute/hourly/per-interface), top N, chart interval, name resolution |
 
 Reverse DNS threads, timeout and cache lifetime are shared with NetPath and live on the Settings tab.
 
@@ -457,7 +457,13 @@ Interface names are entered one per line as `10.20.0.1:1=LAN-Core`. Without them
 
 ### Views
 
-Traffic over time is a stacked area chart of the top series plus an *other* band, in bits per second, so it reads the way link utilisation is usually quoted. Below it, a top-N bar chart and a flow record table share the width.
+Three subtabs, from 5.67.0: **TRAFFIC**, **EXPORTERS** and **INTERFACES** — the exporter → interface → report shape NetFlow tools like Plixer Scrutinizer use, built inside this one tab.
+
+**TRAFFIC** is the original view: traffic over time is a stacked area chart of the top series plus an *other* band, in bits per second, so it reads the way link utilisation is usually quoted. Below it, a top-N bar chart and a flow record table share the width. Once an exporter is chosen, Interface and Direction (Bidirectional/Inbound/Outbound) filters become available alongside the existing source, destination, port and protocol ones. The exporter dropdown reads `NAME (10.199.17.1, v9)` when a name is known, `10.199.17.1 (v9)` otherwise.
+
+**EXPORTERS** lists every device that has sent flows — status, name, address, version, flows/s, bits/s, interface count, missed sequence numbers, sampling and first/last seen — and a **Report** button that jumps to TRAFFIC filtered to that device.
+
+**INTERFACES** lists each exporter's interfaces with inbound and outbound utilisation bars measured against the interface speed Nodes has polled; clicking a row opens TRAFFIC filtered to that exporter, interface and direction.
 
 ### Zooming without a wheel
 
@@ -490,13 +496,13 @@ Pruning runs every 15 minutes against the retention window, the row cap and the 
 
 ### Proving the socket receives
 
-**Send test packet** on the NetFlow status strip sends a valid NetFlow v5 header declaring zero records to the collector over loopback, and shows the PowerShell command that does the same thing by hand. The packet counter should move within a few seconds while flows stored stays at zero — that is the point, it separates "the socket is receiving" from "the decoder is producing flows".
+**Send test packet** on the NetFlow status strip sends a valid NetFlow v5 header declaring zero records to the collector over loopback, and shows the PowerShell command that does the same thing by hand. The packet counter should move within a few seconds while flows received stays at zero — that is the point, it separates "the socket is receiving" from "the decoder is producing flows".
 
 ### When no flows arrive
 
 The status strip is the first place to look. It now reports the last packet time, so `Listening on 0.0.0.0:2055 (UDP) · no packets yet (7 min)` distinguishes a socket that is bound but silent from one that is receiving.
 
-The counters separate the failure modes. *Packets* counts datagrams that reached the socket; *flows stored* counts records decoded from them. Packets rising with flows flat means the exporter is sending but its template hasn't arrived yet, or its version is switched off. Packets flat means nothing is reaching the socket at all.
+The counters separate the failure modes. *Packets* counts datagrams that reached the socket; *flows received* counts records decoded from them. Packets rising with flows flat means the exporter is sending but its template hasn't arrived yet, or its version is switched off. Packets flat means nothing is reaching the socket at all.
 
 On Windows the collector binds with `SO_EXCLUSIVEADDRUSE` rather than `SO_REUSEADDR`. Windows lets two processes share a UDP port under `SO_REUSEADDR` and delivers datagrams to only one of them, so a leftover instance silently swallows every packet while the visible one looks healthy and idle. Exclusive binding turns that into a plain "port already in use" error at startup.
 

@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.67.0 — NetFlow: filtered charts now read the summaries per exporter and interface, the page says what records-only views can reach, exporters are named, and EXPORTERS/INTERFACES views arrive](#5670--netflow-filtered-charts-now-read-the-summaries-per-exporter-and-interface-the-page-says-what-records-only-views-can-reach-exporters-are-named-and-exportersinterfaces-views-arrive)
 - [5.66.0 — A stored DHCP credential now runs the poll locally as that account, not over WinRM](#5660--a-stored-dhcp-credential-now-runs-the-poll-locally-as-that-account-not-over-winrm)
 - [5.65.0 — The DHCP server status line now follows the selected server, and Rules gets an Email column](#5650--the-dhcp-server-status-line-now-follows-the-selected-server-and-rules-gets-an-email-column)
 - [5.64.0 — Alerts Rules table gets a Text column, DHCP credentials confirmed and shown per server, ConfigRX SSH account replaces Global SSH account, and a team roster update](#5640--alerts-rules-table-gets-a-text-column-dhcp-credentials-confirmed-and-shown-per-server-configrx-ssh-account-replaces-global-ssh-account-and-a-team-roster-update)
@@ -200,6 +201,197 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.67.0 — NetFlow: filtered charts now read the summaries per exporter and interface, the page says what records-only views can reach, exporters are named, and EXPORTERS/INTERFACES views arrive
+
+Two operator messages, the second asking for a full review. First: "Netflow
+'Exporters' Drop down selection should show both the IP address and the
+name of the exporter not just the IP address." Second, with a screenshot
+of a **Last 3 days** chart for exporter 10.199.17.1 showing almost nothing
+but the last few hours, under a strip reading `history: raw 1.7h · minute
+7.3d (4m behind) · hourly 17.5d`: "Netflow has been collecting data for
+DAYS now yet look at this 3 day graph for a specific exporter -
+essentially nothing showing except the last few hours. ... This module has
+been performing the worst out of all the modules ... DO EXTENSIVE research
+on other netflow offerings ESPECIALLY PLIXER Netflow and do everything in
+your power to create a complete recreation of that netflow platform while
+keeping the graphical styling of the current SappiWhere."
+
+**The root cause.** Every filtered NetFlow chart — including one filtered
+only to an exporter — was answered entirely from the raw flow-record
+table; the minute and hourly summaries existed but were never consulted
+for a filtered view, so the strip's own coverage line was true and
+irrelevant at the same time. On the operator's box the row cap
+(`max_flows`, 5,000,000 by default) had shrunk raw retention to 1.7
+hours, while the minute summary reached back 7.3 days and the hourly
+summary 17.5 days — a three-day chart filtered to one exporter could
+only ever show the last couple of hours of it, no matter how much history
+the store actually held. The Settings dialog's own hint — "a chart older
+than the flow retention is drawn from the summaries" — said the opposite
+of what a filtered chart actually did. Separately, the exporter dropdown
+built its labels straight from the address, with no name, while the flow
+table and the chart's own Exporter series already resolved one.
+
+**Summaries are now kept per scope, not only globally.** Beside the
+existing global summary, the collector keeps one per exporter at both the
+minute and hourly tiers, one per (exporter, interface, direction) at the
+hourly tier only, and a per-interface grand total at both tiers. Caps:
+48 keys per dimension per bucket at the minute tier and 64 at the hourly
+tier globally (unchanged); 32 and 48 for the same two tiers scoped to one
+exporter; 16 for an hourly interface breakdown. An exporter filter, or an
+exporter-plus-interface filter, now reads its own scope's summary instead
+of falling through to raw — which is what makes a multi-day chart filtered
+to one device answer as fast as the unfiltered one. A source, destination,
+port or protocol filter has no scope to read (none of those columns are
+summarised) and still reads the records table, exactly as before; the
+chart and the totals line now say so in words rather than just going
+quiet.
+
+**Upgrading a store rebuilds its summary tables once, in one transaction,
+the first time it opens after this update** — the three rollup tables gain
+the scope columns, existing global rows carry over unchanged, and the
+store's watermark at that moment becomes the floor below which the new
+per-exporter and per-interface summaries do not reach; nothing is deleted
+or reprocessed to fill that gap, so an upgraded store's exporter and
+interface views read records instead, and say so, back to the point of the
+upgrade. On the bench this rebuild took about 6 seconds for 2 million
+summary rows; budget roughly 15–20 seconds for a 5-million-row store —
+enough that it should not be mistaken for a hang on first start after the
+upgrade.
+
+**The row cap's hold-back now protects both tiers, not just the minute
+one.** The row cap and the size cap already refused to delete flows the
+minute summary had not yet reached; they now hold back to whichever of
+the minute or hourly watermark is older, so raw history always reaches
+back an hour or two even when the hourly tier — which the new exporter and
+interface summaries partly depend on — is the one running behind.
+
+**Backfilling a week of history now takes minutes, not hours.** The
+minute-by-minute rollup loop runs one paced 5-second backfill pass per
+tier every minute while older history is still unsummarised, and a
+maintenance sweep now budgets 20 seconds across both tiers in one pass
+instead of a single fixed-size chunk. Loading a simulated week of flows in
+one sitting, or a store that has just been upgraded, now catches up to
+"chart-able" in a few minutes rather than trickling in over the next several
+maintenance cycles.
+
+**Query routing, made honest.** An exporter or interface view over a
+window the minute-tier summary can no longer reach now widens its own
+bucket to the hourly tier, the same fallback an unfiltered chart already
+had, rather than falling back to raw. Where a source, destination, port or protocol
+filter is in play, the chart now shades the part of the window records
+cannot reach (labelled "no records kept before …") and the totals line
+appends "· records only for this filter · records reach back to …", so a
+gap in the chart is something the page explains rather than something you
+have to notice on your own.
+
+**The exporter dropdown is named**, on TRAFFIC and INTERFACES alike:
+`NAME (10.199.17.1, v9)` when a name is known (from the Nodes inventory or
+reverse DNS, the same precedence the flow table already used), `10.199.17.1
+(v9)` otherwise, sorted by that label. The EXPORTERS table names the same
+way.
+
+**Two new subtabs arrive beside today's TRAFFIC** — the Plixer Scrutinizer
+shape (exporter → interface → report) built inside the existing NetFlow
+tab, nothing from TRAFFIC removed or rearranged. **EXPORTERS** lists every
+device that has sent flows: a status dot (active under 5 minutes since its
+last flow, idle under an hour, silent past that), name, address, version,
+flows/s, bits/s, interface count, missed sequence numbers, sampling rate,
+last flow and first seen; a row click opens INTERFACES for that device, a
+**Report** button jumps straight to TRAFFIC filtered to it. **INTERFACES**
+lists each exporter's interfaces with in/out utilisation bars measured
+against the speed Nodes polled for that port (a plain rate where no speed
+is known), sorted busiest first; a row click lands on TRAFFIC with the
+exporter, interface and direction already filtered, grouped by
+Application. TRAFFIC itself gains **Interface** and **Direction**
+(Bidirectional / Inbound / Outbound) filters, both disabled until an
+exporter is chosen.
+
+**Missed sequence numbers, Plixer's "vitals" idea applied here.** Each
+exporter's next-expected sequence number is tracked per (exporter,
+observation domain) — a v5 count of records, a v9 count of packets, an
+IPFIX count of records — and a gap adds to a running counter shown on the
+status strip ("N missed sequence") and per exporter on the EXPORTERS
+table. A sequence that goes backward, or jumps by more than 1,000,000, is
+read as the exporter having restarted or its counter having wrapped, and
+resets the baseline instead of counting a million "missed" records that
+were never sent.
+
+**"flows stored" on the status strip is renamed "flows received"** — it
+has always counted every flow decoded since the collector started, not
+how many are currently in the table, and the old name implied the latter.
+
+**A new setting, "Keep per-interface summaries for (days)"** (default 30),
+bounds the hourly interface breakdowns' own retention, independent of the
+existing minute- and hourly-summary settings.
+
+**The simulator, `demo/flows.py`.** Stdlib only, multi-exporter, real
+history over the wire: one NetFlow v5 exporter, two v9 (one announcing
+1:100 sampling through an options template, resent the way a real router
+does), one IPFIX; each with 4–6 interfaces; traffic across roughly 40
+internal hosts and a dozen external addresses on common application ports
+(443, 80, 53, 2055, 161, 3268, 5007, 22, 445 and one unregistered port);
+one exporter about ten times busier than the rest; a diurnal volume curve.
+The default run — 3 days of history across 4 exporters — sends about
+300,990 flow records, oldest first, paced under the collector's own
+20,000-datagram queue; `--live` then keeps sending at a chosen rate until
+Ctrl-C. Building it caught two bugs in itself before it was ever pointed
+at a real collector: an exporter's simulated boot time was not always
+placed early enough for every flow a long `--burst` would generate, which
+v5/v9's uptime-relative timestamps cannot represent as negative, now fixed
+by anchoring every exporter's boot ahead of the oldest flow the run will
+send; and the exit summary undercounted a run that used `--live`, since it
+was not folding the live-phase record count into the total it printed.
+
+**The trade: scoped history costs storage and build time.** On a
+1-million-flow, 30-day bench the summary tables grew from 180 MB to
+488 MB, and the time to build them from 15 seconds to 111 seconds. The
+expensive part is the hourly interface breakdown, which scans each hour's
+raw rows once per dimension and per direction; on a store writing millions
+of flows an hour that is seconds of intermittent write-lock time, once an
+hour — accepted as a known cost for this release, with a temp-table
+aggregation noted as a follow-up rather than built now.
+
+**Verification.** New suites: `test_netflow_scoped.py` (every scope agrees
+with raw across the bucket ladder; caps, truncation flags and repair work
+per scope; an old-layout store migrates cleanly; retention and the size
+cap reach scoped rows; hourly-from-minute agrees with hourly-from-raw; an
+interface view widens to the hour; the row cap holds back at the older of
+the two watermarks), `test_netflow_history.py` (the operator's own
+scenario, reproduced: four exporters over a week, pruned down to about
+two hours of raw, and the three-day exporter chart and interface report
+both come back identical to what they read before the prune; a
+source-address filter over the same window correctly reports itself as
+records-only), `test_netflow_restart.py` (a child process that calls
+`os._exit` inside a summary-table write reopens clean and resumes
+compaction with no double-counted or missing bucket; a collector stop and
+restart on the same store restores its templates and keeps counting
+sequence gaps across v5, v9 and IPFIX), and `test_netflow_exporters_api.py`
+(exporter naming and state, interface utilisation math, the two new
+routes and their permission gate, records-only reporting, and the new
+interface/direction filters). `test_flows_simulator.py` decodes every
+datagram `demo/flows.py` builds and checks the exporter, interface,
+timestamp and sampling shape its docstring promises, with no network
+involved. `tests/ui/walk.mjs` gains checks for the new subtabs, the named
+exporter dropdown, a three-day exporter-filtered chart carrying traffic on
+at least three distinct days, and zoom/pan/brush/Live each firing exactly
+one fetch — all of which skip with a clear reason rather than fail when
+the simulator has not been run first.
+
+**Reference.** Plixer Scrutinizer supplied the shape borrowed here: an
+exporter list, an interface list with utilisation, a report per interface,
+and a vitals-style sequence-gap counter — kept inside SappiWhere's own
+NetFlow tab and its existing look rather than a separate module.
+
+Files: `netpath/flowdb.py`, `netpath/web/service.py`,
+`netpath/web/api/netflow.py`, `netpath/web/api/settings.py`,
+`netpath/web/server.py`, `netpath/namelookup.py`, `netpath/nfdecode.py`,
+`netpath/collector.py`, `netpath/web/static/index.html`,
+`netpath/web/static/netflow.js`, `demo/flows.py`,
+`tests/test_netflow_rollup.py`, `tests/test_netflow_scoped.py`,
+`tests/test_netflow_history.py`, `tests/test_netflow_restart.py`,
+`tests/test_netflow_exporters_api.py`, `tests/test_flows_simulator.py`,
+`tests/test_frontend_contracts.py`, `tests/ui/walk.mjs`, plus docs.
 
 ### 5.66.0 — A stored DHCP credential now runs the poll locally as that account, not over WinRM
 
