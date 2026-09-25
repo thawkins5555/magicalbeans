@@ -1330,6 +1330,64 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       }
     });
 
+  await check('Alerts rules: the Rules table Text column reflects '
+    + 'notify_sms per rule (5.64.0)',
+    async () => {
+      const origin = new URL(page.url()).origin;
+      await page.keyboard.press('Escape').catch(() => {});
+      await selectTab(page, 'alerts');
+      await settle(page, 800);
+      let ruleId = null;
+      try {
+        await page.click('#page-alerts > .subtabs > .subtab[data-subtab="rules"]');
+        await page.waitForSelector('#alerts-rules-table tbody tr', { timeout: 20000 });
+        const headerText = await page.locator('#alerts-rules-table thead').innerText();
+        assert(/Text/.test(headerText),
+          `expected a Text column in the Rules table header, got: ${headerText}`);
+
+        const rulesRes = await page.request.get(`${origin}/api/alerts/rules`);
+        const rules = (await rulesRes.json()).rules || [];
+        const target = rules.find((r) => r.key === 'dhcp_poll_failed');
+        assert(target, 'expected the built-in dhcp_poll_failed rule to test against');
+        const other = rules.find((r) => r.id !== target.id && !r.notify_sms);
+        assert(other, 'expected another rule with notify_sms already off');
+        ruleId = target.id;
+
+        const cellFor = (name) => page.evaluate((ruleName) => {
+          const rows = [...document.querySelectorAll('#alerts-rules-table tbody tr')];
+          const row = rows.find((tr) => tr.cells[0].textContent.includes(ruleName));
+          return row ? row.cells[4].textContent.trim() : null;
+        }, name);
+
+        assert((await cellFor(target.name)) === 'no',
+          `expected ${target.name}'s Text cell to read no before enabling it`);
+
+        const put = await page.request.put(`${origin}/api/alerts/rules/${target.id}`,
+          { data: { notify_sms: true } });
+        assert(put.ok(), `enabling notify_sms answered ${put.status()}`);
+        await selectTab(page, 'alerts');
+        await page.click('#page-alerts > .subtabs > .subtab[data-subtab="rules"]');
+        await page.waitForSelector('#alerts-rules-table tbody tr', { timeout: 20000 });
+
+        const targetCell = await cellFor(target.name);
+        const otherCell = await cellFor(other.name);
+        assert(targetCell === 'yes',
+          `expected ${target.name}'s Text cell to read yes, got: ${targetCell}`);
+        assert(otherCell === 'no',
+          `expected ${other.name}'s Text cell to read no, got: ${otherCell}`);
+        return `${target.name} Text=yes, ${other.name} Text=no`;
+      } finally {
+        if (ruleId !== null) {
+          await page.request.put(`${origin}/api/alerts/rules/${ruleId}`,
+            { data: { notify_sms: false } }).catch(() => {});
+        }
+        await page.keyboard.press('Escape').catch(() => {});
+        await sleep(300);
+        await page.click('#page-alerts > .subtabs > .subtab[data-subtab="current"]').catch(() => {});
+        await sleep(300);
+      }
+    });
+
   await check('Alerts: two consecutive failed DHCP polls open a '
     + 'dhcp_poll_failed alert, a good poll resolves it (5.63.0)',
     async () => {
@@ -2909,7 +2967,7 @@ async function checkDialog(page, dir, tag) {
       return 'DPAPI available: saved then cleared';
     });
 
-  await check('ConfigRX settings: the Global SSH account fieldset renders; '
+  await check('ConfigRX settings: the ConfigRX SSH account fieldset renders; '
     + 'store/clear refuses or succeeds per DPAPI availability (5.63.0)',
     async () => {
       const origin = new URL(page.url()).origin;
@@ -2919,11 +2977,11 @@ async function checkDialog(page, dir, tag) {
       await page.waitForSelector('#modal:not([hidden])', { timeout: 10000 });
       await page.waitForSelector('#cxs-global-username', { timeout: 10000 });
       const canStore = await page.evaluate(() => App.canStoreSecrets());
-      const fieldset = page.locator('fieldset', { hasText: 'GLOBAL SSH ACCOUNT' });
+      const fieldset = page.locator('fieldset', { hasText: 'CONFIGRX SSH ACCOUNT' });
       if (!canStore) {
         const html = await fieldset.innerHTML();
         assert(/cannot be stored on this host/.test(html),
-          `expected the DPAPI-unavailable notice in the Global SSH account fieldset, got: ${html}`);
+          `expected the DPAPI-unavailable notice in the ConfigRX SSH account fieldset, got: ${html}`);
         assert(!(await page.$('#cxs-global-password')),
           'expected no #cxs-global-password field with DPAPI unavailable');
         await page.keyboard.press('Escape');
@@ -2943,10 +3001,10 @@ async function checkDialog(page, dir, tag) {
       await page.waitForSelector('#modal[hidden]', { timeout: 15000 });
       await page.click('#cx-settings');
       await page.waitForSelector('#modal:not([hidden])', { timeout: 10000 });
-      const stored = await page.locator('fieldset', { hasText: 'GLOBAL SSH ACCOUNT' }).innerHTML();
+      const stored = await page.locator('fieldset', { hasText: 'CONFIGRX SSH ACCOUNT' }).innerHTML();
       assert(/Stored as/.test(stored), `expected a "Stored as" line, got: ${stored}`);
-      const clearButton = page.locator('.modal-buttons button', { hasText: 'Clear global SSH account' });
-      assert(await clearButton.count() > 0, 'expected a Clear global SSH account button once stored');
+      const clearButton = page.locator('.modal-buttons button', { hasText: 'Clear ConfigRX SSH account' });
+      assert(await clearButton.count() > 0, 'expected a Clear ConfigRX SSH account button once stored');
       await clearButton.click();
       await page.waitForSelector('#modal:not([hidden]) .modal-buttons button.danger', { timeout: 10000 });
       await page.click('#modal:not([hidden]) .modal-buttons button.danger');

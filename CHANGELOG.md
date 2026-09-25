@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.64.0 — Alerts Rules table gets a Text column, DHCP credentials confirmed and shown per server, ConfigRX SSH account replaces Global SSH account, and a team roster update](#5640--alerts-rules-table-gets-a-text-column-dhcp-credentials-confirmed-and-shown-per-server-configrx-ssh-account-replaces-global-ssh-account-and-a-team-roster-update)
 - [5.63.0 — Routes toolbar and Mapper legend reverted, centred SSH/WEB windows, DAF active-optical cables, text alerts are opt-in only, a DHCP poll-failure alert, and a per-account SSH login separate from ConfigRX](#5630--routes-toolbar-and-mapper-legend-reverted-centred-sshweb-windows-daf-active-optical-cables-text-alerts-are-opt-in-only-a-dhcp-poll-failure-alert-and-a-per-account-ssh-login-separate-from-configrx)
 - [5.62.0 — Every STP-blocked link is now found: a trunk without VLAN 1 was invisible on every VLAN, the scan runs every five minutes, and an undotted link names its own cause](#5620--every-stp-blocked-link-is-now-found-a-trunk-without-vlan-1-was-invisible-on-every-vlan-the-scan-runs-every-five-minutes-and-an-undotted-link-names-its-own-cause)
 - [5.61.0 — VlanView glows a link only when the picked VLAN is on both ends; Nodes gets a fleet-wide VLAN scan button](#5610--vlanview-glows-a-link-only-when-the-picked-vlan-is-on-both-ends-nodes-gets-a-fleet-wide-vlan-scan-button)
@@ -197,6 +198,60 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.64.0 — Alerts Rules table gets a Text column, DHCP credentials confirmed and shown per server, ConfigRX SSH account replaces Global SSH account, and a team roster update
+
+Three operator asks, plus a team roster update alongside them.
+
+**Alerts → Rules gets a Text column.** The Rules table (Alerts → Rules and
+Templates) now shows a **Text** column right after **On**, reading *yes*
+when that rule's own "Send a text (SMS) for this rule" box is ticked and
+*no* when it isn't — the same `notify_sms` flag the rule already carried,
+now visible without opening the rule to check. The Templates table is
+unchanged; a template carries no text setting of its own to show.
+
+**DHCP server credentials were per server all along — the dialog just
+never said so.** An operator who stored a credential on one DHCP server
+saw the status line read "stored credential," but found nothing about it
+on opening that server's own Edit dialog, and asked that credentials
+never be shared across servers. Tracing it through the real routes
+confirmed there is no shared or fleet-wide DHCP credential anywhere in
+the code — each DHCP server's row has always held its own username and
+password, decrypted only for that row, on both the scheduled poll and
+Poll now. What was missing was the dialog saying so: opening a server
+that already has a credential now shows, above the Username and Password
+boxes, "Stored for this server as `<user>`, saved `<when>`. Only this
+server uses it." A stray double-escape of the username on the status
+line, which could make a stored credential look wrong or blank at a
+glance, is fixed alongside it. A new `credential_ts` column on
+`dhcp_servers` records when a credential was last stored and is cleared
+when the credential is; a new 20-check test
+(`tests/test_ipam_dhcp_credential.py`) pins that a credential stored on
+one server is never visible to, or used for polling, another.
+
+**"Global SSH account" is now "ConfigRX SSH account," everywhere it
+appears.** ConfigRX → Settings' fieldset, its Clear button and
+confirmation, the device list's Credential column, the Events log lines
+for storing and clearing the account, and the backup failure message all
+read "ConfigRX SSH account" instead of "Global SSH account." This is
+wording only: the same one shared account still backs up any device that
+carries no credential of its own, a device's own credential still wins
+over it, and nothing about how the account is stored, cleared or used has
+changed.
+
+**Team.** Fisty and SuperThing1 (renamed from Thing1) now run on Opus
+5.5; Javariius, the team's code-review step before anything reaches
+`main`, moves back to Fable 5.1.
+
+Files: `netpath/ipamdb.py`, `netpath/web/api/ipam.py`,
+`netpath/web/static/ipam.js`, `netpath/web/static/alerts.js`,
+`netpath/configrx.py`, `netpath/web/api/configrx.py`,
+`netpath/web/static/configrx.js`, `tests/test_ipam_dhcp_credential.py`,
+`tests/test_frontend_contracts.py`, `tests/test_configrx_cisco_platforms.py`,
+`tests/ui/walk.mjs`, `.claude/agents/fisty.md`,
+`.claude/agents/superthing1.md`, `.claude/agents/javariius.md`,
+`.claude/agents/testy.md`, `.claude/agents/thing2.md`,
+`.claude/agents/thing3.md`, `.claude/agents/thing4.md`, `CLAUDE.md`.
 
 ### 5.63.0 — Routes toolbar and Mapper legend reverted, centred SSH/WEB windows, DAF active-optical cables, text alerts are opt-in only, a DHCP poll-failure alert, and a per-account SSH login separate from ConfigRX
 

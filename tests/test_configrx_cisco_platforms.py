@@ -294,11 +294,11 @@ finally:
     asa.close()
 
 
-# ---- The global ConfigRX account: falls back to it only when a device
+# ---- The ConfigRX SSH account: falls back to it only when a device
 # carries no username/password of its own, and a per-device credential still
 # wins over it once one is set.
 print()
-print("configrxdb: the global ConfigRX account, its fallback in _backup, and "
+print("configrxdb: the ConfigRX SSH account, its fallback in _backup, and "
       "credential_source")
 generic = stub_ssh_device.StubDevice(mode="slow", pause_s=0.02, host="127.0.0.9")
 default_check_auth = stub_ssh_device._Server.check_auth_password
@@ -329,7 +329,7 @@ try:
             config = service.configrx_db.device_config(gid)
         check("with no credential at all the backup fails naming both",
              config["last_backup_status"] == "error"
-             and "no global ConfigRX account" in (config["last_backup_error"] or ""),
+             and "no ConfigRX SSH account" in (config["last_backup_error"] or ""),
              config["last_backup_error"])
 
         service.configrx_db.set_global_credential(

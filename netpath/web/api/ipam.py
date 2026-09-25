@@ -277,7 +277,8 @@ def _dhcp_server_json(row) -> dict:
             # The username is not sensitive on its own and is shown so the
             # form can be prefilled; the password never appears in any
             # response, encrypted or not — only whether one is stored.
-            "username": row["username"], "has_credential": bool(row["password_enc"])}
+            "username": row["username"], "has_credential": bool(row["password_enc"]),
+            "credential_ts": row["credential_ts"]}
 
 
 def get_ipam_dhcp_servers(service, params, body) -> dict:

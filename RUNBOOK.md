@@ -22,6 +22,7 @@ backup, `INTERNALS.md` is why any of this works the way it does.
 - [Alert email has stopped](#alert-email-has-stopped)
 - [Alert texts are not arriving](#alert-texts-are-not-arriving)
 - [A DHCP server shows "poll failing"](#a-dhcp-server-shows-poll-failing)
+- [The DHCP status line says stored credential but the dialog shows nothing](#the-dhcp-status-line-says-stored-credential-but-the-dialog-shows-nothing)
 - [A ConfigRX backup says the host key changed](#a-configrx-backup-says-the-host-key-changed)
 - [The SSH button says "No SSH login is stored for your account"](#the-ssh-button-says-no-ssh-login-is-stored-for-your-account)
 - [The poll pool is saturated](#the-poll-pool-is-saturated)
@@ -434,15 +435,48 @@ good poll with no action needed here.
 1. **The server's own last error**, in the alert's message and on IPAM's DHCP
    servers list, names the actual failure — timeout, refused connection, bad
    credential.
-2. **If it is a credential failure**, check that server's own stored
-   username/password on the DHCP servers list — separate from, and
-   unaffected by, the ConfigRX/SSH-button credential split described
-   elsewhere in this release.
+2. **If it is a credential failure**, open that server's own Edit dialog on
+   the DHCP servers list. From 5.64.0 the AUTHENTICATION fieldset opens with
+   "Stored for this server as `<user>`, saved `<when>`" when a credential is
+   on file, so a wrong or stale username is visible without guessing —
+   separate from, and unaffected by, the ConfigRX/SSH-button credential
+   split described elsewhere in this release.
 3. **Reachability** — the same network path a manual "Test connection" from
    the DHCP servers list already exercises; if that fails too, the fault is
    upstream of this application.
 4. **It emails and texts like any other rule**, so a muted rule or a
    maintenance window on the device suppresses it the same way.
+
+---
+
+## The DHCP status line says stored credential but the dialog shows nothing
+
+**Symptom.** The DHCP servers list reads "stored credential" for a server,
+but opening **Edit** on that same server shows nothing to confirm it — no
+line above the Username/Password boxes says a credential is on file.
+
+**Cause, not a fault.** From 5.64.0 the dialog says this plainly; before
+it, the credential was there but nothing in the dialog stated it. This was
+never a global or shared credential — each DHCP server has always held its
+own username and password, and the scheduled poll and Poll now both use
+only that server's own row. Nothing here was ever mixed between servers.
+
+**What to look for now.**
+
+1. **Open Edit on the server.** If a credential is stored, the AUTHENTICATION
+   fieldset opens with "Stored for this server as `<user>`, saved `<when>`.
+   Only this server uses it." and the Username box is pre-filled.
+2. **If that line is missing**, no credential is stored for that server —
+   the status line should instead read "ambient identity," meaning the
+   server relies on the account SappiWhere itself runs as, or a matching
+   entry in Windows Credential Manager (see IPAM → DHCP under
+   `FEATURES.md`).
+3. **Clearing a credential removes the line** the next time the dialog is
+   opened, and reverts that one server to ambient identity — it never
+   affects any other server.
+4. **There is no fleet-wide DHCP account to look for.** A credential
+   problem on one server is always that server's own row; checking another
+   server's credential, or a settings-page account, will not explain it.
 
 ---
 
@@ -491,10 +525,11 @@ one, or set it under Account."
 
 **Cause, not a fault.** From 5.63.0 the SSH button no longer reads ConfigRX's
 own SSH credential for the device — the two are deliberately separate, so
-that ConfigRX can run one shared account across a fleet while the terminal
-still knows exactly which operator typed what. Every account now needs its
-own SSH login on file; nothing carries over automatically from what ConfigRX
-already had stored for that device or globally.
+that ConfigRX can run the ConfigRX SSH account across a fleet while the
+terminal still knows exactly which operator typed what. Every account now
+needs its own SSH login on file; nothing carries over automatically from
+what ConfigRX already had stored for that device or the ConfigRX SSH
+account.
 
 **Fix, in order.**
 

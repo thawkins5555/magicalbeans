@@ -3118,6 +3118,10 @@ hard to trip — a path monitor that cries wolf gets turned off.
   email one) on the system rules (`smtp_failing`, `sms_failing` and the
   like), which would otherwise be able to text about their own channel
   failing.
+- **From 5.64.0, the Rules table shows that checkbox at a glance.** A
+  **Text** column, right after **On**, reads *yes* or *no* for whether
+  **Send a text (SMS) for this rule** is ticked. The Templates table is
+  unchanged — a template carries no text setting of its own.
 - **From 5.56.0, the severity floor and a missing template say so on the
   alert.** An alert dropped by the floor above, or by a rule whose email
   template has been deleted, used to leave the Notifications pane reading
@@ -4269,6 +4273,15 @@ the `DhcpServer` module installed — the trade-off going the other way from the
 first method. A real DHCP server almost always already has the module, since
 it ships with the role.
 
+**This has always been a per-server credential — from 5.64.0 the Edit
+dialog says so plainly.** Opening a server that already has one stored
+shows, above the Username and Password boxes, "Stored for this server as
+`<user>`, saved `<when>`. Only this server uses it." Storing a
+credential on one server never touches, or is visible on, any other
+server on the list — each server's username and password live on that
+server's own row and nothing reads across rows, for the scheduled poll or
+for Poll now.
+
 Storing a credential needs Windows — DPAPI is a Windows-only API — so on any
 other platform the credential fields are refused with a message pointing at
 Credential Manager instead, which works everywhere PowerShell reaches a DHCP
@@ -4647,20 +4660,23 @@ to a manual name in Nodes.
   and is never returned by any API response — only whether one is stored.
   It is decrypted only in memory, immediately before connecting, and
   discarded the moment the connection attempt finishes.
-- **A single global SSH account, from 5.63.0, backs up any device that
-  carries none of its own.** ConfigRX → Settings gains a **GLOBAL SSH
-  ACCOUNT** fieldset — username and password (leave blank to keep the
+- **A single shared account, from 5.63.0, backs up any device that
+  carries none of its own; from 5.64.0 it is called the ConfigRX SSH
+  account, not the global one.** ConfigRX → Settings gains a **CONFIGRX
+  SSH ACCOUNT** fieldset — username and password (leave blank to keep the
   stored one), saved with the dialog's own **Save**, plus a **Clear
-  global SSH account** button — encrypted and cleared exactly like a
+  ConfigRX SSH account** button — encrypted and cleared exactly like a
   per-device credential — for a
   fleet where most devices share one login and only a handful need their
   own override. A device's own stored credential still wins whenever it
-  has one; only a device with neither its own credential nor a global
-  account fails, now with a clearer reason: "No SSH credential stored for
-  this device and no global ConfigRX account." The device list's
+  has one; only a device with neither its own credential nor this account
+  fails, now with a clearer reason: "No SSH credential stored for this
+  device and no ConfigRX SSH account." The device list's
   **Credential** column shows *stored* for a device's own credential,
-  *global* for one falling back to the account above, or *—* for
-  neither. **This account is never used by the SSH button** (see
+  *ConfigRX* for one falling back to the account above, or *—* for
+  neither — the wording changed, not the mechanism: the same one account,
+  wired the same way, only what it's called on screen is new. **This
+  account is never used by the SSH button** (see
   Drill-down, under Nodes, above, and the Account dialog under
   Permissions, below) — the two credentials are kept deliberately
   separate.

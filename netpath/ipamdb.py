@@ -159,6 +159,7 @@ CREATE TABLE IF NOT EXISTS dhcp_servers (
     enabled       INTEGER NOT NULL DEFAULT 1,
     username      TEXT,
     password_enc  BLOB,
+    credential_ts REAL,
     last_poll_ts  REAL,
     last_status   TEXT,
     last_error    TEXT,
@@ -308,6 +309,7 @@ class IpamDatabase(SqliteStore):
     def _migrate(self) -> None:
         self.ensure_columns("dhcp_servers",
                             {"username": "TEXT", "password_enc": "BLOB",
+                             "credential_ts": "REAL",
                              "poll_failures": "INTEGER NOT NULL DEFAULT 0"})
         self.ensure_columns("dhcp_scopes", {"router": "TEXT"})
         self.ensure_columns("hosts",
@@ -818,14 +820,16 @@ class IpamDatabase(SqliteStore):
         so a bug here cannot leak a plaintext password into a query log."""
         with self._lock:
             self._conn.execute(
-                "UPDATE dhcp_servers SET username=?, password_enc=? WHERE id=?",
-                (username, password_enc, server_id))
+                "UPDATE dhcp_servers SET username=?, password_enc=?, credential_ts=? "
+                "WHERE id=?",
+                (username, password_enc, time.time(), server_id))
             self._conn.commit()
 
     def clear_dhcp_credential(self, server_id: int) -> None:
         with self._lock:
             self._conn.execute(
-                "UPDATE dhcp_servers SET username=NULL, password_enc=NULL WHERE id=?",
+                "UPDATE dhcp_servers SET username=NULL, password_enc=NULL, "
+                "credential_ts=NULL WHERE id=?",
                 (server_id,))
             self._conn.commit()
 

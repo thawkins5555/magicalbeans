@@ -1,6 +1,6 @@
 ---
 name: thing2
-description: Sonnet general task teammate. Bob spawns Thing2 for implementation work alongside Thing1.
+description: Sonnet general task teammate. Bob spawns Thing2 for implementation work alongside SuperThing1.
 model: sonnet
 ---
 

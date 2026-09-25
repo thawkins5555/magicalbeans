@@ -8759,6 +8759,47 @@ branch reading `ipam_db.dhcp_server(int(entity_id))["address"]` for
 `entity_id` is a compound `"{server_id}:{scope_id}"` string this one does
 not need to split.
 
+### DHCP credential shown per server (`ipamdb.py`, `api/ipam.py`, `ipam.js`) — 5.64.0
+
+**The credential was already scoped to one `dhcp_servers` row; nothing in
+the code ever read or wrote it globally.** `set_dhcp_credential`/
+`clear_dhcp_credential` take a `server_id` and update exactly that row
+(`ipamdb.py:816-832`); the periodic tick and Poll now both run
+`ipam_worker._poll`, which decrypts only the row it was given
+(`credential_for_server`). The operator's report traced to the dialog, not
+the storage: `dhcpServerForm` pre-filled the Username box from the row's
+own JSON but said nothing above it when a credential was already there,
+so a server with one on file looked identical to a server without.
+
+`ipamdb`'s `dhcp_servers` table gains `credential_ts REAL` (via
+`ensure_columns`, same pattern as `poll_failures` above).
+`set_dhcp_credential` now also writes `credential_ts=time.time()` in the
+same `UPDATE`; `clear_dhcp_credential` NULLs it alongside `username` and
+`password_enc`, so the three fields can never drift apart. `_dhcp_server_json`
+exposes it as `"credential_ts"` beside the existing `username` and
+`has_credential`; `has_credential` is unchanged (`bool(row["password_enc"])`).
+
+`dhcpServerForm` reads `s.has_credential` to decide whether to render, above
+the Username/Password inputs, `<p class="hint" id="dh-stored">Stored for
+this server as <b>${escape(s.username || '')}</b>, saved
+${App.agoCell(s.credential_ts)}. Only this server uses it.</p>` — the same
+per-object phrasing ConfigRX's own stored-credential hint uses
+(`configrx.js:995-996`), naming the server explicitly rather than leaving
+"stored" ambiguous between one server and every server. The status line's
+`stored credential · ${server.username}` no longer runs the username
+through `escape()` before assigning it to `textContent`, which was
+double-escaping it (the DOM already escapes `textContent` on assignment)
+and could make a real username render oddly.
+
+`tests/test_ipam_dhcp_credential.py` (new, 20 checks, portable secret
+store via `NETPATH_SECRET_PASSPHRASE`) pins the isolation directly:
+storing a credential on server A leaves B's row, B's JSON and
+`credential_for_server(B)` untouched; clearing A nulls all three of
+`username`/`password_enc`/`credential_ts`; storing different credentials
+on A and B each reads back its own; and stubbing `ipam_worker.dhcp_poll` to
+capture the poll's environment shows the worker's poll of B sending B's
+own username and password, never A's.
+
 ### NetPath destination thresholds (`alertengine._evaluate_netpath_thresholds`)
 
 A third threshold evaluator, for the same reason there is a second one: a
@@ -10520,6 +10561,12 @@ texting about every rule it was only ever emailing about). The system rules
 `_seed_rules()` seeds — including `sms_failing` itself — have both
 checkboxes ignored by `_notify`: a rule that exists to report a channel's
 own failure must not be able to depend on that same channel to report it.
+`notify_sms` was already in `_rule_json` (`api/alerts.py`); from 5.64.0
+`alerts.js`'s `drawRulesTable` also reads it directly, adding a **Text**
+cell (`r.notify_sms ? 'yes' : 'no'`) between **On** and **Overrides**, so
+the Rules table's row order is Name, Kind, Sev, On, Text, Overrides. The
+Templates table is untouched — a template has no `notify_sms` of its own
+to show.
 
 **`sms_failing` is a system alert with the identical shape `smtp_failing`
 already has**, raised when `SmsQueue`'s breaker opens and cleared when it
@@ -16697,7 +16744,7 @@ secret, nor `_pull_config` — a person at the terminal who needs privileged
 mode types `enable` themselves. The two features share exactly one thing,
 the host-key store.
 
-### One credential for ConfigRX, a separate one for the SSH button (`configrxdb.py`, `configrx.py`, `appdb.py`, `web/api/auth.py`, `web/api/configrx.py`, `sshterm.py`, `web/api/relays.py`, `ssh.html`, `ssh.js`) — 5.63.0
+### One credential for ConfigRX, a separate one for the SSH button (`configrxdb.py`, `configrx.py`, `appdb.py`, `web/api/auth.py`, `web/api/configrx.py`, `sshterm.py`, `web/api/relays.py`, `ssh.html`, `ssh.js`) — 5.63.0, wording 5.64.0
 
 **Before this release `sshterm._load_stored_credential` read
 `configrx_db.device_config(device_id)`** — the same per-device
@@ -16709,16 +16756,17 @@ stays per-device with one new global fallback, and the SSH button's
 becomes per-*account*, global by nature (an operator's own login, usable
 against any device), and never falls back to ConfigRX's.
 
-**ConfigRX's own global account** is `configrxdb.global_credential`, a
-single-row table (`id INTEGER PRIMARY KEY CHECK (id = 1)`, `username`,
-`password_enc`, `stored_ts`) — the same one-row pattern
+**ConfigRX's own account** — called the **ConfigRX SSH account** on
+screen from 5.64.0, `configrxdb.global_credential` internally, unchanged —
+is a single-row table (`id INTEGER PRIMARY KEY CHECK (id = 1)`,
+`username`, `password_enc`, `stored_ts`) — the same one-row pattern
 `alertsdb.sms_credential` already uses — with `global_credential()`,
 `set_global_credential()` and `clear_global_credential()`.
 `configrx.ConfigRxWorker._backup` reads a device's own `ssh_username`/
-`ssh_password_enc` first; only when *either* is empty does it read the
-global row, and only when the global row also has nothing stored does it
-give up with "No SSH credential stored for this device and no global
-ConfigRX account" — the device's own row, when it has one, always wins.
+`ssh_password_enc` first; only when *either* is empty does it read this
+row, and only when it also has nothing stored does it give up with "No
+SSH credential stored for this device and no ConfigRX SSH account" — the
+device's own row, when it has one, always wins.
 `POST /api/configrx/credential` (`ssh_username`, `ssh_password`, encrypted
 through `_encrypt_secret`, audited `credential.store` target
 `configrx:global`) and `DELETE /api/configrx/credential` manage it;
@@ -16727,7 +16775,10 @@ through `_encrypt_secret`, audited `credential.store` target
 so the settings dialog can render its status without a dedicated fetch.
 `_configrx_device_json`'s `credential_source` (`"stored"`/`"global"`/`""`)
 is what the device list's Credential column reads, computed once per list
-call against one `global_credential()` read rather than once per device.
+call against one `global_credential()` read rather than once per device;
+from 5.64.0 `configrx.js`'s cell renders `"global"` as **ConfigRX** rather
+than **global** — the wire value and the field name are unchanged, only
+the word shown on screen.
 
 **The SSH button's login is `appdb.user_ssh`, one row per account**
 (`username PRIMARY KEY`, `ssh_username`, `ssh_password_enc`, `stored_ts`),

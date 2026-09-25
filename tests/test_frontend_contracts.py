@@ -6144,13 +6144,58 @@ check("app_db.user_ssh(self.app_user)" in _SSHTERM134,
 CONFIGRXJS134 = read("configrx.js")
 check('id="cxs-global-username"' in CONFIGRXJS134
       and 'id="cxs-global-password"' in CONFIGRXJS134,
-      "settingsDialog gains the global ConfigRX SSH account fields")
+      "settingsDialog gains the ConfigRX SSH account fields")
 check("/api/configrx/credential" in CONFIGRXJS134,
       "the global account is stored/cleared through its own route, apart "
       "from the settings save")
 
 check("w.opener = null" in _WEB_CLICK,
       "block 40's WEB relay window handling is unaffected by this block")
+
+
+# ---------------------------------------------------------------------------
+# 135. Rules table Text column (5.64.0): whether SMS is on for the rule,
+#      Templates table untouched (templates carry no text setting).
+ALERTS135 = read("alerts.js")
+check('<th scope="col">On</th><th scope="col">Text</th>' in ALERTS135,
+      "the Rules table header gains a Text column right after On")
+_DRAWRULES135 = js_function(ALERTS135, "drawRulesTable")
+check("r.notify_sms ? 'yes' : 'no'" in _DRAWRULES135,
+      "each rule row's Text cell reads notify_sms")
+
+
+# ---------------------------------------------------------------------------
+# 136. "ConfigRX SSH Account" wording (5.64.0): the shared-credential fieldset,
+#      its clear button and the device list's Credential cell say ConfigRX,
+#      not Global; the wire value and ids underneath are unchanged.
+CONFIGRXJS136 = read("configrx.js")
+check("<legend>CONFIGRX SSH ACCOUNT</legend>" in CONFIGRXJS136,
+      "the settings fieldset legend reads CONFIGRX SSH ACCOUNT")
+check("'Clear ConfigRX SSH account'" in CONFIGRXJS136,
+      "the clear button label and confirm title say ConfigRX SSH account")
+check("r.credential_source === 'global' ? 'ConfigRX'" in CONFIGRXJS136,
+      "the device list's Credential column shows ConfigRX for the shared "
+      "account, even though credential_source stays 'global' on the wire")
+
+CONFIGRXPY136 = python_text("web.api.configrx")
+check('"Stored the ConfigRX SSH account"' in CONFIGRXPY136
+      and '"Cleared the ConfigRX SSH account"' in CONFIGRXPY136,
+      "the Events log lines for storing and clearing the account say "
+      "ConfigRX, not Global")
+
+
+# ---------------------------------------------------------------------------
+# 137. DHCP server dialog states its credential is per server (5.64.0): the
+#      Edit dialog names the stored username and when it was saved, so a
+#      credential on one server is never mistaken for a global one.
+IPAMJS137 = read("ipam.js")
+_DHCPFORM137 = js_function(IPAMJS137, "dhcpServerForm")
+check('id="dh-stored"' in _DHCPFORM137,
+      "dhcpServerForm gains the #dh-stored line when a credential is stored")
+check("Stored for this server as" in _DHCPFORM137,
+      "the stored line names the server it belongs to, not a global account")
+check('value="${escape(s.username ?? \'\')}"' in _DHCPFORM137,
+      "the Username input is still pre-filled from the server's own row")
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))

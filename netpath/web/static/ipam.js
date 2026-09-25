@@ -586,7 +586,7 @@
       : server.last_status === 'error' ? `error · ${ago(server.last_poll)}`
       : 'never polled';
     const authText = server.has_credential
-      ? `stored credential · ${escape(server.username || '')}` : 'ambient identity';
+      ? `stored credential · ${server.username || ''}` : 'ambient identity';
     // `hint err`, not `sev sev-1`: .sev is the syslog table's severity chip,
     // a fixed 62px inline-block, and borrowing it here purely for its red
     // meant this whole line was laid out in a 62px column — one word per
@@ -607,6 +607,7 @@
         <label>Label <input id="dh-label" value="${escape(s.label ?? '')}"></label>
       </fieldset>
       <fieldset><legend>AUTHENTICATION</legend>
+        ${s.has_credential ? `<p class="hint" id="dh-stored">Stored for this server as <b>${escape(s.username || '')}</b>, ${s.credential_ts ? `saved ${App.agoCell(s.credential_ts)}` : 'saved before 5.64.0'}. Only this server uses it.</p>` : ''}
         <label>Username <input id="dh-username" placeholder="CORP\\svc-sappiwhere-ro" value="${escape(s.username ?? '')}"></label>
         <label>Password <input id="dh-password" type="password" autocomplete="new-password" placeholder="${s.has_credential ? 'stored — leave blank to keep it' : 'leave blank to skip a stored credential'}"></label>
         <p class="hint">${s.has_credential

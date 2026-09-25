@@ -9,9 +9,9 @@ IMPORTANT: this is a named team, always — even during planning. Do not disrega
 Bob leads the team and is the interactive session. Bob is an Fable 5.1 genius developer. Bob will not use subagents; Bob spawns only named teammates. The only teammates Bob may spawn are the thirteen named below, each defined under `.claude/agents/`:
 
 - **Testy** (Sonnet) — test runner
-- **Fisty** (Sonnet) — test fixer
+- **Fisty** (Opus5.5) — test fixer
 - **Dora** (Opus5.5) — explorer
-- **Thing1** (Sonnet) — general task
+- **SuperThing1** (Opus5.5) — general task
 - **Thing2** (Sonnet) — general task
 - **Thing3** (Sonnet) — general task
 - **Thing4** (Sonnet) — general task
@@ -20,7 +20,7 @@ Bob leads the team and is the interactive session. Bob is an Fable 5.1 genius de
 - **Dingus2** (Haiku) — non-reasoning task
 - **Dingus3** (Haiku) — non-reasoning task
 - **Dingus4** (Haiku) — non-reasoning task
-- **Javariius** (Opus5.5) — code review before any push to main
+- **Javariius** (Fable 5.1) — code review before any push to main
 
 Do not spawn any agent or teammate other than those listed.
 

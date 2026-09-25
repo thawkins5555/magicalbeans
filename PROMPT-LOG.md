@@ -5,6 +5,120 @@ grouped by the version that carries it. This is a working record for the
 operator — the full story of each change is in `CHANGELOG.md`, and this file
 does not replace it.
 
+## 5.64.0 — Alerts Rules gets a Text column, DHCP credentials confirmed and shown per server, "ConfigRX SSH account" replaces "Global", and a team roster update
+
+**Operator message, verbatim (six lines):**
+
+"-Change Fisty to Opus5.5
+-Change Thing1 to 'SuperThing1' and adjust to Opus5.5
+-Change Javariius back to Fable 5.1
+-Add column in Alerts -> Rules and Templates -> labeled 'Text' showing
+whether or not text alerts are on for that template.  Also changed the -
+-The IPAM module -> If you store a credential for a single DHCP Server the
+DHCP Server note says 'stored credential' but when you open the credential
+for that server there is nothing listed.  Please make sure that the DHCP
+server credentials do not apply globally.  Each DHCP server entry should
+have it's own stand alone stored credential not a global one.
+-Change 'Global SSH Account' verbiage to 'ConfigRX SSH Account'."
+
+**Mid-planning follow-up.** "Each DHCP Server should have it's own
+standalone credentials - the IPAM credentials should not be global." A
+second grep confirmed there is no fleet-wide DHCP username or password
+anywhere in the code — in settings, `ipam.js`, `ipam_dhcp.py` or
+`ipam_worker.py` — only the two columns already on each DHCP server's own
+row.
+
+**Dora's audit, before planning.** DHCP credentials were already per
+server end to end: each `dhcp_servers` row carries its own username and
+password, the store/clear functions update one row by id, and the
+periodic poll and Poll now both decrypt only that row's own pair — nothing
+in the code path ever reads or writes a credential across servers. The
+only writer of the password column requires both a username and a
+password together, so a row with one and not the other could not have
+been produced by current code. What the Edit dialog actually did wrong:
+it read the same server data the status line uses and pre-filled the
+Username box from it, but said nothing above the boxes to confirm a
+credential was on file — a server with a stored credential and a server
+with none looked the same on opening Edit. Separately, the status line ran
+the username through an escaping call meant for a different kind of
+insertion, which could make it read oddly. Text messages already had a
+per-rule setting (`notify_sms`) sent to the browser with every rule; the
+Rules table itself just wasn't showing it. Every "Global SSH account"
+string was located across the settings dialog, its buttons and
+confirmations, two Events log lines, the backup failure message, the
+device list's Credential column, and the tests and docs that pin all of
+it — with the underlying identifiers, database table and audit target
+confirmed separate from the wording and left untouched.
+
+**Planning answers.**
+- The DHCP dialog's **Username box was empty too** — treated as a
+  possible data bug and reproduced through the real routes before
+  changing anything, rather than assumed away.
+- The Text column goes on the **Rules table only (Recommended)** —
+  Templates carries no text setting to show.
+- The cut-off "Also changed the -" line in the operator's message lost
+  **nothing**.
+- The wording change is **"ConfigRX" (Recommended)**.
+
+**Per-lane notes.**
+- **Team roster (Bob).** Fisty and Thing1 (renamed **SuperThing1**) now
+  run on Opus 5.5; Javariius moves back to Fable 5.1. `CLAUDE.md` and the
+  seven affected files under `.claude/agents/` were updated to match,
+  including the other teammates' descriptions that named Thing1 by its old
+  name.
+- **DHCP credential (Thing2).** Reproduced the store/list round trip
+  through the real API routes with the portable secret store first — the
+  credential and username came back correctly for the server it was
+  stored on and nowhere else; the report traced entirely to the dialog's
+  own display, not to storage or polling. Added a `credential_ts` column
+  (set on store, cleared on clear), exposed it in the server's JSON, added
+  the "Stored for this server as `<user>`, saved `<when>`. Only this
+  server uses it." line to the Edit dialog's AUTHENTICATION section, and
+  fixed the status line's double-escaped username. New
+  `tests/test_ipam_dhcp_credential.py` (20 checks) pins that a credential
+  on one server is never visible to, or used for polling, another —
+  including the worker's own poll of a second server.
+- **Rules Text column (Thing3).** Added the column and cell to the Rules
+  table only; the Templates table is untouched. Left alone, as pre-existing
+  and unrelated to this request: a comment at `alerts.js:21` and a
+  docstring at `dashboard.py:604-609` that already read as if `notify_sms`
+  weren't sent to the browser, when it has been in the rule payload since
+  5.19.0 — a stale note, not a bug this change touches.
+- **ConfigRX wording (Thing4).** "Global SSH account" replaced by
+  "ConfigRX SSH account" everywhere an operator sees it — the Settings
+  fieldset, its Clear button and confirmation dialog, the two Events log
+  lines, and the backup failure message. The device list's Credential
+  column now shows **ConfigRX** where it used to show **global**; the
+  value the browser actually receives (`"global"`) and every internal
+  identifier, table name and audit target are unchanged.
+
+**Outcome.** Shipped as 5.64.0. Full suite 219 of 223 with the three
+environmental failures (`test_alert_sms`, `test_collectors_hardening`,
+`test_prune_lock_hold`) and `test_ssh_terminal`, which failed three runs
+and passed the fourth: its stub devices bind kernel-chosen ports, and any
+that lands in the 40000–40999 relay range trips the loopback guard from
+5.51.0 — a pre-existing flake in untouched code, noted for a later fix.
+Every targeted suite green, including the new
+`test_ipam_dhcp_credential` (20 checks). Javariius asked for one change
+before push: a credential stored before this release has no timestamp, so
+the new dialog line would have read "saved never"; it now reads "saved
+before 5.64.0" for those rows. Walk 112 of 115 twice, 0 console or page
+errors; the four checks on this release's changes (Rules Text column,
+ConfigRX SSH account fieldset, the DHCP poll-failure rule and its alert)
+all passed both runs.
+
+**Follow-up.** The three misses are the Mapper spanning-tree checks on
+acc-sw-005's second uplink, in code this release does not touch. The
+Events ring shows why: between the device's arrival and the end of the
+walk it got MAC and VLAN walks but no neighbour walk, so the uplink was
+never on the map to be marked blocking. One Poll now on the idle server
+afterwards learned its four neighbours in 2 seconds and the map link
+read blocking on VLAN 30. The neighbour reader returns nothing, silently,
+when one of its SNMP columns times out under load (12 SNMP timeouts were
+counted during the walk), and the next attempt is the hourly cadence
+away. Worth a small change next time: an Events line when a neighbour
+walk gives up, and a retry sooner than an hour.
+
 ## 5.63.0 — Routes toolbar and Mapper legend reverted, centred SSH/WEB windows, DAF cables, user-only text alerts, a DHCP poll alert, and per-account SSH logins
 
 **Operator message, verbatim (nine lines):**

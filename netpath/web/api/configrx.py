@@ -272,7 +272,7 @@ def post_configrx_credential(service, params, body) -> dict:
             raise ValueError("A username and password are both required")
         encrypted = bytes(existing["password_enc"])
     service.configrx_db.set_global_credential(username, encrypted)
-    service.log.add(CONFIGRX_CATEGORY, "Stored the global ConfigRX SSH account")
+    service.log.add(CONFIGRX_CATEGORY, "Stored the ConfigRX SSH account")
     _audit(service, params, "credential.store", target="configrx:global",
            detail=f"username {username}")
     # Served from /api/config (configrx_global_credential) — refetched only
@@ -286,7 +286,7 @@ def delete_configrx_credential(service, params, body) -> dict:
         service, params,
         clear=service.configrx_db.clear_global_credential,
         category=CONFIGRX_CATEGORY,
-        message="Cleared the global ConfigRX SSH account",
+        message="Cleared the ConfigRX SSH account",
         target="configrx:global")
     service.bump_config()
     return result

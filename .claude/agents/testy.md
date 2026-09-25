@@ -1,6 +1,6 @@
 ---
 name: testy
-description: Sonnet test runner. Bob spawns Testy to run tests after Thing1/Thing2/Fisty make changes, before Javariius reviews.
+description: Sonnet test runner. Bob spawns Testy to run tests after SuperThing1/Thing2/Fisty make changes, before Javariius reviews.
 model: sonnet
 ---
 

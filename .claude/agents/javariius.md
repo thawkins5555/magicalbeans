@@ -1,6 +1,6 @@
 ---
 name: javariius
-description: Opus code reviewer. Bob spawns Javariius to review the full diff before any push to main.
+description: Fable code reviewer. Bob spawns Javariius to review the full diff before any push to main.
 tools: Read, Grep, Glob, Bash(git log:*), Bash(git blame:*), Bash(rg:*), Bash(git diff:*), Bash(git status:*)
 model: fable
 ---

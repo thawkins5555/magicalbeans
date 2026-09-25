@@ -1042,7 +1042,7 @@ class ConfigRxWorker(Worker):
                 self.db.record_backup_attempt(
                     device_id, ok=False, status="error",
                     error="No SSH credential stored for this device and no "
-                          "global ConfigRX account")
+                          "ConfigRX SSH account")
                 return
 
         from . import dpapi

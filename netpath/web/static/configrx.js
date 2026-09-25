@@ -216,7 +216,7 @@
     { key: 'ssh_port', label: 'Port', width: 70, numeric: true, on: true },
     { key: 'has_credential', label: 'Credential', width: 90, on: true,
       value: (r) => (r.has_credential ? 1 : 0),
-      cell: (r) => (r.credential_source === 'global' ? 'global'
+      cell: (r) => (r.credential_source === 'global' ? 'ConfigRX'
         : r.has_credential ? 'stored' : '\u2014') },
   ];
 
@@ -983,7 +983,7 @@
           paramiko still implements those algorithms: paramiko 5 removed them
           outright, which is why this app pins paramiko below 5.</p>
       </fieldset>
-      <fieldset><legend>GLOBAL SSH ACCOUNT</legend>
+      <fieldset><legend>CONFIGRX SSH ACCOUNT</legend>
         <p class="hint">Used for a backup on any device with no SSH credential of
           its own; a device's own credential still wins over this one.</p>
         <label>Username <input id="cxs-global-username"
@@ -1015,10 +1015,10 @@
       ${App.columnPickerFieldset('BACKUP LIST COLUMNS', 'cxbackups', BACKUP_COLUMNS,
                                  s.table_columns_backups)}`, [
       { label: 'Cancel', onClick: App.closeModal },
-      ...(g.has_password ? [{ label: 'Clear global SSH account', danger: true, onClick: () => {
+      ...(g.has_password ? [{ label: 'Clear ConfigRX SSH account', danger: true, onClick: () => {
         const snap = App.modalFormSnapshot();
-        App.confirmDestructive('Clear global SSH account',
-          '<p>Clear the global ConfigRX SSH account?</p>' +
+        App.confirmDestructive('Clear ConfigRX SSH account',
+          '<p>Clear the ConfigRX SSH account?</p>' +
           '<p class="hint">Any device with no credential of its own can no ' +
           'longer be backed up until it has one, or this is set again. The ' +
           'stored password cannot be recovered.</p>',
