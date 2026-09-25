@@ -362,8 +362,8 @@ def get_flow_exporters(service, params, body) -> dict:
 
 # ---------------------------------------------------------- interfaces view
 
-def _interface_label(setting_names: dict, exporter: str, if_index: int,
-                     device_ifaces: dict) -> str:
+def _flow_interface_label(setting_names: dict, exporter: str, if_index: int,
+                          device_ifaces: dict) -> str:
     """interface_names setting -> Nodes alias/descr/name -> the bare index."""
     key = f"{exporter}:{if_index}"
     if key in setting_names:
@@ -418,7 +418,7 @@ def get_flow_interfaces(service, params, body) -> dict:
             "exporter": address,
             "exporter_name": exporter_names.get(address),
             "if_index": if_index,
-            "name": _interface_label(setting_names, address, if_index, ifaces),
+            "name": _flow_interface_label(setting_names, address, if_index, ifaces),
             "speed_bps": speed_bps,
             "in_bytes": entry["in_bytes"], "out_bytes": entry["out_bytes"],
             "in_bps": in_bps, "out_bps": out_bps,
