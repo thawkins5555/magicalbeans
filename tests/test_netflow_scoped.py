@@ -18,8 +18,7 @@ import types
 from _paths import tmpdir
 
 from netpath import flowdb
-from netpath.flowdb import (DIMENSIONS, GLOBAL_SCOPE, SCOPED_KEYS,
-                            FlowDatabase)
+from netpath.flowdb import DIMENSIONS, SCOPED_KEYS, FlowDatabase
 
 TMPDIR = tmpdir("netflow_scoped_")
 FAILS: list[str] = []

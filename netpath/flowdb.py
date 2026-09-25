@@ -161,7 +161,7 @@ CREATE TABLE IF NOT EXISTS flow_rollup_span (
 CREATE INDEX IF NOT EXISTS ix_flow_rollup_span_bucket
     ON flow_rollup_span(tier, bucket);
 
--- Which (tier, dim, bucket) cells the ROLLUP_KEYS cap actually cut short:
+-- Which (tier, scope, dim, bucket) cells the cap actually cut short:
 -- present when the bucket held at least as many distinct keys as the cap
 -- kept, absent otherwise. A read serves a flagged bucket from the raw rows
 -- instead of the capped ones while the raw rows still reach it, so a key
@@ -253,9 +253,8 @@ ROLLUP_TIERS = (60, 3600)
 # above that for every bar the page draws to be exact.
 ROLLUP_KEYS = {60: 48, 3600: 64}
 
-# The same cap for the scoped summaries. Smaller, because there are many
-# more of them: E exporters x 10 dimensions per bucket, and for interfaces
-# E x I x 2 directions x 10 per hour. Interface breakdowns are hourly only.
+# Smaller caps for the scoped summaries, of which there are E x 10 per bucket
+# and E x I x 2 x 10 per hour. Interface breakdowns are hourly only.
 SCOPED_KEYS = {"exporter": {60: 32, 3600: 48}, "interface": {3600: 16}}
 
 # (exporter, iface, dir) of the unscoped summaries.
@@ -296,12 +295,9 @@ _REPAIR_MAX_FLOWS = 100_000
 
 
 def _repair_budget(scopes) -> tuple[int, int]:
-    """(flagged buckets, raw flows) one scope of a query may repair.
-
-    A scoped run costs up to eight parameters rather than six (the raw arm
-    carries exporter = ? and in_if/out_if = ?), so 90 runs are the global
-    120's ~730 parameters, split between the scopes of an 'both' query.
-    """
+    """(flagged buckets, raw flows) one scope of a query may repair. A scoped
+    run binds up to eight parameters, not six: 90 runs are the global 120's
+    ~730, split between the scopes of a 'both' query."""
     if list(scopes) == [GLOBAL_SCOPE]:
         return _REPAIR_MAX_BUCKETS, _REPAIR_MAX_FLOWS
     return (_REPAIR_MAX_BUCKETS * 3 // 4 // len(scopes),
@@ -335,10 +331,8 @@ _FLOOR = "flow_rollup_floor_%d"             # backward edge backfill has reached
 # tier, because each consumes it at its own pace — one shared mark was
 # cleared by whichever tier compacted first, and the other never saw it.
 _DIRTY = "flow_rollup_dirty_ts_%d"
-# How far back each tier's exporter-scope rows (and every scoped span row)
-# reach, and the hourly interface breakdown's own: a store upgraded from the
-# unscoped layout has none below the watermark it had. Backfill lowers each
-# only while contiguous with it.
+# How far back each tier's scoped rows reach, and the hourly interface keys'
+# own; an upgraded store has none below its old watermark.
 _SCOPED_FLOOR = "flow_rollup_scoped_floor_%d"
 _IFACE_FLOOR = "flow_rollup_iface_floor"
 
@@ -458,12 +452,9 @@ class FlowDatabase(SqliteStore):
         super().__init__(path)
 
     def _before_schema(self) -> None:
-        """Rebuild an unscoped store's summaries with the scope columns.
-
-        Before SCHEMA, so its CREATE ... IF NOT EXISTS never lands an index
-        on an old table. One transaction; a *_old table found at open is a
-        rebuild to finish, not one to start.
-        """
+        """Rebuild an unscoped store's summaries with the scope columns, in
+        one transaction, before SCHEMA can index the old tables. A *_old
+        table found at open is a rebuild to finish."""
         names = {row[0] for row in self._conn.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN"
             " ('flow_rollup', 'flow_rollup_span', 'flow_rollup_trunc',"
@@ -678,8 +669,7 @@ class FlowDatabase(SqliteStore):
                 and bucket >= floor and bucket + tier <= watermark)
 
     def _scope_floor(self, tier: int, kind: str) -> int | None:
-        """How far back a tier answers for a scope kind: the tier's floor,
-        raised by the scoped floor, and for interfaces by their own."""
+        """How far back a tier answers for a scope kind."""
         floor, _watermark = self.rollup_bounds(tier)
         marks = [floor]
         if kind != "global":
@@ -691,7 +681,6 @@ class FlowDatabase(SqliteStore):
         return max(int(mark) for mark in marks)
 
     def _seed_scoped(self, tier: int, at: int) -> None:
-        """Start a tier's scoped floors where its scoped rows start, if unset."""
         keys = [_SCOPED_FLOOR % tier]
         if tier in SCOPED_KEYS["interface"]:
             keys.append(_IFACE_FLOOR)
@@ -700,7 +689,6 @@ class FlowDatabase(SqliteStore):
                 self._set_private_setting(key, int(at))
 
     def _raise_floors(self, tier: int, reached: int) -> None:
-        """Retention or the size cap removed every scope below `reached`."""
         keys = [_FLOOR % tier, _SCOPED_FLOOR % tier]
         if tier in SCOPED_KEYS["interface"]:
             keys.append(_IFACE_FLOOR)
@@ -716,8 +704,7 @@ class FlowDatabase(SqliteStore):
         return row["oldest"] if row else None
 
     def _raw_covers(self, tier: int, bucket: int, from_minutes: bool) -> bool:
-        """Whether the raw rows still hold everything the bucket's minute
-        rows counted: interface breakdowns can only be built from raw."""
+        """Whether raw still holds all the bucket's minute rows counted."""
         if not from_minutes:
             return True
         with self._lock:
@@ -740,6 +727,8 @@ class FlowDatabase(SqliteStore):
         never held across more than one.
         """
         from_minutes = self._from_minute_tier(tier, bucket)
+        # Interface keys come from raw only, so they are kept as built rather
+        # than rebuilt short once raw has been pruned.
         scoped_floor = self._private_setting(_SCOPED_FLOOR % 60)
         scoped_minutes = (from_minutes and scoped_floor is not None
                           and bucket >= int(scoped_floor))
@@ -751,7 +740,6 @@ class FlowDatabase(SqliteStore):
                     " WHERE tier = 60 AND bucket >= ? AND bucket < ?"
                     " AND exporter != '' AND iface = -1",
                     (bucket, bucket + tier))]
-        # Kept as built rather than rebuilt short once raw has been pruned.
         interfaces = (tier in SCOPED_KEYS["interface"]
                       and self._raw_covers(tier, bucket, from_minutes))
         written = 0
@@ -838,7 +826,6 @@ class FlowDatabase(SqliteStore):
 
     def _compact_exporters(self, tier: int, bucket: int, dim: int, expr: str,
                            from_minutes: bool, exporters: list) -> int:
-        """The exporter scope of one dimension: each exporter's top keys."""
         limit = SCOPED_KEYS["exporter"][tier]
         scope = "exporter != '' AND iface = -1"
         stored = 0
@@ -881,8 +868,6 @@ class FlowDatabase(SqliteStore):
 
     def _compact_interfaces(self, tier: int, bucket: int, dim: int, expr: str,
                             side: str) -> int:
-        """One direction of the interface scope of one dimension, from raw:
-        flows with in_if (or out_if) = N are interface N's."""
         limit = SCOPED_KEYS["interface"][tier]
         column = _IF_COLUMN[side]
         scope = "iface >= 0 AND dir = ?"
@@ -908,8 +893,7 @@ class FlowDatabase(SqliteStore):
 
     def _flag_capped(self, tier: int, bucket: int, dim: int, scope: str,
                      columns: str, group: str, limit: int, extra=()) -> None:
-        """Flag every scope of the bucket whose stored keys reached the cap.
-        Lock held, no commit."""
+        """Flag each scope whose stored keys reached the cap. Lock held."""
         self._conn.execute(
             f"INSERT OR IGNORE INTO flow_rollup_trunc(tier, exporter, iface,"
             f" dir, dim, bucket) SELECT ?, {columns}, ?, ? FROM flow_rollup"
@@ -919,8 +903,7 @@ class FlowDatabase(SqliteStore):
 
     def _compact_spans(self, tier: int, bucket: int, from_minutes: bool,
                        scoped_minutes: bool, interfaces: bool) -> None:
-        """Every scope's grand totals for the bucket, in one transaction.
-        Interface spans are left as they are when `interfaces` is false."""
+        """Every scope's grand totals; interface ones only if `interfaces`."""
         upper = bucket + tier
         raw_where = "ts_end >= ? AND ts_end < ?"
         minute_where = "tier = 60 AND bucket >= ? AND bucket < ?"
@@ -1178,7 +1161,6 @@ class FlowDatabase(SqliteStore):
         return removed
 
     def _prune_interfaces(self, days: float, deadline: float) -> int:
-        """Age out the hourly interface scope on its own, shorter clock."""
         tier = 3600
         cutoff = _align_down(time.time() - days * 86400, tier)
         with self._lock:
@@ -1200,8 +1182,7 @@ class FlowDatabase(SqliteStore):
         return removed
 
     def _summary_watermark(self) -> int | None:
-        """The oldest bucket some seeded tier has yet to build from raw: the
-        hourly interface breakdown is built from raw an hour after the fact."""
+        """The oldest bucket a seeded tier has yet to build from raw."""
         marks = [self.rollup_bounds(tier)[1] for tier in ROLLUP_TIERS]
         marks = [mark for mark in marks if mark is not None]
         return min(marks) if marks else None
@@ -1446,8 +1427,8 @@ class FlowDatabase(SqliteStore):
 
     def _where(self, t0: float, t1: float, filters: dict,
                side: str | None = None) -> tuple[str, list]:
-        """`side` pins an interface filter to one direction; without it
-        'both' matches either, which is what the record list wants."""
+        """`side` pins an interface filter to one direction; else 'both'
+        matches either, as the record list wants."""
         clauses = ["ts_end >= ?", "ts_end <= ?"]
         params: list = [t0, t1]
         if filters.get("src_ip"):
@@ -1527,9 +1508,8 @@ class FlowDatabase(SqliteStore):
         return None
 
     def _widens(self, t0: float, kind: str) -> bool:
-        """A4: whether a sub-hour bucket should widen to the hourly tier,
-        because only it reaches t0 for this scope. An interface filter has
-        no minute tier, so what it is weighed against is the raw rows."""
+        """A4: widen a sub-hour bucket when only the hourly tier reaches t0;
+        an interface scope, having no minute tier, weighs it against raw."""
         hourly_floor = self._scope_floor(3600, kind)
         _floor, hourly_watermark = self.rollup_bounds(3600)
         if (hourly_floor is None or hourly_watermark is None
@@ -1764,9 +1744,8 @@ class FlowDatabase(SqliteStore):
         return t0, bucket_s, n_buckets, rows, spans
 
     def _span_plan(self, t0: float, t1: float, kind: str):
-        """(tier, start, seal) for a totals read: the finest tier whose
-        scoped spans reach t0 serves [start, seal), whole buckets inside the
-        window, and raw the edges; tier None means raw throughout."""
+        """(tier, start, seal): the finest tier reaching t0 serves the whole
+        buckets [start, seal), raw the edges; tier None is raw throughout."""
         for tier in sorted(ROLLUP_TIERS):
             start = _align_up(t0, tier)
             floor = self._scope_floor(tier, kind)
@@ -1780,9 +1759,8 @@ class FlowDatabase(SqliteStore):
 
     def interface_totals(self, t0: float, t1: float,
                          exporter: str | None = None) -> list[dict]:
-        """Traffic per (exporter, interface, direction) over the window:
-        'in' is flows with in_if = iface, 'out' those with out_if = iface.
-        `exporter` of None means every exporter."""
+        """Traffic per (exporter, iface, dir) over the window, every
+        exporter when `exporter` is None."""
         tier, start, seal = self._span_plan(t0, t1, "interface")
         where = " AND exporter = ?" if exporter else ""
         extra = [exporter] if exporter else []

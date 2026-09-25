@@ -261,7 +261,9 @@ def test_6_the_size_cap_takes_raw_first() -> None:
     print("6: the file size cap empties the raw table before the summaries")
     db = store("trim.db")
     now = time.time()
-    start = flowdb._align_down(now - 6 * 3600, 3600)
+    # Ends over an hour back: the cap never reaches rows the hourly tier
+    # has yet to build, even in the two minutes after an hour turns.
+    start = flowdb._align_down(now - 7 * 3600, 3600)
     db.insert_flows([flow(i, start + i * 0.5) for i in range(40_000)])
     for tier in flowdb.ROLLUP_TIERS:
         db.compact_rollup(tier, max_buckets=10_000, budget_s=120)
