@@ -244,6 +244,7 @@ It needs a running application with data behind it:
 python3 demo/fleet.py --count 50 &                 # simulated devices on loopback
 python3 -m netpath --headless --port 8099 &        # the application
 python3 demo/seed.py --base http://127.0.0.1:8099  # devices, profiles, a target
+python3 demo/flows.py --days 3 --burst --live &     # multi-exporter NetFlow/IPFIX traffic
 node tests/ui/walk.mjs                             # the checks
 ```
 

@@ -28,6 +28,12 @@ CASES = ((10, 900), (60, 3600), (300, 21600), (900, 86400),
          (3600, 259200), (21600, 2592000))
 INSERT_BATCH = 100_000
 
+# One exporter/interface seed() actually wrote rows for, to time the scoped
+# (exporter-only, and exporter+iface+direction) rollup paths alongside the
+# unscoped one above.
+SCOPED_EXPORTER = "10.0.0.1"
+SCOPED_IFACE = 3
+
 
 def seed(db: FlowDatabase, rows: int, end: float) -> None:
     """`rows` flows spread evenly across the window before `end`, written the
@@ -68,13 +74,13 @@ def build(db: FlowDatabase) -> float:
 
 
 def timed(db: FlowDatabase, t0: float, t1: float, bucket: float,
-          rollups: bool) -> tuple[float, int]:
+          rollups: bool, filters: dict | None = None) -> tuple[float, int]:
     real = FlowDatabase._rollup_plan
     if not rollups:
         FlowDatabase._rollup_plan = lambda *a, **k: None
     try:
         started = time.monotonic()
-        result = db.overview(t0, t1, "Conversation", {}, bucket)
+        result = db.overview(t0, t1, "Conversation", filters or {}, bucket)
         return time.monotonic() - started, result[4]["bytes"]
     finally:
         FlowDatabase._rollup_plan = real
@@ -102,6 +108,27 @@ def run(folder: str, rows: int) -> None:
               f"{roll_s * 1000:>8.0f} ms  {raw_s / max(roll_s, 1e-9):>7.1f}x  "
               f"{('tier ' + str(plan[0])) if plan else 'raw':>9}  "
               f"{'exact' if raw_bytes == roll_bytes else 'differs'}")
+
+    # Scoped rollups (exporter, and exporter+iface+direction): SuperThing1's
+    # concurrent work, so this stays informational if it is not there yet.
+    for label, filters in (
+            (f"exporter={SCOPED_EXPORTER}", {"exporter": SCOPED_EXPORTER}),
+            (f"exporter={SCOPED_EXPORTER} iface={SCOPED_IFACE} direction=both",
+             {"exporter": SCOPED_EXPORTER, "iface": SCOPED_IFACE, "direction": "both"})):
+        print(f"  scoped ({label}):")
+        for bucket, span in CASES:
+            t0, t1 = end - span, end
+            try:
+                raw_s, raw_bytes = timed(db, t0, t1, bucket, rollups=False, filters=filters)
+                roll_s, roll_bytes = timed(db, t0, t1, bucket, rollups=True, filters=filters)
+                plan = db._rollup_plan(flowdb._align_down(t0, bucket), t1,
+                                       "Conversation", filters, bucket)
+                print(f"    {span:>8}  {bucket:>7}  {raw_s * 1000:>8.0f} ms  "
+                      f"{roll_s * 1000:>8.0f} ms  {raw_s / max(roll_s, 1e-9):>7.1f}x  "
+                      f"{('tier ' + str(plan[0])) if plan else 'raw':>9}  "
+                      f"{'exact' if raw_bytes == roll_bytes else 'differs'}")
+            except Exception as exc:
+                print(f"    {span:>8}  {bucket:>7}  scoped path not available yet ({exc})")
     db.close()
 
 

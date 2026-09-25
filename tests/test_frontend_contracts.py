@@ -1437,9 +1437,17 @@ for _id, _key in (("n-rollup-min", "rollup_minute_days"),
           "...seeded from the settings the dialog was opened with")
     check("%s: num('#%s')" % (_key, _id) in _NF_SETTINGS,
           "...and posted to /api/settings under %s" % _key)
-check("summaries, not from the records" in _NF_STORAGE,
-      "the hint says what a chart older than the flow retention is drawn "
-      "from, which is the only reason the two fields exist")
+check("reads the records instead" in _NF_STORAGE,
+      "the hint says which views are drawn from the summaries and which "
+      "filters read the records instead, which is the only reason the two "
+      "fields exist")
+check("'n-rollup-iface'" in _NF_STORAGE and "s.rollup_interface_days" in _NF_STORAGE
+      and "rollup_interface_days: num('#n-rollup-iface')" in _NF_SETTINGS,
+      "the STORAGE fieldset also carries the per-interface summary "
+      "retention, posted under rollup_interface_days")
+check("coverageSettingsLine" in _NETFLOW,
+      "settingsDialog shows a read-only coverage line built from "
+      "collector.coverage")
 check("scan_bounded" in _NETFLOW,
       "the record list reads the server's scan bound rather than implying "
       "it ordered every record in the window")
@@ -5154,9 +5162,10 @@ check("opts.label === '' ? ''" in IPCELL107,
       "an empty label renders the actions button alone, for cells that "
       "already print the address")
 check("[['src', 'nf-src'], ['dst', 'nf-dst'], ['port', 'nf-port'],\n"
-      "      ['protocol', 'nf-protocol'], ['exporter', 'nf-exporter']]" in read("netflow.js"),
-      "NetFlow's activate() reads src, dst, port, protocol and exporter "
-      "query keys into their filters")
+      "      ['protocol', 'nf-protocol'], ['exporter', 'nf-exporter'], ['iface', 'nf-iface'],\n"
+      "      ['direction', 'nf-direction']]" in read("netflow.js"),
+      "NetFlow's activate() reads src, dst, port, protocol, exporter, iface "
+      "and direction query keys into their filters")
 OPEN107 = js_function(APP, "openIpPopover")
 check("el.setAttribute('role', 'menu')" in OPEN107,
       "openIpPopover's popover carries role=menu")
@@ -5836,9 +5845,10 @@ check("App.ipCell(r.src_ip, { label: r.src_name || undefined })" in NETFLOW121
 #      'name' — the same key that skips the MAC-search prompt on replay.
 NETFLOW122 = read("netflow.js")
 check("src: 'nf-src', dst: 'nf-dst', port: 'nf-port', protocol: 'nf-protocol',\n"
-      "      exporter: 'nf-exporter', window: 'nf-range'," in NETFLOW122,
-      "syncNetflowRoute mirrors window (nf-range) into the hash alongside "
-      "the other filters")
+      "      exporter: 'nf-exporter', iface: 'nf-iface', direction: 'nf-direction',\n"
+      "      window: 'nf-range'," in NETFLOW122,
+      "syncNetflowRoute mirrors window (nf-range), iface and direction into "
+      "the hash alongside the other filters")
 NODES122 = read("nodes.js")
 _ACTIVATE122 = js_function(NODES122, "activate")
 check("['nd-filter-group', 'group']" in _ACTIVATE122
@@ -6216,6 +6226,55 @@ check(_SET138 in _ONCHANGE138
       "the server drop-down's onchange sets dhcpServerId, then calls "
       "renderDhcpServerSelect() before loadDhcpScopes(), so the status line "
       "shows the selected server")
+
+# ---------------------------------------------------------------------------
+# 139. NetFlow rebuild (5.67.0): a Plixer-style TRAFFIC/EXPORTERS/INTERFACES
+#      split inside the one NetFlow tab, named exporters, and honest coverage
+#      for a records-only filter. See the plan's root-cause section.
+INDEX139 = read("index.html")
+_NETFLOW_SECTION139 = INDEX139[INDEX139.index('id="page-netflow"'):
+                               INDEX139.index('id="page-snmp"')]
+for _subtab, _label in (("traffic", "TRAFFIC"), ("exporters", "EXPORTERS"),
+                        ("interfaces", "INTERFACES")):
+    check('data-subtab="%s">%s<' % (_subtab, _label) in _NETFLOW_SECTION139,
+          "index.html's NetFlow subtabs carry a %s button" % _label)
+check('<button class="subtab active" data-subtab="traffic">TRAFFIC</button>'
+      in _NETFLOW_SECTION139,
+      "TRAFFIC is the subtab active by default")
+check('id="netflow-sub-exporters"' in _NETFLOW_SECTION139
+      and 'id="netflow-sub-interfaces"' in _NETFLOW_SECTION139
+      and 'id="nf-exporters"' in _NETFLOW_SECTION139
+      and 'id="nf-interfaces"' in _NETFLOW_SECTION139,
+      "index.html carries the EXPORTERS and INTERFACES subpages and tables")
+check('id="nf-iface"' in _NETFLOW_SECTION139 and 'id="nf-direction"' in _NETFLOW_SECTION139,
+      "TRAFFIC's filter bar carries nf-iface and nf-direction")
+
+NETFLOW139 = read("netflow.js")
+check("function exporterLabel(item) {\n"
+      "    return item.name ? `${item.name} (${item.address}, v${item.version})`\n"
+      "                      : `${item.address} (v${item.version})`;\n"
+      "  }" in NETFLOW139,
+      "exporterLabel names the exporter when namelookup resolved one, "
+      "address-only otherwise -- Symptom 1 in the plan")
+check("exporterLabel(a).localeCompare(exporterLabel(b))" in NETFLOW139,
+      "exporterOptionsHtml sorts by that label rather than by address")
+check("['iface', 'nf-iface']" in NETFLOW139 and "['direction', 'nf-direction']" in NETFLOW139,
+      "activate() reads iface and direction query keys too")
+check("iface: 'nf-iface', direction: 'nf-direction'," in NETFLOW139,
+      "syncNetflowRoute mirrors iface and direction into the hash too")
+check("recordsOnlyEmptyText" in NETFLOW139
+      and "No records kept before" in NETFLOW139
+      and "records only for this filter" in NETFLOW139
+      and "records reach back" in NETFLOW139,
+      "a records-only answer says so on the empty pane and in the totals line")
+check("if (data.widened) totalsText += ' · hourly summary';" in NETFLOW139,
+      "a widened (summary-served) answer says so in the totals line too")
+check("`${counters.flows || 0} flows received`" in NETFLOW139,
+      "the strip reads 'flows received', not the old 'flows stored'")
+check("if (counters.seq_missed) parts.push(`${counters.seq_missed} missed sequence`);"
+      in NETFLOW139,
+      "a non-zero seq_missed counter is surfaced on the strip locally, since "
+      "it is not one of App.extraCounterParts' fixed EXTRA_COUNTERS entries")
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))

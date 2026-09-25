@@ -342,7 +342,7 @@
     const current = iface.value || App.savedControl('netflow', 'nf-iface') || '';
     iface.innerHTML = '<option value="">Any interface</option>' +
       (data.interfaces || []).map((row) =>
-        `<option value="${row.if_index}">${escape(row.name)}</option>`).join('');
+        `<option value="${escape(String(row.if_index))}">${escape(row.name)}</option>`).join('');
     iface.value = [...iface.options].some((o) => o.value === current) ? current : '';
     if (iface.selectedIndex < 0) iface.value = '';
   }
@@ -1250,9 +1250,32 @@
       not a sign the rate is wrong.</p>` },
   });
 
+  /* A5/root-cause: "Records reach back <span> · per-exporter summaries
+     since <stamp> · per-interface since <stamp>", each part omitted when
+     its floor is not known yet -- a fresh install or a collector that has
+     never run. Read straight off the same coverage() /api/state polls, so
+     this line and the strip's own history readout cannot disagree. */
+  function coverageSettingsLine() {
+    const coverage = ((App.state.serverState || {}).collector || {}).coverage || {};
+    const bits = [];
+    if (coverage.raw_oldest != null) {
+      bits.push(`Records reach back ${App.span(Date.now() / 1000 - coverage.raw_oldest)}`);
+    }
+    const exporterFloor = coverage.scoped_hourly_floor != null
+      ? coverage.scoped_hourly_floor : coverage.scoped_minute_floor;
+    if (exporterFloor != null) {
+      bits.push(`per-exporter summaries since ${App.stamp(exporterFloor)}`);
+    }
+    if (coverage.iface_hourly_floor != null) {
+      bits.push(`per-interface since ${App.stamp(coverage.iface_hourly_floor)}`);
+    }
+    return bits.join(' · ');
+  }
+
   function settingsDialog() {
     const s = App.state.flowSettings || {};
     const { check, number } = App.form;
+    const coverageLineText = coverageSettingsLine();
     const settingsBox = App.modal('NetFlow settings', `
       <fieldset><legend>COLLECTOR</legend>
         ${check('n-enabled', 'Run the collector', s.enabled)}
@@ -1287,13 +1310,17 @@
         ${number('n-max', 'Row cap', s.max_flows, 'min=10000 step=100000')}
         ${number('n-rollup-min', 'Keep minute summaries for (days)', s.rollup_minute_days, 'min=0')}
         ${number('n-rollup-days', 'Keep hourly summaries for (days)', s.rollup_retention_days, 'min=0')}
+        ${number('n-rollup-iface', 'Keep per-interface summaries for (days)', s.rollup_interface_days, 'min=0')}
         ${number('n-topn', 'Top N', s.top_n, 'min=3 max=25')}
         ${number('n-bucket', 'Chart interval (s, 0 = auto)', s.bucket_seconds, 'min=0')}
         ${check('n-ports', 'Show service names for well-known ports', s.resolve_ports)}
         ${check('n-addr', 'Reverse-resolve addresses in the flow table', s.resolve_addresses)}
-        <p class="hint">A chart older than the flow retention above is drawn from the
-          summaries, not from the records — they are what a 30-day view still has to
-          show once the individual flows behind it have aged out.</p>
+        <p class="hint">The EXPORTERS and INTERFACES views, and TRAFFIC with no
+          source, destination, port or protocol filter, are drawn from the
+          summaries above; a source, destination, port or protocol filter
+          reads the records instead, and how far back it can reach is
+          bounded by the row cap.</p>
+        ${coverageLineText ? `<p class="hint">${escape(coverageLineText)}</p>` : ''}
         <p class="hint">Reverse DNS threads, timeout and cache lifetime are shared with
           NetPath and live on the Settings tab.</p>
       </fieldset>
@@ -1315,6 +1342,7 @@
           max_flows: num('#n-max'),
           rollup_minute_days: num('#n-rollup-min'),
           rollup_retention_days: num('#n-rollup-days'),
+          rollup_interface_days: num('#n-rollup-iface'),
           top_n: num('#n-topn'),
           bucket_seconds: num('#n-bucket'), resolve_ports: on('#n-ports'),
           resolve_addresses: on('#n-addr'),
