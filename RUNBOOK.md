@@ -455,11 +455,20 @@ good poll with no action needed here.
 but opening **Edit** on that same server shows nothing to confirm it — no
 line above the Username/Password boxes says a credential is on file.
 
-**Cause, not a fault.** From 5.64.0 the dialog says this plainly; before
-it, the credential was there but nothing in the dialog stated it. This was
-never a global or shared credential — each DHCP server has always held its
-own username and password, and the scheduled poll and Poll now both use
-only that server's own row. Nothing here was ever mixed between servers.
+**Real cause, found in 5.65.0.** The status line beside the server
+dropdown was not redrawn when the dropdown's selection changed — only the
+scopes and leases underneath it were. So the line kept showing whichever
+server was current at the last full page refresh, Poll now, or Save, no
+matter which server the dropdown was actually set to. That is exactly
+what made "stored credential" appear beside every server, and what made
+this symptom (a credential noted on the list but nothing in that server's
+own Edit dialog) look like a shared or global credential when it never
+was — each server's username and password have always lived on that
+server's own row, and the scheduled poll and Poll now have always used
+only that row. **Fixed in 5.65.0; upgrade.** The dropdown's change handler
+now redraws the status line for the newly selected server immediately, so
+it always reads that server's own address, credential state and last poll
+result.
 
 **What to look for now.**
 

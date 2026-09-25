@@ -1348,6 +1348,7 @@
     App.el('ipam-poll-now').onclick = pollNow;
     App.el('ipam-dhcp-server-select').onchange = (event) => {
       view.dhcpServerId = Number(event.target.value) || null;
+      renderDhcpServerSelect();
       // Drop the row id (it belongs to the old server) but keep the scope's
       // own identifier, so the same scope stays selected where the new
       // server also has one.

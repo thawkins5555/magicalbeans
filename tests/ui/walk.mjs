@@ -1330,8 +1330,8 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       }
     });
 
-  await check('Alerts rules: the Rules table Text column reflects '
-    + 'notify_sms per rule (5.64.0)',
+  await check('Alerts rules: the Rules table Email and Text columns reflect '
+    + 'notify and notify_sms per rule (5.65.0)',
     async () => {
       const origin = new URL(page.url()).origin;
       await page.keyboard.press('Escape').catch(() => {});
@@ -1342,8 +1342,8 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
         await page.click('#page-alerts > .subtabs > .subtab[data-subtab="rules"]');
         await page.waitForSelector('#alerts-rules-table tbody tr', { timeout: 20000 });
         const headerText = await page.locator('#alerts-rules-table thead').innerText();
-        assert(/Text/.test(headerText),
-          `expected a Text column in the Rules table header, got: ${headerText}`);
+        assert(/Email/.test(headerText) && /Text/.test(headerText),
+          `expected Email and Text columns in the Rules table header, got: ${headerText}`);
 
         const rulesRes = await page.request.get(`${origin}/api/alerts/rules`);
         const rules = (await rulesRes.json()).rules || [];
@@ -1351,15 +1351,17 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
         assert(target, 'expected the built-in dhcp_poll_failed rule to test against');
         const other = rules.find((r) => r.id !== target.id && !r.notify_sms);
         assert(other, 'expected another rule with notify_sms already off');
+        const emailOther = rules.find((r) => r.id !== target.id && r.notify);
+        assert(emailOther, 'expected another rule with notify already on');
         ruleId = target.id;
 
-        const cellFor = (name) => page.evaluate((ruleName) => {
+        const cellFor = (name, index) => page.evaluate(([ruleName, idx]) => {
           const rows = [...document.querySelectorAll('#alerts-rules-table tbody tr')];
           const row = rows.find((tr) => tr.cells[0].textContent.includes(ruleName));
-          return row ? row.cells[4].textContent.trim() : null;
-        }, name);
+          return row ? row.cells[idx].textContent.trim() : null;
+        }, [name, index]);
 
-        assert((await cellFor(target.name)) === 'no',
+        assert((await cellFor(target.name, 5)) === 'no',
           `expected ${target.name}'s Text cell to read no before enabling it`);
 
         const put = await page.request.put(`${origin}/api/alerts/rules/${target.id}`,
@@ -1369,17 +1371,33 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
         await page.click('#page-alerts > .subtabs > .subtab[data-subtab="rules"]');
         await page.waitForSelector('#alerts-rules-table tbody tr', { timeout: 20000 });
 
-        const targetCell = await cellFor(target.name);
-        const otherCell = await cellFor(other.name);
+        const targetCell = await cellFor(target.name, 5);
+        const otherCell = await cellFor(other.name, 5);
         assert(targetCell === 'yes',
           `expected ${target.name}'s Text cell to read yes, got: ${targetCell}`);
         assert(otherCell === 'no',
           `expected ${other.name}'s Text cell to read no, got: ${otherCell}`);
-        return `${target.name} Text=yes, ${other.name} Text=no`;
+
+        const putEmail = await page.request.put(`${origin}/api/alerts/rules/${target.id}`,
+          { data: { notify: false } });
+        assert(putEmail.ok(), `disabling notify answered ${putEmail.status()}`);
+        await selectTab(page, 'alerts');
+        await page.click('#page-alerts > .subtabs > .subtab[data-subtab="rules"]');
+        await page.waitForSelector('#alerts-rules-table tbody tr', { timeout: 20000 });
+
+        const targetEmailCell = await cellFor(target.name, 4);
+        const otherEmailCell = await cellFor(emailOther.name, 4);
+        assert(targetEmailCell === 'no',
+          `expected ${target.name}'s Email cell to read no, got: ${targetEmailCell}`);
+        assert(otherEmailCell === 'yes',
+          `expected ${emailOther.name}'s Email cell to read yes, got: ${otherEmailCell}`);
+
+        return `${target.name} Email=no Text=yes, ${other.name} Text=no, `
+          + `${emailOther.name} Email=yes`;
       } finally {
         if (ruleId !== null) {
           await page.request.put(`${origin}/api/alerts/rules/${ruleId}`,
-            { data: { notify_sms: false } }).catch(() => {});
+            { data: { notify: true, notify_sms: false } }).catch(() => {});
         }
         await page.keyboard.press('Escape').catch(() => {});
         await sleep(300);

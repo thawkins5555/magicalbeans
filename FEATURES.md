@@ -3122,6 +3122,11 @@ hard to trip — a path monitor that cries wolf gets turned off.
   **Text** column, right after **On**, reads *yes* or *no* for whether
   **Send a text (SMS) for this rule** is ticked. The Templates table is
   unchanged — a template carries no text setting of its own.
+- **From 5.65.0, an Email column does the same for the email checkbox.**
+  The Rules table now reads Name, Kind, Sev, On, Email, Text, Overrides —
+  **Email** sits between **On** and **Text** and reads *yes* or *no* for
+  whether **Send email for this rule** is ticked (on by default). The
+  Templates table is unchanged.
 - **From 5.56.0, the severity floor and a missing template say so on the
   alert.** An alert dropped by the floor above, or by a rule whose email
   template has been deleted, used to leave the Notifications pane reading
@@ -4280,7 +4285,11 @@ shows, above the Username and Password boxes, "Stored for this server as
 credential on one server never touches, or is visible on, any other
 server on the list — each server's username and password live on that
 server's own row and nothing reads across rows, for the scheduled poll or
-for Poll now.
+for Poll now. The status line beside the server dropdown — address,
+stored credential or ambient identity, and last poll result — reads for
+whichever server the dropdown is currently set to, and **from 5.65.0
+updates the moment you switch it**, rather than waiting for the page's
+own refresh, a Poll now, or a Save.
 
 Storing a credential needs Windows — DPAPI is a Windows-only API — so on any
 other platform the credential fields are refused with a message pointing at

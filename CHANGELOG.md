@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.65.0 — The DHCP server status line now follows the selected server, and Rules gets an Email column](#5650--the-dhcp-server-status-line-now-follows-the-selected-server-and-rules-gets-an-email-column)
 - [5.64.0 — Alerts Rules table gets a Text column, DHCP credentials confirmed and shown per server, ConfigRX SSH account replaces Global SSH account, and a team roster update](#5640--alerts-rules-table-gets-a-text-column-dhcp-credentials-confirmed-and-shown-per-server-configrx-ssh-account-replaces-global-ssh-account-and-a-team-roster-update)
 - [5.63.0 — Routes toolbar and Mapper legend reverted, centred SSH/WEB windows, DAF active-optical cables, text alerts are opt-in only, a DHCP poll-failure alert, and a per-account SSH login separate from ConfigRX](#5630--routes-toolbar-and-mapper-legend-reverted-centred-sshweb-windows-daf-active-optical-cables-text-alerts-are-opt-in-only-a-dhcp-poll-failure-alert-and-a-per-account-ssh-login-separate-from-configrx)
 - [5.62.0 — Every STP-blocked link is now found: a trunk without VLAN 1 was invisible on every VLAN, the scan runs every five minutes, and an undotted link names its own cause](#5620--every-stp-blocked-link-is-now-found-a-trunk-without-vlan-1-was-invisible-on-every-vlan-the-scan-runs-every-five-minutes-and-an-undotted-link-names-its-own-cause)
@@ -198,6 +199,42 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.65.0 — The DHCP server status line now follows the selected server, and Rules gets an Email column
+
+One operator screenshot, plus a second ask added on plan review.
+
+**The IPAM → DHCP status line beside the server drop-down now redraws the
+moment you switch servers.** The line reading, for example, "10.201.212.214
+· stored credential · SAPPI-NA\admna-thawkins · error · 47s ago" used to
+keep showing whichever server was current at the last full page redraw —
+the page's own periodic refresh, a **Poll now**, or a **Save**/**Clear**/
+**Add** — no matter which server the drop-down was actually set to in
+between. Switching the drop-down changed the scopes and leases underneath
+it correctly, but never touched that one line, so every server's address,
+credential and last-poll time appeared to read as one shared value. That
+is what the operator's screenshot showed ("If you poll one server it then
+updates the line on ALL servers. If you update the username on one server
+it then shows that username for ALL servers.") and it is the same
+appearance that produced 5.64.0's "stored credential" report against a
+server whose Edit dialog showed nothing — the credential itself was never
+shared, only this one line's display of it. The drop-down's change handler
+now rebuilds the status line for the newly selected server immediately,
+the same call the page's own refresh already made. The store, the API, the
+Edit dialog and Poll now were never affected — this was a display bug on
+one line, not a credential or polling bug.
+
+**Alerts → Rules and Templates gets an Email column**, added on plan
+review: "Please also add a column on the Alerts -> Rules & Templates page
+showing whether Email is on or not similar to the text column." The Rules
+table now reads Name, Kind, Sev, On, Email, Text, Overrides — **Email**
+sits between **On** and **Text** and reads *yes* or *no* for that rule's
+own "Send email for this rule" box (on by default), the same idiom
+5.64.0's Text column already used for texting. The Templates table is
+unchanged.
+
+Files: `netpath/web/static/ipam.js`, `netpath/web/static/alerts.js`,
+`tests/test_frontend_contracts.py`, `tests/ui/walk.mjs`, plus docs.
 
 ### 5.64.0 — Alerts Rules table gets a Text column, DHCP credentials confirmed and shown per server, ConfigRX SSH account replaces Global SSH account, and a team roster update
 

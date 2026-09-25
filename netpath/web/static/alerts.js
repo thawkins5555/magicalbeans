@@ -953,7 +953,8 @@
   function drawRulesTable() {
     const table = App.el('alerts-rules-table');
     table.innerHTML = '<caption class="sr-only">Alert rules</caption><thead><tr><th scope="col">Name</th>' +
-      '<th scope="col">Kind</th><th scope="col">Sev</th><th scope="col">On</th><th scope="col">Text</th>' +
+      '<th scope="col">Kind</th><th scope="col">Sev</th>' +
+      '<th scope="col">On</th><th scope="col">Email</th><th scope="col">Text</th>' +
       '<th scope="col">Overrides</th></tr></thead>';
     const body = document.createElement('tbody');
     for (const r of view.rules) {
@@ -965,6 +966,7 @@
         `<td><span class="sev sev-${r.severity}">${
           escape(App.state.severities?.[r.severity] || r.severity)}</span></td>` +
         `<td>${r.enabled ? 'yes' : 'no'}</td>` +
+        `<td>${r.notify ? 'yes' : 'no'}</td>` +
         `<td>${r.notify_sms ? 'yes' : 'no'}</td>` +
         `<td>${overridesCellHtml(r)}</td>`;
       tr.onclick = () => { view.rulesSelected = r.id; drawRulesTable(); };

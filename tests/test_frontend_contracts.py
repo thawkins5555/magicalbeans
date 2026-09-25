@@ -6154,12 +6154,14 @@ check("w.opener = null" in _WEB_CLICK,
 
 
 # ---------------------------------------------------------------------------
-# 135. Rules table Text column (5.64.0): whether SMS is on for the rule,
-#      Templates table untouched (templates carry no text setting).
+# 135. Rules table Email and Text columns (5.64.0/5.65.0): whether email and
+#      SMS are on for the rule; the Templates table carries no such setting.
 ALERTS135 = read("alerts.js")
-check('<th scope="col">On</th><th scope="col">Text</th>' in ALERTS135,
-      "the Rules table header gains a Text column right after On")
+check('<th scope="col">On</th><th scope="col">Email</th><th scope="col">Text</th>' in ALERTS135,
+      "the Rules table header gains Email and Text columns right after On")
 _DRAWRULES135 = js_function(ALERTS135, "drawRulesTable")
+check("r.notify ? 'yes' : 'no'" in _DRAWRULES135,
+      "each rule row's Email cell reads notify")
 check("r.notify_sms ? 'yes' : 'no'" in _DRAWRULES135,
       "each rule row's Text cell reads notify_sms")
 
@@ -6196,6 +6198,24 @@ check("Stored for this server as" in _DHCPFORM137,
       "the stored line names the server it belongs to, not a global account")
 check('value="${escape(s.username ?? \'\')}"' in _DHCPFORM137,
       "the Username input is still pre-filled from the server's own row")
+
+# ---------------------------------------------------------------------------
+# 138. DHCP server status line follows the drop-down (5.65.0): picking another
+#      server redraws #ipam-dhcp-server-status for it, not only on refresh.
+IPAMJS138 = read("ipam.js")
+_ONCHANGE138 = IPAMJS138[
+    IPAMJS138.index("App.el('ipam-dhcp-server-select').onchange"):]
+_ONCHANGE138 = _ONCHANGE138[:_ONCHANGE138.index("\n    };")]
+_SET138 = "view.dhcpServerId = Number(event.target.value) || null;"
+check(_SET138 in _ONCHANGE138
+      and "renderDhcpServerSelect();" in _ONCHANGE138
+      and "loadDhcpScopes();" in _ONCHANGE138
+      and _ONCHANGE138.index(_SET138)
+      < _ONCHANGE138.index("renderDhcpServerSelect();")
+      < _ONCHANGE138.index("loadDhcpScopes();"),
+      "the server drop-down's onchange sets dhcpServerId, then calls "
+      "renderDhcpServerSelect() before loadDhcpScopes(), so the status line "
+      "shows the selected server")
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))

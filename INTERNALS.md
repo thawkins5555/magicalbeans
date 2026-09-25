@@ -8800,6 +8800,26 @@ on A and B each reads back its own; and stubbing `ipam_worker.dhcp_poll` to
 capture the poll's environment shows the worker's poll of B sending B's
 own username and password, never A's.
 
+### DHCP server select redraws the status line on change (`ipam.js`) — 5.65.0
+
+**The select's own `onchange` handler set `view.dhcpServerId` and called
+`loadDhcpScopes()`, but never called `renderDhcpServerSelect()`** — the one
+function (`ipam.js:570-600`) that rebuilds the option list and writes
+`#ipam-dhcp-server-status`. Every other consumer of the selection already
+called it first: the initial `loadDhcpServers()` render, and every Save/
+Clear/Add path that reloads the server list. So the status line only ever
+caught up on one of those, or on the page's own periodic refresh — not on
+a plain dropdown switch — and kept reading the previously selected
+server's address, credential state and last poll result until one of
+those happened. The handler now calls `renderDhcpServerSelect()`
+immediately after setting `view.dhcpServerId` and before
+`loadDhcpScopes()`, matching the order the page's own load already uses
+(`ipam.js:1133-1134`). `tests/test_frontend_contracts.py` (block 138)
+pins that the handler contains `renderDhcpServerSelect();` after
+`view.dhcpServerId = Number(event.target.value) || null;`. The DHCP
+sub-tab is hidden off Windows, so `tests/ui/walk.mjs` cannot exercise this
+element; the contracts pin is the only coverage.
+
 ### NetPath destination thresholds (`alertengine._evaluate_netpath_thresholds`)
 
 A third threshold evaluator, for the same reason there is a second one: a
@@ -10566,7 +10586,9 @@ own failure must not be able to depend on that same channel to report it.
 cell (`r.notify_sms ? 'yes' : 'no'`) between **On** and **Overrides**, so
 the Rules table's row order is Name, Kind, Sev, On, Text, Overrides. The
 Templates table is untouched — a template has no `notify_sms` of its own
-to show.
+to show. **From 5.65.0** the same table reads `notify` directly too,
+adding an **Email** cell (`r.notify ? 'yes' : 'no'`) between **On** and
+**Text**, so the row order is Name, Kind, Sev, On, Email, Text, Overrides.
 
 **`sms_failing` is a system alert with the identical shape `smtp_failing`
 already has**, raised when `SmsQueue`'s breaker opens and cleared when it

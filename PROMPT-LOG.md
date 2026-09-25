@@ -5,6 +5,54 @@ grouped by the version that carries it. This is a working record for the
 operator — the full story of each change is in `CHANGELOG.md`, and this file
 does not replace it.
 
+## 5.65.0 — DHCP status line now follows the selected server, and Rules gets an Email column
+
+**Operator message, verbatim (with screenshot):**
+
+"The line I am pointing out in this screenshot appears to be common to all
+servers.  If you poll one server it then updates the line on ALL servers.
+If you update the username on one server it then shows that username for
+ALL servers."
+
+**Plan-review addition, verbatim:**
+
+"Please also add a column on the Alerts -> Rules & Templates page showing
+whether Email is on or not similar to the text column."
+
+**Cause, read from the code.** The screenshot showed
+"10.201.212.214 · stored credential · SAPPI-NA\admna-thawkins · error ·
+47s ago" beside the DHCP server drop-down, and the operator's own testing
+(poll one server, edit one username) confirmed the line was reacting to
+the wrong server. Tracing the drop-down's `onchange` handler found it set
+the selected server, reloaded scopes and leases, and stopped — it never
+called `renderDhcpServerSelect()`, the one function that rebuilds that
+status line. So the line kept showing whichever server was current at the
+last full render (a page refresh, a Poll now, or a Save), no matter which
+server the drop-down was actually set to. The credential itself was never
+shared: the store, the API, the Edit dialog and Poll now have always been
+per server, which is exactly why 5.64.0's report of "stored credential"
+against a server whose own Edit dialog showed nothing was a display bug,
+not a storage one. The Email column's per-rule flag (`rules.notify`, on by
+default) was already in the rule data sent to the browser — the Rules
+table itself just wasn't showing it, the same gap 5.64.0 closed for texting.
+
+**Lanes.** SuperThing1: the one-line `ipam.js` fix, pinned by a new
+contracts block. Thing3: the Rules table's Email column, between On and
+Text, mirroring the Text column's own yes/no cell.
+
+**Outcome.** Shipped as 5.65.0. Targeted suites green (frontend
+contracts with blocks 135 and 138, alerts API, DHCP credential isolation,
+layout contracts); no full suite, since the code beneath these two
+one-line changes ran green in 5.64.0 an hour earlier. Javariius approved
+without a required change. Walk 112 of 115: the Rules check passed with
+the dhcp_poll_failed rule reading Email=no, Text=yes after the toggles and
+another rule reading the defaults; the three misses are the Mapper
+spanning-tree checks on acc-sw-005 documented under 5.64.0, unchanged and
+not this release's code. The DHCP status line cannot be walked here
+(hidden off Windows), so its coverage is contracts block 138 and the
+operator's own check after upgrading: switch servers in the drop-down and
+the line changes at once.
+
 ## 5.64.0 — Alerts Rules gets a Text column, DHCP credentials confirmed and shown per server, "ConfigRX SSH account" replaces "Global", and a team roster update
 
 **Operator message, verbatim (six lines):**
