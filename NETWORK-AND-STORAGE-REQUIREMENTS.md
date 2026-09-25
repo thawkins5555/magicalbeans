@@ -126,8 +126,8 @@ reachable.
 | Forward DNS, resolving destination names | UDP/TCP | 53 | To this machine's configured DNS servers |
 | Reverse DNS (PTR), naming hop addresses | UDP/TCP | 53 | Same servers; can be disabled on the Settings tab |
 | IPAM subnet discovery | ICMP Echo Request (type 8) | — | One ping per address in an enabled subnet, on a schedule |
-| IPAM DHCP polling, ambient identity or Credential Manager | TCP (MS-RPC) | 135, plus a dynamic high port | To each configured Windows DHCP server; read-only |
-| IPAM DHCP polling, a stored credential | TCP (WinRM) | 5985 (HTTP) or 5986 (HTTPS) | Only for a server with a username and password saved; read-only |
+| IPAM DHCP polling, ambient identity, Credential Manager, or a stored credential | TCP (MS-RPC) | 135, plus a dynamic high port | To each configured Windows DHCP server; read-only. From 5.66.0 this is the same DHCP RPC call for all three authentication methods — a stored credential no longer changes the transport |
+| IPAM DHCP polling, a stored credential (before 5.66.0) | TCP (WinRM) | 5985 (HTTP) or 5986 (HTTPS) | Superseded from 5.66.0 — see the row above |
 | Nodes SNMP polling | UDP | 161 (fixed) | GET/GETBULK to each configured device, on its own poll interval. On a Cisco device (enterprise arc 9), from 5.32.0, this includes thirteen extra column walks for CISCO-STACKWISE-MIB stack power (five port columns, four per-switch power columns, four per-stack columns) — read on every poll once a switch has answered any of them, and retried at most once an hour on a Cisco device that never does. From 5.33.0, the same Cisco devices also get one extra fan-state column walk on the same cadence as power-supply state: `cefcFanTrayOperStatus` first, then `ciscoEnvMonFanState` only when the first table answers no rows at all — never both on the same poll |
 | Nodes ping monitoring | ICMP Echo Request (type 8) | — | One ping per device with ping enabled, on its own poll interval |
 | Nodes per-device or per-subnet discovery | ICMP Echo Request (type 8), then UDP 161 | — | Same shape as IPAM's own subnet sweep, plus an SNMP identity probe against whatever answers — from 5.29.0, exactly one identity probe per responding address and nothing more. Through 5.28.0 a device that answered also got one extra bounded read of its own address table (up to 33 GETNEXTs, `ipAdEntAddr`) so a router reached on two addresses could be offered once; that extra read is removed, so a sweep's SNMP traffic per responding host is smaller than before |
@@ -147,11 +147,12 @@ type above and allow the ICMP replies back.
 
 No outbound connection is made for the NetFlow module — it only listens.
 
-DHCP polling's transport depends on how a server authenticates. Ambient
-identity and Credential Manager both go through the `DhcpServer` PowerShell
-module's own transport, Microsoft's RPC over TCP: an initial connection to the
-endpoint mapper on 135, which hands back a dynamically chosen high port for
-the actual call. The exact high port varies and is not something this
+DHCP polling always goes over the `DhcpServer` PowerShell module's own
+transport, Microsoft's RPC over TCP — regardless of which of the three
+authentication methods a server uses (ambient identity, Credential Manager,
+or a stored credential). That means an initial connection to the endpoint
+mapper on 135, which hands back a dynamically chosen high port for the
+actual call. The exact high port varies and is not something this
 application controls; a firewall between SappiWhere and a DHCP server needs
 either the full dynamic RPC range open or, better, the DHCP server's RPC port
 range fixed to something narrower with `netsh int ipv4 set dynamicport tcp
@@ -159,15 +160,19 @@ startport=<n> numberofports=<n>` (see Microsoft's guidance on restricting RPC
 dynamic port allocation). This is a property of Windows RPC, not of
 SappiWhere.
 
-A stored credential goes over PowerShell remoting instead — `Invoke-Command`
-to the DHCP server, which needs WinRM listening there. This is usually already
-true of a domain-joined server with remote management enabled, but is worth
-checking before relying on it: `Test-WSMan <server>` from any Windows machine
-confirms whether WinRM answers. If it doesn't, `winrm quickconfig` on the DHCP
-server turns it on. The read-only account only needs whatever local rights
-let it query DHCP; it does not need to be a local administrator on the DHCP
-server for this to work, though DHCP Server management typically expects
-membership in the local `DHCP Users` group or higher.
+From 5.66.0, a stored credential no longer changes any of this: instead of
+connecting to the DHCP server over PowerShell remoting, SappiWhere starts a
+local PowerShell background job as the stored account **on the machine
+running SappiWhere**, and that job makes the same DHCP RPC call as the other
+two methods. There is no WinRM prerequisite on the DHCP server for this
+path — nothing on 5985/5986, no `Test-WSMan`, no `winrm quickconfig`.
+What the stored account needs instead is local to the SappiWhere machine:
+"Allow log on locally" (Local Security Policy → User Rights Assignment),
+the Secondary Logon service running, and DHCP read rights on the DHCP
+server itself (typically membership in the local `DHCP Users` group there).
+The `DhcpServer` PowerShell module (RSAT: DHCP Server Tools) needs to be
+installed on the SappiWhere machine for every authentication method, not
+just this one.
 
 Discovery's ARP lookups are read-only and local to whichever machine runs
 SappiWhere — nothing is transmitted on the wire beyond the ping itself; the

@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.66.0 — A stored DHCP credential now runs the poll locally as that account, not over WinRM](#5660--a-stored-dhcp-credential-now-runs-the-poll-locally-as-that-account-not-over-winrm)
 - [5.65.0 — The DHCP server status line now follows the selected server, and Rules gets an Email column](#5650--the-dhcp-server-status-line-now-follows-the-selected-server-and-rules-gets-an-email-column)
 - [5.64.0 — Alerts Rules table gets a Text column, DHCP credentials confirmed and shown per server, ConfigRX SSH account replaces Global SSH account, and a team roster update](#5640--alerts-rules-table-gets-a-text-column-dhcp-credentials-confirmed-and-shown-per-server-configrx-ssh-account-replaces-global-ssh-account-and-a-team-roster-update)
 - [5.63.0 — Routes toolbar and Mapper legend reverted, centred SSH/WEB windows, DAF active-optical cables, text alerts are opt-in only, a DHCP poll-failure alert, and a per-account SSH login separate from ConfigRX](#5630--routes-toolbar-and-mapper-legend-reverted-centred-sshweb-windows-daf-active-optical-cables-text-alerts-are-opt-in-only-a-dhcp-poll-failure-alert-and-a-per-account-ssh-login-separate-from-configrx)
@@ -200,13 +201,72 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 5.66.0 — A stored DHCP credential now runs the poll locally as that account, not over WinRM
+
+One operator report: two of four DHCP servers, all polled with a stored
+credential, started showing "error" on the status line, while the other two
+kept working under what the operator confirmed was the same account and
+permissions.
+
+**What changed.** Polling a DHCP server that has a stored credential no
+longer runs the query on the DHCP server itself over PowerShell remoting
+(`Invoke-Command`, i.e. WinRM). It now starts a local PowerShell background
+job as that stored account, on the machine running SappiWhere
+(`Start-Job -Credential`), and that job runs the exact same `DhcpServer`
+cmdlets with `-ComputerName` over DHCP RPC — the same commands an operator
+types by hand at a console. Neither machine needs WinRM for this any more.
+**Test connection** on IPAM → DHCP uses the identical job. A new
+`SAPPI_DHCP_TIMEOUT_S` budget bounds how long the job may run (five seconds
+inside the overall timeout, so the job is always torn down before the
+outer limit fires), and a job that fails to even launch reports why instead
+of timing out silently.
+
+**What the stored account needs now:**
+
+- The right to log on locally on the machine running SappiWhere (an
+  administrator account already has it), and the Secondary Logon service
+  left enabled there.
+- Membership in **DHCP Users** (or Administrators) on each DHCP server —
+  unchanged from before.
+- The `DhcpServer` PowerShell module installed on the machine running
+  SappiWhere: `Install-WindowsFeature RSAT-DHCP` on a server OS, or
+  `Add-WindowsCapability -Online -Name Rsat.DHCP.Tools~~~~0.0.1.0` on a
+  client OS. The DHCP server itself needs nothing extra for this path any
+  more.
+
+**Simplest setup, zero configuration.** Run SappiWhere's scheduled task or
+service as an account that is already a member of DHCP Users (or
+Administrators) on the DHCP servers, and store no credential at all. The
+cmdlets then run directly as that account with nothing to configure here.
+
+**Why this surfaced now, not earlier.** This poll, and the Test connection
+probe, have worked this way since 5.51.0 — nothing in `ipam_dhcp.py` or
+`ipam_worker.py` changed between 5.51.0 and this release. What changed is
+visibility: 5.65.0 fixed the DHCP status line so it shows each server's own
+last result instead of one shared line, which is what exposed two servers
+that had most likely been failing for a while under the old WinRM step. The
+`DhcpServer` cmdlets have no `-Credential` parameter of their own, which is
+why that WinRM wrapper existed before there was a simpler way to run the
+same cmdlets as a different local account.
+
+**Known limit.** Starting a job as another account depends on the Secondary
+Logon service and a session capable of an interactive logon. A scheduled
+task set to "run whether user is logged on or not" can refuse to launch it.
+If Test connection reports "An error occurred while starting the background
+process. Error reported: ..." use the zero-configuration option above, or
+wait for a CIM-session-over-DCOM path to the DHCP server — a fallback noted
+for later, not built in this release.
+
+Files: `netpath/ipam_dhcp.py`, `netpath/web/static/ipam.js` (comment only),
+`tests/test_ipam_dhcp_temp.py`, plus docs.
+
 ### 5.65.0 — The DHCP server status line now follows the selected server, and Rules gets an Email column
 
 One operator screenshot, plus a second ask added on plan review.
 
 **The IPAM → DHCP status line beside the server drop-down now redraws the
-moment you switch servers.** The line reading, for example, "10.201.212.214
-· stored credential · SAPPI-NA\admna-thawkins · error · 47s ago" used to
+moment you switch servers.** The line reading, for example, "<server>
+· stored credential · <domain>\<account> · error · 47s ago" used to
 keep showing whichever server was current at the last full page redraw —
 the page's own periodic refresh, a **Poll now**, or a **Save**/**Clear**/
 **Add** — no matter which server the drop-down was actually set to in

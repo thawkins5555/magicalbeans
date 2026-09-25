@@ -326,10 +326,10 @@ The fixed PowerShell script (`_SCRIPT` and `_TEST_SCRIPT` in
 `ipam_dhcp.py`) calls only `Get-DhcpServerv4Scope`, `Get-DhcpServerv4Lease`,
 `Get-DhcpServerv4Reservation`, and `Get-DhcpServerVersion` against the DHCP
 server — every one a `Get-`, none of them capable of changing anything.
-`Invoke-Command`, used only for the stored-credential path, is never handed
-a string: it runs a fixed scriptblock (`$body` / `$probe`) defined earlier in
-the same constant script, so there is nothing for a crafted server name or
-credential to inject into even in principle. This isn't just a claim in a
+`Start-Job -Credential`, used only for the stored-credential path, is never
+handed a string: it runs a fixed scriptblock (`$body` / `$probe`) defined
+earlier in the same constant script, so there is nothing for a crafted
+server name or credential to inject into even in principle. This isn't just a claim in a
 docstring — it's mechanically checkable by grepping the two script constants
 for every cmdlet name they contain and confirming none is a mutating verb,
 which is exactly the check that was run against them before they shipped.

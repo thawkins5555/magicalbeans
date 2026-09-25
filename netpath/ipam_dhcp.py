@@ -1,9 +1,9 @@
 """Read-only polling of a Windows DHCP server's scopes and leases, via
-PowerShell `DhcpServer` cmdlets — either ambient Windows identity
-(`-ComputerName`, local module) or a stored credential over
-`Invoke-Command -Credential` (module runs on the DHCP server itself). All
-scripts are fixed constants; server name/username/password travel as
-environment variables, never woven into command text.
+PowerShell `DhcpServer` cmdlets with `-ComputerName` over DHCP RPC, run
+locally — as the ambient Windows identity, or, with a stored credential, in
+a local `Start-Job -Credential` job as that account. No WinRM. All scripts
+are fixed constants; server name/username/password travel as environment
+variables, never woven into command text.
 """
 
 from __future__ import annotations
@@ -29,14 +29,14 @@ IS_WINDOWS = os.name == "nt"
 # actual injection defense.
 _VALID_ADDRESS = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.\-:]{0,253}$")
 
-# The DHCP query itself, as a scriptblock rather than inline: the ambient path
-# runs it locally (Import-Module + -ComputerName, over RPC), the credentialed
-# path hands the identical block to Invoke-Command to run on the DHCP server
-# itself (over WinRM). One definition, so the two paths cannot drift apart and
-# report different shapes of data.
+# The DHCP query itself, as a scriptblock: the ambient path runs it in-process,
+# the credentialed path runs the identical block in a local job as the stored
+# account. Both use -ComputerName over DHCP RPC; no WinRM. One definition, one
+# data shape.
 _BODY = r"""
 $body = {
     param($ComputerName)
+    $ErrorActionPreference = 'Stop'
     Import-Module DhcpServer -ErrorAction Stop
     $out = [ordered]@{ scopes = @(); leases = @(); reservations = @() }
     $scopeObjs = @(Get-DhcpServerv4Scope -ComputerName $ComputerName)
@@ -91,23 +91,37 @@ $body = {
 }
 """
 
-# Every verb below is Get-, plus Import-Module and formatting/output cmdlets,
-# with one exception: Invoke-Command, used only to run the fixed $body
-# scriptblock above on the DHCP server when a stored credential is supplied.
-# It is never handed a string built at runtime.
+# Every verb below is Get-, plus Import-Module, the *-Job cmdlets and
+# formatting/output cmdlets. The job only ever runs the fixed $body scriptblock
+# above, locally, as the stored account; never a string built at runtime.
 _SCRIPT = _BODY + r"""
 $ErrorActionPreference = 'Stop'
 $server   = $env:SAPPI_DHCP_SERVER
 $username = $env:SAPPI_DHCP_USERNAME
+$timeout  = [int]$env:SAPPI_DHCP_TIMEOUT_S
+if ($timeout -le 0) { $timeout = 30 }
 try {
     if ([string]::IsNullOrEmpty($username)) {
         $result = & $body $server
     } else {
         $securePw = ConvertTo-SecureString $env:SAPPI_DHCP_PASSWORD -AsPlainText -Force
         $cred = New-Object System.Management.Automation.PSCredential($username, $securePw)
-        # Runs ON the DHCP server over WinRM, so $ComputerName targeting the
-        # server's own name works the same as "localhost" would.
-        $result = Invoke-Command -ComputerName $server -Credential $cred -ScriptBlock $body -ArgumentList $server
+        # Local child powershell as the stored account; DHCP RPC to $server.
+        $job = Start-Job -Credential $cred -ScriptBlock $body -ArgumentList $server
+        try {
+            if (-not (Wait-Job -Job $job -Timeout $timeout)) {
+                throw "The DHCP query as $username did not finish within $timeout seconds"
+            }
+            if ($job.State -eq 'Failed' -and $job.ChildJobs[0].JobStateInfo.Reason) {
+                throw $job.ChildJobs[0].JobStateInfo.Reason.Message
+            }
+            $result = Receive-Job -Job $job -ErrorAction Stop
+            if ($null -eq $result) {
+                throw "The DHCP query as $username returned nothing (job state $($job.State))"
+            }
+        } finally {
+            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+        }
     }
     $result | ConvertTo-Json -Depth 6 -Compress
 } catch {
@@ -123,8 +137,11 @@ _TEST_SCRIPT = r"""
 $ErrorActionPreference = 'Stop'
 $server   = $env:SAPPI_DHCP_SERVER
 $username = $env:SAPPI_DHCP_USERNAME
+$timeout  = [int]$env:SAPPI_DHCP_TIMEOUT_S
+if ($timeout -le 0) { $timeout = 30 }
 $probe = {
     param($ComputerName)
+    $ErrorActionPreference = 'Stop'
     Import-Module DhcpServer -ErrorAction Stop
     $version = Get-DhcpServerVersion -ComputerName $ComputerName
     $scopeCount = @(Get-DhcpServerv4Scope -ComputerName $ComputerName).Count
@@ -137,7 +154,21 @@ try {
     } else {
         $securePw = ConvertTo-SecureString $env:SAPPI_DHCP_PASSWORD -AsPlainText -Force
         $cred = New-Object System.Management.Automation.PSCredential($username, $securePw)
-        $result = Invoke-Command -ComputerName $server -Credential $cred -ScriptBlock $probe -ArgumentList $server
+        $job = Start-Job -Credential $cred -ScriptBlock $probe -ArgumentList $server
+        try {
+            if (-not (Wait-Job -Job $job -Timeout $timeout)) {
+                throw "The DHCP query as $username did not finish within $timeout seconds"
+            }
+            if ($job.State -eq 'Failed' -and $job.ChildJobs[0].JobStateInfo.Reason) {
+                throw $job.ChildJobs[0].JobStateInfo.Reason.Message
+            }
+            $result = Receive-Job -Job $job -ErrorAction Stop
+            if ($null -eq $result) {
+                throw "The DHCP query as $username returned nothing (job state $($job.State))"
+            }
+        } finally {
+            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+        }
     }
     $result | ConvertTo-Json -Compress
 } catch {
@@ -173,53 +204,39 @@ def _validate_address(server: str) -> str:
 
 
 def _friendly_error(message: str) -> str:
-    """Append actionable guidance to a handful of WinRM errors this module's
-    credentialed path is known to hit, without hiding the original message —
-    the person editing the DHCP server still sees exactly what PowerShell
-    said, just with the fix appended rather than left as a lookup exercise.
-    """
-    if "TrustedHosts" in message:
+    """Append actionable guidance to a handful of errors the credentialed
+    (local job as the stored account) path is known to hit, keeping the
+    original message first."""
+    if ("has not been granted the requested logon type" in message
+            or "Logon failure" in message
+            or "starting the background process" in message):
         return (
-            f"{message}\n\nThis is a WinRM client setting on the machine "
-            f"running SappiWhere, not the DHCP server — by default it will "
-            f"only use Kerberos to authenticate a remote target, and "
-            f"Kerberos cannot vouch for a bare IP address, only a hostname. "
-            f"Easiest fix: edit this server here and use its hostname or "
-            f"FQDN instead of its IP address; that alone resolves it, no "
-            f"WinRM configuration needed. If it must stay an IP address, "
-            f"add it to TrustedHosts on the SappiWhere machine instead, run "
-            f"as Administrator:\n"
-            f"  winrm set winrm/config/client '@{{TrustedHosts=\"<address>\"}}'\n"
-            f"That falls back to NTLM and skips verifying the server's "
-            f"identity, so prefer the hostname fix where the address has one.")
+            f"{message}\n\nThis is on the machine running SappiWhere, not the "
+            f"DHCP server: the stored account is used by starting a local "
+            f"PowerShell as that account, so it must be allowed to log on "
+            f"here. Grant it in Local Security Policy -> User Rights "
+            f"Assignment -> \"Allow log on locally\" (and make sure it is not "
+            f"listed under \"Deny log on locally\"), and check that the "
+            f"Secondary Logon service is not disabled. Or store a different "
+            f"account that already has that right. If the message says the "
+            f"user name or password is wrong, re-enter the stored password.")
     if "CIM server" in message:
         return (
-            f"{message}\n\nThis one is on the DHCP server itself: WinRM "
-            f"reached it and authenticated fine, but once there, the "
-            f"DhcpServer cmdlets talk to it over CIM/WMI, and this account "
-            f"isn't authorized for that — a different permission from "
-            f"WinRM access. It needs membership in the DHCP server's local "
-            f"`DHCP Users` group (Administrator rights are not required, "
-            f"just that group), added on the DHCP server itself, not here."
-        )
+            f"{message}\n\nThe DhcpServer cmdlets run on the machine running "
+            f"SappiWhere, as the stored account, and this is that machine's "
+            f"local WMI/CIM refusing the account. Check its WMI permissions "
+            f"there. Separately, the account still needs membership in the "
+            f"DHCP server's local `DHCP Users` group (or Administrators), "
+            f"added on the DHCP server itself.")
     if "DhcpServer" in message and "not loaded" in message:
         return (
-            f"{message}\n\nAlso on the DHCP server itself: the script got "
-            f"this far — WinRM and CIM access both worked — but the "
-            f"server's PowerShell management module for DHCP isn't "
-            f"installed there, separately from the DHCP Server role "
-            f"actually running. Fix, on the DHCP server as Administrator:\n"
-            f"  Install-WindowsFeature RSAT-DHCP\n"
-            f"Confirm with: Get-Module -ListAvailable DhcpServer\n\n"
-            f"If that already shows the module installed and this error "
-            f"still happens, the WinRM service itself was already running "
-            f"before the feature was added and is still using its old "
-            f"environment — an interactive session picks up the change "
-            f"immediately, a long-running service does not. Restart it, "
-            f"on the DHCP server:\n"
-            f"  Restart-Service WinRM\n"
-            f"A full reboot of the DHCP server is the fallback if that "
-            f"alone doesn't clear it.")
+            f"{message}\n\nThe DhcpServer PowerShell module must be installed "
+            f"on the machine running SappiWhere (the DHCP server itself needs "
+            f"nothing extra). As Administrator there:\n"
+            f"  Server OS: Install-WindowsFeature RSAT-DHCP\n"
+            f"  Client OS: Add-WindowsCapability -Online -Name "
+            f"Rsat.DHCP.Tools~~~~0.0.1.0\n"
+            f"Confirm with: Get-Module -ListAvailable DhcpServer")
     return message
 
 
@@ -287,6 +304,8 @@ def _run(script: str, server: str, timeout_s: float,
     # usable.
     env["SAPPI_DHCP_USERNAME"] = username or ""
     env["SAPPI_DHCP_PASSWORD"] = password or ""
+    # Five seconds inside the Python limit, so the job is cleaned up here.
+    env["SAPPI_DHCP_TIMEOUT_S"] = str(max(5, int(timeout_s) - 5))
 
     # A temp .ps1 file rather than piping the script in on stdin with
     # `-Command -`: that form is unreliable for a multi-statement script with

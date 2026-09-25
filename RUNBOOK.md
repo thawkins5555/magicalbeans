@@ -23,6 +23,8 @@ backup, `INTERNALS.md` is why any of this works the way it does.
 - [Alert texts are not arriving](#alert-texts-are-not-arriving)
 - [A DHCP server shows "poll failing"](#a-dhcp-server-shows-poll-failing)
 - [The DHCP status line says stored credential but the dialog shows nothing](#the-dhcp-status-line-says-stored-credential-but-the-dialog-shows-nothing)
+- [A DHCP server with a stored credential fails to log on locally](#a-dhcp-server-with-a-stored-credential-fails-to-log-on-locally)
+- [A DHCP server reports "error starting the background process"](#a-dhcp-server-reports-error-starting-the-background-process)
 - [A ConfigRX backup says the host key changed](#a-configrx-backup-says-the-host-key-changed)
 - [The SSH button says "No SSH login is stored for your account"](#the-ssh-button-says-no-ssh-login-is-stored-for-your-account)
 - [The poll pool is saturated](#the-poll-pool-is-saturated)
@@ -434,7 +436,12 @@ good poll with no action needed here.
 
 1. **The server's own last error**, in the alert's message and on IPAM's DHCP
    servers list, names the actual failure — timeout, refused connection, bad
-   credential.
+   credential. "The DHCP query as `<user>` did not finish within `<N>`
+   seconds" means the stored-credential job (a fresh PowerShell as that
+   account plus `Import-Module DhcpServer`, typically 5-10 s before it even
+   reaches the first query) ran past the configured **Poll timeout** —
+   raise **Poll timeout** under IPAM → Settings, rather than treating it as
+   a credential or reachability problem.
 2. **If it is a credential failure**, open that server's own Edit dialog on
    the DHCP servers list. From 5.64.0 the AUTHENTICATION fieldset opens with
    "Stored for this server as `<user>`, saved `<when>`" when a credential is
@@ -486,6 +493,72 @@ result.
 4. **There is no fleet-wide DHCP account to look for.** A credential
    problem on one server is always that server's own row; checking another
    server's credential, or a settings-page account, will not explain it.
+
+---
+
+## A DHCP server with a stored credential fails to log on locally
+
+**Symptom.** A DHCP server with a stored credential shows "error" on Poll
+now or Test connection, and the message contains "Logon failure" or "has
+not been granted the requested logon type" — even though the same account,
+typed by hand at that DHCP server's own console, works fine.
+
+**What it means.** From 5.66.0, a stored credential is used by starting a
+local PowerShell background job as that account **on the machine running
+SappiWhere**, not by connecting to the DHCP server with it. This error is
+that machine refusing the account a logon, not the DHCP server refusing
+anything.
+
+**Checks, in order.**
+
+1. On the machine running SappiWhere: Local Security Policy → User Rights
+   Assignment → grant that account "Allow log on locally," and confirm it
+   is not also listed under "Deny log on locally," which wins if both are
+   set.
+2. Confirm the Secondary Logon service is not disabled there — starting a
+   job as another account depends on it.
+3. If the message instead says the user name or password is wrong, open
+   that server's Edit dialog and re-enter the password; it is re-encrypted
+   with DPAPI on save.
+4. Simplest fix if none of the above suits the estate: run SappiWhere's own
+   scheduled task or service as an account already in DHCP Users (or
+   Administrators) on the DHCP servers, and clear the stored credential —
+   see IPAM → DHCP under `FEATURES.md`.
+
+---
+
+## A DHCP server reports "error starting the background process"
+
+**Symptom.** A DHCP server with a stored credential fails with a message
+of the shape "An error occurred while starting the background process.
+Error reported: `<Windows reason>`." — for example "... Error reported:
+Logon failure: the user has not been granted the requested logon type at
+this computer." This is Windows PowerShell 5.1's own wording, not a
+PowerShell error from the DHCP query itself.
+
+**What it means.** The local job that runs the query as the stored account
+(`Start-Job -Credential`, from 5.66.0) could not even start. This depends
+on the Secondary Logon service and a session capable of an interactive
+logon; a scheduled task set to "run whether user is logged on or not" can
+refuse to launch it outright, regardless of whether the account's
+permissions are otherwise correct. Because the message contains the
+"starting the background process" stem, it now also gets the same
+appended guidance as the previous section (the code's `_friendly_error`
+matches "has not been granted the requested logon type", "Logon failure",
+and "starting the background process") — so the on-screen error already
+points at "Allow log on locally" and the Secondary Logon service before
+you reach the checks below.
+
+**Fix, in order.**
+
+1. Switch that server to no stored credential and instead run SappiWhere's
+   scheduled task or service as an account already in DHCP Users (or
+   Administrators) on the DHCP servers — the zero-configuration option,
+   and the one recommended where it fits.
+2. If a different stored account is required, confirm the Secondary Logon
+   service is running and the scheduled task is not set to the mode above.
+3. If neither is workable, this needs a CIM session over DCOM to the DHCP
+   server instead of a local job — not built in this release.
 
 ---
 

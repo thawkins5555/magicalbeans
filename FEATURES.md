@@ -4272,11 +4272,16 @@ specific machine — not a portable secret if `ipam.db` is copied elsewhere, and
 not readable by SappiWhere itself as plain text once saved. The listing
 afterward shows the username and that a credential is stored; the password is
 never returned by the API in any form, encrypted or not. This path runs the
-same read-only query through PowerShell remoting instead of RPC, which needs
-WinRM reachable on the DHCP server rather than SappiWhere's own machine having
-the `DhcpServer` module installed — the trade-off going the other way from the
-first method. A real DHCP server almost always already has the module, since
-it ships with the role.
+same read-only query as a local PowerShell background job started under that
+account, on this machine — not PowerShell remoting, so nothing needs opening
+on the DHCP server for it. What it does need: this account must be allowed to
+log on locally on the machine running SappiWhere (an administrator account
+already qualifies, and the Secondary Logon service must be enabled here), the
+same `DhcpServer` module the first method needs on this machine, and DHCP
+Users (or Administrators) membership on the DHCP server itself. Simplest of
+all: run SappiWhere as an account that already has that DHCP server
+membership and store no credential here at all — then the first method
+applies and nothing above is needed.
 
 **This has always been a per-server credential — from 5.64.0 the Edit
 dialog says so plainly.** Opening a server that already has one stored

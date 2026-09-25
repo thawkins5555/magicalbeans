@@ -5,6 +5,74 @@ grouped by the version that carries it. This is a working record for the
 operator — the full story of each change is in `CHANGELOG.md`, and this file
 does not replace it.
 
+## 5.66.0 — A stored DHCP credential now runs the poll locally, not over WinRM
+
+**Operator message, verbatim:**
+
+"Something has changed with the DHCP Polling method - I am now seeing
+WINRM errors for two of my 4 dhcp servers that are being polled - I have
+confirmed with powershell that my user has the correct permissions same
+as the other two working DHCP servers."
+
+**Follow-up, verbatim:**
+
+"The DHCP servers should not be polled with Win RM - they should be
+polled with the powershell commands like GET-DHCPServerVersion"
+
+**Clarifying answers, verbatim:** "All four the same way" (all four DHCP
+servers are entered, and hold a stored credential, the same way) and
+"Started with Task Scheduler." (SappiWhere itself runs headless under
+Windows Task Scheduler). The failing status line read:
+
+"<server> · stored credential · <account> · error · 13m ago"
+
+**A challenge mid-investigation, verbatim:** "Did you actually search the
+code?  When was WINRM implemented?  I was under the impression the DHCP
+servers were being polled via cmdlet" — answered from the code, not from
+memory: `Invoke-Command`/WinRM has been used for the stored-credential path
+only since 2.5.0; the no-credential path has always run the DhcpServer
+cmdlets directly with `-ComputerName`, and is the default when no
+username/password is entered for a server. Nothing in the polling code
+(`ipam_dhcp.py`, `ipam_worker.py`) had changed since 5.51.0 — the two
+failing servers had most likely been failing under WinRM for a while, and
+5.65.0's status-line fix (each server now shows its own result, not one
+shared line) is what made that visible.
+
+**Cause and fix.** With a credential stored, all four servers went out
+over `Invoke-Command`/WinRM to run the DHCP query on the DHCP server
+itself; two of the four evidently do not accept that step, under an
+account that runs the same cmdlets fine when typed by hand. The fix
+changes how a stored credential is used, not the cmdlets themselves: the
+credentialed path now starts a local PowerShell background job as the
+stored account, on the machine running SappiWhere, and that job runs the
+identical `Get-DhcpServer*` cmdlets with `-ComputerName` over DHCP RPC —
+no WinRM on either machine. The requirements moved with it: the stored
+account needs to log on locally on the SappiWhere machine, not the DHCP
+server, and the `DhcpServer` module needs to be installed there.
+
+**Lane.** SuperThing1: the script and test change in `ipam_dhcp.py`.
+Bob's own two guards, run before any code changed: confirming from source
+history that the polling code was untouched since 5.51.0, and confirming
+from source history when WinRM was first introduced for this path
+(2.5.0) — so the operator's question above was answered from the code,
+not asserted from memory.
+
+**Outcome.** Shipped as 5.66.0. All eight IPAM suites, the secret
+store with the portable passphrase, contracts, API helpers and web
+security green; no full suite (the Python change is one environment
+variable) and no walk (the DHCP section is hidden off Windows and this
+container has no PowerShell). Javariius read the PowerShell line by line
+and approved the code; he held the push for two pages outside the plan
+that still described WinRM firewall rules (the network requirements page
+and the README), for the exact wording of the launch-failure message, and
+for this paragraph. Two of his optional notes were taken as well: the
+script now throws if the job ends with no output, so the Test button can
+never receive a null payload, and the launch-failure stem "starting the
+background process" triggers the same guidance as a refused logon. The
+proof is the operator's own Test connection on all four servers after
+upgrading; the runbook names the two fallbacks if the scheduled task's
+session cannot start a job as another account.
+
 ## 5.65.0 — DHCP status line now follows the selected server, and Rules gets an Email column
 
 **Operator message, verbatim (with screenshot):**
@@ -20,7 +88,7 @@ ALL servers."
 whether Email is on or not similar to the text column."
 
 **Cause, read from the code.** The screenshot showed
-"10.201.212.214 · stored credential · SAPPI-NA\admna-thawkins · error ·
+"<server> · stored credential · <domain>\<account> · error ·
 47s ago" beside the DHCP server drop-down, and the operator's own testing
 (poll one server, edit one username) confirmed the line was reacting to
 the wrong server. Tracing the drop-down's `onchange` handler found it set

@@ -582,12 +582,15 @@ touches disk, tied to this specific machine: not a plaintext secret in
 `ipam.db`, and not something that would still work if that file were copied
 elsewhere. **Test connection** in the same dialog checks it before you save,
 and works against whatever's currently typed even if you haven't saved yet.
-This path uses PowerShell remoting rather than RPC, so it needs WinRM
-reachable on the DHCP server instead — `Test-WSMan dhcp01.corp.local` from
-any Windows machine confirms whether it already is; `winrm quickconfig` on
-the DHCP server turns it on if not. The account only needs DHCP read rights
-there, typically membership in the local `DHCP Users` group — it does not
-need to be an administrator on the DHCP server.
+From 5.66.0 this path still uses the same DHCP RPC call as the other two
+methods, not PowerShell remoting — there's no WinRM prerequisite on the
+DHCP server, nothing on 5985/5986. Instead, SappiWhere starts a local
+PowerShell background job as the stored account on the machine running
+SappiWhere, so that account needs "Allow log on locally" there (Local
+Security Policy → User Rights Assignment) and the Secondary Logon service
+running. The account only needs DHCP read rights on the DHCP server itself,
+typically membership in the local `DHCP Users` group — it does not need to
+be an administrator on the DHCP server.
 
 Storing a credential needs Windows, since DPAPI is a Windows-only API; on any
 other platform the fields are refused with a message pointing at Credential

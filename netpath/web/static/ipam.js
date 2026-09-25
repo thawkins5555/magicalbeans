@@ -728,7 +728,7 @@
           const errorBox = b.querySelector('#dh-error');
           const label = button.textContent;
           // This can take a while -- it's a PowerShell round trip to the
-          // DHCP server, over WinRM when a credential is set -- so say so
+          // DHCP server, as the stored account when one is set -- so say so
           // immediately rather than leaving the dialog looking inert until
           // the response lands.
           button.disabled = true;

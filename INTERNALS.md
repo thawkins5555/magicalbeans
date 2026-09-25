@@ -12722,34 +12722,58 @@ One fixed PowerShell scriptblock (`_BODY`) does the actual query —
 3` per scope for its router, wrapped in its own try/catch since not every
 scope has one configured. Every cmdlet used is a `Get-`; nothing here can
 write to a DHCP server. The same scriptblock runs two different ways
-depending on whether a credential is configured:
+depending on whether a credential is configured, and both reach the DHCP
+server the same way — the `-ComputerName` parameter on each `Get-*` cmdlet,
+over the DhcpServer module's own RPC endpoint. Neither path uses PowerShell
+remoting:
 
 - **Ambient identity** (username/password blank): `& $body $server` —
   invoked directly, in the *local* PowerShell process this application
-  spawned. The `-ComputerName` parameter on each `Get-*` cmdlet is what
-  reaches the remote server, over the DhcpServer module's own RPC
-  endpoint. `Import-Module DhcpServer` therefore needs to succeed on
-  **the machine running SappiWhere**, not the DHCP server — this is the
-  detail that made an early support case (`Import-Module DhcpServer ...
-  not loaded`) confusing until the ambient-vs-credentialed distinction
-  was worked out: WinRM/CIM errors only apply to the credentialed path
-  below.
-- **A stored credential**: `Invoke-Command -ComputerName $server
-  -Credential $cred -ScriptBlock $body -ArgumentList $server` — the
-  scriptblock runs **on the DHCP server itself**, reached over WinRM.
-  `Import-Module DhcpServer` here needs to succeed on the DHCP server,
-  the opposite requirement from the ambient path. A stored credential is
-  decrypted immediately before this one call
-  (`ipam_worker.credential_for_server()`) and the plaintext reference is
-  dropped (`finally: username = password = None`) right after, so its
-  lifetime in the process is as short as the call that needs it.
+  spawned.
+- **A stored credential** (from 5.66.0): `Start-Job -Credential $cred
+  -ScriptBlock $body -ArgumentList $server` — a local background job,
+  spawned as the stored account on the machine running SappiWhere, that
+  runs the identical scriptblock. `Wait-Job -Job $job -Timeout $timeout`
+  bounds how long it may run; `$timeout` comes from a new
+  `SAPPI_DHCP_TIMEOUT_S` environment variable that `_run()` sets to the
+  overall timeout minus five seconds (floored at five), so the job is
+  always torn down well inside the Python-side kill. A job that times out,
+  or that fails outright, throws with its own reason; `Receive-Job -Job
+  $job -ErrorAction Stop` propagates that into the same `catch` the
+  ambient path uses, and `Remove-Job -Job $job -Force` in a `finally`
+  always cleans the job up. If the job ends without producing any output at
+  all, the script throws "returned nothing (job state `<State>`)" itself,
+  so the Python side never has to treat a null payload as success. A stored
+  credential is decrypted immediately
+  before this one call (`ipam_worker.credential_for_server()`) and the
+  plaintext reference is dropped (`finally: username = password = None`)
+  right after, so its lifetime in the process is as short as the call
+  that needs it.
 
-The server address, and the username/password for the credentialed path,
-travel as environment variables (`SAPPI_DHCP_SERVER`,
-`SAPPI_DHCP_USERNAME`, `SAPPI_DHCP_PASSWORD`) rather than being woven
-into the script text — the script itself is always one of two fixed
-constants (`_SCRIPT` for a full poll, `_TEST_SCRIPT` for the cheap
-reachability check), so there is no string for anything to inject into.
+`Import-Module DhcpServer` needs to succeed **on the machine running
+SappiWhere** for both paths now — this is the detail that made an early
+support case (`Import-Module DhcpServer ... not loaded`) confusing before
+the ambient-vs-credentialed distinction was worked out, and it now holds
+for the credentialed path too since its job also runs locally. Before
+5.66.0 the credentialed path instead ran the scriptblock on the DHCP
+server itself over WinRM (`Invoke-Command -ComputerName $server -Credential
+$cred -ScriptBlock $body -ArgumentList $server`); two of an operator's four
+DHCP servers were declining that WinRM step under an account that worked
+fine run by hand, which is what forced the change to a local job. The
+`DhcpServer` cmdlets have no `-Credential` parameter of their own, which is
+why the WinRM wrapper existed before there was a simpler way to run them
+as a different local account.
+
+The server address, the username/password for the credentialed path, and
+the job timeout travel as environment variables (`SAPPI_DHCP_SERVER`,
+`SAPPI_DHCP_USERNAME`, `SAPPI_DHCP_PASSWORD`, `SAPPI_DHCP_TIMEOUT_S`)
+rather than being woven into the script text — the script itself is always
+one of two fixed constants (`_SCRIPT` for a full poll, `_TEST_SCRIPT` for
+the cheap reachability check), so there is no string for anything to
+inject into. Both scriptblocks (`$body`, `$probe`) set
+`$ErrorActionPreference = 'Stop'` as their first statement, so a failing
+cmdlet inside the job surfaces as a terminating error the job boundary
+carries out, rather than a partial result.
 
 **Invocation** (`_run()`): the script is written to a temp `.ps1` file
 with a UTF-8 byte-order mark and run with `-File`, not piped over stdin
@@ -12764,9 +12788,12 @@ stdout (anything printed earlier — a progress line, a warning — is
 tolerated and ignored); the catch block on the PowerShell side prints
 `{"error": ...}` and exits 1 on any failure, which `_run()` turns into a
 `DhcpUnavailable` exception. `_friendly_error()` recognizes a handful of
-error substrings from real field failures (`"TrustedHosts"`, `"CIM
-server"`, `"DhcpServer" ... "not loaded"`) and appends the specific fix
-for each, without hiding PowerShell's own message.
+error substrings from real field failures — a local logon refusal
+(`"Logon failure"` / `"has not been granted the requested logon type"` / `"starting the background process"`),
+local CIM/WMI access on the SappiWhere machine (`"CIM server"`), and the
+module not being installed on the SappiWhere machine (`"DhcpServer" ...
+"not loaded"`) — and appends the specific fix for each, without hiding
+PowerShell's own message.
 
 ### Leased-IP history (`dhcp_scope_history`, in `ipamdb.py`)
 

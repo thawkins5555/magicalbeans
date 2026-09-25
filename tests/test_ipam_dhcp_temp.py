@@ -259,13 +259,14 @@ try:
     check("5f. ...the password was scrubbed",
           rec.calls and rec.calls[0]["env"]["SAPPI_DHCP_PASSWORD"] == "")
 
-    rec = Recorder(completed(1, '{"ok":false,"error":"Connecting to remote server '
-                                'failed: TrustedHosts"}\n'))
+    rec = Recorder(completed(1, '{"ok":false,"error":"Logon failure: the user has '
+                                'not been granted the requested logon type"}\n'))
     _, raised = run_with(rec)
     check("5g. the script reporting an error is DhcpUnavailable with the "
           "friendly guidance appended",
-          isinstance(raised, DhcpUnavailable) and "TrustedHosts" in str(raised)
-          and "winrm set" in str(raised), f"{type(raised).__name__}: {raised}")
+          isinstance(raised, DhcpUnavailable)
+          and str(raised).startswith("Logon failure: the user has not been granted")
+          and "Allow log on locally" in str(raised), f"{type(raised).__name__}: {raised}")
     check("5h. ...the script file was removed",
           rec.calls and not os.path.exists(rec.calls[0]["path"]))
     check("5i. ...the password was scrubbed",
@@ -280,6 +281,45 @@ try:
           rec.calls and not os.path.exists(rec.calls[0]["path"]))
     check("5l. ...the password was scrubbed",
           rec.calls and rec.calls[0]["env"]["SAPPI_DHCP_PASSWORD"] == "")
+
+    # ------------------ 6. stored credential: local job as that account, no WinRM
+    rec = Recorder(completed())
+    run_with(rec, timeout_s=42.7)
+    check("6a. _run hands the timeout, less five seconds, to the script as SAPPI_DHCP_TIMEOUT_S",
+          rec.calls and rec.calls[0]["env"].get("SAPPI_DHCP_TIMEOUT_S") == "37",
+          repr(rec.calls[0]["env"].get("SAPPI_DHCP_TIMEOUT_S")) if rec.calls else "no call")
+    for label, script, block in (("_SCRIPT", ipam_dhcp._SCRIPT, "$body"),
+                                 ("_TEST_SCRIPT", ipam_dhcp._TEST_SCRIPT, "$probe")):
+        check(f"6b. {label} has no Invoke-Command (no WinRM)",
+              "Invoke-Command" not in script)
+        check(f"6c. {label} runs {block} in a local job as the stored account, "
+              "bounded by $timeout",
+              f"Start-Job -Credential $cred -ScriptBlock {block} -ArgumentList $server" in script
+              and "Wait-Job -Job $job -Timeout $timeout" in script
+              and "Receive-Job -Job $job -ErrorAction Stop" in script
+              and "$job.State -eq 'Failed'" in script
+              and "if ($null -eq $result)" in script
+              and "Remove-Job -Job $job -Force" in script
+              and "$timeout  = [int]$env:SAPPI_DHCP_TIMEOUT_S" in script)
+        check(f"6d. {label}: {block} sets ErrorActionPreference Stop straight after param()",
+              f"{block} = {{\n    param($ComputerName)\n    $ErrorActionPreference = 'Stop'\n"
+              in script)
+    logon = ("Logon failure: the user has not been granted the requested logon "
+             "type at this computer")
+    friendly = ipam_dhcp._friendly_error(logon)
+    check("6e. the local logon refusal keeps the message and appends the "
+          "\"Allow log on locally\" guidance",
+          friendly.startswith(logon) and "Allow log on locally" in friendly
+          and "Secondary Logon" in friendly, friendly)
+    launch = ("An error occurred while starting the background process. "
+              "Error reported: Logon failure: unknown user name or bad password.")
+    check("6e2. a job that fails to start gets the same logon guidance",
+          "Allow log on locally" in ipam_dhcp._friendly_error(launch))
+    check("6f. no WinRM advice is left in the guidance",
+          all("winrm" not in ipam_dhcp._friendly_error(m).lower() for m in (
+              logon, "The WS-Management service cannot process the request. "
+              "The CIM server: access denied",
+              "The specified module 'DhcpServer' was not loaded")))
 finally:
     tempfile.tempdir = real_tempdir_cache
     shutil.rmtree(ROOT, ignore_errors=True)
