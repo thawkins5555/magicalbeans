@@ -435,7 +435,7 @@ class _ExporterState:
         else:
             data = build_ipfix_data(IPFIX_TEMPLATE_ID, IPFIX_FIELDS,
                                     [_ipfix_record(f) for f in records])
-            datagram = _ipfix_header(int(now_ts), self.records + len(records),
+            datagram = _ipfix_header(int(now_ts), self.records,
                                      0, 16 + len(data)) + data
         self.packets += 1
         self.records += len(records)

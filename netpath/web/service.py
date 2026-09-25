@@ -1774,7 +1774,7 @@ class Service:
                                      f"NetFlow: summarised the stored history "
                                      f"into the {ROLLUP_TIER_NAMES[tier]} rollups "
                                      f"({written[tier]} row(s) on this sweep)")
-                    if done or not rows:
+                    if done or not self.flow_db.backfill_pending(tier):
                         pending.remove(tier)
 
     def _maintenance_flow_prune(self) -> None:

@@ -263,6 +263,16 @@ def test_2_sequence_gaps_v5_v9_ipfix() -> None:
           f"IPFIX: sequence_gaps() attributes the 7 to {expfx} "
           f"({decoder.sequence_gaps().get(expfx)})")
 
+    # IPFIX data before its template carries an unknown record count: no baseline, no loss.
+    expfx2 = "10.60.0.4"
+    before = decoder.stats["seq_missed"]
+    decoder.decode(_ipfix_packet(_ipfix_data(901, 3), sequence=0), expfx2)
+    decoder.decode(_ipfix_packet(_ipfix_template(901) + _ipfix_data(901, 2), sequence=3), expfx2)
+    decoder.decode(_ipfix_packet(_ipfix_data(901, 2), sequence=5), expfx2)
+    check(decoder.stats["seq_missed"] - before == 0,
+          f"IPFIX: data sent before its template adds nothing to seq_missed "
+          f"(+{decoder.stats['seq_missed'] - before})")
+
     check(decoder.stats["seq_missed"] == sum(decoder.sequence_gaps().values()),
           "the running total agrees with the per-exporter breakdown")
 

@@ -278,10 +278,12 @@ maintenance cycles.
 **Query routing, made honest.** An exporter or interface view over a
 window the minute-tier summary can no longer reach now widens its own
 bucket to the hourly tier, the same fallback an unfiltered chart already
-had, rather than falling back to raw. Where a source, destination, port or protocol
-filter is in play, the chart now shades the part of the window records
-cannot reach (labelled "no records kept before …") and the totals line
-appends "· records only for this filter · records reach back to …", so a
+had, rather than falling back to raw. Wherever a view is answered from
+records alone — a source, destination, port or protocol filter, or an
+exporter or interface filter on history older than the summaries an
+upgraded store has built — the chart now shades the part of the window
+records cannot reach (labelled "no records kept before …") and the totals
+line appends "· answered from records only · records reach back to …", so a
 gap in the chart is something the page explains rather than something you
 have to notice on your own.
 

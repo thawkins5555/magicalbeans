@@ -3656,7 +3656,10 @@ Filters for source, destination, port, protocol and exporter apply to all three
 at once. **From 5.67.0, choosing an exporter also enables Interface and
 Direction** (Bidirectional / Inbound / Outbound) filters, blank and disabled
 until an exporter is chosen since an interface number only means anything on
-one device. Clicking a bar filters to it.
+one device. With Bidirectional, the chart and totals count a flow that both
+entered and left on the interface once per direction, while the record list
+and CSV list it once, so the "flow records" figure can exceed the CSV row
+count. Clicking a bar filters to it.
 
 ### EXPORTERS and INTERFACES — 5.67.0
 

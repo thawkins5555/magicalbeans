@@ -59,10 +59,7 @@ MAX_FIELDS_PER_TEMPLATE = 128
 # ceiling (~9.2e18), so it costs no real deployment anything.
 MAX_PLAUSIBLE_SAMPLING = 1_000_000
 
-# A sequence jump past this, in either direction, is the exporter's counter
-# wrapping or restarting rather than a real run of dropped packets, so it
-# resets the baseline instead of being added to seq_missed. Wide enough that
-# no real gap this collector could plausibly witness is mistaken for a reset.
+# A larger jump either way is a counter wrap or exporter restart, not loss.
 MAX_SEQUENCE_JUMP = 1_000_000
 
 # How many flows one datagram may yield. Nothing in the wire format bounds
@@ -437,18 +434,14 @@ class Decoder:
             while len(self.learned_rates) > MAX_SAMPLING:
                 self.learned_rates.pop(next(iter(self.learned_rates)))
 
-    def _note_sequence(self, exporter: str, domain: int, got: int, advance: int) -> None:
-        """Count sequence numbers an exporter's packet skipped since the
-        last one seen for this (exporter, domain).
-
-        `advance` is how far this packet's own sequence value moves the
-        baseline for the packet after it: v5 by its record count, v9 by one
-        packet, IPFIX by the records this packet carried. A decrease, or a
-        jump past MAX_SEQUENCE_JUMP either way, means the exporter restarted
-        or the counter wrapped rather than that many packets were lost, so it
-        resets the baseline instead of being counted.
-        """
+    def _note_sequence(self, exporter: str, domain: int, got: int,
+                       advance: int | None) -> None:
+        """Count sequence numbers skipped per (exporter, domain). `advance` is
+        this packet's step (v5/IPFIX records, v9 one); None drops the baseline."""
         key = (exporter, domain)
+        if advance is None:
+            self._expected_seq.pop(key, None)
+            return
         expected = self._expected_seq.get(key)
         if expected is not None:
             missed = got - expected
@@ -590,7 +583,7 @@ class Decoder:
         length = min(length, len(data))
         offset = 16
         flows: list[Flow] = []
-        records_total = 0
+        records_total: int | None = 0
 
         while offset + 4 <= length:
             set_id, set_len = struct.unpack_from("!HH", data, offset)
@@ -606,7 +599,10 @@ class Decoder:
                     body, exporter, domain, set_id, IPFIX, 0.0, export_time,
                     MAX_FLOWS_PER_PACKET - len(flows))
                 flows.extend(set_flows)
-                records_total += set_records
+                if set_records is None or records_total is None:
+                    records_total = None
+                else:
+                    records_total += set_records
             offset += set_len
         # IPFIX's sequence counts Data Records (flow and options data sets
         # both) sent so far, so the next packet's value is expected to be
@@ -796,16 +792,15 @@ class Decoder:
 
     def _read_data(self, body: bytes, exporter: str, domain: int, template_id: int,
                    version: int, boot: float, export_time: float,
-                   budget: int = MAX_FLOWS_PER_PACKET) -> tuple[list[Flow], int]:
-        """Returns (flows, records read) -- the second is every record this
-        set actually carried, options and budget-truncated ones included,
-        for IPFIX's sequence number to count against."""
+                   budget: int = MAX_FLOWS_PER_PACKET) -> tuple[list[Flow], int | None]:
+        """Returns (flows, records read) for IPFIX's sequence to count against;
+        the count is None when unknown (no or rejected template, or truncated)."""
         key = (exporter, domain, template_id)
         template = self.templates.get(key)
         if template is None:
             self.stats["no_template"] += 1
             self._note_missing(key)
-            return [], 0
+            return [], None
 
         flows: list[Flow] = []
         record_count = 0
@@ -819,7 +814,7 @@ class Decoder:
             self.stats["bad_template"] += 1
             self.stats["errors"] += 1
             self.templates.reject(key, "record shorter than 4 bytes")
-            return [], 0
+            return [], None
 
         while offset < len(body):
             if fixed is not None:
@@ -838,7 +833,7 @@ class Decoder:
 
             if len(flows) >= budget:
                 self.stats["truncated_flows"] += 1
-                break
+                return flows, None
 
             flow = self._build_flow(values, exporter, version, boot, export_time,
                                     domain)

@@ -73,9 +73,20 @@ two bugs in the simulator itself (an exporter boot time not always ahead
 of every flow a long `--burst` would generate; the exit summary not
 counting live-phase records) before it was ever pointed at the collector.
 
-**Outcome.** Testy, Fisty and Javariius's phases are in progress as this
-entry is written — Bob will amend this line once review and the push to
-`main` are done. See `CHANGELOG.md`'s 5.67.0 entry for the shipped result.
+**Outcome.** Testy ran the fifteen NetFlow-adjacent suites (all green), the
+full suite (215 of 220 passing; the five failures were the known
+environmental ones plus one real defect), two browser walks with the
+simulator live (every NetFlow check passed both times, once after a clean
+restart of the headless application), and the operator's own proof: a
+3-day exporter-filtered chart kept all three days after the raw records
+were pruned to about nine hours, and a source-filtered view said it was
+answered from records only. Fisty fixed the defect (a helper name defined
+twice in the API package broke two suites) and added two justified
+entries to the web-gates false-positive list for the new read routes.
+Javariius found no Major or Critical issues; its two P2 findings (IPFIX
+packets arriving before their template were counted as missed sequence
+numbers; this placeholder) and seven Low ones were all resolved before
+the push. Released as 5.67.0; `CHANGELOG.md` carries the full account.
 
 ## 5.66.0 — A stored DHCP credential now runs the poll locally, not over WinRM
 

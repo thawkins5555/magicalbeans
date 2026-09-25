@@ -6264,9 +6264,14 @@ check("iface: 'nf-iface', direction: 'nf-direction'," in NETFLOW139,
       "syncNetflowRoute mirrors iface and direction into the hash too")
 check("recordsOnlyEmptyText" in NETFLOW139
       and "No records kept before" in NETFLOW139
-      and "records only for this filter" in NETFLOW139
-      and "records reach back" in NETFLOW139,
+      and "is answered from records only.${hint}" in NETFLOW139
+      and "' · answered from records only · records reach back '" in NETFLOW139,
       "a records-only answer says so on the empty pane and in the totals line")
+check("const hint = f.src || f.dst || f.port || f.protocol\n"
+      "      ? ' Filter by exporter or interface for summary-backed history.' : '';"
+      in NETFLOW139,
+      "the exporter/interface hint is offered only when a source, destination, "
+      "port or protocol filter is set")
 check("if (data.widened) totalsText += ' · hourly summary';" in NETFLOW139,
       "a widened (summary-served) answer says so in the totals line too")
 check("`${counters.flows || 0} flows received`" in NETFLOW139,

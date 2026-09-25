@@ -12356,11 +12356,11 @@ minute tier of its own to compare against. `_agg_rows` reads one rollup
 arm — key rows and span rows — per scope `_rollup_plan` returned, and
 repairs each scope's own flagged buckets independently through
 `_repair_ranges(tier, scope, dim, t0, seal)`; `_repair_budget(scopes)`
-halves the global bounds per scope in play: the global scope alone keeps
-`_REPAIR_MAX_BUCKETS` (120) and `_REPAIR_MAX_FLOWS` (100,000) outright, a
-single scoped query gets `120 * 3 // 4 = 90` buckets and half the flow
-budget, and a two-scope `direction=both` interface query splits that once
-more to 45 buckets each — the same bound-parameter arithmetic as the
+divides the global bounds among the scopes in play: the global scope alone
+keeps `_REPAIR_MAX_BUCKETS` (120) and `_REPAIR_MAX_FLOWS` (100,000)
+outright, a single scoped query gets `120 * 3 // 4 = 90` buckets and the
+full 100,000-flow budget, and a two-scope `direction=both` interface query
+halves both to 45 buckets and 50,000 flows each — the same bound-parameter arithmetic as the
 global case (see Repairing a truncated rollup bucket, above), just spent
 across more scopes.
 

@@ -18,13 +18,16 @@ def _flow_filters(params) -> dict:
     direction = str(params.get("direction") or "both").lower()
     if direction not in ("in", "out", "both"):
         direction = "both"
+    iface = _num(params, "iface", None, int)
+    if iface is not None and not 0 <= iface <= 4294967295:
+        iface = None
     return {
         "src_ip": params.get("src", ""),
         "dst_ip": params.get("dst", ""),
         "port": params.get("port") or None,
         "protocol": _num(params, "protocol", None, int),
         "exporter": exporter,
-        "iface": _num(params, "iface", None, int),
+        "iface": iface,
         # A direction only means something scoped to one exporter's own
         # interface numbering; without one chosen it is forced back to
         # "both" here, so every downstream reader agrees it is a no-op

@@ -73,6 +73,12 @@ def main() -> int:
           f"every record generate_flows() produced decodes to exactly one "
           f"Flow ({len(decoded)} of {n_expected})")
 
+    ipfix_exp = next(exp for exp in exporters if exp.version == nfdecode.IPFIX)
+    ipfix_decoder, _, _ = decode_all([ipfix_exp], t0, t1, SEED)
+    check(ipfix_decoder.stats["seq_missed"] == 0,
+          f"an in-order IPFIX burst counts no missed sequence "
+          f"(seq_missed={ipfix_decoder.stats['seq_missed']})")
+
     by_exporter: dict = {}
     for exp_index, flow in decoded:
         by_exporter.setdefault(exp_index, []).append(flow)

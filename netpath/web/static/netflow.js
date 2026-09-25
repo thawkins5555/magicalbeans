@@ -83,15 +83,17 @@
   const FAILED_TEXT = 'Could not load flows for this window. The next refresh '
     + 'will try again.';
 
-  // Records-only history (A: the operator's report): a source/destination/
-  // port/protocol filter is answered from the raw records alone, which do
-  // not reach back as far as the summaries do. A window that falls wholly
-  // before that reach is not "no flows match" — it is a question this
-  // filter cannot answer that far back at all.
-  const recordsOnlyEmptyText = (data) =>
-    `No records kept before ${App.stamp(data.records_from)}; this filter ` +
-    '(source, destination, port or protocol) is answered from records ' +
-    'only. Filter by exporter or interface for summary-backed history.';
+  // Records-only history (A: the operator's report): a view answered from
+  // the raw records alone cannot reach back as far as the summaries do. A
+  // window wholly before that reach is not "no flows match". The hint only
+  // helps when a source/destination/port/protocol filter caused it.
+  const recordsOnlyEmptyText = (data) => {
+    const f = filters();
+    const hint = f.src || f.dst || f.port || f.protocol
+      ? ' Filter by exporter or interface for summary-backed history.' : '';
+    return `No records kept before ${App.stamp(data.records_from)}; this view `
+      + `is answered from records only.${hint}`;
+  };
 
   const view = {
     t0: Date.now() / 1000 - 3600,
@@ -1516,12 +1518,10 @@
     const totals = view.data.totals;
     let totalsText = `${totals.bytes_text} · ${totals.rate_text} avg · ` +
       `${totals.packets_text} packets · ${totals.flows} flow records`;
-    // Coverage honesty: a source/destination/port/protocol filter answers
-    // from the records alone, which reach back less far than the summaries
-    // that serve everything else — said in words here, not just implied by
-    // a chart that goes quiet before the window the operator asked for.
+    // Coverage honesty: a records-only answer reaches back less far than the
+    // summaries — said in words, not just implied by a chart gone quiet.
     if (data.records_only && data.records_from != null) {
-      totalsText += ' · records only for this filter · records reach back '
+      totalsText += ' · answered from records only · records reach back '
         + `to ${App.stamp(data.records_from)}`;
     }
     if (data.widened) totalsText += ' · hourly summary';
