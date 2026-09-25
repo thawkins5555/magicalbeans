@@ -4204,6 +4204,266 @@ async function checkMisc(page, watcher) {
              `window(s) (spans ${stale.join(', ')}); only ${result.wanted}s may be asked for`);
       return `${result.steps} steps -> ${result.spans.length} fetch(es), all ${result.wanted}s`;
     });
+
+  /* 5.67.0: the Plixer-style rebuild -- TRAFFIC/EXPORTERS/INTERFACES
+     subtabs, named exporters, and coverage honesty. Checks past this point
+     that need real multi-exporter history (demo/flows.py, run before the
+     walk) skip with a clear reason rather than fail on a sparse fleet. */
+  let netflowExporters = [];
+  let sparseNetflow = true;
+  const sparseSkip = 'skipped: /api/netflow/exporters returned fewer than 2 '
+    + 'exporters -- run demo/flows.py before the walk';
+
+  await check('the NetFlow TRAFFIC/EXPORTERS/INTERFACES subtabs render without a page error',
+    async () => {
+      await selectTab(page, 'netflow');
+      await settle(page, 1000);
+      try {
+        netflowExporters = await page.evaluate(async () => {
+          const res = await fetch('/api/netflow/exporters');
+          if (!res.ok) return [];
+          return ((await res.json()).exporters) || [];
+        });
+      } catch { netflowExporters = []; }
+      sparseNetflow = netflowExporters.length < 2;
+      const before = watcher.pageErrors.length + watcher.consoleErrors.length;
+      for (const name of ['exporters', 'interfaces', 'traffic']) {
+        await page.click(`#page-netflow > .subtabs > .subtab[data-subtab="${name}"]`);
+        await settle(page, 500);
+      }
+      const after = watcher.pageErrors.length + watcher.consoleErrors.length;
+      assert(after === before,
+             `${after - before} error(s) switching NetFlow subtabs: ` +
+             JSON.stringify([...watcher.pageErrors, ...watcher.consoleErrors]
+               .slice(before).map((e) => e.message || e.text)));
+      const active = await page.evaluate(() =>
+        (document.querySelector('#page-netflow > .subtabs > .subtab.active') || {}).dataset
+          ?.subtab);
+      assert(active === 'traffic', `expected TRAFFIC active after the walk, got "${active}"`);
+      return sparseNetflow
+        ? `TRAFFIC -> EXPORTERS -> INTERFACES -> TRAFFIC, no errors (${netflowExporters.length} exporter(s))`
+        : `TRAFFIC -> EXPORTERS -> INTERFACES -> TRAFFIC, no errors (${netflowExporters.length} exporters)`;
+    });
+
+  await check('NetFlow EXPORTERS lists at least two named exporters', async () => {
+    if (sparseNetflow) return sparseSkip;
+    await page.click('#page-netflow > .subtabs > .subtab[data-subtab="exporters"]');
+    await page.waitForSelector('#nf-exporters tbody tr', { timeout: 15000 });
+    await settle(page, 500);
+    const rows = await page.evaluate(() => {
+      const heads = [...document.querySelectorAll('#nf-exporters thead th')]
+        .map((th) => th.textContent.trim());
+      const exporterIdx = heads.findIndex((t) => t.startsWith('Exporter'));
+      const addressIdx = heads.findIndex((t) => t.startsWith('Address'));
+      return [...document.querySelectorAll('#nf-exporters tbody tr')].map((tr) => ({
+        exporter: (tr.cells[exporterIdx] || {}).textContent?.trim(),
+        address: (tr.cells[addressIdx] || {}).textContent?.trim(),
+      }));
+    });
+    assert(rows.length >= 2, `expected >= 2 exporter rows, got ${rows.length}`);
+    const named = rows.some((r) => r.exporter && r.address && r.exporter !== r.address);
+    assert(named, 'no exporter row shows a name distinct from its address');
+    return `${rows.length} exporter row(s), at least one named`;
+  });
+
+  await check('NetFlow INTERFACES lists rows with a rate figure or a utilisation bar',
+    async () => {
+      if (sparseNetflow) return sparseSkip;
+      await page.click('#page-netflow > .subtabs > .subtab[data-subtab="interfaces"]');
+      await page.waitForSelector('#nf-interfaces tbody tr', { timeout: 15000 });
+      await settle(page, 500);
+      const info = await page.evaluate(() => {
+        const rows = [...document.querySelectorAll('#nf-interfaces tbody tr')];
+        return { count: rows.length,
+                withBar: rows.filter((tr) => tr.querySelector('.bar-fill')).length,
+                text: rows.map((tr) => tr.textContent).join('|') };
+      });
+      assert(info.count >= 1, 'no interface rows rendered');
+      assert(info.withBar > 0 || /\d+(\.\d+)?\s*(bps|Kbps|Mbps|Gbps)/.test(info.text),
+             'no interface row carries a utilisation bar or a rate figure');
+      return `${info.count} interface row(s), ${info.withBar} with a utilisation bar`;
+    });
+
+  await check('clicking an INTERFACES row lands on TRAFFIC filtered to it, with a drawn chart',
+    async () => {
+      if (sparseNetflow) return sparseSkip;
+      await page.click('#page-netflow > .subtabs > .subtab[data-subtab="interfaces"]');
+      await page.waitForSelector('#nf-interfaces tbody tr', { timeout: 15000 });
+      await settle(page, 500);
+      await page.click('#nf-interfaces tbody tr');
+      await settle(page, 1200);
+      const state = await page.evaluate(() => ({
+        sub: (document.querySelector('#page-netflow > .subtabs > .subtab.active') || {})
+          .dataset?.subtab,
+        exporter: document.getElementById('nf-exporter').value,
+        iface: document.getElementById('nf-iface').value,
+        direction: document.getElementById('nf-direction').value,
+        bands: document.querySelectorAll(
+          '#nf-chart-svg polygon, #nf-chart-svg rect, #nf-chart-svg path').length,
+      }));
+      assert(state.sub === 'traffic', `expected TRAFFIC active, got "${state.sub}"`);
+      assert(state.exporter, 'nf-exporter was not set by the row click');
+      assert(state.direction === 'both', `expected nf-direction "both", got "${state.direction}"`);
+      assert(state.bands >= 1, 'the chart SVG carries no path/rect band after the jump');
+      return `exporter=${state.exporter} iface=${state.iface} direction=${state.direction}, `
+        + `${state.bands} band(s)`;
+    });
+
+  await check('NetFlow exporter options read "name (address, vN)" or "address (vN)"',
+    async () => {
+      if (sparseNetflow) return sparseSkip;
+      await page.click('#page-netflow > .subtabs > .subtab[data-subtab="traffic"]');
+      await settle(page, 500);
+      const options = await page.evaluate(() =>
+        [...document.getElementById('nf-exporter').options]
+          .map((o) => o.textContent).filter((t) => t !== 'All exporters'));
+      assert(options.length > 0, 'nf-exporter has no exporter options besides "All exporters"');
+      const named = /^.+ \(\d+\.\d+\.\d+\.\d+, v\d+\)$/;
+      const bare = /^\d+\.\d+\.\d+\.\d+ \(v\d+\)$/;
+      const bad = options.filter((t) => !named.test(t) && !bare.test(t));
+      assert(bad.length === 0, `option(s) matching neither format: ${bad.join(', ')}`);
+      return `${options.length} exporter option(s), all matching`;
+    });
+
+  await check('a 3-day exporter-filtered overview has traffic on >= 3 distinct days',
+    async () => {
+      if (sparseNetflow) return sparseSkip;
+      await page.click('#page-netflow > .subtabs > .subtab[data-subtab="traffic"]');
+      await settle(page, 500);
+      const busiest = [...netflowExporters]
+        .sort((a, b) => (b.flows_per_s || 0) - (a.flows_per_s || 0))[0];
+      const payload = await page.evaluate(async ({ address, seconds }) => {
+        document.getElementById('nf-range').value = String(seconds);
+        document.getElementById('nf-range').dispatchEvent(new Event('change'));
+        document.getElementById('nf-exporter').value = address;
+        document.getElementById('nf-exporter').dispatchEvent(new Event('change'));
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        const now = Date.now() / 1000;
+        const res = await fetch(`/api/netflow/overview?t0=${now - seconds}&t1=${now}` +
+          `&dimension=Application&exporter=${encodeURIComponent(address)}`);
+        return res.json();
+      }, { address: busiest.address, seconds: 259200 });
+      const days = new Set();
+      (payload.times || []).forEach((ts, i) => {
+        const total = (payload.series || [])
+          .reduce((sum, s) => sum + (s.values[i] || 0), 0);
+        if (total > 0) days.add(new Date(ts * 1000).toISOString().slice(0, 10));
+      });
+      assert(days.size >= 3,
+             `expected traffic on >= 3 distinct days, got ${days.size} (${[...days].join(', ')})`);
+      return `traffic on ${days.size} distinct day(s) for ${busiest.address}`;
+    });
+
+  await check('zoom, pan, a Live toggle and a brush drag each fetch once and never stay on Loading…',
+    async () => {
+      if (sparseNetflow) return sparseSkip;
+      await page.click('#page-netflow > .subtabs > .subtab[data-subtab="traffic"]');
+      await settle(page, 1200);
+      const before = watcher.pageErrors.length + watcher.consoleErrors.length;
+      const result = await page.evaluate(async () => {
+        const sleep_ = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+        // A known, wide starting window: predictable pixel/second math for
+        // the brush drag below, and independent of whatever range a prior
+        // check left selected.
+        const range = document.getElementById('nf-range');
+        range.value = '3600';
+        range.dispatchEvent(new Event('change'));
+        await sleep_(1000);
+
+        const counts = {};
+        let current = null;
+        const real = window.fetch;
+        window.fetch = (input, init) => {
+          const url = String(typeof input === 'string' ? input : (input || {}).url || '');
+          if (current && url.includes('/api/netflow/overview')) {
+            counts[current] = (counts[current] || 0) + 1;
+          }
+          return real(input, init);
+        };
+        const run = async (name, fn) => {
+          current = name;
+          counts[name] = 0;
+          await fn();
+          await sleep_(1200);
+          counts[`${name}_loading`] =
+            document.getElementById('nf-totals').textContent.includes('Loading');
+          current = null;
+        };
+        await run('zoomIn', () => document.getElementById('nf-in').click());
+        await run('zoomOut', () => document.getElementById('nf-out').click());
+        await run('panBack', () => document.getElementById('nf-back').click());
+        await run('panForward', () => document.getElementById('nf-fwd').click());
+        // One combined gesture: nf-follow's own onchange only fetches when
+        // it is switched back ON (turning it off just stops the window
+        // sliding), so off-then-on is the "toggle Live" this checks for one
+        // fetch from.
+        await run('liveToggle', () => {
+          const box = document.getElementById('nf-follow');
+          box.checked = false;
+          box.dispatchEvent(new Event('change'));
+          box.checked = true;
+          box.dispatchEvent(new Event('change'));
+        });
+        await run('brush', () => {
+          const svg = document.getElementById('nf-chart-svg');
+          const box = svg.getBoundingClientRect();
+          const y = box.top + box.height / 2;
+          const x1 = box.left + box.width * 0.3;
+          const x2 = box.left + box.width * 0.6;
+          const opts = { bubbles: true, cancelable: true, pointerId: 1, isPrimary: true,
+            button: 0 };
+          svg.setPointerCapture = svg.setPointerCapture || (() => {});
+          svg.dispatchEvent(new PointerEvent('pointerdown', { ...opts, clientX: x1, clientY: y }));
+          svg.dispatchEvent(new PointerEvent('pointermove', { ...opts, clientX: x2, clientY: y }));
+          svg.dispatchEvent(new PointerEvent('pointerup', { ...opts, clientX: x2, clientY: y }));
+        });
+        window.fetch = real;
+        return counts;
+      });
+      const after = watcher.pageErrors.length + watcher.consoleErrors.length;
+      assert(after === before,
+             `${after - before} error(s) during the zoom/pan/live/brush walk`);
+      for (const name of ['zoomIn', 'zoomOut', 'panBack', 'panForward', 'liveToggle', 'brush']) {
+        assert(result[name] === 1,
+               `${name} issued ${result[name]} /api/netflow/overview fetch(es), want 1`);
+        assert(!result[`${name}_loading`], `${name} left the totals pane reading "Loading…"`);
+      }
+      return 'zoom in/out, pan back/forward, Live toggle and a brush drag each fetched once';
+    });
+
+  await check("Reset returns the window span to the range's seconds", async () => {
+    await page.click('#page-netflow > .subtabs > .subtab[data-subtab="traffic"]');
+    await settle(page, 500);
+    const result = await page.evaluate(async () => {
+      const spans = [];
+      const real = window.fetch;
+      window.fetch = (input, init) => {
+        const url = String(typeof input === 'string' ? input : (input || {}).url || '');
+        if (url.includes('/api/netflow/overview')) {
+          const query = new URLSearchParams(url.split('?')[1] || '');
+          spans.push(Math.round(Number(query.get('t1')) - Number(query.get('t0'))));
+        }
+        return real(input, init);
+      };
+      const range = document.getElementById('nf-range');
+      range.value = '21600';
+      range.dispatchEvent(new Event('change'));
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      // Zoomed away from the range's own span, so Reset below has something
+      // to undo rather than trivially matching by having never moved.
+      document.getElementById('nf-in').click();
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      document.getElementById('nf-reset').click();
+      await new Promise((resolve) => setTimeout(resolve, 800));
+      window.fetch = real;
+      return { spans, wanted: 21600 };
+    });
+    const last = result.spans[result.spans.length - 1];
+    assert(last === result.wanted,
+           `expected the window after Reset to span ${result.wanted}s, the last fetch asked ` +
+           `for ${last}s (all: ${result.spans.join(', ')})`);
+    return `Reset -> ${last}s window`;
+  });
 }
 
 async function checkReadOnly(browser, base, creds, dir, tag) {
