@@ -430,6 +430,12 @@ try:
         "get_flow_records": "same namelookup.resolve_name false match as "
                            "get_flow_overview",
         "get_flow_records_export": "same namelookup.resolve_name false match",
+        "get_flow_exporters": "namelookup.resolve_names, the batched "
+                              "resolve_name: SELECT-only (devices_by_addresses "
+                              "+ app_db.hostnames), matched only on its "
+                              "resolve_ prefix",
+        "get_flow_interfaces": "same namelookup.resolve_names false match as "
+                               "get_flow_exporters",
         "get_syslog_search": "same namelookup.resolve_name false match",
         "get_syslog_search_export": "same namelookup.resolve_name false match",
         "get_nodes_device": "alerts_db.mute_row is a SELECT for the currently-"
