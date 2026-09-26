@@ -23,9 +23,10 @@ import sys
 import time
 import types
 
-from _paths import tmpdir
+from _paths import free_udp_port, tmpdir
 
-from netpath import flowdb, nfdecode, permissions
+from netpath import eventlog, flowdb, nfdecode, permissions
+from netpath.collector import Collector
 from netpath.flowdb import FlowDatabase
 from netpath.web import api
 from netpath.web.server import ROUTES
@@ -233,9 +234,15 @@ def test_2_sequence_gaps_v5_v9_ipfix() -> None:
     check(decoder.stats["seq_missed"] - before == 7,
           f"v5: a jump from expected 10 to 17 counts 7 missed "
           f"(+{decoder.stats['seq_missed'] - before})")
-    check(decoder.sequence_gaps().get(exp5) == 7,
-          f"v5: sequence_gaps() attributes the 7 to {exp5} "
-          f"({decoder.sequence_gaps().get(exp5)})")
+    gap5 = decoder.sequence_gaps().get(exp5)
+    check(gap5 is not None and gap5["missed"] == 7 and gap5["gaps"] == 1
+          and gap5["resets"] == 0,
+          f"v5: sequence_gaps() attributes 7 missed, 1 gap, 0 resets to "
+          f"{exp5} ({gap5})")
+    check(gap5["last"]["expected"] == 10 and gap5["last"]["got"] == 17
+          and gap5["last"]["domain"] == 0 and gap5["last"]["gap_s"] >= 0,
+          f"...and 'last' names the expected/got/domain and a non-negative "
+          f"gap_s ({gap5['last']})")
 
     # v9: header sequence counts packets; expected next = last + 1.
     exp9 = "10.60.0.2"
@@ -246,9 +253,11 @@ def test_2_sequence_gaps_v5_v9_ipfix() -> None:
     check(decoder.stats["seq_missed"] - before == 3,
           f"v9: a jump from expected 102 to 105 counts 3 missed "
           f"(+{decoder.stats['seq_missed'] - before})")
-    check(decoder.sequence_gaps().get(exp9) == 3,
-          f"v9: sequence_gaps() attributes the 3 to {exp9} "
-          f"({decoder.sequence_gaps().get(exp9)})")
+    gap9 = decoder.sequence_gaps().get(exp9)
+    check(gap9 is not None and gap9["missed"] == 3 and gap9["gaps"] == 1,
+          f"v9: sequence_gaps() attributes 3 missed, 1 gap to {exp9} ({gap9})")
+    check(gap9["last"]["expected"] == 102 and gap9["last"]["got"] == 105,
+          f"...and 'last' names expected 102, got 105 ({gap9['last']})")
 
     # IPFIX: sequence counts data records; expected next = last + records.
     expfx = "10.60.0.3"
@@ -259,9 +268,12 @@ def test_2_sequence_gaps_v5_v9_ipfix() -> None:
     check(decoder.stats["seq_missed"] - before == 7,
           f"IPFIX: a jump from expected 3 to 10 counts 7 missed "
           f"(+{decoder.stats['seq_missed'] - before})")
-    check(decoder.sequence_gaps().get(expfx) == 7,
-          f"IPFIX: sequence_gaps() attributes the 7 to {expfx} "
-          f"({decoder.sequence_gaps().get(expfx)})")
+    gapfx = decoder.sequence_gaps().get(expfx)
+    check(gapfx is not None and gapfx["missed"] == 7 and gapfx["gaps"] == 1,
+          f"IPFIX: sequence_gaps() attributes 7 missed, 1 gap to {expfx} "
+          f"({gapfx})")
+    check(gapfx["last"]["expected"] == 3 and gapfx["last"]["got"] == 10,
+          f"...and 'last' names expected 3, got 10 ({gapfx['last']})")
 
     # IPFIX data before its template carries an unknown record count: no baseline, no loss.
     expfx2 = "10.60.0.4"
@@ -272,16 +284,44 @@ def test_2_sequence_gaps_v5_v9_ipfix() -> None:
     check(decoder.stats["seq_missed"] - before == 0,
           f"IPFIX: data sent before its template adds nothing to seq_missed "
           f"(+{decoder.stats['seq_missed'] - before})")
+    check(expfx2 not in decoder.sequence_gaps(),
+          "...and the templateless baseline drop is not counted as a gap either")
 
-    check(decoder.stats["seq_missed"] == sum(decoder.sequence_gaps().values()),
+    check(decoder.stats["seq_missed"]
+          == sum(entry["missed"] for entry in decoder.sequence_gaps().values()),
           "the running total agrees with the per-exporter breakdown")
 
     # A decrease resets rather than counts: a restarted exporter is not "billions missed".
-    decoder.decode(_v5_packet(count=1, flow_sequence=2), exp5)
-    before = decoder.stats["seq_missed"]
-    decoder.decode(_v5_packet(count=1, flow_sequence=1), exp5)
-    check(decoder.stats["seq_missed"] == before,
+    decoder.decode(_v5_packet(count=1, flow_sequence=2), exp5)  # expected 22 -> a reset
+    before_missed = decoder.stats["seq_missed"]
+    before_resets = decoder.stats["seq_resets"]
+    gaps_before = decoder.sequence_gaps().get(exp5, {}).get("gaps", 0)
+    decoder.decode(_v5_packet(count=1, flow_sequence=1), exp5)  # another decrease
+    check(decoder.stats["seq_missed"] == before_missed,
           "a lower sequence than expected (a restart) is not counted as missed")
+    check(decoder.stats["seq_resets"] == before_resets + 1,
+          "...but is counted as a reset")
+    check(decoder.sequence_gaps()[exp5]["resets"] >= 1
+          and decoder.sequence_gaps()[exp5]["gaps"] == gaps_before,
+          "...and the per-exporter breakdown carries the reset without "
+          "adding it as an extra gap")
+
+    # Two observation domains from one exporter: missed/gaps/resets sum
+    # across domains, and 'last' is whichever domain's gap is most recent.
+    multi = "10.60.0.5"
+    decoder.decode(_v9_packet(_v9_template_and_data(750, 2000, 20), sequence=0, domain=0), multi)
+    decoder.decode(_v9_packet(_v9_template_and_data(750, 2000, 20), sequence=0, domain=1), multi)
+    decoder.decode(_v9_packet(_v9_data_only(750, 2000, 20), sequence=1, domain=0), multi)
+    decoder.decode(_v9_packet(_v9_data_only(750, 2000, 20), sequence=1, domain=1), multi)
+    decoder.decode(_v9_packet(_v9_data_only(750, 2000, 20), sequence=9, domain=0), multi)   # 7 missed
+    time.sleep(0.01)   # so the two gaps cannot land on the same timestamp
+    decoder.decode(_v9_packet(_v9_data_only(750, 2000, 20), sequence=5, domain=1), multi)   # 3 missed, more recent
+    gap_multi = decoder.sequence_gaps().get(multi)
+    check(gap_multi is not None and gap_multi["missed"] == 10 and gap_multi["gaps"] == 2,
+          f"missed and gaps sum across the exporter's two domains ({gap_multi})")
+    check(gap_multi["last"]["domain"] == 1 and gap_multi["last"]["expected"] == 2
+          and gap_multi["last"]["got"] == 5,
+          f"'last' is the more recent gap, from domain 1 ({gap_multi['last']})")
 
 
 # ------------------------------------------------------------------------- 3
@@ -366,6 +406,12 @@ def _exporters_fixture(name: str):
         interfaces={1: [iface_row(1, 1_000_000_000, descr="Gi0/1")]})
     app = StubAppDb({"10.70.0.2": "edge2.example.net"})
     collector = StubCollector(nfdecode.Decoder())
+    # A's decoder sees one sequence gap (expected 1, got 5 -- 4 missed); B
+    # and C never do, so the route can be checked both ways.
+    collector.decoder.decode(
+        _v9_packet(_v9_template_and_data(750, 100, 5), sequence=0), "10.70.0.1")
+    collector.decoder.decode(
+        _v9_packet(_v9_data_only(750, 100, 5), sequence=5), "10.70.0.1")
     return db, nodes, app, collector, t0, t1
 
 
@@ -394,6 +440,21 @@ def test_5_get_flow_exporters() -> None:
               f"({by_address['10.70.0.1']['rate_text']})")
         check(sorted(payload["exporters"], key=lambda e: (e["name"] or "", e["address"]))
               == payload["exporters"], "sorted by name then address")
+
+        gap_a = by_address["10.70.0.1"]
+        check(gap_a["seq_missed"] == 4 and gap_a["seq_gaps"] == 1
+              and gap_a["seq_resets"] == 0,
+              f"A's one sequence gap is reflected as seq_missed/seq_gaps/"
+              f"seq_resets ({gap_a['seq_missed']}, {gap_a['seq_gaps']}, "
+              f"{gap_a['seq_resets']})")
+        check(gap_a["seq_last"] is not None
+              and gap_a["seq_last"]["expected"] == 1 and gap_a["seq_last"]["got"] == 5,
+              f"...and seq_last names the gap ({gap_a['seq_last']})")
+        check(by_address["10.70.0.2"]["seq_missed"] == 0
+              and by_address["10.70.0.2"]["seq_gaps"] == 0
+              and by_address["10.70.0.2"]["seq_resets"] == 0
+              and by_address["10.70.0.2"]["seq_last"] is None,
+              "B, which never had a gap, reports zeros and no seq_last")
     finally:
         db.close()
 
@@ -450,6 +511,10 @@ def test_7_overview_exporter_names_and_records_only() -> None:
         check(exporters.get("10.70.0.1") == "core1",
               f"the overview's exporter list carries the resolved name "
               f"({exporters.get('10.70.0.1')})")
+        check("breakdown_from" in overview and overview["breakdown_from"] is None,
+              f"the overview always carries breakdown_from, None until "
+              f"flowdb's reconstruction step lands "
+              f"({overview.get('breakdown_from')})")
 
         src_params = {**params, "src": "192.168.0.1"}
         src_overview = api.get_flow_overview(svc, src_params, None)
@@ -491,6 +556,59 @@ def test_8_iface_direction_filters_narrow_records() -> None:
         db.close()
 
 
+def test_9_collector_logs_sequence_gap_throttled() -> None:
+    print("9: the collector logs a sequence gap once per 600s per exporter")
+    flow_db = FlowDatabase(os.path.join(TMPDIR, "seqgap.db"))
+    log = eventlog.EventLog()
+    collector = Collector(flow_db, log=log)
+    port = free_udp_port()
+    exporter = "10.199.17.1"
+    try:
+        assert collector.start({"port": port, "bind_address": "127.0.0.1"})
+        # No socket traffic needed -- feed the decoder path directly, the
+        # way test_collector_errors.py's R11 drives _handle_datagram.
+        collector._handle_datagram(_v5_packet(count=5, flow_sequence=0), (exporter, 1))
+        collector._handle_datagram(_v5_packet(count=5, flow_sequence=1240), (exporter, 1))
+        gap_lines = [e for e in log.all() if "Sequence gap from" in e.message]
+        check(len(gap_lines) == 1,
+              f"one Sequence gap line is logged (got {len(gap_lines)})")
+        check("expected 5, got 1240" in gap_lines[0].message
+              and "1235 packet(s) missing" in gap_lines[0].message
+              and "domain 0" in gap_lines[0].message,
+              f"it names the expected/got, domain and the count missing "
+              f"({gap_lines[0].message!r})")
+        check(gap_lines[0].detail,
+              "the detail carries the same numbers as the message")
+
+        # A second gap inside the same 600s window is suppressed.
+        collector._handle_datagram(_v5_packet(count=5, flow_sequence=2000), (exporter, 1))
+        gap_lines = [e for e in log.all() if "Sequence gap from" in e.message]
+        check(len(gap_lines) == 1,
+              "a second gap inside the throttle window logs nothing more")
+
+        # Advance the throttle clock directly: the next gap logs again.
+        collector._log_times[f"seqgap:{exporter}"] = 0.0
+        collector._handle_datagram(_v5_packet(count=5, flow_sequence=5000), (exporter, 1))
+        gap_lines = [e for e in log.all() if "Sequence gap from" in e.message]
+        check(len(gap_lines) == 2,
+              "...but fires again once the throttle window is reset")
+        check("1,235 missed and 0 resets" in gap_lines[0].message,
+              f"the first line's running total is exact and comma-formatted "
+              f"({gap_lines[0].message!r})")
+        check("4,985 missed and 0 resets" in gap_lines[1].message,
+              f"the second line's running total includes the suppressed gap "
+              f"too ({gap_lines[1].message!r})")
+
+        # A reset (a decrease) is not logged as a sequence gap.
+        collector._log_times[f"seqgap:{exporter}"] = 0.0
+        collector._handle_datagram(_v5_packet(count=1, flow_sequence=1), (exporter, 1))
+        gap_lines = [e for e in log.all() if "Sequence gap from" in e.message]
+        check(len(gap_lines) == 2, "a decrease logs no new sequence gap line")
+    finally:
+        collector.stop()
+        flow_db.close()
+
+
 TESTS = [
     ("1", test_1_routes_registered),
     ("2", test_2_sequence_gaps_v5_v9_ipfix),
@@ -500,6 +618,7 @@ TESTS = [
     ("6", test_6_get_flow_interfaces_utilisation),
     ("7", test_7_overview_exporter_names_and_records_only),
     ("8", test_8_iface_direction_filters_narrow_records),
+    ("9", test_9_collector_logs_sequence_gap_throttled),
 ]
 
 

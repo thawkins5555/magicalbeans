@@ -601,6 +601,24 @@
         x: plot.x + 4, y: plot.y + 12, fill: 'var(--dim)',
         'font-family': 'var(--mono)', 'font-size': 'var(--fs-2xs)',
       }, `no records kept before ${App.stamp(data.records_from, view.t1 - view.t0)}`));
+    } else if (data.breakdown_from != null && data.breakdown_from > t0) {
+      // Reconstruction (5.67.1): a scoped window drawn from summaries below
+      // the breakdown floor carries the scope's totals only, in "— other —"
+      // — the per-exporter/host/application rows never existed before the
+      // upgrade. Fainter than the records-only shade above (0.08 vs 0.12) so
+      // the two are never mistaken for the same gap; the `else` keeps that
+      // one's precedence, since a records-only answer has no breakdown of
+      // its own to speak of either.
+      const shadeEnd = Math.min(data.breakdown_from, t1);
+      svg.appendChild(App.svgNode('rect', {
+        x: xOf(t0), y: plot.y, width: Math.max(xOf(shadeEnd) - xOf(t0), 0),
+        height: plot.h, fill: 'var(--data-neutral)', 'fill-opacity': 0.08,
+      }));
+      svg.appendChild(App.svgNode('text', {
+        x: plot.x + 4, y: plot.y + 12, fill: 'var(--dim)',
+        'font-family': 'var(--mono)', 'font-size': 'var(--fs-2xs)',
+      }, `totals only before ${App.stamp(data.breakdown_from, view.t1 - view.t0)}; ` +
+         'breakdown by application, host and interface from the upgrade onward'));
     }
 
     const span = view.t1 - view.t0;
@@ -724,6 +742,12 @@
       if (covered < seconds) heading += `, rated over ${App.span(seconds)}`;
     }
     const rows = [{ text: heading }];
+    // Same floor as the shaded region above: a slot starting before it drew
+    // its whole value into "— other —" for want of a breakdown, not because
+    // nothing else was talking.
+    if (data.breakdown_from != null && data.times[slot] < data.breakdown_from) {
+      rows.push({ text: 'totals only (before the upgrade)' });
+    }
     // The index has to survive the sort: it is what maps a series to the
     // colour of its band, and sorting by volume reorders the rows.
     const pairs = data.series
@@ -955,7 +979,11 @@
     { key: 'interfaces', label: 'Interfaces', width: 90, numeric: true,
       cell: (r) => String(r.interfaces || 0) },
     { key: 'seq_missed', label: 'Missed seq', width: 100, numeric: true,
-      cell: (r) => (r.seq_missed || 0).toLocaleString() },
+      cell: (r) => {
+        const missed = (r.seq_missed || 0).toLocaleString();
+        return r.seq_resets > 0
+          ? `${missed} (${r.seq_resets.toLocaleString()} resets)` : missed;
+      } },
     { key: 'sampling', label: 'Sampling', width: 90, numeric: true,
       value: (r) => r.sampling || 0,
       cell: (r) => (r.sampling ? escape(`1:${r.sampling}`) : '—') },
@@ -969,6 +997,20 @@
     // flow table's own Route column uses.
     { key: 'report', label: '', sortable: false, fixed: true, width: 84, cell: () => '' },
   ];
+
+  // The Missed seq cell's hover detail: how many gap events sit behind the
+  // running count, and the most recent one by name, rather than making an
+  // operator go looking in Debug for what a bare number does not say.
+  function seqTip(row) {
+    const rows = [{ text: `${(row.seq_gaps || 0).toLocaleString()} gap events` }];
+    const last = row.seq_last;
+    if (last) {
+      rows.push({ text: `last gap: expected ${last.expected.toLocaleString()}, ` +
+        `got ${last.got.toLocaleString()}, domain ${last.domain}, ${ago(last.ts)}, ` +
+        `${last.gap_s.toFixed(1)}s after the previous packet` });
+    }
+    return rows;
+  }
 
   let exportersSort = { key: 'flows_per_s', descending: true };
   function onExportersSort(key, descending) {
@@ -990,6 +1032,12 @@
         if (event.target.closest('.nf-exp-report')) return;
         goToInterfaces(row);
       };
+      const seqCell = tr.cells[EXPORTER_COLUMNS.findIndex((c) => c.key === 'seq_missed')];
+      if (seqCell) {
+        const tip = seqTip(row);
+        seqCell.addEventListener('mousemove', (event) => App.tooltip(tip, event));
+        seqCell.addEventListener('mouseleave', App.hideTooltip);
+      }
       const reportCell = tr.cells[EXPORTER_COLUMNS.findIndex((c) => c.key === 'report')];
       if (!reportCell) return;
       const btn = document.createElement('button');
@@ -1523,6 +1571,11 @@
     if (data.records_only && data.records_from != null) {
       totalsText += ' · answered from records only · records reach back '
         + `to ${App.stamp(data.records_from)}`;
+    }
+    // Same floor the chart shades: said here too, since the totals line is
+    // what a screen reader gets instead of the shading.
+    if (data.breakdown_from != null && data.breakdown_from > data.t0) {
+      totalsText += ` · breakdown from ${App.stamp(data.breakdown_from)}`;
     }
     if (data.widened) totalsText += ' · hourly summary';
     App.el('nf-totals').textContent = totalsText;

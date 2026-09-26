@@ -185,6 +185,7 @@ class Collector(udpsock.UdpReceiver):
         templates_before = self.decoder.stats["templates"]
         errors_before = self.decoder.stats["errors"]
         no_template_before = self.decoder.stats["no_template"]
+        seq_missed_before = self.decoder.stats["seq_missed"]
         flows = self.decoder.decode(data, exporter)
 
         # One line per interval for the whole collector, not per key: the key
@@ -232,6 +233,23 @@ class Collector(udpsock.UdpReceiver):
                     f"Received {self._templates_pending} template(s) from "
                     f"{exporter}", target=exporter):
                 self._templates_pending = 0
+        if self.decoder.stats["seq_missed"] > seq_missed_before:
+            # Whether path loss or the exporter's own numbering is doing
+            # this is for the operator to judge -- this line and the
+            # Exporters table just say what happened, plainly.
+            gap = self.decoder.sequence_gaps().get(exporter) or {}
+            last = gap.get("last")
+            if last is not None:
+                message = (
+                    f"Sequence gap from {exporter} (domain {last['domain']}): "
+                    f"expected {last['expected']}, got {last['got']} — "
+                    f"{last['got'] - last['expected']} packet(s) missing, "
+                    f"{last['gap_s']:.1f} s after the previous packet; "
+                    f"{gap.get('missed', 0):,} missed and "
+                    f"{gap.get('resets', 0)} resets so far since start")
+                self._log_netflow_throttled(
+                    f"seqgap:{exporter}", message, detail=message,
+                    target=exporter, interval_s=600)
         if self.decoder.stats["errors"] > errors_before:
             # One line a minute, not one per datagram: the event log is a
             # 3,000-entry ring, and a flood of runts emptied it of everything

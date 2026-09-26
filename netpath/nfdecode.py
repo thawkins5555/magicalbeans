@@ -371,15 +371,23 @@ class Decoder:
         self.stats = {"packets": 0, "flows": 0, "templates": 0, "errors": 0,
                       "no_template": 0, "bad_template": 0,
                       "implausible_sampling": 0, "truncated_flows": 0,
-                      "seq_missed": 0}
+                      "seq_missed": 0, "seq_resets": 0}
         # (exporter, domain) -> the sequence value the exporter's next packet
         # should carry. Bounded the same way self.sampling is: a flat LRU
         # keyed on wire-controlled fields, capped at MAX_TEMPLATE_EXPORTERS so
         # a source cycling `domain` cannot grow it without bound.
         self._expected_seq: _Lru = _Lru(MAX_TEMPLATE_EXPORTERS)
-        # (exporter, domain) -> sequence numbers missed since the baseline
-        # was last reset, for sequence_gaps() to sum per exporter.
+        # (exporter, domain) -> sequence numbers missed / gap events / reset
+        # events since the baseline was last reset, for sequence_gaps() to
+        # sum per exporter. Same bound as _expected_seq, same reason.
         self._seq_missed_by_key: _Lru = _Lru(MAX_TEMPLATE_EXPORTERS)
+        self._seq_gaps_by_key: _Lru = _Lru(MAX_TEMPLATE_EXPORTERS)
+        self._seq_resets_by_key: _Lru = _Lru(MAX_TEMPLATE_EXPORTERS)
+        # (exporter, domain) -> {expected, got, ts, gap_s} for the most
+        # recent gap, and -> the arrival time of the last packet, so gap_s
+        # (time since the previous packet from that key) can be measured.
+        self._last_gap_by_key: _Lru = _Lru(MAX_TEMPLATE_EXPORTERS)
+        self._last_arrival: _Lru = _Lru(MAX_TEMPLATE_EXPORTERS)
         # (exporter, domain, template_id) -> {count, first_ts, last_ts, reason}
         # for data sets dropped since no template was cached for that key.
         self.missing: _Lru = _Lru(256)
@@ -436,12 +444,15 @@ class Decoder:
 
     def _note_sequence(self, exporter: str, domain: int, got: int,
                        advance: int | None) -> None:
-        """Count sequence numbers skipped per (exporter, domain). `advance` is
-        this packet's step (v5/IPFIX records, v9 one); None drops the baseline."""
+        """Count sequence numbers skipped per (exporter, domain), and note
+        gap/reset events and the most recent gap for sequence_gaps(). `advance`
+        is this packet's step (v5/IPFIX records, v9 one); None drops the
+        baseline without counting anything (a templateless IPFIX packet)."""
         key = (exporter, domain)
         if advance is None:
             self._expected_seq.pop(key, None)
             return
+        now = time.time()
         expected = self._expected_seq.get(key)
         if expected is not None:
             missed = got - expected
@@ -449,14 +460,44 @@ class Decoder:
                 self.stats["seq_missed"] += missed
                 self._seq_missed_by_key[key] = (
                     self._seq_missed_by_key.get(key, 0) + missed)
+                self._seq_gaps_by_key[key] = (
+                    self._seq_gaps_by_key.get(key, 0) + 1)
+                prev_ts = self._last_arrival.get(key)
+                self._last_gap_by_key[key] = {
+                    "expected": expected, "got": got, "ts": now,
+                    "gap_s": now - prev_ts if prev_ts is not None else 0.0,
+                }
+            elif missed != 0:
+                # A decrease (the exporter restarted) or a jump past
+                # MAX_SEQUENCE_JUMP (a counter wrap) is not loss -- a reset,
+                # counted separately so it cannot read as "billions missed".
+                self.stats["seq_resets"] += 1
+                self._seq_resets_by_key[key] = (
+                    self._seq_resets_by_key.get(key, 0) + 1)
         self._expected_seq[key] = got + advance
+        self._last_arrival[key] = now
 
-    def sequence_gaps(self) -> dict[str, int]:
-        """Missed sequence numbers so far, summed across domains, per
-        exporter -- for the Exporters table and /api/netflow/exporters."""
-        totals: dict[str, int] = {}
-        for (exporter, _domain), missed in self._seq_missed_by_key.items():
-            totals[exporter] = totals.get(exporter, 0) + missed
+    def sequence_gaps(self) -> dict[str, dict]:
+        """Missed/gaps/resets so far, summed across domains, per exporter --
+        for the Exporters table and /api/netflow/exporters. `last` is the
+        most recent gap event across the exporter's domains, carrying which
+        domain it came from."""
+        totals: dict[str, dict] = {}
+
+        def entry(exporter: str) -> dict:
+            return totals.setdefault(
+                exporter, {"missed": 0, "gaps": 0, "resets": 0, "last": None})
+
+        for (exporter, _domain), missed in list(self._seq_missed_by_key.items()):
+            entry(exporter)["missed"] += missed
+        for (exporter, _domain), gaps in list(self._seq_gaps_by_key.items()):
+            entry(exporter)["gaps"] += gaps
+        for (exporter, _domain), resets in list(self._seq_resets_by_key.items()):
+            entry(exporter)["resets"] += resets
+        for (exporter, domain), gap in list(self._last_gap_by_key.items()):
+            current = entry(exporter)
+            if current["last"] is None or gap["ts"] > current["last"]["ts"]:
+                current["last"] = {**gap, "domain": domain}
         return totals
 
     def drain_learned_rates(self, limit: int | None = None) -> list[tuple[str, int, int, int]]:

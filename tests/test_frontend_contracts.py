@@ -6281,6 +6281,43 @@ check("if (counters.seq_missed) parts.push(`${counters.seq_missed} missed sequen
       "a non-zero seq_missed counter is surfaced on the strip locally, since "
       "it is not one of App.extraCounterParts' fixed EXTRA_COUNTERS entries")
 
+# ---------------------------------------------------------------------------
+# 140. NetFlow follow-up (5.67.1): pre-upgrade history is totals-only, not
+#      absent, and sequence gaps get their own diagnostics. See the plan's
+#      "NetFlow follow-up" section.
+NETFLOW140 = read("netflow.js")
+_DRAWCHART140 = js_function(NETFLOW140, "drawChart")
+check("} else if (data.breakdown_from != null && data.breakdown_from > t0) {"
+      in _DRAWCHART140
+      and "'fill-opacity': 0.08," in _DRAWCHART140
+      and "`totals only before ${App.stamp(data.breakdown_from, view.t1 - view.t0)}; ` +"
+      in _DRAWCHART140
+      and "'breakdown by application, host and interface from the upgrade onward'"
+      in _DRAWCHART140,
+      "drawChart shades [t0, breakdown_from) at 0.08 opacity with its own "
+      "label, in an else-if that keeps the records-only shade's precedence")
+
+_REFRESH140 = js_function(NETFLOW140, "refresh")
+check("if (data.breakdown_from != null && data.breakdown_from > data.t0) {" in _REFRESH140
+      and "totalsText += ` · breakdown from ${App.stamp(data.breakdown_from)}`;"
+      in _REFRESH140,
+      "the totals line appends '· breakdown from <stamp>' once breakdown_from "
+      "is set and past the response's own t0")
+
+_EXPCOLS140 = js_const(NETFLOW140, "EXPORTER_COLUMNS")
+check("const missed = (r.seq_missed || 0).toLocaleString();" in _EXPCOLS140
+      and "return r.seq_resets > 0\n"
+          "          ? `${missed} (${r.seq_resets.toLocaleString()} resets)` : missed;"
+      in _EXPCOLS140,
+      "the Missed seq cell reads '<missed>' or '<missed> (<resets> resets)', "
+      "both numbers through toLocaleString")
+
+AGO140 = js_function(APP, "ago")
+check("if (age < -60) return `in ${span(-age)}`;" in AGO140
+      and "if (age < 0) return" not in AGO140,
+      "App.ago clamps a negative age to 'just now' for up to 60s of clock "
+      "skew, only reading 'in …' past that")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

@@ -26,7 +26,9 @@ bucket older than the raw retention keeps the hole.
 Summaries are kept per scope as well as globally: per exporter at both tiers,
 and per (exporter, interface, direction) at the hourly tier, each with its own
 smaller cap. An exporter or interface filter reads its scope; an address,
-port or protocol filter has no scope and reads raw.
+port or protocol filter has no scope and reads raw. A store upgraded from
+before the scopes holds only their totals below its breakdown floors, rebuilt
+once from the global Exporter and interface dimensions.
 """
 
 from __future__ import annotations
@@ -335,6 +337,11 @@ _DIRTY = "flow_rollup_dirty_ts_%d"
 # own; an upgraded store has none below its old watermark.
 _SCOPED_FLOOR = "flow_rollup_scoped_floor_%d"
 _IFACE_FLOOR = "flow_rollup_iface_floor"
+# Where the scoped floors stood before _reconstruct_scoped_spans lowered them:
+# below these an upgraded store's scopes hold totals only, no keys.
+_BREAKDOWN_FLOOR = "flow_rollup_breakdown_floor_%d"
+_IFACE_BREAKDOWN_FLOOR = "flow_rollup_iface_breakdown_floor"
+_RECONSTRUCTED = "flow_rollup_spans_reconstructed"
 
 
 def _align_down(ts: float, width: float) -> int:
@@ -407,6 +414,15 @@ def _top_k_sql(scope_cols: str, partition: str, source: str) -> str:
             f" bytes, packets, flows FROM (SELECT *, ROW_NUMBER() OVER"
             f" (PARTITION BY {partition} ORDER BY bytes DESC, key) AS rn"
             f" FROM ({source})) WHERE rn <= ?")
+
+
+def _interface_spans(tier: int, side: str, rows):
+    """Span rows from global interface keys "address:ifIndex", split on the
+    last ':' since an IPv6 address carries its own."""
+    for bucket, key, *sums in rows:
+        address, _sep, index = key.rpartition(":")
+        if address and index.isdecimal():
+            yield (tier, address, int(index), side, bucket, *sums)
 
 
 _RAW_SUMS = ("COALESCE(SUM(bytes * sampling), 0) AS bytes,"
@@ -513,6 +529,76 @@ class FlowDatabase(SqliteStore):
         # Existing rows keep the sampling factor baked into them at decode time.
         self.ensure_columns("flows", {"domain": "INTEGER DEFAULT 0",
                                       "sampler_id": "INTEGER DEFAULT 0"})
+
+    def _after_open(self) -> None:
+        self._reconstruct_scoped_spans()
+
+    def _reconstruct_scoped_spans(self) -> None:
+        """Once per store: give each exporter and interface its totals below
+        the scoped floors from the global Exporter and interface dimensions,
+        then lower those floors to the global ones, keeping where they stood
+        as the breakdown floors. Exact where the exporter or interface was
+        among its bucket's top ROLLUP_KEYS; a bucket that left it out reads
+        zero for it."""
+        if self._private_setting(_RECONSTRUCTED):
+            return
+        started = time.monotonic()
+        counts = {"exporter": 0, "interface": 0}
+        worked = False
+        insert = ("INSERT OR IGNORE INTO flow_rollup_span(tier, exporter, iface,"
+                  " dir, bucket, bytes, packets, flows)")
+        for tier in ROLLUP_TIERS:
+            floor = self._private_setting(_FLOOR % tier)
+            scoped = self._private_setting(_SCOPED_FLOOR % tier)
+            if floor is None or scoped is None or int(scoped) <= int(floor):
+                continue
+            floor, scoped = int(floor), int(scoped)
+            iface = (self._private_setting(_IFACE_FLOOR)
+                     if tier in SCOPED_KEYS["interface"] else None)
+            upper = scoped if iface is None else max(scoped, int(iface))
+            with self._lock:
+                self._conn.commit()
+                self._conn.execute("BEGIN IMMEDIATE")
+                try:
+                    counts["exporter"] += self._conn.execute(
+                        insert + f" SELECT tier, CAST(key AS TEXT), -1, '',"
+                        f" bucket, bytes, packets, flows FROM flow_rollup"
+                        f" WHERE tier = ? AND {_GLOBAL_SQL} AND dim = ?"
+                        f" AND bucket >= ? AND bucket < ? AND key != ''",
+                        (tier, DIMENSION_IDS["Exporter"], floor,
+                         scoped)).rowcount or 0
+                    for name, side in (("Ingress interface", "in"),
+                                       ("Egress interface", "out")):
+                        rows = self._conn.execute(
+                            f"SELECT bucket, CAST(key AS TEXT), bytes, packets,"
+                            f" flows FROM flow_rollup WHERE tier = ?"
+                            f" AND {_GLOBAL_SQL} AND dim = ? AND bucket >= ?"
+                            f" AND bucket < ?",
+                            (tier, DIMENSION_IDS[name], floor, upper))
+                        counts["interface"] += self._conn.executemany(
+                            insert + " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                            _interface_spans(tier, side, rows)).rowcount or 0
+                    self._set_private_setting(_BREAKDOWN_FLOOR % tier, scoped,
+                                              commit=False)
+                    self._set_private_setting(_SCOPED_FLOOR % tier, floor,
+                                              commit=False)
+                    if iface is not None and int(iface) > floor:
+                        self._set_private_setting(_IFACE_BREAKDOWN_FLOOR,
+                                                  int(iface), commit=False)
+                        self._set_private_setting(_IFACE_FLOOR, floor,
+                                                  commit=False)
+                    self._conn.commit()
+                except sqlite3.DatabaseError:
+                    self._conn.rollback()
+                    raise
+            worked = True
+        self._set_private_setting(_RECONSTRUCTED, True)
+        if worked:
+            log.info("netpath.flowdb: exporter and interface totals rebuilt"
+                     " from the global summaries below the scoped floors"
+                     " (%d exporter row(s), %d interface row(s), %.2f s)",
+                     counts["exporter"], counts["interface"],
+                     time.monotonic() - started)
 
     # ------------------------------------------------------------------ write
 
@@ -732,8 +818,13 @@ class FlowDatabase(SqliteStore):
         scoped_floor = self._private_setting(_SCOPED_FLOOR % 60)
         scoped_minutes = (from_minutes and scoped_floor is not None
                           and bucket >= int(scoped_floor))
+        # Minute exporter keys start at the breakdown floor: below it an
+        # hour's come from raw while raw holds the hour, else stay as built.
+        breakdown = self._private_setting(_BREAKDOWN_FLOOR % 60)
+        keys_from_minutes = scoped_minutes and (breakdown is None
+                                                or bucket >= int(breakdown))
         exporters: list = []
-        if scoped_minutes:
+        if keys_from_minutes:
             with self._lock:
                 exporters = [row[0] for row in self._conn.execute(
                     "SELECT DISTINCT exporter FROM flow_rollup_span"
@@ -742,6 +833,7 @@ class FlowDatabase(SqliteStore):
                     (bucket, bucket + tier))]
         interfaces = (tier in SCOPED_KEYS["interface"]
                       and self._raw_covers(tier, bucket, from_minutes))
+        keep_keys = scoped_minutes and not keys_from_minutes and not interfaces
         written = 0
         for name, expr in DIMENSIONS.items():
             dim = DIMENSION_IDS[name]
@@ -753,9 +845,10 @@ class FlowDatabase(SqliteStore):
             time.sleep(0)
             if name == "Exporter":
                 continue   # one key per exporter scope: its span says it all
-            written += self._compact_exporters(tier, bucket, dim, expr,
-                                               scoped_minutes, exporters)
-            time.sleep(0)
+            if not keep_keys:
+                written += self._compact_exporters(tier, bucket, dim, expr,
+                                                   keys_from_minutes, exporters)
+                time.sleep(0)
             if interfaces:
                 for side in _DIRECTIONS["both"]:
                     written += self._compact_interfaces(tier, bucket, dim,
@@ -1419,6 +1512,11 @@ class FlowDatabase(SqliteStore):
             "scoped_minute_floor": self._scope_floor(60, "exporter"),
             "scoped_hourly_floor": self._scope_floor(3600, "exporter"),
             "iface_hourly_floor": self._scope_floor(3600, "interface"),
+            # Below these an upgraded store's scopes hold totals only.
+            "breakdown_minute_floor": self._private_setting(_BREAKDOWN_FLOOR % 60),
+            "breakdown_hourly_floor": self._private_setting(
+                _BREAKDOWN_FLOOR % 3600),
+            "iface_breakdown_floor": self._private_setting(_IFACE_BREAKDOWN_FLOOR),
             "cap_held_back": self.cap_held_back,
             "prune_incomplete": self.last_prune_incomplete,
         }
@@ -1623,10 +1721,17 @@ class FlowDatabase(SqliteStore):
             n_buckets = max(1, int((t1 - t0) / bucket_s) + 1)
         plan = self._rollup_plan(t0, t1, dimension, filters, bucket_s)
         if info is not None:
+            floor = None if plan is None else self._scope_floor(plan[0], kind)
+            breakdown = None
+            if floor is not None and kind != "global":
+                breakdown = self._private_setting(
+                    _IFACE_BREAKDOWN_FLOOR if kind == "interface"
+                    else _BREAKDOWN_FLOOR % plan[0])
             info.update(records_only=plan is None,
                         tier=None if plan is None else plan[0],
-                        summaries_from=(None if plan is None
-                                        else self._scope_floor(plan[0], kind)),
+                        summaries_from=floor,
+                        breakdown_from=(int(breakdown) if breakdown is not None
+                                        and int(breakdown) > floor else None),
                         widened=widened)
 
         def slot(column: str) -> tuple[str, list]:
@@ -1843,8 +1948,9 @@ class FlowDatabase(SqliteStore):
         stored only the heaviest keys of each bucket.
         Returns (times, series, bucket_s, top_rows, totals). `info`, when a
         dict, gets records_only (no summary answered), tier, summaries_from
-        (the floor of the scope that did) and widened (bucket_s raised to
-        the hourly tier).
+        (the floor of the scope that did), breakdown_from (where that scope's
+        keys start above it, else None) and widened (bucket_s raised to the
+        hourly tier).
         """
         t0, bucket_s, n_buckets, rows, spans = self._agg_rows(
             t0, t1, dimension, filters, bucket_s, info)

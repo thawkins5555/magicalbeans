@@ -199,6 +199,9 @@ def get_flow_overview(service, params, body) -> dict:
         "records_from": coverage.get("raw_oldest"),
         "summaries_from": info.get("summaries_from"),
         "widened": bool(info.get("widened")),
+        # None until flowdb's reconstruction step lands; the chart treats
+        # that as "no pre-upgrade totals-only span to shade".
+        "breakdown_from": info.get("breakdown_from"),
     }
 
 
@@ -322,7 +325,7 @@ def get_flow_exporters(service, params, body) -> dict:
     for row in service.flow_db.interface_totals(now - 3600, now):
         iface_counts.setdefault(row["exporter"], set()).add(row["iface"])
 
-    seq_missed = service.collector.decoder.sequence_gaps()
+    seq_stats = service.collector.decoder.sequence_gaps()
     missing_counts: dict[str, int] = {}
     for entry in service.collector.decoder.missing_templates(MISSING_TEMPLATES_ALL):
         missing_counts[entry["exporter"]] = missing_counts.get(entry["exporter"], 0) + 1
@@ -342,6 +345,7 @@ def get_flow_exporters(service, params, body) -> dict:
             state = "idle"
         else:
             state = "silent"
+        gap = seq_stats.get(address) or {}
         exporters.append({
             "address": address,
             "name": names.get(address),
@@ -356,7 +360,10 @@ def get_flow_exporters(service, params, body) -> dict:
             "flows": row["flows"],
             "sampling": row["sampling"],
             "interfaces": len(iface_counts.get(address, ())),
-            "seq_missed": seq_missed.get(address, 0),
+            "seq_missed": gap.get("missed", 0),
+            "seq_gaps": gap.get("gaps", 0),
+            "seq_resets": gap.get("resets", 0),
+            "seq_last": gap.get("last"),
             "missing_templates": missing_counts.get(address, 0),
         })
     exporters.sort(key=lambda e: (e["name"] or "", e["address"]))

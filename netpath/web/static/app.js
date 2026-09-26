@@ -1580,7 +1580,9 @@ const App = (() => {
   function ago(ts, empty = 'never') {
     if (!ts) return empty;
     const age = Date.now() / 1000 - ts;
-    if (age < 0) return `in ${span(-age)}`;
+    // Up to a minute of "in the future" is the server's clock running a
+    // touch ahead of the browser's, not a real future event.
+    if (age < -60) return `in ${span(-age)}`;
     if (age < 5) return 'just now';
     return `${span(age)} ago`;
   }
