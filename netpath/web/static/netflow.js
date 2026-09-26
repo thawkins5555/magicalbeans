@@ -240,6 +240,9 @@
     view.loading = true;
     view.failed = false;
     App.el('nf-totals').textContent = LOADING_TEXT;
+    const overlay = App.el('nf-chart-loading');
+    overlay.innerHTML = App.loadingMark();
+    overlay.hidden = false;
     drawChart();
     drawBars();
     drawTable(view.records);
@@ -264,6 +267,7 @@
     view.loading = false;
     view.failed = true;
     App.el('nf-totals').textContent = FAILED_TEXT;
+    App.el('nf-chart-loading').hidden = true;
     drawChart();
     drawBars();
     drawTable(view.records);
@@ -776,7 +780,7 @@
   function drawBars() {
     const wrap = App.el('nf-bars');
     wrap.innerHTML = '';
-    if (view.loading) { wrap.innerHTML = App.loading(); return; }
+    if (view.loading) { wrap.innerHTML = App.loadingMark(); return; }
     const rows = view.data && !view.failed ? view.data.top : [];
     if (!rows.length) {
       wrap.innerHTML = `<p class="empty">${emptyMessage()}</p>`;
@@ -1073,24 +1077,37 @@
 
   const INTERFACE_COLUMNS = [
     { key: 'exporter_name', label: 'Exporter', width: 160,
+      value: (r) => (r.exporter_name || r.exporter || '').toLowerCase(),
       cell: (r) => escape(r.exporter_name || r.exporter || '') },
     { key: 'name', label: 'Interface', width: 150,
+      value: (r) => (r.name || String(r.if_index)).toLowerCase(),
       cell: (r) => escape(r.name || String(r.if_index)) },
-    { key: 'speed', label: 'Speed', width: 90,
+    { key: 'speed', label: 'Speed', width: 90, numeric: true,
+      value: (r) => r.speed_bps,
       cell: (r) => (r.speed_bps ? App.rate(r.speed_bps / 8, 1) : '—') },
-    { key: 'in', label: 'In', width: 170, cell: (r) => utilCell(r.in_text, r.in_util) },
-    { key: 'out', label: 'Out', width: 170, cell: (r) => utilCell(r.out_text, r.out_util) },
-    { key: 'flows', label: 'Flows', width: 90,
+    { key: 'in', label: 'In', width: 170, numeric: true, descendingFirst: true,
+      value: (r) => r.in_bps, cell: (r) => utilCell(r.in_text, r.in_util) },
+    { key: 'out', label: 'Out', width: 170, numeric: true, descendingFirst: true,
+      value: (r) => r.out_bps, cell: (r) => utilCell(r.out_text, r.out_util) },
+    { key: 'flows', label: 'Flows', width: 90, numeric: true, descendingFirst: true,
+      value: (r) => (r.in_flows || 0) + (r.out_flows || 0),
       cell: (r) => String((r.in_flows || 0) + (r.out_flows || 0)) },
   ];
 
+  let interfacesSort = App.recallSort('nf-interfaces', { key: 'in', descending: true });
+  function onInterfacesSort(key, descending) {
+    interfacesSort = { key, descending };
+    drawInterfacesTable(view.interfaces || []);
+  }
+
   function drawInterfacesTable(rows) {
-    // No sort/onSort: the server's own order (busiest first) is the order
-    // shown, rather than a client re-sort that could disagree with it.
     const table = App.grid(App.el('nf-interfaces'),
-      { name: 'nf-interfaces', caption: 'NetFlow interfaces', columns: INTERFACE_COLUMNS });
+      { name: 'nf-interfaces', caption: 'NetFlow interfaces', columns: INTERFACE_COLUMNS,
+        sort: interfacesSort, onSort: onInterfacesSort });
     const body = document.createElement('tbody');
-    App.drawRows(body, rows, INTERFACE_COLUMNS, (tr, row) => {
+    const sorted = App.sortRows(rows, interfacesSort.key, interfacesSort.descending,
+                                INTERFACE_COLUMNS);
+    App.drawRows(body, sorted, INTERFACE_COLUMNS, (tr, row) => {
       tr.className = 'clickable';
       tr.title = `View ${row.name || row.if_index} on TRAFFIC`;
       tr.onclick = () => goToTrafficFiltered({

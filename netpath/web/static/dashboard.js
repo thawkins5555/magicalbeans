@@ -1043,7 +1043,7 @@
     const tools = view.editing ? tileTools(layoutTile, def) : tileRangeHtml(layoutTile, def);
     return tile(title, body, {
       w: layoutTile.w || def.w, h: layoutTile.h || def.h,
-      id: layoutTile.id, tools, tone,
+      id: layoutTile.id, tools, tone, legend: def.family === 'Graphs',
     });
   }
 
@@ -1125,8 +1125,9 @@
       // A percent tile with no user-set ceiling still needs a fixed 0-100
       // axis — otherwise a 3% CPU line auto-scales to fill the plot.
       const peak = cfg.y_max || (chart && chart.unit === '%' ? 100 : undefined);
+      const legendHost = host && host.querySelector('.tile-legend');
       const geo = App.drawSeriesChart(svg, wrap, chart || null,
-        { emptyText: 'No data in this window', peak });
+        { emptyText: 'No data in this window', peak, legendHost });
       if (layoutTile && !view.editing && geo) {
         App.attachChartZoom(svg, geo, {
           wheelRequiresCtrl: true,

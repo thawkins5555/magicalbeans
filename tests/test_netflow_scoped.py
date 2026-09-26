@@ -643,23 +643,25 @@ def test_10_totals_reads() -> None:
                          (t0, t1, exporter, exporter))]
         return sorted(rows, key=lambda r: (r["exporter"], r["iface"], r["dir"]))
 
+    def tiers_of(t0, t1, kind):
+        return [arm[0] for arm in db._span_plan(t0, t1, kind)[0]]
+
     windows = (("last 5 minutes", now - 300, now),
                ("2.5 hours, unaligned", now - 2.5 * 3600 - 17, now - 40),
                ("3 whole hours", start + 3600, start + 4 * 3600))
     for name, t0, t1 in windows:
-        tiers = (db._span_plan(t0, t1, "exporter")[0],
-                 db._span_plan(t0, t1, "interface")[0])
+        tiers = (tiers_of(t0, t1, "exporter"), tiers_of(t0, t1, "interface"))
         check(db.exporter_totals(t0, t1) == want_exporters(t0, t1),
-              f"{name}: exporter_totals equals raw (tier {tiers[0]})")
+              f"{name}: exporter_totals equals raw (tiers {tiers[0]})")
         check(db.interface_totals(t0, t1) == want_interfaces(t0, t1)
               and db.interface_totals(t0, t1, EXPORTER)
               == want_interfaces(t0, t1, EXPORTER),
               f"{name}: interface_totals equals raw, all exporters and one "
-              f"(tier {tiers[1]})")
-    check(db._span_plan(now - 300, now, "exporter")[0] == 60
-          and db._span_plan(start + 3600, start + 4 * 3600, "interface")[0]
-          == 60,
-          "the finest tier reaching t0 serves the spans")
+              f"(tiers {tiers[1]})")
+    check(tiers_of(now - 300, now, "exporter") == [60]
+          and tiers_of(start + 3600, start + 4 * 3600, "interface")[:1]
+          == [3600],
+          "the coarsest tier serves the whole hours, the minute tier the rest")
     cov = db.coverage()
     check(cov["scoped_minute_floor"] == db.rollup_bounds(60)[0]
           and cov["scoped_hourly_floor"] == db.rollup_bounds(3600)[0]
@@ -668,8 +670,11 @@ def test_10_totals_reads() -> None:
           f"floors ({cov})")
     db._set_private_setting(flowdb._SCOPED_FLOOR % 60, start + 2 * 3600)
     t0, t1 = start + 3600, now - 40
-    check(db._span_plan(t0, t1, "exporter")[0] == 3600
-          and db._span_plan(t0, t1, "interface")[0] == 3600
+    minute_arms = [arm for kind in ("exporter", "interface")
+                   for arm in db._span_plan(t0, t1, kind)[0] if arm[0] == 60]
+    check(tiers_of(t0, t1, "exporter")[:1] == [3600]
+          and tiers_of(t0, t1, "interface")[:1] == [3600]
+          and all(arm[1] >= start + 2 * 3600 for arm in minute_arms)
           and db.exporter_totals(t0, t1) == want_exporters(t0, t1)
           and db.interface_totals(t0, t1) == want_interfaces(t0, t1),
           "and with the minute scope short of t0 the hourly tier answers, "

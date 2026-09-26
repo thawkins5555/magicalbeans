@@ -724,7 +724,7 @@
   </header>
   <div class="rows" data-splitter="netflow-body">
    <div class="pane pad-x" data-grow="3">
-    <div id="nf-chart" class="canvas chart brush"><svg id="nf-chart-svg"></svg></div>
+    <div id="nf-chart" class="canvas chart brush"><svg id="nf-chart-svg"></svg><div id="nf-chart-loading" class="pane-loading" hidden></div></div>
     <p class="hint">Drag across the chart to zoom into a range · scroll to zoom</p>
    </div>
    <div class="divider"></div>
@@ -757,6 +757,7 @@
      <span class="section">EXPORTERS</span>
      <span class="hint">Every device sending flows to this collector</span>
    </header>
+   <div id="nf-exporters-loading" class="pane-loading-block" hidden></div>
    <div class="table-wrap"><table id="nf-exporters"></table></div>
   </div>
 
@@ -765,6 +766,7 @@
      <label>Window <select id="nf-if-range"></select></label>
      <label>Exporter <select id="nf-if-exporter"></select></label>
    </div>
+   <div id="nf-interfaces-loading" class="pane-loading-block" hidden></div>
    <div class="table-wrap"><table id="nf-interfaces"></table></div>
   </div>
 </section>

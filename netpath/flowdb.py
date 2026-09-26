@@ -39,7 +39,7 @@ import time
 
 from .sqlitebase import (  # re-exported: tests adjust netpath.flowdb.TRIM_CHUNK
     LIKE_ESCAPE, TRIM_BUDGET_S, TRIM_CHUNK, TRIM_CHUNK_MAX, TRIM_CHUNK_MIN,
-    SqliteStore, id_chunks, like_contains, marks_for)
+    InstrumentedLock, SqliteStore, connect, id_chunks, like_contains, marks_for)
 
 log = logging.getLogger(__name__)
 
@@ -287,11 +287,11 @@ _IF_COLUMN = {"in": "in_if", "out": "out_if"}
 #
 # _REPAIR_MAX_FLOWS bounds the work: the raw rows the repair arms will scan,
 # known in advance from the span rows' own flow counts. The overview holds
-# the collector's write lock for the whole query and NetFlow is UDP, so a
-# repair that took seconds would cost flows at the socket to redraw a chart;
-# a hundred thousand rows is a few hundred milliseconds. A quiet store never
-# reaches it; a store busy enough to does not get its holes repaired, which
-# is where it stood before.
+# the read lock for the whole query, shared only with the other web reads,
+# so a repair that took seconds would stall every other chart and the record
+# list behind it; a hundred thousand rows is a few hundred milliseconds. A
+# quiet store never reaches it; a store busy enough to does not get its holes
+# repaired, which is where it stood before.
 _REPAIR_MAX_BUCKETS = 120
 _REPAIR_MAX_FLOWS = 100_000
 
@@ -318,6 +318,11 @@ ROLLUP_DAYS_SETTING = {60: "rollup_minute_days", 3600: "rollup_retention_days"}
 _ROLLUP_LAG_S = 120
 _ROLLUP_MAX_BUCKETS = {60: 240, 3600: 48}
 _ROLLUP_BUDGET_S = 5.0
+
+# How long a _raw_holds answer is reused: every interface-filtered chart poll
+# asks it, and prune() clears the memo.
+_RAW_HOLDS_TTL_S = 60.0
+_RAW_HOLDS_MEMO_MAX = 200
 
 # How far back down the table the flow-record list sorts. Ordering by
 # bytes * sampling cannot be index-served — the sort key is a product, and
@@ -465,7 +470,39 @@ class FlowDatabase(SqliteStore):
         self.cap_held_back = 0   # rows prune()'s row-cap stage spared, not yet summarised
         self._compact_hit_limit: dict[int, bool] = {}   # tier -> whether compact_rollup's last call used its full bucket limit
         self._iface_built: int | None = None   # the last hourly bucket whose interface breakdown _compact_bucket rebuilt
+        self._raw_holds_memo: dict = {}   # (tier, aligned t0, upper) -> (monotonic, answer)
+        self._coverage_last: dict | None = None
         super().__init__(path)
+        # Request-path reads, so a chart or the record list never holds the
+        # lock the collector's writer and the summariser need.
+        if path and path != ":memory:":
+            self._read_conn = connect(path)
+            self._read_conn.row_factory = sqlite3.Row
+            self._read_conn.execute("PRAGMA query_only=1")
+            self._read_lock = InstrumentedLock()
+        else:
+            self._read_conn, self._read_lock = self._conn, self._lock
+        self.coverage()
+
+    def close(self, timeout_s: float | None = None) -> None:
+        if self._closed:
+            return
+        if self._read_conn is not self._conn:
+            wait = (self.CLOSE_LOCK_WAIT_S if timeout_s is None
+                    else max(0.0, timeout_s))
+            held = (self._read_lock.acquire(timeout=wait) if wait
+                    else self._read_lock.acquire(blocking=False))
+            try:
+                self._read_conn.close()
+            finally:
+                if held:
+                    self._read_lock.release()
+        super().close(timeout_s)
+
+    def read_lock_stats(self) -> dict:
+        """lock_stats() for the read connection's lock."""
+        stats = getattr(self._read_lock, "stats", None)
+        return stats() if callable(stats) else {}
 
     def _before_schema(self) -> None:
         """Rebuild an unscoped store's summaries with the scope columns, in
@@ -701,8 +738,8 @@ class FlowDatabase(SqliteStore):
             ).fetchall()
 
     def exporters(self) -> list[sqlite3.Row]:
-        with self._lock:
-            return self._conn.execute(
+        with self._read_lock:
+            return self._read_conn.execute(
                 "SELECT * FROM exporters ORDER BY last_seen DESC").fetchall()
 
     def set_interface_names(self, mapping: dict[tuple[str, int], str]) -> None:
@@ -715,8 +752,8 @@ class FlowDatabase(SqliteStore):
             self._conn.commit()
 
     def interface_names(self) -> dict[str, str]:
-        with self._lock:
-            rows = self._conn.execute("SELECT * FROM interfaces").fetchall()
+        with self._read_lock:
+            rows = self._read_conn.execute("SELECT * FROM interfaces").fetchall()
         return {f"{row['exporter']}:{row['if_index']}": row["name"] for row in rows}
 
     # ----------------------------------------------------------------- rollup
@@ -788,18 +825,28 @@ class FlowDatabase(SqliteStore):
         """Whether raw holds every flow this tier's global spans in
         [t0, upper) counted. Counted as _repair_ranges does, not read off
         MIN(ts_end), which one flow from a lagging clock drags back."""
-        with self._lock:
-            wanted = self._conn.execute(
+        memo = self._raw_holds_memo
+        key = (tier, _align_down(t0, tier), int(upper))
+        now = time.monotonic()
+        hit = memo.get(key)
+        if hit is not None and now - hit[0] < _RAW_HOLDS_TTL_S:
+            return hit[1]
+        with self._read_lock:
+            wanted = self._read_conn.execute(
                 f"SELECT COALESCE(SUM(flows), 0) AS n FROM flow_rollup_span"
                 f" WHERE tier = ? AND {_GLOBAL_SQL} AND bucket >= ?"
                 f" AND bucket < ?", (tier, t0, upper)).fetchone()["n"]
-            if not wanted:
-                return False
-            held = self._conn.execute(
+            held = self._read_conn.execute(
                 "SELECT COUNT(*) AS n FROM (SELECT 1 FROM flows"
                 " WHERE ts_end >= ? AND ts_end < ? LIMIT ?)",
-                (t0, upper, wanted)).fetchone()["n"]
-        return held >= wanted
+                (t0, upper, wanted)).fetchone()["n"] if wanted else 0
+        answer = bool(wanted) and held >= wanted
+        if len(memo) > _RAW_HOLDS_MEMO_MAX:
+            for stale in [k for k, (when, _a) in list(memo.items())
+                          if now - when >= _RAW_HOLDS_TTL_S]:
+                memo.pop(stale, None)
+        memo[key] = (now, answer)
+        return answer
 
     def _seed_scoped(self, tier: int, at: int) -> None:
         keys = [_SCOPED_FLOOR % tier]
@@ -1352,6 +1399,7 @@ class FlowDatabase(SqliteStore):
         for the first four (the Settings page's maintenance button) matches
         every existing row.
         """
+        self._raw_holds_memo.clear()
         now = time.time()
         cutoff = now - retention_days * 86400
         deadline = time.monotonic() + budget_s
@@ -1551,14 +1599,22 @@ class FlowDatabase(SqliteStore):
         return max(0.0, sealed - watermark)
 
     def coverage(self) -> dict:
-        """What each tier still covers, for the NetFlow status strip (A5)."""
-        with self._lock:
-            row = self._conn.execute(
+        """What each tier still covers, for the NetFlow status strip (A5).
+        The last answer when a chart or record query holds the read lock, so
+        /api/state never waits behind one."""
+        if self._coverage_last is None:
+            self._read_lock.acquire()
+        elif not self._read_lock.acquire(timeout=0.25):
+            return dict(self._coverage_last)
+        try:
+            row = self._read_conn.execute(
                 "SELECT MIN(ts_end) AS oldest, MAX(ts_end) AS newest"
                 " FROM flows").fetchone()
+        finally:
+            self._read_lock.release()
         minute_floor, minute_watermark = self.rollup_bounds(60)
         hourly_floor, hourly_watermark = self.rollup_bounds(3600)
-        return {
+        answer = {
             "raw_oldest": row["oldest"], "raw_newest": row["newest"],
             "minute_floor": minute_floor, "minute_watermark": minute_watermark,
             "hourly_floor": hourly_floor, "hourly_watermark": hourly_watermark,
@@ -1574,6 +1630,8 @@ class FlowDatabase(SqliteStore):
             "cap_held_back": self.cap_held_back,
             "prune_incomplete": self.last_prune_incomplete,
         }
+        self._coverage_last = dict(answer)
+        return answer
 
     # ------------------------------------------------------------------ query
 
@@ -1706,8 +1764,8 @@ class FlowDatabase(SqliteStore):
         a scoped arm still walks every raw row in its range.
         """
         scope_where, scope_params = _scope_where(scope)
-        with self._lock:
-            rows = self._conn.execute(
+        with self._read_lock:
+            rows = self._read_conn.execute(
                 "SELECT bucket FROM flow_rollup_trunc WHERE tier = ?"
                 " AND exporter = ? AND iface = ? AND dir = ? AND dim = ?"
                 " AND bucket >= ? AND bucket < ? ORDER BY bucket LIMIT ?",
@@ -1723,7 +1781,7 @@ class FlowDatabase(SqliteStore):
                     runs.append([bucket, bucket + tier])
 
             def span_flows(low: int, upper: int, span_scope) -> int:
-                return self._conn.execute(
+                return self._read_conn.execute(
                     "SELECT COALESCE(SUM(flows), 0) AS n FROM flow_rollup_span"
                     " WHERE tier = ? AND exporter = ? AND iface = ? AND dir = ?"
                     " AND bucket >= ? AND bucket < ?",
@@ -1736,7 +1794,7 @@ class FlowDatabase(SqliteStore):
             for (low, upper), total in zip(runs, work):
                 wanted = (total if tuple(scope) == GLOBAL_SCOPE
                           else span_flows(low, upper, scope))
-                held = self._conn.execute(
+                held = self._read_conn.execute(
                     f"SELECT COUNT(*) AS n FROM flows WHERE ts_end >= ?"
                     f" AND ts_end < ?{scope_where}",
                     (low, upper, *scope_params)).fetchone()["n"]
@@ -1879,15 +1937,15 @@ class FlowDatabase(SqliteStore):
 
         rows: list = []
         spans: dict[int, list] = {}
-        with self._lock:
+        with self._read_lock:
             if key_sql:
-                rows = self._conn.execute(
+                rows = self._read_conn.execute(
                     "SELECT key, slot, SUM(bytes) AS bytes,"
                     " SUM(packets) AS packets, SUM(flows) AS flows FROM ("
                     + " UNION ALL ".join(key_sql) +
                     ") GROUP BY key, slot", key_params).fetchall()
             if span_sql:
-                for row in self._conn.execute(
+                for row in self._read_conn.execute(
                         "SELECT slot, SUM(bytes) AS bytes,"
                         " SUM(packets) AS packets, SUM(flows) AS flows FROM ("
                         + " UNION ALL ".join(span_sql) +
@@ -1907,36 +1965,46 @@ class FlowDatabase(SqliteStore):
         return t0, bucket_s, n_buckets, rows, spans
 
     def _span_plan(self, t0: float, t1: float, kind: str):
-        """(tier, start, seal): the finest tier reaching t0 serves the whole
-        buckets [start, seal), raw the edges; tier None is raw throughout."""
-        for tier in sorted(ROLLUP_TIERS):
-            start = _align_up(t0, tier)
+        """(arms, edges): arms (tier, start, seal) serve whole buckets
+        [start, seal), coarsest tier first, each finer tier filling what the
+        coarser left; edges (low, upper, closed) are the raw ts_end ranges
+        between them, closed only at t1. Together they tile [t0, t1]."""
+        arms = []
+        gaps = [(t0, t1)]
+        for tier in sorted(ROLLUP_TIERS, reverse=True):
             floor = self._scope_floor(tier, kind)
             _floor, watermark = self.rollup_bounds(tier)
-            if floor is None or watermark is None or start < floor:
+            if floor is None or watermark is None:
                 continue
-            seal = min(watermark, _align_down(t1, tier))
-            if seal > start:
-                return tier, start, seal
-        return None, t1, t1
+            left = []
+            for low, upper in gaps:
+                start = _align_up(low, tier)
+                seal = min(watermark, _align_down(upper, tier))
+                if start < floor or seal <= start:
+                    left.append((low, upper))
+                    continue
+                arms.append((tier, start, seal))
+                left += [(low, start), (seal, upper)]
+            gaps = left
+        edges = [(low, upper, upper == t1) for low, upper in gaps
+                 if upper > low or (upper == low and upper == t1)]
+        return arms, edges
 
     def interface_totals(self, t0: float, t1: float,
                          exporter: str | None = None) -> list[dict]:
         """Traffic per (exporter, iface, dir) over the window, every
         exporter when `exporter` is None."""
-        tier, start, seal = self._span_plan(t0, t1, "interface")
+        arms, edges = self._span_plan(t0, t1, "interface")
         where = " AND exporter = ?" if exporter else ""
         extra = [exporter] if exporter else []
         sql = []
         params: list = []
-        if tier is not None:
+        for tier, start, seal in arms:
             sql.append(f"SELECT exporter, iface, dir, bytes, packets, flows"
                        f" FROM flow_rollup_span WHERE tier = ? AND bucket >= ?"
                        f" AND bucket < ? AND iface >= 0{where}")
             params.extend([tier, start, seal, *extra])
-        for low, upper, closed in ((t0, start, False), (seal, t1, True)):
-            if upper < low or (upper == low and not closed):
-                continue
+        for low, upper, closed in edges:
             for side, column in _IF_COLUMN.items():
                 sql.append(
                     f"SELECT exporter, {column} AS iface, '{side}' AS dir,"
@@ -1944,8 +2012,8 @@ class FlowDatabase(SqliteStore):
                     f" AND ts_end {'<=' if closed else '<'} ? AND {column} >= 0"
                     f"{where} GROUP BY exporter, {column}")
                 params.extend([low, upper, *extra])
-        with self._lock:
-            rows = self._conn.execute(
+        with self._read_lock:
+            rows = self._read_conn.execute(
                 "SELECT exporter, iface, dir, SUM(bytes) AS bytes,"
                 " SUM(packets) AS packets, SUM(flows) AS flows FROM ("
                 + " UNION ALL ".join(sql) + ") GROUP BY exporter, iface, dir"
@@ -1957,23 +2025,21 @@ class FlowDatabase(SqliteStore):
 
     def exporter_totals(self, t0: float, t1: float) -> dict:
         """{exporter: {"bytes", "packets", "flows"}} over the window."""
-        tier, start, seal = self._span_plan(t0, t1, "exporter")
+        arms, edges = self._span_plan(t0, t1, "exporter")
         sql = []
         params: list = []
-        if tier is not None:
+        for tier, start, seal in arms:
             sql.append("SELECT exporter, bytes, packets, flows"
                        " FROM flow_rollup_span WHERE tier = ? AND bucket >= ?"
                        " AND bucket < ? AND exporter != '' AND iface = -1")
             params.extend([tier, start, seal])
-        for low, upper, closed in ((t0, start, False), (seal, t1, True)):
-            if upper < low or (upper == low and not closed):
-                continue
+        for low, upper, closed in edges:
             sql.append(f"SELECT exporter, {_RAW_SUMS} FROM flows"
                        f" WHERE ts_end >= ? AND ts_end {'<=' if closed else '<'} ?"
                        f" GROUP BY exporter")
             params.extend([low, upper])
-        with self._lock:
-            rows = self._conn.execute(
+        with self._read_lock:
+            rows = self._read_conn.execute(
                 "SELECT exporter, SUM(bytes) AS bytes, SUM(packets) AS packets,"
                 " SUM(flows) AS flows FROM (" + " UNION ALL ".join(sql)
                 + ") GROUP BY exporter", params).fetchall()
@@ -2087,13 +2153,13 @@ class FlowDatabase(SqliteStore):
         where, params = self._where(t0, t1, filters)
         column = {"bytes": "bytes * sampling", "packets": "packets * sampling",
                   "time": "ts_end"}.get(order, "bytes * sampling")
-        with self._lock:
+        with self._read_lock:
             if order in ("bytes", "packets"):
-                highest = self._conn.execute(
+                highest = self._read_conn.execute(
                     "SELECT MAX(id) AS hi FROM flows").fetchone()["hi"] or 0
                 floor_id = highest - FLOW_SCAN_CAP
                 if floor_id > 0:
-                    rows = self._conn.execute(
+                    rows = self._read_conn.execute(
                         f"SELECT * FROM flows WHERE id > ? AND {where}"
                         f" ORDER BY {column} DESC LIMIT ?",
                         (floor_id, *params, limit)).fetchall()
@@ -2101,13 +2167,13 @@ class FlowDatabase(SqliteStore):
                     # left out: ids are handed out in arrival order, so
                     # whether the row at the bound is still inside the window
                     # is the same question.
-                    edge = self._conn.execute(
+                    edge = self._read_conn.execute(
                         "SELECT ts_end FROM flows WHERE id <= ? ORDER BY id"
                         " DESC LIMIT 1", (floor_id,)).fetchone()
                     bounded = bool(edge is not None and edge["ts_end"] >= t0)
                     if rows or not bounded:
                         return rows, bounded
-            rows = self._conn.execute(
+            rows = self._read_conn.execute(
                 f"SELECT * FROM flows WHERE {where}"
                 f" ORDER BY {column} DESC LIMIT ?",
                 (*params, limit)).fetchall()

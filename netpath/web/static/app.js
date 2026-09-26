@@ -3526,9 +3526,15 @@ const App = (() => {
       }
     }
 
-    // Legend inside the plot's top-left when the lines need telling apart.
+    // Legend beside the tile title (opts.legendHost) when a caller has one,
+    // else inside the plot's top-left, when the lines need telling apart —
+    // same "more than one labelled series" rule either way.
     const labelled = seriesList.filter((s) => s.label);
-    if (labelled.length > 1) {
+    if (opts.legendHost) {
+      opts.legendHost.innerHTML = labelled.length > 1 ? labelled.map((s) =>
+        `<span class="legend-item"><i class="legend-swatch${s.dash ? ' dashed' : ''}"` +
+        ` style="color:${escapeHtml(s.color)}"></i>${escapeHtml(s.label)}</span>`).join('') : '';
+    } else if (labelled.length > 1) {
       let x = plot.x + 8;
       for (const s of labelled) {
         svg.appendChild(svgNode(s.dash ? 'line' : 'rect', s.dash
@@ -3788,8 +3794,14 @@ const App = (() => {
     if (options.h === 2) cls.push('tall');
     if (options.tone) cls.push(`tone-${options.tone}`);
     const idAttr = options.id ? ` data-tile="${escapeHtml(options.id)}"` : '';
+    // options.legend: the title shares its <h3> with a .tile-legend span
+    // that drawSeriesChart fills in-place (see opts.legendHost) — used by
+    // the graph tiles, whose in-plot legend used to cover the top lines.
+    const h3 = options.legend
+      ? `<h3><span class="tile-title">${escapeHtml(title)}</span><span class="tile-legend"></span></h3>`
+      : `<h3>${escapeHtml(title)}</h3>`;
     return `<section class="${cls.join(' ')}"${idAttr}>
-      <h3>${escapeHtml(title)}</h3>
+      ${h3}
       ${options.tools || ''}
       ${bodyHtml}
     </section>`;
@@ -5509,6 +5521,22 @@ const App = (() => {
   function emptyState(message) { return `<p class="hint">${escapeHtml(message)}</p>`; }
   function loading() { return '<p class="hint">Loading…</p>'; }
 
+  /* Same loading state, with the brand mark animated in place of plain text
+     — used where a whole view/pane is being replaced (see loadingMark's
+     callers), never on the periodic poll of a view already on screen. The
+     svg markup is copied verbatim from the header's brand mark. */
+  function loadingMark(text = 'Loading…') {
+    return '<p class="hint loading-mark" role="status">'
+      + '<svg class="mark" viewBox="0 0 32 32" aria-hidden="true" focusable="false">'
+      + '<path class="mark-route" d="M6 22 L13 12 L20 20 L26 10"/>'
+      + '<circle class="mark-start" cx="6" cy="22" r="3.1"/>'
+      + '<circle class="mark-hop" cx="13" cy="12" r="2.6"/>'
+      + '<circle class="mark-hop" cx="20" cy="20" r="2.6"/>'
+      + '<circle class="mark-end" cx="26" cy="10" r="3.4"/>'
+      + '</svg>'
+      + `<span>${escapeHtml(text)}</span></p>`;
+  }
+
   /* Builds a table body from column descriptors: `cell(row)` renders when
      given, otherwise the raw field with an em dash for blank. This is what
      makes hiding a column safe — every other table in this app used to zip a
@@ -6493,6 +6521,11 @@ const App = (() => {
     } catch (error) {
       if (error && error.superseded) return;
       connected(false, String(error.message || error));
+      // /api/state is down, but /api/config is a separate endpoint and does
+      // not touch the flow store; fetch it on its own so state.permissions
+      // lands and the Dashboard tiles and tabs render with the account's
+      // real access while the state poll keeps retrying.
+      if (!state.config) loadConfig().catch(() => {});
       // /api/state failing says nothing about the current tab's own endpoint; try it once.
       const first = pages[state.tab];
       if (first && first.refresh && !first.lastFetch && !first.refreshing) {
@@ -6954,7 +6987,7 @@ const App = (() => {
     closeModal, requestCloseModal, confirmDestructive, el, svgNode,
     setText, setHtml, setBg, setHidden, strip, wireToggle,
     tooltip, hideTooltip, toast, showModalError, clearModalError, requireFields,
-    runJob, watchJob, settleButton, form, emptyRow, emptyState, loading, bulkBar,
+    runJob, watchJob, settleButton, form, emptyRow, emptyState, loading, loadingMark, bulkBar,
     bulkToggle, bulkClear,
     announce, desktopNotifyEnabled, setDesktopNotify, titleForAlerts,
     canStoreSecrets, credentialUnavailableHtml,

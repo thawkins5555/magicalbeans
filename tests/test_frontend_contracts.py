@@ -6323,6 +6323,35 @@ check("if (age < -60) return `in ${span(-age)}`;" in AGO140
       "App.ago clamps a negative age to 'just now' for up to 60s of clock "
       "skew, only reading 'in …' past that")
 
+# ---- 142: 5.68.0 tile legend
+# A graph tile's series legend used to draw inside the plot's top-left
+# corner, over the first points of every line. It now shares the tile's
+# <h3> with the title instead, filled in by drawSeriesChart's legendHost.
+TILE142 = js_function(APP, "tile")
+check('class="tile-title"' in TILE142 and 'class="tile-legend"' in TILE142,
+      "tile() gives a legend tile an h3 holding .tile-title and .tile-legend spans")
+
+DRAWSERIES142 = js_function(APP, "drawSeriesChart")
+check("opts.legendHost" in DRAWSERIES142,
+      "drawSeriesChart takes an opts.legendHost")
+check("if (opts.legendHost) {" in DRAWSERIES142
+      and "} else if (labelled.length > 1) {" in DRAWSERIES142
+      and "plot.x + 8" in DRAWSERIES142,
+      "the in-plot top-left legend (plot.x + 8) still draws, but only in "
+      "the else branch of the legendHost check")
+
+DASHBOARD142 = read("dashboard.js")
+RENDERTILE142 = js_function(DASHBOARD142, "renderTile")
+check("legend: def.family === 'Graphs'" in RENDERTILE142,
+      "renderTile only asks tile() for a legend span on a Graphs-family tile")
+
+DRAWCHARTS142 = js_function(DASHBOARD142, "drawCharts")
+check("host && host.querySelector('.tile-legend')" in DRAWCHARTS142
+      and "peak, legendHost });" in DRAWCHARTS142,
+      "drawCharts reads the tile's .tile-legend host null-safely (the same "
+      "host && … guard already used for host.dataset.tile) and forwards it "
+      "to drawSeriesChart")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:
