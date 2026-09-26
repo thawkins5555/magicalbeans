@@ -3699,6 +3699,31 @@ async function checkDashboard(page, dir, tag) {
              `tile count went ${before} -> ${afterAdd} -> ${afterRemove}, expected back to ${before}`);
       return `${before} -> ${afterAdd} -> ${afterRemove}`;
     });
+
+  // 5.68.0: a graph tile's series legend moved from the plot's top-left
+  // corner to the tile's own <h3>, beside the title. The fleet has to carry
+  // a *configured* Interface traffic tile for this to say anything — the
+  // other Dashboard checks above only ever add and then cancel one — so
+  // this skips cleanly rather than failing when none is on the page.
+  await check('a graph tile with a two-series legend draws it beside the title, not over the plot',
+    async () => {
+      const info = await page.evaluate(() => {
+        const host = [...document.querySelectorAll('#dash-grid .tile-legend')]
+          .find((el) => el.querySelectorAll('.legend-item').length > 1);
+        if (!host) return null;
+        const labels = [...host.querySelectorAll('.legend-item')].map((el) => el.textContent.trim());
+        const tile = host.closest('.tile');
+        const svgTexts = [...(tile ? tile.querySelectorAll('.tile-chart svg text') : [])]
+          .map((t) => t.textContent.trim());
+        return { items: labels.length, labels, svgTexts };
+      });
+      if (!info) return 'skipped: no configured graph tile with two labelled series on this page';
+      assert(info.items === 2, `legend holds ${info.items} .legend-item(s), expected 2`);
+      const leaked = info.labels.filter((label) => info.svgTexts.includes(label));
+      assert(!leaked.length,
+             `the plot's svg still carries its own legend text: ${leaked.join(', ')}`);
+      return `${info.items} legend item(s) beside the title, none duplicated in the plot's svg`;
+    });
 }
 
 async function checkOfflineBanner(context, page) {

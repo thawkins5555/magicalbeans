@@ -115,10 +115,15 @@
     // EXPORTERS/INTERFACES read this, to fetch on the poll while they are
     // the one showing rather than on every tick regardless.
     sub: 'traffic',
+    // Set to 'exporters'/'interfaces' only while that pane is being
+    // replaced (entering it, or a range/exporter change on INTERFACES),
+    // never for the poll tick alone; cleared once that fetch lands.
+    subLoading: null,
     // The exporter nf-iface's options were last built for, so a poll tick
     // that sees the same choice again does not refetch the interface list.
     ifaceExporter: '',
     exporters: [],
+    interfaces: [],
   };
 
   // Which of the four sentences a pane with nothing to draw is telling: the
@@ -169,9 +174,10 @@
      400 ms, and the Loading state below, carry the rest of the wait. */
   const REFETCH_MS = 250;
 
-  /* The window an operator has just left is not worth finishing. Its two
-     queries hold the same flow-database lock the collector writes flows
-     through, and the token check in refresh() only hides a stale answer in
+  /* The window an operator has just left is not worth finishing. Its
+     queries run on a connection of their own now, but still queue on the
+     flow store's read lock ahead of the answer the operator actually
+     wants, and the token check in refresh() only hides a stale answer in
      the browser — the server had already computed it. The token is bumped
      here as well as aborted, for the pair that answered a moment before. */
   function dropInFlight() {
@@ -909,17 +915,18 @@
 
   /* ------------------------------------------------------- exporters / interfaces
 
-     The two Plixer-style report views: TRAFFIC's own subtab keeps its data
-     fresh on every poll regardless of which subtab is on screen (drawStatus
-     needs it live and switching back to TRAFFIC must not show a stale
-     chart); these two fetch only when they are the one showing, on
-     selectSub and on the module's own poll. */
+     The two Plixer-style report views: only the subtab on screen fetches,
+     on selectSub and on the module's own poll (drawStatus alone still runs
+     every tick, off /api/state). Whichever one that is shows the loading
+     mark and hides its pane while its own first answer for this view is
+     in flight; the poll tick that follows leaves both alone. */
 
   function selectSub(name) {
     view.sub = name;
     App.selectSub('netflow', name);
-    if (name === 'exporters') refreshExporters();
-    else if (name === 'interfaces') refreshInterfaces();
+    if (name === 'exporters') { view.subLoading = 'exporters'; refreshExporters(); }
+    else if (name === 'interfaces') { view.subLoading = 'interfaces'; refreshInterfaces(); }
+    else if (name === 'traffic') requestFetch(true);
   }
 
   // A device on TRAFFIC's own exporter and iface pickers, set from a report
@@ -1051,13 +1058,35 @@
     App.wireRowKeyboard(body);
   }
 
+  // The mark in the sibling placeholder, table hidden behind it, while
+  // view.subLoading names the pane being replaced (first open, subtab
+  // switch, a filter changing) — never set for the poll tick alone.
+  function showPaneLoading(loadingId, tableId) {
+    const el = App.el(loadingId);
+    el.innerHTML = App.loadingMark();
+    el.hidden = false;
+    App.el(tableId).hidden = true;
+  }
+  function hidePaneLoading(loadingId, tableId) {
+    App.el(loadingId).hidden = true;
+    App.el(tableId).hidden = false;
+  }
+
   async function refreshExporters() {
+    if (view.subLoading === 'exporters') showPaneLoading('nf-exporters-loading', 'nf-exporters');
     let data;
     try {
       data = await App.get('/api/netflow/exporters', {});
-    } catch (error) { return; }
+    } catch (error) {
+      // A failed fetch still retracts the loading claim; the table left
+      // behind is whatever it last showed, same as the TRAFFIC rule.
+      if (view.sub === 'exporters') { view.subLoading = null; hidePaneLoading('nf-exporters-loading', 'nf-exporters'); }
+      return;
+    }
     if (view.sub !== 'exporters') return;    // an operator moved on while this was in flight
     view.exporters = data.exporters || [];
+    view.subLoading = null;
+    hidePaneLoading('nf-exporters-loading', 'nf-exporters');
     drawExportersTable(view.exporters);
   }
 
@@ -1126,6 +1155,7 @@
   }
 
   async function refreshInterfaces() {
+    if (view.subLoading === 'interfaces') showPaneLoading('nf-interfaces-loading', 'nf-interfaces');
     const [t0, t1] = ifaceRangeWindow();
     const exporterSelect = App.el('nf-if-exporter');
     const exporter = exporterSelect.value;
@@ -1136,12 +1166,18 @@
         App.get('/api/netflow/exporters', {}),
         App.get('/api/netflow/interfaces', { t0, t1, exporter }),
       ]);
-    } catch (error) { return; }
+    } catch (error) {
+      if (view.sub === 'interfaces') { view.subLoading = null; hidePaneLoading('nf-interfaces-loading', 'nf-interfaces'); }
+      return;
+    }
     if (view.sub !== 'interfaces') return;   // an operator moved on while this was in flight
     const current = exporterSelect.value;
     App.setHtml(exporterSelect, exporterOptionsHtml(exportersData.exporters || []));
     exporterSelect.value = current;
-    drawInterfacesTable(data.interfaces || []);
+    view.subLoading = null;
+    hidePaneLoading('nf-interfaces-loading', 'nf-interfaces');
+    view.interfaces = data.interfaces || [];
+    drawInterfacesTable(view.interfaces);
   }
 
   /* ------------------------------------------------------------- table */
@@ -1518,10 +1554,11 @@
   async function refresh() {
     if (App.state.tab !== 'netflow') return;
     drawStatus();
-    // EXPORTERS/INTERFACES fetch on the poll only while they are the pane
-    // on screen, independent of TRAFFIC's own window-change debounce below.
-    if (view.sub === 'exporters') refreshExporters();
-    else if (view.sub === 'interfaces') refreshInterfaces();
+    // Only the subtab on screen fetches this tick, and page.refreshing
+    // (app.js runRefresh) covers it end to end, so a slow server gets one
+    // set of requests per tick rather than three piling up behind it.
+    if (view.sub === 'exporters') { await refreshExporters(); return; }
+    if (view.sub === 'interfaces') { await refreshInterfaces(); return; }
     /* A window change is still settling. The poll tick can see the window
        half way through the burst — the dropdown is on 6h on its way to 30d —
        and fetching that one is exactly the waste requestFetch() exists to
@@ -1570,6 +1607,7 @@
     if (token !== view.request) return;
     view.loading = false;
     view.failed = false;
+    App.el('nf-chart-loading').hidden = true;
     view.data = data;
 
     const totals = view.data.totals;
@@ -1759,8 +1797,8 @@
     }
     App.fillRanges(App.el('nf-if-range'), 'Last hour');
     App.el('nf-if-exporter').innerHTML = '<option value="">All exporters</option>';
-    App.el('nf-if-range').onchange = () => refreshInterfaces();
-    App.el('nf-if-exporter').onchange = () => refreshInterfaces();
+    App.el('nf-if-range').onchange = () => { view.subLoading = 'interfaces'; refreshInterfaces(); };
+    App.el('nf-if-exporter').onchange = () => { view.subLoading = 'interfaces'; refreshInterfaces(); };
 
     // Restored before the window is sized, which reads the range straight
     // off nf-range — after it, the window would be built from the markup
