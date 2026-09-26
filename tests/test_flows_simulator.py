@@ -39,6 +39,22 @@ def busy_window(hours: float) -> tuple:
     return t1 - hours * 3600, t1
 
 
+def decode_two_phases(exporters: list, t0: float, t1: float, t2: float,
+                      seed: int):
+    """Decodes a "burst" window (t0..t1) then a "live" window (t1..t2) with
+    one _ExporterState per exporter shared across both stream_datagrams()
+    calls, the way main() shares one across _run_burst/_run_live -- so any
+    counter that resets at the handoff shows up as seq_missed/seq_resets."""
+    decoder = nfdecode.Decoder()
+    by_index = {exp.index: exp for exp in exporters}
+    states = {exp.index: flows._ExporterState(exp) for exp in exporters}
+    for t_lo, t_hi in ((t0, t1), (t1, t2)):
+        for exp_index, _ts_end, datagram, _n in flows.stream_datagrams(
+                exporters, t_lo, t_hi, seed, states=states):
+            decoder.decode(datagram, by_index[exp_index].address)
+    return decoder
+
+
 def decode_all(exporters: list, t0: float, t1: float, seed: int):
     """Every flow decode() yields, in the exact order stream_datagrams()
     sent its datagrams (arrival order)."""
@@ -150,6 +166,26 @@ def main() -> int:
     check(hour3 < hour15,
           f"the diurnal shape holds: a 03:00 hour ({hour3} records) is "
           f"quieter than a 15:00 hour ({hour15}) over a one-day window")
+
+    # --- burst -> live handoff: one sequence counter per exporter, so a ----
+    # --- collector sees no gap or reset crossing it, including across a ----
+    # --- template refresh on each side ---------------------------------
+    handoff_end = _midnight_utc(1) + 16 * 3600
+    handoff_mid = handoff_end - 24 * 3600
+    handoff_start = handoff_mid - 24 * 3600
+    handoff_exporters = flows.build_exporters(4, SEED, handoff_start - 3600)
+    handoff_decoder = decode_two_phases(
+        handoff_exporters, handoff_start, handoff_mid, handoff_end, SEED)
+    check(handoff_decoder.stats["templates"] >= 8,
+          f"the burst+live windows are long enough to force template "
+          f"refreshes on both sides of the handoff "
+          f"(templates={handoff_decoder.stats['templates']})")
+    check(handoff_decoder.stats["seq_missed"] == 0,
+          f"no sequence number is missed across the burst -> live handoff "
+          f"(seq_missed={handoff_decoder.stats['seq_missed']})")
+    check(handoff_decoder.stats["seq_resets"] == 0,
+          f"no exporter's counter resets across the burst -> live handoff "
+          f"(seq_resets={handoff_decoder.stats['seq_resets']})")
 
     print(f"\n{len(FAILURES)} failure(s)" if FAILURES else "\nall checks passed")
     return 1 if FAILURES else 0

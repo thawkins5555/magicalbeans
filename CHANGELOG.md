@@ -315,6 +315,28 @@ land on today, so this was dropped rather than half-built; the cell's own
 tooltip (gap-event count and the last gap's detail) answers the question
 an operator would have followed that link to ask.
 
+**The simulator's own sequence numbers are now continuous, and its
+burst is paced at a quarter of the old rate.** The first run of the new
+diagnostics against `demo/flows.py` showed every simulated exporter with
+a reset and a run of gaps of its own. Two causes. The burst and the live
+phase each kept their own counters, so the hand-off between them read as
+a decrease and a reset; they now share one counter per exporter,
+advanced exactly as the decoder expects for each protocol, and
+`tests/test_flows_simulator.py` decodes a burst followed by a live segment
+and requires zero missed and zero resets. The larger gap, tens of
+thousands of v5 records at once, was genuine loss: with the collector's
+own process under CPU load, as it is when a browser walk drives the
+headless application, a burst at 400 datagrams a second overran the
+socket and some datagrams never reached the receive thread, while the
+same run on an idle box lost nothing. The default burst rate is now 100
+datagrams a second, at which the same contention showed no loss; the
+3-day default burst takes about two minutes instead of half a minute.
+One observation from that test is left for a later release: the
+`kernel_dropped` figure the collector reads from the kernel's own socket
+table stayed at zero while datagrams were demonstrably lost, so that
+counter does not account for every kind of loss on the way to the
+socket.
+
 **Verification.** `tests/test_netflow_scoped.py` gained test 11: an
 old-layout store built by hand gets exporter and interface span rows for
 every pre-upgrade bucket, summing to the same totals the global rows

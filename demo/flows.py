@@ -22,13 +22,15 @@ a diurnal curve: quiet 01:00-06:00, peak in the mid-afternoon.
                           [--flows N] [--seed 1] [--quiet]
 
 --burst sends `--days` of history oldest first (arrival order matches time
-order, since the collector's row cap deletes by arrival order), paced under
-the collector's 20,000-datagram queue at roughly 400 datagrams/s; the
-default (3 days, 4 exporters) sends about 301,000 flow records (300,990 with
-the default seed). --live then
+order, since the collector's row cap deletes by arrival order), paced at
+roughly 100 datagrams/s so a collector sharing its process with other
+threads (the live app under a browser walk, say) does not lose any to its
+4 MB receive buffer; the default (3 days, 4 exporters) sends about 301,000
+flow records (300,990 with the default seed) in about 112 s. --live then
 carries on (or runs alone) at --rate records/s until Ctrl-C, resending
 v9/IPFIX templates every 60 s. --flows caps the total records sent across
-both phases.
+both phases. Burst and live share one running sequence counter per
+exporter, so a collector sees no gap or reset at the handoff.
 
 One line "sending to host:port from N exporters" prints at start; a summary
 of records, datagrams and per-exporter totals prints at exit.
@@ -79,7 +81,7 @@ IPFIX_BATCH = 20
 REFRESH_EVERY_PACKETS = 200          # "like a real router" template resend
 LIVE_TEMPLATE_REFRESH_S = 60.0
 
-BURST_RATE_PER_S = 400.0             # datagrams/s, aggregate across exporters
+BURST_RATE_PER_S = 100.0             # datagrams/s, aggregate across exporters
 
 V9_TEMPLATE_ID = 256
 V9_OPTIONS_TEMPLATE_ID = 257
