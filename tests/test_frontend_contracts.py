@@ -6323,6 +6323,43 @@ check("if (age < -60) return `in ${span(-age)}`;" in AGO140
       "App.ago clamps a negative age to 'just now' for up to 60s of clock "
       "skew, only reading 'in …' past that")
 
+# ---- 141: 5.68.0 web tier
+# The animated loading mark (App.loadingMark), master()'s /api/config
+# fallback when /api/state is down, and NetFlow fetching only the subtab on
+# screen with INTERFACES sortable like the record table.
+NETFLOW141 = read("netflow.js")
+
+LOADINGMARK141 = js_function(APP, "loadingMark")
+check('class="hint loading-mark"' in LOADINGMARK141,
+      "App.loadingMark() returns a <p class=\"hint loading-mark\">")
+
+check("@keyframes mark-draw" in APP_CSS and "prefers-reduced-motion" in APP_CSS,
+      "app.css animates the loading mark's route and turns the animation "
+      "off under prefers-reduced-motion")
+
+check("nf-chart-loading" in INDEX and "nf-chart-loading" in NETFLOW141
+      and "nf-exporters-loading" in INDEX and "nf-exporters-loading" in NETFLOW141
+      and "nf-interfaces-loading" in INDEX and "nf-interfaces-loading" in NETFLOW141,
+      "the chart and both NetFlow tables have their own loading placeholder "
+      "in the markup, toggled from netflow.js")
+
+MASTER141 = js_function(APP, "master")
+check("if (!state.config) loadConfig().catch(() => {});" in MASTER141,
+      "master()'s failed-poll branch fetches /api/config on its own so "
+      "state.permissions lands while /api/state keeps retrying")
+
+REFRESH141 = js_function(NETFLOW141, "refresh")
+check("if (view.sub === 'exporters') { await refreshExporters(); return; }" in REFRESH141
+      and "if (view.sub === 'interfaces') { await refreshInterfaces(); return; }" in REFRESH141
+      and "view.sub === 'traffic'" in REFRESH141,
+      "refresh() awaits and returns after whichever subtab's own fetch is "
+      "on screen, and only falls through to TRAFFIC's own pair otherwise")
+
+check("let interfacesSort = App.recallSort('nf-interfaces'," in NETFLOW141
+      and "function onInterfacesSort(" in NETFLOW141,
+      "INTERFACES remembers its own sort across reloads the same way the "
+      "record table does")
+
 # ---- 142: 5.68.0 tile legend
 # A graph tile's series legend used to draw inside the plot's top-left
 # corner, over the first points of every line. It now shares the tile's

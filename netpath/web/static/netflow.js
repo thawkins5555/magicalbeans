@@ -1559,6 +1559,8 @@
     // set of requests per tick rather than three piling up behind it.
     if (view.sub === 'exporters') { await refreshExporters(); return; }
     if (view.sub === 'interfaces') { await refreshInterfaces(); return; }
+    // From here down, view.sub === 'traffic': the window-change debounce
+    // and the overview+records pair TRAFFIC has always fetched.
     /* A window change is still settling. The poll tick can see the window
        half way through the burst — the dropdown is on 6h on its way to 30d —
        and fetching that one is exactly the waste requestFetch() exists to

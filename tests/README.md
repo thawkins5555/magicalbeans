@@ -118,6 +118,12 @@ too-big reply halves the batch size and the walk still completes, and a
 controller that refuses GETBULK outright falls back to GETNEXT once and
 is never asked with GETBULK again for the life of the poller).
 
+5.68.0 added one suite: `test_netflow_readconn.py` (NetFlow chart, record
+and totals reads run on a second, query-only connection, so the collector's
+writer never waits behind them; `coverage()` returns its last answer rather
+than wait; `_raw_holds` is memoised; `_span_plan` tiles a window hours first,
+minutes next, raw at the edges, and totals equal raw).
+
 One family is worth calling out by name: `test_frontend_contracts.py`,
 `test_time_contracts.py`, `test_layout_contracts.py`, `test_design_tokens.py`
 and `test_static_headers.py` read the shipped JS/HTML/CSS as text rather than

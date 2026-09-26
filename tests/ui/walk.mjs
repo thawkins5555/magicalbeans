@@ -4309,6 +4309,29 @@ async function checkMisc(page, watcher) {
       return `${info.count} interface row(s), ${info.withBar} with a utilisation bar`;
     });
 
+  await check('clicking the INTERFACES In header re-sorts the table', async () => {
+    if (sparseNetflow) return sparseSkip;
+    await page.click('#page-netflow > .subtabs > .subtab[data-subtab="interfaces"]');
+    await page.waitForSelector('#nf-interfaces tbody tr', { timeout: 15000 });
+    await settle(page, 500);
+    const snapshot = () => page.evaluate(() => {
+      const th = [...document.querySelectorAll('#nf-interfaces thead th')]
+        .find((t) => (t.childNodes[0] || {}).textContent === 'In');
+      return { row: (document.querySelector('#nf-interfaces tbody tr') || {}).textContent,
+               ariaSort: th && th.getAttribute('aria-sort') };
+    });
+    const before = await snapshot();
+    await page.evaluate(() => {
+      [...document.querySelectorAll('#nf-interfaces thead th')]
+        .find((t) => (t.childNodes[0] || {}).textContent === 'In').click();
+    });
+    await settle(page, 300);
+    const after = await snapshot();
+    assert(after.row !== before.row || after.ariaSort !== before.ariaSort,
+           'clicking the In header changed neither the first row nor its aria-sort');
+    return `aria-sort ${before.ariaSort} -> ${after.ariaSort}`;
+  });
+
   await check('clicking an INTERFACES row lands on TRAFFIC filtered to it, with a drawn chart',
     async () => {
       if (sparseNetflow) return sparseSkip;

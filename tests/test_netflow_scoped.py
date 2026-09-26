@@ -544,6 +544,7 @@ def test_7_interface_buckets_widen_to_the_hour() -> None:
     with db._lock:
         db._conn.execute("DELETE FROM flows WHERE ts_end < ?", (end - 3600,))
         db._conn.commit()
+    db._raw_holds_memo.clear()   # as prune() does
     for bucket in (60, 300, 900):
         info: dict = {}
         got = db.overview(start, end, "Application", filters, bucket, info=info)
@@ -868,6 +869,7 @@ def test_11_upgraded_history_gets_scoped_totals() -> None:
           f"and stays summary-served ({info})")
     db.insert_flows([flow(i, floors[3600] - 3000 + i * 300, exporter=EXPORTER)
                      for i in range(84)])
+    db._raw_holds_memo.clear()   # its answers are otherwise a minute old
     info = {}
     got = db.overview(floors[3600], hour, "Application", exporter, 3600,
                       info=info)
