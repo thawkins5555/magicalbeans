@@ -79,6 +79,8 @@ IPFIX_BATCH = 20
 REFRESH_EVERY_PACKETS = 200          # "like a real router" template resend
 LIVE_TEMPLATE_REFRESH_S = 60.0
 
+BURST_RATE_PER_S = 400.0             # datagrams/s, aggregate across exporters
+
 V9_TEMPLATE_ID = 256
 V9_OPTIONS_TEMPLATE_ID = 257
 IPFIX_TEMPLATE_ID = 256
@@ -444,12 +446,17 @@ class _ExporterState:
 
 
 def stream_datagrams(exporters: list, t0: float, t1: float, seed: int,
-                     flows_cap: int | None = None):
+                     flows_cap: int | None = None, states: dict | None = None):
     """Yields (exporter_index, ts_end, datagram_bytes, n_records), oldest
     first - the same datagrams main() would send, built with no socket
     involved so a test can decode them directly. A template/options refresh
-    datagram carries n_records == 0: it produces no Flow on its own."""
-    states = {exp.index: _ExporterState(exp) for exp in exporters}
+    datagram carries n_records == 0: it produces no Flow on its own.
+
+    `states` lets a caller share one _ExporterState per exporter across
+    calls (e.g. burst then live) so sequence counters stay continuous;
+    omitting it builds fresh ones, as a single-phase decode needs."""
+    if states is None:
+        states = {exp.index: _ExporterState(exp) for exp in exporters}
     for exp_index, ts_end, flow in generate_flows(exporters, t0, t1, seed, flows_cap):
         state = states[exp_index]
         exp = state.exp
@@ -495,16 +502,16 @@ def _send(sock: socket.socket, host: str, port: int, datagram: bytes,
 
 def _run_burst(exporters: list, sockets: dict, host: str, port: int,
                days: float, seed: int, flows_cap, quiet: bool,
-               totals: dict, errors: list) -> int:
+               totals: dict, errors: list, states: dict) -> int:
     now = time.time()
     t0, t1 = now - days * 86400, now
-    rate_per_s = 400.0
+    rate_per_s = BURST_RATE_PER_S
     interval = 1.0 / rate_per_s
     next_send = time.monotonic()
     total_records = 0
     last_hour_shown = None
     for exp_index, ts_end, datagram, n_records in stream_datagrams(
-            exporters, t0, t1, seed, flows_cap):
+            exporters, t0, t1, seed, flows_cap, states):
         _send(sockets[exp_index], host, port, datagram, errors)
         totals[exp_index]["datagrams"] += 1
         totals[exp_index]["records"] += n_records
@@ -525,8 +532,7 @@ def _run_burst(exporters: list, sockets: dict, host: str, port: int,
 
 def _run_live(exporters: list, sockets: dict, host: str, port: int,
              rate: float, seed: int, flows_cap, records_sent: int,
-             quiet: bool, totals: dict, errors: list) -> None:
-    states = {exp.index: _ExporterState(exp) for exp in exporters}
+             quiet: bool, totals: dict, errors: list, states: dict) -> None:
     weights = {exp.index: BUSY_MULTIPLIER if exp.busy else 1.0 for exp in exporters}
     total_weight = sum(weights.values())
     per_exporter_interval = {
@@ -604,6 +610,9 @@ def main(argv=None) -> int:
                           "version": exp.version, "address": exp.address}
              for exp in exporters}
     errors: list = []
+    # One _ExporterState per exporter, shared by burst and live: the
+    # sequence counters the decoder tracks must not restart at the handoff.
+    states = {exp.index: _ExporterState(exp) for exp in exporters}
 
     print(f"sending to {args.host}:{args.port} from {len(exporters)} exporters",
           flush=True)
@@ -613,10 +622,11 @@ def main(argv=None) -> int:
         if args.burst:
             sent = _run_burst(exporters, sockets, args.host, args.port,
                               args.days, args.seed, args.flows, args.quiet,
-                              totals, errors)
+                              totals, errors, states)
         if args.live:
             _run_live(exporters, sockets, args.host, args.port, args.rate,
-                     args.seed, args.flows, sent, args.quiet, totals, errors)
+                     args.seed, args.flows, sent, args.quiet, totals, errors,
+                     states)
     except KeyboardInterrupt:
         pass
     finally:
