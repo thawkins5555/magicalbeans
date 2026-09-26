@@ -295,25 +295,35 @@ minute/hourly summaries) — before → after:
 
 | Query | Before | After |
 | --- | --- | --- |
-| Overview, 24 h, unfiltered | 5.3 ms | AFTER-PENDING |
-| Overview, 7 d, exporter-filtered | 1,076 ms | AFTER-PENDING |
-| Overview, 24 h, exporter + interface | 1,417 ms | AFTER-PENDING |
-| Overview, 24 h, source-filtered (records) | 923 ms | AFTER-PENDING |
-| Record list, 24 h | 561 ms | AFTER-PENDING |
-| Interface totals, 1 h | 27 ms | AFTER-PENDING |
-| Interface totals, 24 h | 116 ms | AFTER-PENDING |
-| Interface totals, 7 d | 18,479 ms | AFTER-PENDING |
-| History probe (`coverage()`) | 1,184 ms | AFTER-PENDING |
-| `/api/state` wait behind a running record list | 847 ms | AFTER-PENDING |
-| Longest single lock hold observed | 19.6 s | AFTER-PENDING |
+| Overview, 24 h, unfiltered | 5.3 ms | 5.3 ms |
+| Overview, 7 d, exporter-filtered | 1,076 ms | 1,038 ms (2.3 ms once the summaries cover the window, see below) |
+| Overview, 24 h, exporter + interface | 1,417 ms | 760 ms |
+| Overview, 24 h, source-filtered (records) | 923 ms | 786 ms |
+| Record list, 24 h | 561 ms | 560 ms |
+| Interface totals, 1 h | 27 ms | 9 ms |
+| Interface totals, 24 h | 116 ms | 6 ms |
+| Interface totals, 7 d | 18,479 ms | 5.5 ms |
+| History probe (`coverage()`) | 1,184 ms | 0.2 ms |
+| `/api/state` wait behind a running record list | 847 ms | 250 ms (the quarter-second try, then the last answer) |
+| Longest single lock hold observed | 19.6 s | 20.8 s on the write lock (the benchmark's own summary build and prune); 1.05 s on the new read lock |
 
-**Left for later, plainly.** The hourly interface breakdown is still
-rebuilt from raw records, one transaction per dimension, and still holds
-the collector's write lock for seconds at this scale on every hourly
-summary pass — the collector's own queue absorbs it and no flow loss was
-seen, but it is not fixed here. The size-cap trim every store shares still
-runs the same combined oldest/newest query this release rewrote for
-`coverage()` and `prune()`'s retention bound alone. An interface-filtered
+The two-day fixture starts a 7-day window before the summaries' oldest
+bucket, so that chart is answered from records on both sides of the
+table. On an eight-day fixture, where the summaries cover the window
+as they do on the operator's store, the same chart went from 1,038 ms
+to 2.3 ms. Record-list and records-answered charts cost what they did;
+what changed is that nothing else waits behind them any more: the
+collector's insert waited 0–2 ms with a record list running.
+
+**Left for later, plainly.** The benchmark's longest single hold of
+the collector's write lock (about 20 s, the same before and after)
+happens inside its own summary build and prune, never in a request;
+which step is responsible has not been pinned down and the collector
+was not running in the benchmark, so whether it drops flows during
+such a hold on a live box is unmeasured. The size-cap trim every store
+shares still runs the same combined oldest/newest query this release
+rewrote for `coverage()` and `prune()`'s row-cap bound alone. An
+interface-filtered
 chart's unsealed tail still comes from raw records, because interfaces
 have no minute-level summary to fall back to. And a chart whose window
 starts before the summaries' own oldest bucket is still answered entirely
