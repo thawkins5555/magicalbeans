@@ -968,8 +968,9 @@ def test_19_coverage_returns_the_documented_keys() -> None:
     cov = db.coverage()
     expected = {"raw_oldest", "raw_newest", "minute_floor", "minute_watermark",
                "hourly_floor", "hourly_watermark", "scoped_minute_floor",
-               "scoped_hourly_floor", "iface_hourly_floor", "cap_held_back",
-               "prune_incomplete"}
+               "scoped_hourly_floor", "iface_hourly_floor",
+               "breakdown_minute_floor", "breakdown_hourly_floor",
+               "iface_breakdown_floor", "cap_held_back", "prune_incomplete"}
     check(set(cov) == expected, f"coverage() keys: {sorted(cov)}")
     check(cov["cap_held_back"] == 0 and cov["prune_incomplete"] is False,
           "a fresh store starts with nothing held back and no incomplete prune")

@@ -367,12 +367,17 @@ def test_4_migration_of_an_unscoped_store() -> None:
     check(sum("rebuilt with a scope column" in line for line in log.lines) == 1,
           f"one log line says so ({log.lines})")
     for tier in flowdb.ROLLUP_TIERS:
-        check(db._private_setting(flowdb._SCOPED_FLOOR % tier)
-              == reference.rollup_bounds(tier)[1],
-              f"tier {tier}: the scoped floor is the old watermark")
-    check(db._private_setting(flowdb._IFACE_FLOOR)
-          == reference.rollup_bounds(3600)[1],
-          "and so is the interface floor")
+        check(db._private_setting(flowdb._BREAKDOWN_FLOOR % tier)
+              == reference.rollup_bounds(tier)[1]
+              and db._private_setting(flowdb._SCOPED_FLOOR % tier)
+              == reference.rollup_bounds(tier)[0],
+              f"tier {tier}: the old watermark is the breakdown floor, the "
+              f"scoped floor the tier's own")
+    check(db._private_setting(flowdb._IFACE_BREAKDOWN_FLOOR)
+          == reference.rollup_bounds(3600)[1]
+          and db._private_setting(flowdb._IFACE_FLOOR)
+          == reference.rollup_bounds(3600)[0],
+          "and so are the interface floors")
 
     mismatched = [f"{dimension} at {bucket}s" for dimension in DIMENSIONS
                   for bucket in BUCKETS
@@ -388,7 +393,8 @@ def test_4_migration_of_an_unscoped_store() -> None:
     got = db.overview(start, end, "Source", scoped(), 300, info=info)
     check(info["records_only"] and got == raw(db, "overview", start, end,
                                              "Source", scoped(), 300),
-          "an exporter filter below the scoped floor reads raw, and says so")
+          "an exporter filter below the breakdown floor reads raw while raw "
+          "reaches t0, and says so")
     before = [tuple(row) for row in db._conn.execute(
         "SELECT * FROM flow_rollup ORDER BY 1, 2, 3, 4, 5, 6, 7")]
     db.close()
@@ -673,6 +679,226 @@ def test_10_totals_reads() -> None:
     db.close()
 
 
+# ------------------------------------------------------------------------ 11
+
+V6 = "2001:db8::1"
+# Global interface keys and how each splits; None never does.
+SPLITS = {7: {f"{EXPORTER}:1": (EXPORTER, 1), f"{EXPORTER}:2": (EXPORTER, 2),
+              f"{V6}:3": (V6, 3), "junk": None, f"{EXPORTER}:x": None},
+          8: {f"{EXPORTER}:2": (EXPORTER, 2), f"{V6}:1": (V6, 1),
+              f"{V6}:-1": None}}
+FLOORS = {60: 2 * 3600, 3600: 6 * 3600}   # each tier's floor below `hour`
+
+
+def seed_global(conn, hour: int) -> dict:
+    """Global rows only, for every bucket from each tier's floor up to `hour`.
+    Returns the scoped spans they imply, {(tier, exporter, iface, dir,
+    bucket): (bytes, packets, flows)}."""
+    rows, spans, want = [], [], {}
+    for tier, depth in FLOORS.items():
+        for bucket in range(hour - depth, hour, tier):
+            n = (bucket // tier) % 7
+            for i, exporter in enumerate((EXPORTER, V6)):
+                sums = (1000 * (i + 1) + n, 10 * (i + 1), i + 1)
+                rows.append((tier, flowdb.DIMENSION_IDS["Exporter"], bucket,
+                             exporter, *sums))
+                want[(tier, exporter, -1, "", bucket)] = sums
+            for dim, side in ((7, "in"), (8, "out")):
+                for i, (key, split) in enumerate(SPLITS[dim].items()):
+                    sums = (100 * (i + 1) + n, i + 1, 1)
+                    rows.append((tier, dim, bucket, key, *sums))
+                    if split:
+                        want[(tier, *split, side, bucket)] = sums
+            rows.append((tier, flowdb.DIMENSION_IDS["Application"], bucket, 443,
+                         1500 + n, 30, 3))
+            spans.append((tier, bucket, 3000 + 2 * n, 30, 3))
+    conn.executemany("INSERT INTO flow_rollup(tier, dim, bucket, key, bytes,"
+                     " packets, flows) VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
+    conn.executemany("INSERT INTO flow_rollup_span(tier, bucket, bytes, packets,"
+                     " flows) VALUES (?, ?, ?, ?, ?)", spans)
+    conn.commit()
+    return want
+
+
+def scoped_spans(db: FlowDatabase) -> dict:
+    return {tuple(row[:5]): tuple(row[5:]) for row in db._conn.execute(
+        "SELECT tier, exporter, iface, dir, bucket, bytes, packets, flows"
+        " FROM flow_rollup_span WHERE exporter != ''")}
+
+
+def summed(want: dict, tier: int, exporter: str, iface: int = -1,
+           sides=("",), low: int = 0, upper: int = 2 ** 62) -> dict:
+    rows = [sums for (t, e, i, d, b), sums in want.items()
+            if (t, e, i) == (tier, exporter, iface) and d in sides
+            and low <= b < upper]
+    return {name: sum(row[k] for row in rows)
+            for k, name in enumerate(("bytes", "packets", "flows"))}
+
+
+def opened(path: str) -> tuple[FlowDatabase, list[str]]:
+    log = captured_log()
+    try:
+        return FlowDatabase(path), log.lines
+    finally:
+        log.detach()
+
+
+def test_11_upgraded_history_gets_scoped_totals() -> None:
+    print("11: an upgraded store's exporters and interfaces get their totals "
+          "for the history before their summaries")
+    hour = flowdb._align_down(time.time() - 300, 3600)
+    floors = {tier: hour - depth for tier, depth in FLOORS.items()}
+    path = os.path.join(TMPDIR, "reconstruct_old.db")
+    old = sqlite3.connect(path)
+    old.executescript(flowdb.SCHEMA.replace(flowdb.ROLLUP_SCHEMA, "")
+                      + OLD_ROLLUP)
+    want = seed_global(old, hour)
+    for tier in flowdb.ROLLUP_TIERS:
+        for key, value in ((flowdb._FLOOR, floors[tier]),
+                           (flowdb._WATERMARK, hour)):
+            old.execute("INSERT INTO settings(key, value) VALUES (?, ?)",
+                        (key % tier, str(value)))
+    old.commit()
+    old.close()
+
+    db, lines = opened(path)
+    got = scoped_spans(db)
+    check(got == want,
+          f"every pre-upgrade bucket has its exporter and interface span rows "
+          f"at both tiers, summing as the global rows; IPv6 keys split on the "
+          f"last ':', malformed ones skipped ({len(got)} of {len(want)})")
+    exporters = sum(1 for key in want if key[2] == -1)
+    rebuilt = [line for line in lines if "totals rebuilt" in line]
+    check(len(rebuilt) == 1 and f"{exporters} exporter row(s), "
+          f"{len(want) - exporters} interface row(s)" in rebuilt[0],
+          f"one log line counts them ({rebuilt})")
+    cov = db.coverage()
+    check(cov["breakdown_minute_floor"] == hour
+          and cov["breakdown_hourly_floor"] == hour
+          and cov["iface_breakdown_floor"] == hour
+          and cov["scoped_minute_floor"] == floors[60]
+          and cov["scoped_hourly_floor"] == floors[3600]
+          and cov["iface_hourly_floor"] == floors[3600],
+          f"coverage() keeps the old watermark as the breakdown floors, the "
+          f"scoped floors now the global ones ({cov})")
+
+    for tier in flowdb.ROLLUP_TIERS:
+        for exporter in (EXPORTER, V6):
+            info: dict = {}
+            _t, series, _b, _top, totals = db.overview(
+                floors[tier], hour, "Application",
+                {**NO_FILTERS, "exporter": exporter}, tier, info=info)
+            check(not info["records_only"] and info["tier"] == tier
+                  and info["summaries_from"] == floors[tier]
+                  and info["breakdown_from"] == hour
+                  and totals == summed(want, tier, exporter)
+                  and set(series) == {"— other —"}
+                  and sum(series["— other —"]) == totals["bytes"],
+                  f"{exporter}, tier {tier}: summary-served, totals are its "
+                  f"global Exporter rows, all of it '— other —', breakdown "
+                  f"from the old watermark ({info})")
+    for filters, sides in (
+            ({**NO_FILTERS, "exporter": EXPORTER, "iface": 2,
+              "direction": "both"}, ("in", "out")),
+            ({**NO_FILTERS, "exporter": V6, "iface": 3, "direction": "in"},
+             ("in",))):
+        info = {}
+        _t, series, _b, _top, totals = db.overview(
+            floors[3600], hour, "Application", filters, 3600, info=info)
+        check(not info["records_only"] and info["tier"] == 3600
+              and info["breakdown_from"] == hour
+              and totals == summed(want, 3600, filters["exporter"],
+                                   filters["iface"], sides)
+              and set(series) == {"— other —"},
+              f"interface {filters['exporter']}:{filters['iface']} "
+              f"{filters['direction']}: likewise, from the global interface "
+              f"rows ({info})")
+    info = {}
+    db.overview(floors[3600], hour, "Application", NO_FILTERS, 3600, info=info)
+    check(not info["records_only"] and info["breakdown_from"] is None,
+          f"the global scope has no breakdown floor ({info})")
+    rows = db.interface_totals(floors[3600], hour)
+    check(db.exporter_totals(floors[3600], hour)
+          == {e: summed(want, 3600, e) for e in (EXPORTER, V6)}
+          and {(r["exporter"], r["iface"], r["dir"]) for r in rows}
+          == {key[1:4] for key in want if key[0] == 3600 and key[2] >= 0}
+          and all({k: r[k] for k in ("bytes", "packets", "flows")}
+                  == summed(want, 3600, r["exporter"], r["iface"], (r["dir"],))
+                  for r in rows),
+          "exporter_totals and interface_totals read the same totals")
+
+    tables = ("flow_rollup", "flow_rollup_span", "settings")
+    before = {table: count(db, f"SELECT COUNT(*) FROM {table}")
+              for table in tables}
+    db.close()
+    db, lines = opened(path)
+    check(not lines and db._private_setting(flowdb._RECONSTRUCTED) is True
+          and {table: count(db, f"SELECT COUNT(*) FROM {table}")
+               for table in tables} == before,
+          "a second open is a no-op: the setting is present, nothing logged "
+          "or added")
+
+    exporter = {**NO_FILTERS, "exporter": EXPORTER}
+    db.insert_flows([flow(i, floors[3600] - 3000 + i * 400, exporter=EXPORTER)
+                     for i in range(20)])
+    info = {}
+    got = db.overview(floors[3600], hour, "Application", exporter, 3600,
+                      info=info)
+    check(info["records_only"] and len(got[1]) > 1
+          and got == raw(db, "overview", floors[3600], hour, "Application",
+                         exporter, 3600),
+          f"with raw reaching t0 below the breakdown floor, raw draws the "
+          f"breakdown as it did before ({info})")
+    for tier in flowdb.ROLLUP_TIERS:
+        db.backfill_rollup(tier, max_buckets=1)
+        floor = db.rollup_bounds(tier)[0]
+        check(floor == floors[tier] - tier
+              and db._private_setting(flowdb._SCOPED_FLOOR % tier) == floor,
+              f"tier {tier}: backfill lowers the scoped floor with the floor")
+    check(db._private_setting(flowdb._IFACE_FLOOR) == floors[3600] - 3600,
+          "and the interface floor with the hourly one")
+    db.close()
+
+    db = store("reconstruct_5670.db")
+    want = seed_global(db._conn, hour)
+    for tier in flowdb.ROLLUP_TIERS:
+        for key, value in ((flowdb._FLOOR, floors[tier]),
+                           (flowdb._WATERMARK, hour),
+                           (flowdb._SCOPED_FLOOR, hour)):
+            db._set_private_setting(key % tier, value)
+    db._set_private_setting(flowdb._IFACE_FLOOR, hour)
+    redo = hour - 3600
+    stored = (3600, EXPORTER, -1, "", flowdb.DIMENSION_IDS["Application"],
+              redo, 443, 700, 7, 1)
+    db._conn.execute("INSERT INTO flow_rollup VALUES (?, ?, ?, ?, ?, ?, ?, ?,"
+                     " ?, ?)", stored)
+    db._conn.commit()
+    db._clear_private_setting(flowdb._RECONSTRUCTED)
+    path = db.path
+    db.close()
+    db, lines = opened(path)
+    cov = db.coverage()
+    check(scoped_spans(db) == want and len(lines) == 1
+          and cov["breakdown_hourly_floor"] == hour
+          and cov["scoped_hourly_floor"] == floors[3600],
+          "a store already on the scoped layout without the setting is "
+          "reconstructed at its next open too")
+    db._compact_bucket(3600, redo)
+    kept = [tuple(row) for row in db._conn.execute(
+        "SELECT * FROM flow_rollup WHERE tier = 3600 AND exporter != ''"
+        " AND bucket = ?", (redo,))]
+    span = db._conn.execute(
+        "SELECT bytes, packets, flows FROM flow_rollup_span WHERE tier = 3600"
+        " AND exporter = ? AND iface = -1 AND bucket = ?",
+        (EXPORTER, redo)).fetchone()
+    minutes = summed(want, 60, EXPORTER, low=redo, upper=redo + 3600)
+    check(kept == [stored] and tuple(span) == tuple(minutes.values()),
+          f"a redo of a pre-upgrade hour raw no longer holds keeps its exporter "
+          f"keys as built rather than emptying them, and sums its span from "
+          f"the minutes ({kept})")
+    db.close()
+
+
 TESTS = [
     test_1_scopes_agree_with_raw,
     test_2_caps_flags_and_repair,
@@ -684,6 +910,7 @@ TESTS = [
     test_8_row_cap_holds_back_at_the_hourly_watermark,
     test_9_oldest_ts_stays_a_probe,
     test_10_totals_reads,
+    test_11_upgraded_history_gets_scoped_totals,
 ]
 
 

@@ -334,7 +334,7 @@ _FLOOR = "flow_rollup_floor_%d"             # backward edge backfill has reached
 # cleared by whichever tier compacted first, and the other never saw it.
 _DIRTY = "flow_rollup_dirty_ts_%d"
 # How far back each tier's scoped rows reach, and the hourly interface keys'
-# own; an upgraded store has none below its old watermark.
+# own.
 _SCOPED_FLOOR = "flow_rollup_scoped_floor_%d"
 _IFACE_FLOOR = "flow_rollup_iface_floor"
 # Where the scoped floors stood before _reconstruct_scoped_spans lowered them:
@@ -836,7 +836,8 @@ class FlowDatabase(SqliteStore):
         scoped_minutes = (from_minutes and scoped_floor is not None
                           and bucket >= int(scoped_floor))
         # Minute exporter keys start at the breakdown floor: below it an
-        # hour's come from raw while raw holds the hour, else stay as built.
+        # hour's come from raw while raw holds the hour (`interfaces`), else
+        # stay as built.
         breakdown = self._private_setting(_BREAKDOWN_FLOOR % 60)
         keys_from_minutes = scoped_minutes and (breakdown is None
                                                 or bucket >= int(breakdown))
