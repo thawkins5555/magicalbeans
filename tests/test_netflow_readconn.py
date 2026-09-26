@@ -387,6 +387,25 @@ def test_e_close() -> None:
     check(elapsed < 0.6, f"a held read lock delays close() by its timeout "
                          f"alone ({elapsed:.2f} s)")
 
+    class Broken:
+        def close(self):
+            raise sqlite3.OperationalError("read side failed to close")
+
+    db = store("close_broken.db")
+    real_read, db._read_conn = db._read_conn, Broken()
+    try:
+        db.close()
+    except sqlite3.OperationalError:
+        pass
+    real_read.close()
+    try:
+        db._conn.execute("SELECT 1")
+        write_closed = False
+    except sqlite3.ProgrammingError:
+        write_closed = True
+    check(write_closed, "a read side that fails to close still lets the "
+                        "write connection close")
+
 
 # ------------------------------------------------------------------------- f
 
@@ -394,8 +413,9 @@ def test_f_memory() -> None:
     print("f: an in-memory store reads through its one connection")
     db = FlowDatabase(":memory:")
     now = time.time()
-    check(db._read_conn is db._conn and db._read_lock is db._lock,
-          "the read pair aliases the write pair")
+    check(db._read_conn is db._conn and db._read_lock is db._lock
+          and db.read_lock_stats() == {},
+          "the read pair aliases the write pair, and reports no read lock")
     db.insert_flows([flow(1, now - 5)])
     check(len(db.flows(now - 60, now, NO_FILTERS)[0]) == 1
           and db.coverage()["raw_newest"] == now - 5,
