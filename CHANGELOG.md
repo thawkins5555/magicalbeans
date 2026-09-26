@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.68.0 — NetFlow's chart and record reads move off the collector's lock, fixing the module freeze and Dashboard's Not readable, plus a moved legend, a loading mark, and sortable INTERFACES](#5680--netflows-chart-and-record-reads-move-off-the-collectors-lock-fixing-the-module-freeze-and-dashboards-not-readable-plus-a-moved-legend-a-loading-mark-and-sortable-interfaces)
 - [5.67.1 — NetFlow follow-up: pre-upgrade history restored for exporter/interface charts, sequence-gap diagnostics, and the clock-skew display fixed](#5671--netflow-follow-up-pre-upgrade-history-restored-for-exporterinterface-charts-sequence-gap-diagnostics-and-the-clock-skew-display-fixed)
 - [5.67.0 — NetFlow: filtered charts now read the summaries per exporter and interface, the page says what records-only views can reach, exporters are named, and EXPORTERS/INTERFACES views arrive](#5670--netflow-filtered-charts-now-read-the-summaries-per-exporter-and-interface-the-page-says-what-records-only-views-can-reach-exporters-are-named-and-exportersinterfaces-views-arrive)
 - [5.66.0 — A stored DHCP credential now runs the poll locally as that account, not over WinRM](#5660--a-stored-dhcp-credential-now-runs-the-poll-locally-as-that-account-not-over-winrm)
@@ -202,6 +203,130 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.68.0 — NetFlow's chart and record reads move off the collector's lock, fixing the module freeze and Dashboard's Not readable, plus a moved legend, a loading mark, and sortable INTERFACES
+
+Five operator reports in one message: the Dashboard's **Interface traffic**
+tile drew its legend over the top of the plot; NetFlow gave no sign a page
+was loading; the INTERFACES table could not be sorted by column; opening
+the NetFlow tab froze the application — charts took a very long time to
+draw, or never drew at all, and other modules slowed down with it; and
+every Dashboard tile read **Not readable with your access**, although
+nothing about the account's permissions had changed.
+
+**Root cause of the freeze and the "Not readable" tiles, together.** Every
+read against the flow store — a chart, the flow-record list, a totals
+figure — took the same single lock the NetFlow collector's writer uses,
+the same lock the minute/hourly summariser uses, and the same lock the
+two-second `/api/state` poll every open browser tab depends on for its
+next screen update. A chart or record list over a five-million-record
+store can run for whole seconds; while it holds the lock, the collector
+can't write, the summariser can't compact, and — because every tab's
+refresh loop waits for its own `/api/state` reply before repainting
+anything — every other open module visibly stalls too. The Dashboard's
+"Not readable with your access" tiles were a second symptom of the exact
+same wait: an account's access grants arrive on `/api/config`, not
+`/api/state`, but `/api/state` failing (queued behind a chart) left
+`state.permissions` never populated, and a tile with no access grant on
+record renders as unreadable rather than as unknown.
+
+**Two further costs the new scale benchmark turned up.** The "how far back
+does history reach" probe behind the status strip runs every ten seconds
+and was walking all five million raw rows on every call — `SELECT
+MIN(ts_end), MAX(ts_end) FROM flows` is written as one query, but SQLite
+plans a combined min-and-max like that as a full table scan rather than
+two index lookups, costing 1.2 seconds a call at this scale. And the
+7-day INTERFACES report was reading ten thousand *minute*-level rows per
+interface to build an hour-by-hour utilisation picture, when the hourly
+summary already had the answer. Separately, on the browser side, the
+EXPORTERS and INTERFACES polls had slipped past the page's own
+one-request-at-a-time guard, so a slow server let their queries pile up
+rather than being held back like every other tab's poll.
+
+**What changed — the flow store.** Chart, record-list and totals reads
+(`flows`, `exporter_totals`, `interface_totals`, `coverage`, `exporters`,
+`interface_names`) now run on a second, query-only SQLite connection
+behind a lock of its own, so the collector's writer, the summariser and
+the status poll never queue behind one any more. The history probe is
+now two scalar subqueries — `(SELECT MIN(ts_end) …)`, `(SELECT MAX(ts_end)
+…)` — which SQLite serves as two index probes rather than a scan; if the
+new read lock happens to be busy when the status poll asks, it gets the
+last answer instead of waiting for one. A 60-second memo covers the
+raw-holds check an interface-filtered chart makes on every poll, so a
+screen left open on INTERFACES stops re-asking the same question ten
+times a minute. Totals reports (INTERFACES, and exporter rate figures)
+now read whole hours from the hourly summary and only the partial hour at
+each edge from the minute-level rows, instead of the minute-level table
+for the whole window; and a 7- or 30-day chart's unsealed tail — the last
+stretch the hourly summary hasn't caught up to yet — is now served from
+the minute-level rows instead of falling back to up to an hour of raw
+records.
+
+**What changed — the browser.** NetFlow's poll tick now fetches only the
+subtab actually on screen (TRAFFIC, EXPORTERS or INTERFACES), awaited
+under the same `page.refreshing` guard every other tab's poll already
+uses, so a slow server queues one request at a time here too rather than
+three. Separately, `master()`'s failed-`/api/state` branch now fetches
+`/api/config` on its own the first time it's missing, so an account's
+access grants land — and the Dashboard renders its tiles against real
+permissions — even while `/api/state` itself keeps retrying behind a slow
+module.
+
+**Three UI items, alongside the above.**
+
+- **The Dashboard tile legend** moves out of the plot's top-left corner
+  and into the tile's own title row, wrapping onto its own line on a
+  narrow tile rather than truncating.
+- **A loading mark** — the brand's route-and-hop mark, animated, honouring
+  "reduce motion" — now shows on NetFlow's chart, EXPORTERS and INTERFACES
+  panes whenever a *view* is being replaced: the tab's first open, a
+  subtab switch, or a window/filter/range change. It is deliberately never
+  shown on the plain periodic refresh of a view already on screen — that
+  keeps updating quietly, the way it always has.
+- **INTERFACES is sortable on every column**, the same click-to-sort,
+  click-again-to-reverse behaviour the flow-record table already has, and
+  it now opens sorted by inbound rate, highest first, remembered per
+  browser like the record table's own sort.
+
+**Measured on the released code, before this release's fixes, at the
+operator's reported scale** (`tests/bench_flow_scale.py`'s defaults: five
+million raw records over 1.7 hours from six exporters, behind two days of
+minute/hourly summaries) — before → after:
+
+| Query | Before | After |
+| --- | --- | --- |
+| Overview, 24 h, unfiltered | 5.3 ms | AFTER-PENDING |
+| Overview, 7 d, exporter-filtered | 1,076 ms | AFTER-PENDING |
+| Overview, 24 h, exporter + interface | 1,417 ms | AFTER-PENDING |
+| Overview, 24 h, source-filtered (records) | 923 ms | AFTER-PENDING |
+| Record list, 24 h | 561 ms | AFTER-PENDING |
+| Interface totals, 1 h | 27 ms | AFTER-PENDING |
+| Interface totals, 24 h | 116 ms | AFTER-PENDING |
+| Interface totals, 7 d | 18,479 ms | AFTER-PENDING |
+| History probe (`coverage()`) | 1,184 ms | AFTER-PENDING |
+| `/api/state` wait behind a running record list | 847 ms | AFTER-PENDING |
+| Longest single lock hold observed | 19.6 s | AFTER-PENDING |
+
+**Left for later, plainly.** The hourly interface breakdown is still
+rebuilt from raw records, one transaction per dimension, and still holds
+the collector's write lock for seconds at this scale on every hourly
+summary pass — the collector's own queue absorbs it and no flow loss was
+seen, but it is not fixed here. The size-cap trim every store shares still
+runs the same combined oldest/newest query this release rewrote for
+`coverage()` and `prune()`'s retention bound alone. An interface-filtered
+chart's unsealed tail still comes from raw records, because interfaces
+have no minute-level summary to fall back to. And a chart whose window
+starts before the summaries' own oldest bucket is still answered entirely
+from records, as it always has been.
+
+Files: `netpath/flowdb.py`, `netpath/sqlitebase.py`,
+`netpath/web/api/debug.py`, `netpath/web/static/app.css`,
+`netpath/web/static/app.js`, `netpath/web/static/dashboard.js`,
+`netpath/web/static/index.html`, `netpath/web/static/netflow.js`,
+`tests/bench_flow_scale.py`, `tests/test_netflow_readconn.py`,
+`tests/test_frontend_contracts.py`, `tests/test_netflow_rollup.py`,
+`tests/test_netflow_scoped.py`, `tests/ui/walk.mjs`, `tests/README.md`,
+`tests/bench_db_search.py`, plus docs.
 
 ### 5.67.1 — NetFlow follow-up: pre-upgrade history restored for exporter/interface charts, sequence-gap diagnostics, and the clock-skew display fixed
 

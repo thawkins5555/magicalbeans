@@ -12489,6 +12489,94 @@ shade and label. `coverage()` gained `breakdown_minute_floor`,
 `scoped_minute_floor`/`scoped_hourly_floor`/`iface_hourly_floor`, all
 `None` until reconstruction has actually run and found a gap to record.
 
+### Read connection (`flowdb.py`) — 5.68.0
+
+Every read in this application takes its store's single write lock —
+`InstrumentedLock` on `self._conn` — which is fine at ordinary fleet
+size but meant a chart, the flow-record list or a totals figure over a
+multi-million-row `flows.db` could hold that lock for seconds, queuing
+the collector's writer, the summariser, and every open tab's two-second
+`/api/state` poll behind it. `FlowDatabase.__init__` now opens a second
+connection, `self._read_conn` (`PRAGMA query_only=1`), behind its own
+`self._read_lock`, whenever `path` is a real file (an in-memory store
+still shares one connection and lock, since there's nothing to gain by
+splitting it). `close()` closes both.
+
+**What moved to the read connection/lock:** `_agg_rows`'s final query
+(the chart/overview path), `_repair_ranges`, `_raw_holds`, `flows`,
+`exporter_totals`, `interface_totals`, `coverage`, `exporters`, and
+`interface_names`. **What stays on the write lock:** every setting read
+(`_private_setting`/`_set_private_setting`, so `rollup_bounds` and every
+floor/watermark lookup are unchanged), compaction (`compact_rollup`),
+backfill (`backfill_rollup`), `prune`, `_reconstruct_scoped_spans`, and
+`insert_flows` — nothing that reads or writes the rollup or setting
+tables moved, only the four request-path reads above.
+
+**`coverage()` no longer waits behind a chart.** It tries the read lock
+with a 0.25 s timeout; on the first call ever (`self._coverage_last is
+None`) it blocks, since there is nothing to answer with yet, but every
+call after that returns `self._coverage_last` — the previous answer —
+the moment the timeout is reached, rather than queuing behind whatever
+read is holding the lock. `/api/state`'s status-strip figures are always
+a little stale in the worst case, never blocked.
+
+**`_raw_holds` is memoised for 60 seconds** (`_raw_holds_memo`, keyed on
+`(tier, aligned t0, upper)`, capped at `_RAW_HOLDS_MEMO_MAX` entries):
+every interface-filtered chart's poll tick asks it, and without the memo
+that is one more raw-table probe every two seconds a screen is left open
+on such a view. `prune()` and the size-cap trim (`_trim_more`) both clear
+it, since either can move the raw table out from under a cached answer.
+
+**`_span_plan(t0, t1, kind)` tiles a window coarsest tier first.** It
+returns `(arms, edges)`: `arms` are `(tier, start, seal)` triples serving
+whole rollup buckets, tried hourly before minute, each finer tier filling
+only the gaps the coarser one couldn't reach and never reading below its
+own scope's floor; `edges` are the raw `ts_end` ranges left over,
+closed only at `t1`. `interface_totals` and `exporter_totals` both read
+this plan straight off the read connection. **The minute tier can also
+serve an hourly plan's unsealed tail** (`_minute_tail`, global and
+exporter kinds only — an interface scope has no minute-level keys): the
+last stretch between the hourly tier's own seal and the window's end used
+to fall to raw wholesale; where the minute tier's watermark reaches past
+that seal, `_agg_rows` now reads the tail from minute rows instead, and
+only whatever the minute tier hasn't sealed yet still comes from raw.
+
+**The SQLite planner fact behind two of this release's fixes:** a single
+query computing both `MIN(x)` and `MAX(x)` in one `SELECT` is planned as a
+full table/index scan, while two separate scalar subqueries — `(SELECT
+MIN(x) …)`, `(SELECT MAX(x) …)` — are each planned as an index probe.
+`coverage()`'s oldest/newest read and `prune()`'s row-cap bound
+(`MIN(id)`/`MAX(id)` over `flows`) both write the two-subquery form for
+exactly this reason; the size-cap trim's own oldest/newest read does not
+yet, see Left for later in the changelog.
+
+**The browser side.** NetFlow's `refresh()` now fetches only the subtab
+actually on screen (`view.sub`) and `await`s it before returning, so
+`page.refreshing` — the guard `app.js`'s `runRefresh` already puts around
+every tab's own poll — covers EXPORTERS and INTERFACES the same way it
+always covered TRAFFIC; before this they could fetch outside that guard
+and stack up behind a slow server. Separately, `master()`'s failed-poll
+branch (`/api/state` down) now calls `loadConfig()` on its own the first
+time `state.config` is still unset, so `state.permissions` lands — and
+`App.canRead()` has a real answer for the Dashboard's tiles — without
+waiting for `/api/state` to recover.
+
+**Benchmark:** `tests/bench_flow_scale.py` seeds a dense recent stretch
+behind a sparse older one (defaults: 5,000,000 raw rows over 1.7 hours,
+two days of summarised history, six exporters), builds both rollup tiers,
+prunes to the dense stretch's raw retention, then times the query shapes
+above plus two contention runs (a slow read alongside a live insert and a
+`coverage()` call) and prints `lock_stats()`/`read_lock_stats()`. Run it
+with `python3 tests/bench_flow_scale.py [--rows N] [--hours H] [--days D]`;
+it is deliberately not a `test_*.py` (informational, not part of the
+suite `run_all.py` collects).
+
+**One line for Debug.** `/api/debug`'s `store_locks` dict gains a
+`flows_reads` row from `FlowDatabase.read_lock_stats()`, labelled "…
+(chart and record reads)" — it rides in the payload next to the existing
+per-store rows the same way they do, unrendered, since `debug.js` does
+not draw a store-locks table on the page today.
+
 ---
 
 ## SNMP Trap

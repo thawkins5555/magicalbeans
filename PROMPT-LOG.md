@@ -5,6 +5,57 @@ grouped by the version that carries it. This is a working record for the
 operator — the full story of each change is in `CHANGELOG.md`, and this file
 does not replace it.
 
+## 5.68.0 — NetFlow's freeze and Dashboard's "Not readable" traced to one shared lock; a loading mark, a moved legend, and sortable INTERFACES
+
+**Operator message, verbatim (five lines):**
+
+"Move the selected legend to be inline with the Title instead of
+overlapping the graph.
+Add 'Loading With a moving logo' while loading the Netflow data on each
+page
+Should be able to sort Netflow interfaces by column.
+Loading the netflow module is freezing up the application and taking
+extended periods of time to display graphs if they do at all and appears
+to be causing performance issues in other modules.
+The Dashboard now says 'Not Readable with your access' since the last
+update on all tiles. Access has not changed."
+
+**Two planning answers, both taken as given.** The loading mark shows only
+while a whole view is being replaced — the tab's first open, a subtab
+switch, or a window/filter/range change — never on the plain periodic
+refresh of a view already sitting on screen, so a NetFlow tab left open
+doesn't flicker every poll. INTERFACES opens sorted by inbound rate,
+highest first, the same as the flow-record table's own remembered sort.
+
+**What was actually wrong, in short.** The freeze, the slow-or-missing
+charts, and the Dashboard's access message all traced back to one thing:
+every read against the flow store — a chart, the record list, a totals
+figure — took the same lock the NetFlow collector's writer, the
+summariser, and every open tab's own two-second status poll all wait on.
+A chart over a multi-million-record store could hold that lock for whole
+seconds; while it did, other tabs' screens stalled behind their own status
+poll, and — because the Dashboard only learns an account's access once
+that same poll succeeds — every tile read "Not readable" instead of
+"unknown." The new scale benchmark also caught the ten-second history
+probe scanning the entire raw table (SQLite plans a combined
+oldest-and-newest query as a full scan) and the 7-day INTERFACES report
+reading far more minute-level detail than it needed.
+
+**Outcome.** Chart, record and totals reads now run on a second,
+query-only connection with a lock of its own; the history probe is two
+fast index probes with a last-answer fallback when that lock is busy; a
+60-second memo covers a repeated interface-filtered check; totals and the
+7/30-day charts read the coarser summary tiers instead of the fine ones
+wherever they can; and the Dashboard's access grants now load on their own
+if the status poll is stuck behind a slow module. Plus the three items
+above: the tile legend moved beside the title, the loading mark, and
+sortable INTERFACES. Left for later, named plainly in `CHANGELOG.md`: the
+hourly interface breakdown's own write-lock cost, and the size-cap trim
+every store shares, which still runs the scanning oldest/newest query.
+Released as 5.68.0; the benchmark's before-figures are in
+`CHANGELOG.md`, with the after-figures marked `AFTER-PENDING` for a
+follow-up.
+
 ## 5.67.1 — NetFlow follow-up: pre-upgrade history restored, sequence-gap diagnostics
 
 **Operator message, with a screenshot** of an exporter-filtered **Last 24

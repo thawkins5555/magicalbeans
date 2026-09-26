@@ -486,6 +486,14 @@ never saved one.
 | Module overviews | IPAM subnets | Subnet utilization, most full first | Rows |
 | Module overviews | HTTPS monitors | State, response code and latency for every NetPath destination with a web check | No |
 
+**From 5.68.0, a graph tile's legend sits in the tile's own title row
+instead of over the plot's top-left corner.** On a tile plotting several
+interfaces or series — Interface traffic being the clearest case — the
+legend used to draw inside the chart itself and could sit directly over
+the first few points of every line. It now shares the `<h3>` beside the
+tile's title, wrapping onto its own line rather than overlapping anything
+when the tile is narrow.
+
 **From 5.22.0, Interface traffic plots up to eight interfaces on one
 chart, from any devices — not necessarily the same one.** Each interface
 adds an in/out pair to the same axis, in solid for in and dashed for
@@ -3667,6 +3675,14 @@ entered and left on the interface once per direction, while the record list
 and CSV list it once, so the "flow records" figure can exceed the CSV row
 count. Clicking a bar filters to it.
 
+**From 5.68.0, a loading mark shows while a view is being replaced.** The
+brand's own animated route-and-hop mark appears on the chart, EXPORTERS
+and INTERFACES panes on the tab's first open, a subtab switch, or a
+window/filter/range change — never on the plain periodic refresh of a
+view already sitting on screen, which keeps updating quietly as it always
+has. It honours "reduce motion": the mark still shows, without the
+animation, for anyone who has that turned on.
+
 ### EXPORTERS and INTERFACES — 5.67.0
 
 Two more subtabs sit beside TRAFFIC (which is unchanged): **EXPORTERS**, a
@@ -3686,10 +3702,16 @@ jumps straight to TRAFFIC filtered to it.
 named from the same **Interface names** setting, then a Nodes-inventory
 alias or description, then the bare index — with an inbound and an
 outbound utilisation bar measured against the interface speed Nodes polled
-for that port (a plain rate, no bar, when no speed is known), sorted
-busiest first. Clicking a row lands on TRAFFIC with that exporter,
-interface and direction already filtered and **Group by** set to
-Application.
+for that port (a plain rate, no bar, when no speed is known). Clicking a
+row lands on TRAFFIC with that exporter, interface and direction already
+filtered and **Group by** set to Application.
+
+**From 5.68.0, INTERFACES sorts on every column**, the same click-to-sort,
+click-again-to-reverse behaviour the flow-record table already has; it
+opens sorted by inbound rate, busiest first, and remembers whichever
+column and direction you last picked, per browser, the same way the
+record table does. Before this it could only ever show the server's own
+busiest-first order.
 
 **The exporter picker is named everywhere it appears** — TRAFFIC's filter,
 INTERFACES' filter and the EXPORTERS table — as `NAME (10.199.17.1, v9)`
