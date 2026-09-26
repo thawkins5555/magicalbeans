@@ -284,6 +284,16 @@ def _store_locks(service) -> dict:
         measured = stats()
         if measured:
             rows[store.name] = {"label": store.label, **measured}
+        # NetFlow's query-only connection (chart/record/totals reads) has
+        # its own InstrumentedLock, separate from the writer's above.
+        read_stats = getattr(db, "read_lock_stats", None)
+        if callable(read_stats):
+            read_measured = read_stats()
+            if read_measured:
+                rows[f"{store.name}_reads"] = {
+                    "label": f"{store.label} (chart and record reads)",
+                    **read_measured,
+                }
     return dict(sorted(rows.items(),
                        key=lambda kv: kv[1].get("wait_s", 0.0), reverse=True))
 
