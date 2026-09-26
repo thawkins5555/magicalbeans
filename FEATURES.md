@@ -3580,6 +3580,12 @@ Listens for exported flow records, stores them, and charts them.
   because v9 and IPFIX records cannot be decoded until a template arrives and
   exporters resend them only every few minutes. It reads `no template yet` when
   none has been seen.
+- **A server clock a few seconds ahead of the browser's no longer reads as
+  "in 5s", from 5.67.1.** Every relative-time figure on the page — template
+  age included — now shows "just now" for anything up to 60 seconds ahead
+  of the browser's own clock, the same as it already did for anything a few
+  seconds in the past; only a gap past 60 seconds still reads "in …", which
+  by then is worth a look at the server's own clock.
 - **Sampling** is read from the v5 header and from v9/IPFIX options templates,
   with a manual override for exporters that report nothing. Every byte and
   packet figure is multiplied by the rate.
@@ -3699,6 +3705,21 @@ what an exporter's next packet should carry and what it did adds to the
 total. A sequence that runs backward, or jumps by more than a million,
 means the exporter restarted or its counter wrapped, not that a million
 records went missing, so it resets the count instead of adding it.
+
+**From 5.67.1, a missed-sequence count is no longer a dead end.** The
+EXPORTERS table's **Missed seq** cell now reads "1,050 (3 resets)" once an
+exporter has had a restart or counter wrap, plain "1,050" otherwise, and
+hovering it shows how many separate gap events sit behind that total and
+the most recent one's detail — the expected and received sequence
+numbers, which observation domain, and how long after the previous packet
+it arrived. The Events log carries the same detail, once per exporter, at
+most every 10 minutes: "Sequence gap from 10.199.17.1 (domain 0): expected
+1234, got 1240 — 6 packet(s) missing, 0.4 s after the previous packet;
+1,050 missed and 3 resets so far since start." A steady percentage missed
+with nothing dropped or kernel-dropped at the collector, and no resets,
+points at the exporter's own packet numbering rather than loss on the
+wire — a call the log line and the tooltip now give enough detail to
+make.
 
 ### Flow-to-path correlation
 
@@ -3837,6 +3858,24 @@ interface filter is summary-served like everything else** and carries the
 same two guarantees; only a source, destination, port or protocol filter —
 which has no summary scope to read — is exact throughout because it is
 always reading the records.
+
+**From 5.67.1, an exporter or interface chart no longer goes blank before
+the point of the 5.67.0 upgrade.** That release's per-exporter and
+per-interface summaries only started counting from the moment of that
+upgrade; a chart filtered further back than that had nothing to read but
+the raw flow table, which a busy store's row cap can hold to an hour or
+two. The store's existing minute and hourly summaries already held each
+exporter's and each interface's grand total for the whole of their own
+retention, so that history is now carried over the first time the store
+opens after upgrading — labelled "totals only before `<time>`" on the
+chart, with the actual breakdown by application, host and the rest still
+starting at the upgrade. The carried-over totals are exact for any
+exporter or interface that was among the heaviest 48 (minute tier) or 64
+(hourly tier) kept in that bucket to begin with — never a concern on a
+fleet of ordinary size, only possibly on a very large one's least busy
+interfaces. Where raw retention genuinely still reaches back that far,
+the chart keeps reading the full breakdown from records instead, exactly
+as before.
 
 **From 5.7.0, a summary period that dropped a key is repaired from the
 individual records where they are still there to repair it from.** Every

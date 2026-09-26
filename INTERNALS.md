@@ -12282,10 +12282,12 @@ bench this cost about 6 seconds for 2 million summary rows; a 5-million-row
 store should budget roughly 15–20 seconds on its first start after the
 upgrade. Once done, `_SCOPED_FLOOR % tier` (and, for the hourly tier,
 `_IFACE_FLOOR`) is seeded at that tier's *existing* watermark — no scoped
-row exists below where the store already stood, so an upgraded store's
-exporter and interface views read raw records, and the overview says
-`records_only`, back to the point of the upgrade until compaction and
-`backfill_rollup` fill the new scopes in from there.
+row exists below where the store already stood. **From 5.67.1** this gap
+is filled in immediately rather than left to compaction and
+`backfill_rollup` to grow into over time: see **Pre-upgrade totals
+reconstructed**, below, which lowers these same floors again once it has
+backfilled each exporter's and interface's totals for everything below
+them.
 
 **Floors and the contiguity rule.** `_scope_floor(tier, kind)` is the
 *highest* (most restrictive) of: the tier's own `_FLOOR % tier`; for any
@@ -12386,6 +12388,106 @@ for each exporter's interface count over the last hour, and
 `interface_totals()` with `nodes_db.devices_by_addresses()`/`interfaces()`
 for the speed and label Nodes already polled, so the utilisation bar is
 never a second, separate poll.
+
+### Pre-upgrade totals reconstructed (`flowdb.py`) — 5.67.1
+
+The operator's report: 5.67.0 seeded `_SCOPED_FLOOR`/`_IFACE_FLOOR` at the
+watermark the store already stood at, so a chart filtered to one exporter
+or interface, asked for a window older than that, had nothing scoped to
+read and fell back to raw — which a busy store's row cap can hold to an
+hour or two, no matter how much history the *global* minute and hourly
+summaries actually covered. Those global summaries already carried each
+exporter's and each interface's grand total for that whole span (the
+Exporter dimension keyed by address; the Ingress/Egress interface
+dimensions keyed by `address:ifIndex`); only the per-key breakdown inside
+a scope was ever missing. `_reconstruct_scoped_spans()` backfills exactly
+that.
+
+**When it runs.** Called from `_after_open()` on every open, after
+`_before_schema()`/`_migrate()` have already run, but does real work only
+once: it returns immediately if the private setting `_RECONSTRUCTED`
+(`"flow_rollup_spans_reconstructed"`) is present. This makes no
+distinction between a store that reached 5.67.0's scoped schema by a
+fresh migration and one that had already been running it for a release —
+both simply have `_FLOOR % tier` below `_SCOPED_FLOOR % tier`, and that
+gap, however it got there, is what gets filled.
+
+**What it writes.** Per tier, while `_SCOPED_FLOOR % tier` (`scoped`) sits
+above `_FLOOR % tier` (`floor`), one transaction: `INSERT OR IGNORE INTO
+flow_rollup_span` selects every row of `flow_rollup` in `[floor, scoped)`
+at `dim = Exporter` and the global scope, and writes each one back as an
+`(exporter, iface=-1, dir='')` span row — the exporter-scope total for
+that bucket. Interface totals follow the same pattern from the
+`Ingress interface`/`Egress interface` dimensions, one side at a time, run
+out to `upper = max(scoped, _IFACE_FLOOR)` rather than `scoped` alone,
+since the interface floor and the exporter one do not always sit at the
+same point (interface backfill has its own `_raw_covers` condition and
+can lag behind); `_interface_spans(tier, side, rows)` does the key split, on the
+key's *last* `:` (`address.rpartition(":")`) so an IPv6 exporter's own
+colons are not mistaken for the separator, and drops any row whose tail
+after the split is not a plain integer. `INSERT OR IGNORE` against the
+existing primary key means a row reconstruction would otherwise duplicate
+(one built normally since the upgrade) is silently skipped rather than
+double-counted.
+
+**Floors moved, not just filled.** Once a tier's insert commits, its old
+`_SCOPED_FLOOR` value is saved as `_BREAKDOWN_FLOOR % tier`
+(`"flow_rollup_breakdown_floor_%d"`) — hourly's interface counterpart as
+`_IFACE_BREAKDOWN_FLOOR` (`"flow_rollup_iface_breakdown_floor"`) — and
+`_SCOPED_FLOOR`/`_IFACE_FLOOR` are then lowered to `_FLOOR`, the same
+floor the global scope has always claimed. A scoped read now reaches as
+far back as the global one does; the breakdown floors are what remember
+where the *keyed* history stops and the reconstructed *totals-only*
+history begins. `_breakdown_floor(tier, kind)` reads the right one back
+(`None` for `kind == "global"`, which was never scoped and has no gap to
+speak of).
+
+**The accuracy limit is inherited, not new.** Because the source rows are
+the global rollup's own Exporter/interface-dimension entries, an
+exporter or interface reconstructed this way is exact only where it was
+already among the heaviest `ROLLUP_KEYS[tier]` (48 minute-tier, 64
+hourly-tier) kept globally for that bucket — the same cap the unfiltered
+chart has always been subject to. A fleet with fewer sending
+exporters/interfaces than that per bucket (the ordinary case) loses
+nothing; a low-traffic interface that never made the global top 48/64 in
+some bucket, on a much larger fleet, reads zero for it there instead of
+its real, small total.
+
+**Raw still wins where it still reaches.** `_raw_breaks_down(tier, kind,
+t0)` is `True` only when a breakdown floor is recorded, `t0` sits below
+it, and `_oldest_raw()` shows the flow-record table itself still reaches
+back to `t0` — i.e. a quiet store that has not yet trimmed that far.
+`_rollup_plan` checks it before routing a *keyed* (non-`None` dimension)
+read to a scope: if raw still breaks it down, the plan is refused and the
+caller falls through to reading records directly, exactly as every scope
+did before this release, rather than serving the coarser totals-only
+answer when the real one is still sitting in `flows`. `_widens` (the A4
+sub-hour-to-hourly fallback) makes the same check before widening into an
+hourly bucket that would only have a totals-only answer to offer, so a
+quiet store's sub-hour chart is not coarsened for no reason.
+
+**Compaction keeps what reconstruction gave it.** `_compact_bucket`'s
+usual delete-and-rebuild only rebuilds an exporter's keyed rows for a
+bucket when either raw or the minute tier can still supply them
+(`keys_from_minutes`/`interfaces`); for a pre-upgrade bucket whose raw
+rows have since aged out, neither can, so `keep_keys` leaves the
+reconstructed exporter rows exactly as `_reconstruct_scoped_spans` wrote
+them instead of deleting them with nothing to rebuild from. The bucket's
+grand total is still kept current, summed from the minute tier's own span
+rows rather than from raw, the same as any other span recompute.
+
+**Surfaced to callers.** `_agg_rows` sets `info["breakdown_from"]` to the
+scope's `_breakdown_floor` whenever a summary answered the query and that
+floor sits above the floor that actually served it — `None` on a raw
+answer, on the global scope (which has no breakdown floor), or once the
+window no longer touches the totals-only stretch at all.
+`overview(..., info)` passes it straight through, and `/api/netflow`'s
+overview response carries it as `breakdown_from` for `netflow.js` to
+shade and label. `coverage()` gained `breakdown_minute_floor`,
+`breakdown_hourly_floor` (`_BREAKDOWN_FLOOR % 60`/`% 3600`) and
+`iface_breakdown_floor` (`_IFACE_BREAKDOWN_FLOOR`) alongside the existing
+`scoped_minute_floor`/`scoped_hourly_floor`/`iface_hourly_floor`, all
+`None` until reconstruction has actually run and found a gap to record.
 
 ---
 

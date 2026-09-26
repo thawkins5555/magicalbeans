@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.67.1 — NetFlow follow-up: pre-upgrade history restored for exporter/interface charts, sequence-gap diagnostics, and the clock-skew display fixed](#5671--netflow-follow-up-pre-upgrade-history-restored-for-exporterinterface-charts-sequence-gap-diagnostics-and-the-clock-skew-display-fixed)
 - [5.67.0 — NetFlow: filtered charts now read the summaries per exporter and interface, the page says what records-only views can reach, exporters are named, and EXPORTERS/INTERFACES views arrive](#5670--netflow-filtered-charts-now-read-the-summaries-per-exporter-and-interface-the-page-says-what-records-only-views-can-reach-exporters-are-named-and-exportersinterfaces-views-arrive)
 - [5.66.0 — A stored DHCP credential now runs the poll locally as that account, not over WinRM](#5660--a-stored-dhcp-credential-now-runs-the-poll-locally-as-that-account-not-over-winrm)
 - [5.65.0 — The DHCP server status line now follows the selected server, and Rules gets an Email column](#5650--the-dhcp-server-status-line-now-follows-the-selected-server-and-rules-gets-an-email-column)
@@ -201,6 +202,140 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.67.1 — NetFlow follow-up: pre-upgrade history restored for exporter/interface charts, sequence-gap diagnostics, and the clock-skew display fixed
+
+Two operator screenshots, taken right after upgrading to 5.67.0. The
+first: a **Last 24 hours** chart filtered to exporter BAXFWSI11, drawing
+nothing before 18:02 and reading "answered from records only · records
+reach back to Sep 25 18:02" with "no records kept before Sep 25 18:02"
+across the empty stretch; the status strip beside it showed "1050 missed
+sequence" out of 9,289 packets and "last template in 5s" — **"Does this
+appear correct to you?"** The second, after a page refresh cleared the
+exporter filter — **"After refreshing the page it appears correctly:"** —
+showed the same day drawing in full.
+
+**As designed, but a real hole.** 5.67.0 gave exporter and interface
+filters their own summary tables, but seeded them starting only from the
+moment of the upgrade — a filtered chart reaching further back than that
+had nothing to read but the raw flow-record table, which the row cap on
+the operator's box holds to one or two hours. That is exactly what the
+first screenshot shows, and it was working as built. The gap was real,
+though: the store's existing minute (7.3 days) and hourly (17.5 days)
+summaries already carried each exporter's and each interface's **total**
+traffic for that whole stretch — global summary, dimension Exporter,
+keyed by address, and the interface dimensions keyed by
+`address:ifIndex` — only the breakdown by application, host and so on
+was genuinely never captured before the upgrade. There was no reason to
+make the operator wait a week for that history to reappear.
+
+**Pre-upgrade totals are now reconstructed once, at the next start.**
+`FlowDatabase._reconstruct_scoped_spans()` runs at every open, but does
+real work only the first time (guarded by a private setting, so a second
+open is a no-op): for every bucket below the exporter/interface floor an
+upgrade had seeded, it copies the store's own global Exporter-dimension
+rows into per-exporter span rows, and the global Ingress/Egress-interface
+rows (split on the key's last `:`, so an IPv6 exporter's own colons are
+left alone) into per-interface span rows — then lowers the exporter and
+interface floors to match the plain global one, keeping where they used
+to stand as a new **breakdown floor**. It also runs, once, for a store
+already on 5.67.0's scoped layout, not only one migrating fresh — the
+setting is what is missing, not the schema. Row counts are small enough
+to log once and move on: *"exporter and interface totals rebuilt from the
+global summaries below the scoped floors (N exporter row(s), M interface
+row(s), T s)"*.
+
+**The accuracy limit, stated plainly.** A bucket's totals are exact for
+any exporter or interface that was among the heaviest kept for that
+bucket in the *global* rollup — the top 48 per minute-tier bucket, 64 per
+hourly-tier bucket, the same caps the unfiltered chart has always lived
+with. A fleet the size of the operator's never has more sending exporters
+or interfaces than that in one bucket, so nothing is lost in practice; a
+low-traffic interface that never cracked the top 48/64 in any bucket, on
+a much larger fleet, would read zero for its pre-upgrade history rather
+than its real (small) total. This is the same honesty the chart has
+always had about the summaries — nothing new is being promised, only
+restored.
+
+**A quiet store still reads its full breakdown from records, unchanged.**
+Where raw retention genuinely still reaches back before the new breakdown
+floor — a low-traffic store that has not yet trimmed that far — a scoped
+view keeps answering from the flow records themselves, application,
+host and all, exactly as it did before this release; the totals-only
+summary path is only taken once raw can no longer reach that far back.
+The same guard also stops a sub-hour view from being silently widened
+into a totals-only hourly bucket it did not need to fall back to.
+
+**A pre-upgrade hour redone by routine compaction keeps what it was
+given.** Once raw has aged past a pre-upgrade hour, the usual
+delete-and-rebuild that keeps each summary bucket's top keys current has
+nothing left to rebuild the reconstructed exporter/interface rows from;
+that bucket's keys are now left as reconstruction wrote them rather than
+being emptied, and its grand total is re-summed from the minute-tier's
+own spans instead.
+
+**Sequence-gap diagnostics, so "1050 missed" is no longer a dead end.**
+The decoder now keeps, per exporter, a count of gap *events* and of
+*resets* (an exporter restart or counter wrap, never counted as loss)
+alongside the running missed total, plus the most recent gap. The
+collector logs one NETFLOW event per exporter, at most once every 600
+seconds, on the first gap in that window: *"Sequence gap from 10.199.17.1
+(domain 0): expected 1234, got 1240 — 6 packet(s) missing, 0.4 s after
+the previous packet; 1,050 missed and 3 resets so far since start."* The
+EXPORTERS table's **Missed seq** cell now reads "1,050 (3 resets)" when
+resets have happened, plain "1,050" otherwise, and hovering it shows the
+gap-event count and the same last-gap detail as the log line. A steady
+percentage of missed packets with nothing dropped or kernel-dropped at
+the collector, and no gap-triggered resets, points at how the exporter
+itself numbers packets rather than loss on the wire — the log line and
+the tooltip now carry the numbers needed to make that call, where before
+there was only the running total on the strip.
+
+**Chart and status-line labelling.** A scoped chart whose window reaches
+below its breakdown floor now shades that stretch (a fainter 0.08
+opacity, so it is never mistaken for the darker 0.12 "no records" shade a
+records-only answer gets) and labels it "totals only before `<time>`;
+breakdown by application, host and interface from the upgrade onward";
+hovering a shaded slot says "totals only (before the upgrade)" instead of
+naming series that were never recorded. The totals line under the chart
+appends "· breakdown from `<time>`" the same way it already appends
+"· answered from records only" for a records-only window. Separately,
+`App.ago()` — the "3.2h ago" / "in 40s" helper used across the whole
+application — now reads any age from 60 seconds in the future down to
+five seconds as "just now" rather than "in …"; a server clock a few
+seconds ahead of the browser's (the cause of "last template in 5s" above)
+is ordinary clock skew, not a real event in the future, and only a gap
+past 60 seconds still reads "in …".
+
+**Left out: a per-exporter link into Debug.** The plan called for the
+EXPORTERS table's Missed seq cell to link straight into the Debug tab's
+event log filtered to that exporter, the way other tables deep-link into
+their own related views. The Debug tab has no deep-link entry point to
+land on today, so this was dropped rather than half-built; the cell's own
+tooltip (gap-event count and the last gap's detail) answers the question
+an operator would have followed that link to ask.
+
+**Verification.** `tests/test_netflow_scoped.py` gained test 11: an
+old-layout store built by hand gets exporter and interface span rows for
+every pre-upgrade bucket, summing to the same totals the global rows
+always held, drawn as a single "— other —" series with `breakdown_from`
+at the old watermark; the step is confirmed to run exactly once, and to
+also run for a store already on the 5.67.0 scoped schema with no
+reconstruction setting recorded; a redone pre-upgrade hour whose raw rows
+are gone keeps its reconstructed keys rather than emptying them.
+`tests/test_netflow_exporters_api.py` gained gap/reset counting across
+v5, v9 and IPFIX (test 2), `seq_gaps`/`seq_resets`/`seq_last` on
+`/api/netflow/exporters` (test 5), and the collector's throttled log line
+— one per 600 seconds per exporter, comma-formatted counts, a reset never
+counted as a gap (test 9). `tests/test_frontend_contracts.py` pins the
+chart's shading, its label text, the totals-line suffix, the Missed seq
+cell's two formats, and the `ago()` clamp.
+
+Files: `netpath/flowdb.py`, `netpath/nfdecode.py`, `netpath/collector.py`,
+`netpath/web/api/netflow.py`, `netpath/web/static/netflow.js`,
+`netpath/web/static/app.js`, `tests/test_netflow_scoped.py`,
+`tests/test_netflow_exporters_api.py`, `tests/test_frontend_contracts.py`,
+plus docs.
 
 ### 5.67.0 — NetFlow: filtered charts now read the summaries per exporter and interface, the page says what records-only views can reach, exporters are named, and EXPORTERS/INTERFACES views arrive
 

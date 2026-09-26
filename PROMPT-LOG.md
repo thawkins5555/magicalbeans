@@ -5,6 +5,66 @@ grouped by the version that carries it. This is a working record for the
 operator — the full story of each change is in `CHANGELOG.md`, and this file
 does not replace it.
 
+## 5.67.1 — NetFlow follow-up: pre-upgrade history restored, sequence-gap diagnostics
+
+**Operator message, with a screenshot** of an exporter-filtered **Last 24
+hours** chart for BAXFWSI11: nothing drawn before 18:02, reading "answered
+from records only · records reach back to Sep 25 18:02" and "no records
+kept before Sep 25 18:02," with "1050 missed sequence" (out of 9,289
+packets) and "last template in 5s" on the strip beside it —
+
+"Does this appear correct to you?"
+
+**Follow-up, with a second screenshot** of the same **Last 24 hours**
+window with the exporter filter cleared, drawing the full day —
+
+"After refreshing the page it appears correctly:"
+
+**Bob's assessment, in short.** Three separate things, only one of them a
+real gap:
+
+1. The chart is doing exactly what 5.67.0 built it to do — an
+   exporter-filtered window older than the upgrade has no scoped summary
+   to read and falls back to records, which the row cap holds to an hour
+   or two. But the store's own minute (7.3 days) and hourly (17.5 days)
+   summaries already held that exporter's *total* traffic the whole way
+   back; only the breakdown by application/host was ever missing. Worth
+   fixing rather than living with for weeks.
+2. "1050 missed sequence" (11% of packets) can't be judged from the strip
+   alone. The counting itself is standard (v9: one expected per packet
+   per observation domain), and the collector shows no dropped or
+   kernel-dropped packets, so the loss is either upstream of the
+   collector or the exporter numbering its own packets differently
+   (FortiGate is a known case elsewhere) — nothing on screen today says
+   which.
+3. "last template in 5s" is the server's clock running a few seconds
+   ahead of the browser's; the page's relative-time helper prints a small
+   negative age as "in …" instead of "just now." Cosmetic, and it
+   predates this release.
+
+**Planning question, and the answer — the recommended option:**
+
+- Take on all three: restore pre-upgrade totals for exporter/interface
+  charts, add sequence-gap diagnostics so "1050 missed" can be judged
+  (gap events, resets, the last gap's detail, a throttled log line), and
+  fix the chart labelling plus the clock-skew display; or just the first,
+  the real gap? — **"All three items (Recommended)."**
+
+**Who built what.** SuperThing1: the one-off reconstruction of exporter
+and interface totals below the old scoped floors, and the breakdown-floor
+bookkeeping that keeps track of where keyed history stops and
+totals-only history begins (`flowdb.py`, `test_netflow_scoped.py`).
+Thing2: the decoder's gap/reset/last-gap tracking and the collector's
+throttled "Sequence gap from …" event, plus the API's
+`seq_gaps`/`seq_resets`/`seq_last` fields (`nfdecode.py`, `collector.py`,
+`web/api/netflow.py`, `test_netflow_exporters_api.py`). Thing3: the
+chart's totals-only shading and label, the EXPORTERS table's "Missed seq"
+cell and its tooltip, and the `App.ago` clock-skew clamp
+(`netflow.js`, `app.js`, `test_frontend_contracts.py`).
+
+**Outcome.** Testy's suite run and Javariius's review are in progress —
+Bob will amend this line with the result before the push to main.
+
 ## 5.67.0 — NetFlow overhaul: scoped summaries, named exporters, EXPORTERS/INTERFACES views
 
 **Operator message, verbatim:**
