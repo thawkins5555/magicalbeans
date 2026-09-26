@@ -6312,6 +6312,11 @@ check("const missed = (r.seq_missed || 0).toLocaleString();" in _EXPCOLS140
       "the Missed seq cell reads '<missed>' or '<missed> (<resets> resets)', "
       "both numbers through toLocaleString")
 
+_SEQTIP140 = js_function(NETFLOW140, "seqTip")
+check("(last.gap_s != null ? `${last.gap_s.toFixed(1)}s after the previous packet`"
+      in _SEQTIP140 and ": 'interval unknown') });" in _SEQTIP140,
+      "seqTip reads 'interval unknown' when seq_last.gap_s is null")
+
 AGO140 = js_function(APP, "ago")
 check("if (age < -60) return `in ${span(-age)}`;" in AGO140
       and "if (age < 0) return" not in AGO140,

@@ -199,8 +199,6 @@ def get_flow_overview(service, params, body) -> dict:
         "records_from": coverage.get("raw_oldest"),
         "summaries_from": info.get("summaries_from"),
         "widened": bool(info.get("widened")),
-        # None until flowdb's reconstruction step lands; the chart treats
-        # that as "no pre-upgrade totals-only span to shade".
         "breakdown_from": info.get("breakdown_from"),
     }
 

@@ -279,7 +279,9 @@ The decoder now keeps, per exporter, a count of gap *events* and of
 *resets* (an exporter restart or counter wrap, never counted as loss)
 alongside the running missed total, plus the most recent gap. The
 collector logs one NETFLOW event per exporter, at most once every 600
-seconds, on the first gap in that window: *"Sequence gap from 10.199.17.1
+seconds, on the first gap in that window, with the missing count in the
+unit the protocol's sequence numbers count (records for v5 and IPFIX,
+packets for v9): *"Sequence gap from 10.199.17.1
 (domain 0): expected 1234, got 1240 — 6 packet(s) missing, 0.4 s after
 the previous packet; 1,050 missed and 3 resets so far since start."* The
 EXPORTERS table's **Missed seq** cell now reads "1,050 (3 resets)" when
@@ -318,24 +320,20 @@ an operator would have followed that link to ask.
 **The simulator's own sequence numbers are now continuous, and its
 burst is paced at a quarter of the old rate.** The first run of the new
 diagnostics against `demo/flows.py` showed every simulated exporter with
-a reset and a run of gaps of its own. Two causes. The burst and the live
-phase each kept their own counters, so the hand-off between them read as
-a decrease and a reset; they now share one counter per exporter,
+a reset and a run of gaps of its own. The reset came from the burst and
+the live phase each keeping their own counters, so the hand-off between
+them read as a decrease; they now share one counter per exporter,
 advanced exactly as the decoder expects for each protocol, and
 `tests/test_flows_simulator.py` decodes a burst followed by a live segment
-and requires zero missed and zero resets. The larger gap, tens of
-thousands of v5 records at once, was genuine loss: with the collector's
-own process under CPU load, as it is when a browser walk drives the
-headless application, a burst at 400 datagrams a second overran the
-socket and some datagrams never reached the receive thread, while the
-same run on an idle box lost nothing. The default burst rate is now 100
-datagrams a second, at which the same contention showed no loss; the
-3-day default burst takes about two minutes instead of half a minute.
-One observation from that test is left for a later release: the
-`kernel_dropped` figure the collector reads from the kernel's own socket
-table stayed at zero while datagrams were demonstrably lost, so that
-counter does not account for every kind of loss on the way to the
-socket.
+and requires zero missed and zero resets. The gaps are recorded as
+observed, not explained: gaps of tens of thousands of v5 records appeared
+during a burst at 400 datagrams a second while the collector's process
+was under browser-walk load, none appeared on an idle box, and the
+collector's `kernel_dropped` counter stayed at zero throughout. The
+default burst rate is now 100 datagrams a second, at which the same walk
+load showed no gaps; the 3-day default burst takes about two minutes
+instead of half a minute. The cause of the gaps is left for a later
+release.
 
 **Verification.** `tests/test_netflow_scoped.py` gained test 11: an
 old-layout store built by hand gets exporter and interface span rows for

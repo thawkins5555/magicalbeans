@@ -3713,7 +3713,9 @@ hovering it shows how many separate gap events sit behind that total and
 the most recent one's detail — the expected and received sequence
 numbers, which observation domain, and how long after the previous packet
 it arrived. The Events log carries the same detail, once per exporter, at
-most every 10 minutes: "Sequence gap from 10.199.17.1 (domain 0): expected
+most every 10 minutes, with the missing count in the protocol's own unit
+(records for v5 and IPFIX, packets for v9):
+"Sequence gap from 10.199.17.1 (domain 0): expected
 1234, got 1240 — 6 packet(s) missing, 0.4 s after the previous packet;
 1,050 missed and 3 resets so far since start." A steady percentage missed
 with nothing dropped or kernel-dropped at the collector, and no resets,

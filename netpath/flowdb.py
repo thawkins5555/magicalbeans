@@ -774,14 +774,28 @@ class FlowDatabase(SqliteStore):
                                      else _BREAKDOWN_FLOOR % tier)
         return None if mark is None else int(mark)
 
-    def _raw_breaks_down(self, tier: int, kind: str, t0: float) -> bool:
-        """Whether raw still reaches a t0 this tier holds only totals for:
-        raw then draws the breakdown, as it did before the reconstruction."""
+    def _raw_breaks_down(self, tier: int, kind: str, t0: float,
+                         t1: float) -> bool:
+        """Whether raw still holds the stretch from t0 this tier has only
+        totals for: raw then draws the breakdown, as it did before the
+        reconstruction. Counted as _repair_ranges does, not read off
+        MIN(ts_end), which one flow from a lagging clock drags back."""
         floor = self._breakdown_floor(tier, kind)
         if floor is None or t0 >= floor:
             return False
-        oldest = self._oldest_raw()
-        return oldest is not None and oldest <= t0
+        upper = min(floor, _align_down(t1, tier))
+        with self._lock:
+            wanted = self._conn.execute(
+                f"SELECT COALESCE(SUM(flows), 0) AS n FROM flow_rollup_span"
+                f" WHERE tier = ? AND {_GLOBAL_SQL} AND bucket >= ?"
+                f" AND bucket < ?", (tier, t0, upper)).fetchone()["n"]
+            if not wanted:
+                return False
+            held = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM (SELECT 1 FROM flows"
+                " WHERE ts_end >= ? AND ts_end < ? LIMIT ?)",
+                (t0, upper, wanted)).fetchone()["n"]
+        return held >= wanted
 
     def _seed_scoped(self, tier: int, at: int) -> None:
         keys = [_SCOPED_FLOOR % tier]
@@ -820,6 +834,20 @@ class FlowDatabase(SqliteStore):
                 " AND ts_end < ?", (bucket, bucket + tier)).fetchone()["n"]
         return held >= wanted
 
+    def _raw_short(self, tier: int, bucket: int) -> bool:
+        """Whether raw holds fewer of a built bucket's flows than its global
+        span counted: late flows only ever add, so raw has aged out."""
+        with self._lock:
+            span = self._conn.execute(
+                f"SELECT flows FROM flow_rollup_span WHERE tier = ?"
+                f" AND {_GLOBAL_SQL} AND bucket = ?", (tier, bucket)).fetchone()
+            if span is None:
+                return False
+            held = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM flows WHERE ts_end >= ?"
+                " AND ts_end < ?", (bucket, bucket + tier)).fetchone()["n"]
+        return held < span["flows"]
+
     def _compact_bucket(self, tier: int, bucket: int) -> int:
         """Rebuild one bucket of every dimension and scope, and its spans.
 
@@ -830,6 +858,10 @@ class FlowDatabase(SqliteStore):
         never held across more than one.
         """
         from_minutes = self._from_minute_tier(tier, bucket)
+        if not from_minutes and self._raw_short(tier, bucket):
+            # A redo after a flush from a lagging clock: rebuilt from the
+            # rows left, every scope would lose what raw no longer holds.
+            return 0
         # Interface keys come from raw only, so they are kept as built rather
         # than rebuilt short once raw has been pruned.
         scoped_floor = self._private_setting(_SCOPED_FLOOR % 60)
@@ -1616,7 +1648,8 @@ class FlowDatabase(SqliteStore):
             _floor, watermark = self.rollup_bounds(tier)
             if floor is None or watermark is None or t0 < floor:
                 continue
-            if dimension is not None and self._raw_breaks_down(tier, kind, t0):
+            if (dimension is not None
+                    and self._raw_breaks_down(tier, kind, t0, t1)):
                 continue
             # Never past t1: a bucket straddling the end of the window holds
             # flows the raw path would not have counted.
@@ -1627,7 +1660,7 @@ class FlowDatabase(SqliteStore):
             return tier, dim, seal, scopes
         return None
 
-    def _widens(self, t0: float, kind: str) -> bool:
+    def _widens(self, t0: float, t1: float, kind: str) -> bool:
         """A4: widen a sub-hour bucket when only the hourly tier reaches t0;
         an interface scope, having no minute tier, weighs it against raw."""
         hourly_floor = self._scope_floor(3600, kind)
@@ -1641,7 +1674,7 @@ class FlowDatabase(SqliteStore):
             return oldest is None or oldest > t0
         minute_floor = self._scope_floor(60, kind)
         return (minute_floor is not None and t0 < minute_floor
-                and not self._raw_breaks_down(3600, kind, t0))
+                and not self._raw_breaks_down(3600, kind, t0, t1))
 
     def _repair_ranges(self, tier: int, scope, dim: int, t0: float,
                        seal: float, max_buckets: int = _REPAIR_MAX_BUCKETS,
@@ -1733,7 +1766,7 @@ class FlowDatabase(SqliteStore):
             bucket_s = max(float(bucket_s), 1.0)
             # A4: widen to the hourly tier rather than falling back to raw when only it reaches t0 (see A4 in CHANGELOG).
             if (bucket_s % 60 == 0 and bucket_s < 3600 and kind is not None
-                    and self._widens(t0, kind)):
+                    and self._widens(t0, t1, kind)):
                 bucket_s = 3600.0
                 widened = True
             # Under a minute nothing is rollup-served anyway.

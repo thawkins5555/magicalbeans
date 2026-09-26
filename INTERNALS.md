@@ -12423,7 +12423,7 @@ out to `upper = max(scoped, _IFACE_FLOOR)` rather than `scoped` alone,
 since the interface floor and the exporter one do not always sit at the
 same point (interface backfill has its own `_raw_covers` condition and
 can lag behind); `_interface_spans(tier, side, rows)` does the key split, on the
-key's *last* `:` (`address.rpartition(":")`) so an IPv6 exporter's own
+key's *last* `:` (`key.rpartition(":")`) so an IPv6 exporter's own
 colons are not mistaken for the separator, and drops any row whose tail
 after the split is not a plain integer. `INSERT OR IGNORE` against the
 existing primary key means a row reconstruction would otherwise duplicate

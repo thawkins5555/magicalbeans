@@ -602,13 +602,8 @@
         'font-family': 'var(--mono)', 'font-size': 'var(--fs-2xs)',
       }, `no records kept before ${App.stamp(data.records_from, view.t1 - view.t0)}`));
     } else if (data.breakdown_from != null && data.breakdown_from > t0) {
-      // Reconstruction (5.67.1): a scoped window drawn from summaries below
-      // the breakdown floor carries the scope's totals only, in "— other —"
-      // — the per-exporter/host/application rows never existed before the
-      // upgrade. Fainter than the records-only shade above (0.08 vs 0.12) so
-      // the two are never mistaken for the same gap; the `else` keeps that
-      // one's precedence, since a records-only answer has no breakdown of
-      // its own to speak of either.
+      // Below the breakdown floor a scoped window holds totals only, in "— other —".
+      // Fainter than the records-only shade (0.08 vs 0.12), which the `else` lets win.
       const shadeEnd = Math.min(data.breakdown_from, t1);
       svg.appendChild(App.svgNode('rect', {
         x: xOf(t0), y: plot.y, width: Math.max(xOf(shadeEnd) - xOf(t0), 0),
@@ -742,9 +737,7 @@
       if (covered < seconds) heading += `, rated over ${App.span(seconds)}`;
     }
     const rows = [{ text: heading }];
-    // Same floor as the shaded region above: a slot starting before it drew
-    // its whole value into "— other —" for want of a breakdown, not because
-    // nothing else was talking.
+    // Same floor as the shaded region: such a slot's whole value sits in "— other —".
     if (data.breakdown_from != null && data.times[slot] < data.breakdown_from) {
       rows.push({ text: 'totals only (before the upgrade)' });
     }
@@ -998,16 +991,15 @@
     { key: 'report', label: '', sortable: false, fixed: true, width: 84, cell: () => '' },
   ];
 
-  // The Missed seq cell's hover detail: how many gap events sit behind the
-  // running count, and the most recent one by name, rather than making an
-  // operator go looking in Debug for what a bare number does not say.
+  // Missed seq hover: the gap event count and the most recent gap.
   function seqTip(row) {
     const rows = [{ text: `${(row.seq_gaps || 0).toLocaleString()} gap events` }];
     const last = row.seq_last;
     if (last) {
       rows.push({ text: `last gap: expected ${last.expected.toLocaleString()}, ` +
         `got ${last.got.toLocaleString()}, domain ${last.domain}, ${ago(last.ts)}, ` +
-        `${last.gap_s.toFixed(1)}s after the previous packet` });
+        (last.gap_s != null ? `${last.gap_s.toFixed(1)}s after the previous packet`
+          : 'interval unknown') });
     }
     return rows;
   }
@@ -1572,8 +1564,7 @@
       totalsText += ' · answered from records only · records reach back '
         + `to ${App.stamp(data.records_from)}`;
     }
-    // Same floor the chart shades: said here too, since the totals line is
-    // what a screen reader gets instead of the shading.
+    // The chart's shaded floor, in words for screen readers.
     if (data.breakdown_from != null && data.breakdown_from > data.t0) {
       totalsText += ` · breakdown from ${App.stamp(data.breakdown_from)}`;
     }

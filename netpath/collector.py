@@ -237,19 +237,24 @@ class Collector(udpsock.UdpReceiver):
             # Whether path loss or the exporter's own numbering is doing
             # this is for the operator to judge -- this line and the
             # Exporters table just say what happened, plainly.
-            gap = self.decoder.sequence_gaps().get(exporter) or {}
+            key, interval_s = f"seqgap:{exporter}", 600
+            gap = {}
+            if time.time() - self._log_times.get(key, 0.0) >= interval_s:
+                gap = self.decoder.sequence_gaps().get(exporter) or {}
             last = gap.get("last")
             if last is not None:
+                since = ("interval unknown" if last["gap_s"] is None
+                         else f"{last['gap_s']:.1f} s after the previous packet")
                 message = (
                     f"Sequence gap from {exporter} (domain {last['domain']}): "
                     f"expected {last['expected']}, got {last['got']} — "
-                    f"{last['got'] - last['expected']} packet(s) missing, "
-                    f"{last['gap_s']:.1f} s after the previous packet; "
+                    f"{last['got'] - last['expected']} {last['unit']} missing, "
+                    f"{since}; "
                     f"{gap.get('missed', 0):,} missed and "
                     f"{gap.get('resets', 0)} resets so far since start")
                 self._log_netflow_throttled(
-                    f"seqgap:{exporter}", message, detail=message,
-                    target=exporter, interval_s=600)
+                    key, message, detail=message,
+                    target=exporter, interval_s=interval_s)
         if self.decoder.stats["errors"] > errors_before:
             # One line a minute, not one per datagram: the event log is a
             # 3,000-entry ring, and a flood of runts emptied it of everything

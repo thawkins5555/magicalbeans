@@ -372,20 +372,16 @@ class Decoder:
                       "no_template": 0, "bad_template": 0,
                       "implausible_sampling": 0, "truncated_flows": 0,
                       "seq_missed": 0, "seq_resets": 0}
-        # (exporter, domain) -> the sequence value the exporter's next packet
-        # should carry. Bounded the same way self.sampling is: a flat LRU
-        # keyed on wire-controlled fields, capped at MAX_TEMPLATE_EXPORTERS so
-        # a source cycling `domain` cannot grow it without bound.
+        # (exporter, domain) -> the sequence value the next packet should carry;
+        # LRU-capped so a source cycling `domain` cannot grow it without bound.
         self._expected_seq: _Lru = _Lru(MAX_TEMPLATE_EXPORTERS)
-        # (exporter, domain) -> sequence numbers missed / gap events / reset
-        # events since the baseline was last reset, for sequence_gaps() to
-        # sum per exporter. Same bound as _expected_seq, same reason.
+        # (exporter, domain) -> missed / gap events / reset events since the
+        # baseline was last reset, summed per exporter by sequence_gaps().
         self._seq_missed_by_key: _Lru = _Lru(MAX_TEMPLATE_EXPORTERS)
         self._seq_gaps_by_key: _Lru = _Lru(MAX_TEMPLATE_EXPORTERS)
         self._seq_resets_by_key: _Lru = _Lru(MAX_TEMPLATE_EXPORTERS)
-        # (exporter, domain) -> {expected, got, ts, gap_s} for the most
-        # recent gap, and -> the arrival time of the last packet, so gap_s
-        # (time since the previous packet from that key) can be measured.
+        # (exporter, domain) -> {expected, got, ts, gap_s, unit} for the most
+        # recent gap, and -> the last packet's arrival time, for gap_s.
         self._last_gap_by_key: _Lru = _Lru(MAX_TEMPLATE_EXPORTERS)
         self._last_arrival: _Lru = _Lru(MAX_TEMPLATE_EXPORTERS)
         # (exporter, domain, template_id) -> {count, first_ts, last_ts, reason}
@@ -443,11 +439,11 @@ class Decoder:
                 self.learned_rates.pop(next(iter(self.learned_rates)))
 
     def _note_sequence(self, exporter: str, domain: int, got: int,
-                       advance: int | None) -> None:
+                       advance: int | None, unit: str) -> None:
         """Count sequence numbers skipped per (exporter, domain), and note
         gap/reset events and the most recent gap for sequence_gaps(). `advance`
-        is this packet's step (v5/IPFIX records, v9 one); None drops the
-        baseline without counting anything (a templateless IPFIX packet)."""
+        is this packet's step (v5/IPFIX records, v9 one), `unit` what it counts;
+        None drops the baseline without counting (a templateless IPFIX packet)."""
         key = (exporter, domain)
         if advance is None:
             self._expected_seq.pop(key, None)
@@ -465,12 +461,12 @@ class Decoder:
                 prev_ts = self._last_arrival.get(key)
                 self._last_gap_by_key[key] = {
                     "expected": expected, "got": got, "ts": now,
-                    "gap_s": now - prev_ts if prev_ts is not None else 0.0,
+                    "gap_s": now - prev_ts if prev_ts is not None else None,
+                    "unit": unit,
                 }
             elif missed != 0:
-                # A decrease (the exporter restarted) or a jump past
-                # MAX_SEQUENCE_JUMP (a counter wrap) is not loss -- a reset,
-                # counted separately so it cannot read as "billions missed".
+                # A decrease (restart) or a jump past MAX_SEQUENCE_JUMP (wrap)
+                # is a reset, counted apart so it cannot read as "billions missed".
                 self.stats["seq_resets"] += 1
                 self._seq_resets_by_key[key] = (
                     self._seq_resets_by_key.get(key, 0) + 1)
@@ -553,7 +549,7 @@ class Decoder:
         # v5 has no observation domain; flow_sequence counts records, so the
         # next packet's own value is expected to be this one plus this
         # packet's count.
-        self._note_sequence(exporter, 0, flow_sequence, count)
+        self._note_sequence(exporter, 0, flow_sequence, count, "record(s)")
 
         boot = unix_secs - sys_uptime / 1000.0
         now = time.time()
@@ -611,7 +607,7 @@ class Decoder:
         # The v9 header's sequence counts export packets, not records, so
         # the next one is expected to be this one plus one regardless of how
         # many flow sets this packet carried.
-        self._note_sequence(exporter, domain, sequence, 1)
+        self._note_sequence(exporter, domain, sequence, 1, "packet(s)")
         return flows
 
     # ------------------------------------------------------------ ipfix
@@ -648,7 +644,7 @@ class Decoder:
         # IPFIX's sequence counts Data Records (flow and options data sets
         # both) sent so far, so the next packet's value is expected to be
         # this one plus every record this packet actually carried.
-        self._note_sequence(exporter, domain, sequence, records_total)
+        self._note_sequence(exporter, domain, sequence, records_total, "record(s)")
         return flows
 
     # ------------------------------------------------------- templates

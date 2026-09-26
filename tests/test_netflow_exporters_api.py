@@ -258,6 +258,12 @@ def test_2_sequence_gaps_v5_v9_ipfix() -> None:
           f"v9: sequence_gaps() attributes 3 missed, 1 gap to {exp9} ({gap9})")
     check(gap9["last"]["expected"] == 102 and gap9["last"]["got"] == 105,
           f"...and 'last' names expected 102, got 105 ({gap9['last']})")
+    decoder._last_arrival.pop((exp9, 0), None)
+    decoder.decode(_v9_packet(_v9_data_only(700, 2000, 20), sequence=108), exp9)
+    last9 = decoder.sequence_gaps()[exp9]["last"]
+    check(last9["got"] == 108 and last9["gap_s"] is None,
+          f"...and a gap with no previous arrival on record carries gap_s None, "
+          f"not 0.0 ({last9})")
 
     # IPFIX: sequence counts data records; expected next = last + records.
     expfx = "10.60.0.3"
@@ -512,8 +518,8 @@ def test_7_overview_exporter_names_and_records_only() -> None:
               f"the overview's exporter list carries the resolved name "
               f"({exporters.get('10.70.0.1')})")
         check("breakdown_from" in overview and overview["breakdown_from"] is None,
-              f"the overview always carries breakdown_from, None until "
-              f"flowdb's reconstruction step lands "
+              f"the overview always carries breakdown_from, None on a store "
+              f"with no pre-upgrade history "
               f"({overview.get('breakdown_from')})")
 
         src_params = {**params, "src": "192.168.0.1"}
@@ -573,7 +579,7 @@ def test_9_collector_logs_sequence_gap_throttled() -> None:
         check(len(gap_lines) == 1,
               f"one Sequence gap line is logged (got {len(gap_lines)})")
         check("expected 5, got 1240" in gap_lines[0].message
-              and "1235 packet(s) missing" in gap_lines[0].message
+              and "1235 record(s) missing" in gap_lines[0].message
               and "domain 0" in gap_lines[0].message,
               f"it names the expected/got, domain and the count missing "
               f"({gap_lines[0].message!r})")
@@ -604,6 +610,19 @@ def test_9_collector_logs_sequence_gap_throttled() -> None:
         collector._handle_datagram(_v5_packet(count=1, flow_sequence=1), (exporter, 1))
         gap_lines = [e for e in log.all() if "Sequence gap from" in e.message]
         check(len(gap_lines) == 2, "a decrease logs no new sequence gap line")
+
+        # v9 sequences count packets, and an unknown previous arrival says so.
+        exp9 = "10.199.17.2"
+        collector._handle_datagram(
+            _v9_packet(_v9_template_and_data(710, 2000, 20), sequence=0), (exp9, 1))
+        collector.decoder._last_arrival.pop((exp9, 0), None)
+        collector._handle_datagram(
+            _v9_packet(_v9_data_only(710, 2000, 20), sequence=4), (exp9, 1))
+        v9_lines = [e for e in log.all() if f"Sequence gap from {exp9}" in e.message]
+        check(len(v9_lines) == 1 and "3 packet(s) missing" in v9_lines[0].message
+              and "interval unknown" in v9_lines[0].message,
+              f"a v9 gap counts packet(s) and reads 'interval unknown' with no "
+              f"previous arrival ({[e.message for e in v9_lines]!r})")
     finally:
         collector.stop()
         flow_db.close()
