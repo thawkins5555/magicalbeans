@@ -60,10 +60,22 @@ throttled "Sequence gap from …" event, plus the API's
 `web/api/netflow.py`, `test_netflow_exporters_api.py`). Thing3: the
 chart's totals-only shading and label, the EXPORTERS table's "Missed seq"
 cell and its tooltip, and the `App.ago` clock-skew clamp
-(`netflow.js`, `app.js`, `test_frontend_contracts.py`).
+(`netflow.js`, `app.js`, `test_frontend_contracts.py`). Thing4, after
+Testy's run showed the simulated exporters reporting gaps of their own:
+one counter set per exporter shared by the burst and the live phase
+(the hand-off had read as a reset), the default burst paced down from
+400 to 100 datagrams a second after real loss under load, and a
+two-phase decode check (`demo/flows.py`, `test_flows_simulator.py`).
 
-**Outcome.** Testy's suite run and Javariius's review are in progress —
-Bob will amend this line with the result before the push to main.
+**Outcome.** Testy: the fifteen NetFlow-adjacent suites green, the full
+suite 217 of 220 (the three known environmental failures), the walk 123
+of 123 with every NetFlow check. Javariius: no Critical finding; three
+P2 (a records-reach probe that one stray old-clock record could flip,
+the gap line saying "packets" for protocols that count records, and
+the prompt-log placeholder) and one Major defect older than this
+release (a late record could erase summaries the records no longer
+backed), all fixed before the push, plus six Low items also taken.
+Released as 5.67.1; `CHANGELOG.md` carries the full account.
 
 ## 5.67.0 — NetFlow overhaul: scoped summaries, named exporters, EXPORTERS/INTERFACES views
 

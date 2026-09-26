@@ -683,16 +683,33 @@ def test_14_a_named_series_is_whole_in_every_bucket() -> None:
     # a bucket that no longer overflows loses its flag with its rows.
     db._compact_bucket(60, start + flooded[0] * 60)
     with db._lock:
-        db._conn.execute("DELETE FROM flows WHERE src_ip LIKE '10.3.%'"
-                         " AND ts_end >= ? AND ts_end < ?",
+        db._conn.execute("UPDATE flows SET src_ip = '10.3.0.0' WHERE src_ip"
+                         " LIKE '10.3.%' AND ts_end >= ? AND ts_end < ?",
                          (start + flooded[1] * 60, start + flooded[1] * 60 + 60))
         db._conn.commit()
     db._compact_bucket(60, start + flooded[1] * 60)
+    # A bucket whose raw rows have partly aged out is kept as built.
+    first = start + flooded[0] * 60
+
+    def built() -> list:
+        return [sorted(tuple(row) for row in db._conn.execute(
+            f"SELECT * FROM {table} WHERE tier = 60 AND bucket = ?", (first,)))
+            for table in ("flow_rollup", "flow_rollup_span",
+                          "flow_rollup_trunc")]
+
+    before = built()
+    with db._lock:
+        db._conn.execute("DELETE FROM flows WHERE src_ip LIKE '10.3.%'"
+                         " AND ts_end >= ? AND ts_end < ?", (first, first + 60))
+        db._conn.commit()
+    db._compact_bucket(60, first)
     flagged = [row["bucket"] for row in db._conn.execute(
         flagged_sql, (dim,)).fetchall()]
-    check(flagged == [start + m * 60 for m in (flooded[0], flooded[2])],
-          f"a rebuilt bucket keeps one flag, and one rebuilt under the cap "
-          f"drops its flag ({[(b - start) // 60 for b in flagged]})")
+    check(flagged == [start + m * 60 for m in (flooded[0], flooded[2])]
+          and built() == before,
+          f"a rebuilt bucket keeps one flag, one rebuilt under the cap drops "
+          f"its flag, and one raw no longer holds in full keeps its rows and "
+          f"flags as built ({[(b - start) // 60 for b in flagged]})")
 
     # Once retention has eaten the raw rows behind a flagged bucket there is
     # nothing to repair it from, and the capped rollup is the honest answer:

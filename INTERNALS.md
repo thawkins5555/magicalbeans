@@ -12493,6 +12493,19 @@ shade and label. `coverage()` gained `breakdown_minute_floor`,
 
 ## SNMP Trap
 
+**Two guards added at review.** `_raw_breaks_down(tier, t0, t1)` no longer
+probes `MIN(ts_end)`: it counts raw rows over the totals-only stretch
+against the global spans' `flows` for the same buckets and treats
+records as reaching it only when `held >= wanted`, the `_repair_ranges`
+rule, so one stray old-clock row cannot flip a scoped window to records.
+`_raw_short(tier, bucket)` guards `_compact_bucket`: a bucket that already
+has a global span row and whose raw count is below that span's `flows`
+is skipped entirely — keys, spans and trunc flags of every scope kept as
+built — because a delete-and-rebuild from trimmed raw would have emptied
+it; `_redo_dirty` reaches such buckets whenever a flush carries a flow
+end time older than raw retention. A bucket with no span row, or with
+raw at or above its count, rebuilds as before.
+
 ### Decoding (`trapdecode.py`)
 
 `Reader` walks a byte range and returns `(tag, value_start, value_end)`

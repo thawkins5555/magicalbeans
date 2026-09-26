@@ -778,12 +778,16 @@ class FlowDatabase(SqliteStore):
                          t1: float) -> bool:
         """Whether raw still holds the stretch from t0 this tier has only
         totals for: raw then draws the breakdown, as it did before the
-        reconstruction. Counted as _repair_ranges does, not read off
-        MIN(ts_end), which one flow from a lagging clock drags back."""
+        reconstruction."""
         floor = self._breakdown_floor(tier, kind)
         if floor is None or t0 >= floor:
             return False
-        upper = min(floor, _align_down(t1, tier))
+        return self._raw_holds(tier, t0, min(floor, _align_down(t1, tier)))
+
+    def _raw_holds(self, tier: int, t0: float, upper: float) -> bool:
+        """Whether raw holds every flow this tier's global spans in
+        [t0, upper) counted. Counted as _repair_ranges does, not read off
+        MIN(ts_end), which one flow from a lagging clock drags back."""
         with self._lock:
             wanted = self._conn.execute(
                 f"SELECT COALESCE(SUM(flows), 0) AS n FROM flow_rollup_span"
@@ -1670,8 +1674,8 @@ class FlowDatabase(SqliteStore):
                 or hourly_watermark <= t0):
             return False
         if kind == "interface":
-            oldest = self._oldest_raw()
-            return oldest is None or oldest > t0
+            return not self._raw_holds(
+                3600, t0, min(hourly_watermark, _align_down(t1, 3600)))
         minute_floor = self._scope_floor(60, kind)
         return (minute_floor is not None and t0 < minute_floor
                 and not self._raw_breaks_down(3600, kind, t0, t1))

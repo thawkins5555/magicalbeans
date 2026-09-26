@@ -265,6 +265,14 @@ host and all, exactly as it did before this release; the totals-only
 summary path is only taken once raw can no longer reach that far back.
 The same guard also stops a sub-hour view from being silently widened
 into a totals-only hourly bucket it did not need to fall back to.
+The guard counts: records are taken to reach a stretch only when the
+store holds at least as many of them as the summaries counted for it.
+A single record from an exporter whose clock runs hours behind — the
+decoder accepts flow end times up to 30 days old — used to be enough
+for the earlier probe to claim records reached that far, which would
+have flipped every exporter and interface chart over the pre-upgrade
+stretch back to a records-only hole on every flush from that exporter
+and back again when the stray record was trimmed.
 
 **A pre-upgrade hour redone by routine compaction keeps what it was
 given.** Once raw has aged past a pre-upgrade hour, the usual
@@ -273,6 +281,28 @@ nothing left to rebuild the reconstructed exporter/interface rows from;
 that bucket's keys are now left as reconstruction wrote them rather than
 being emptied, and its grand total is re-summed from the minute-tier's
 own spans instead.
+
+**A summariser defect older than this release is closed with it: a
+late-arriving record could erase summaries the records no longer
+backed.** Every flush marks the summaries dirty from the oldest flow
+end time it carried, and the next compaction pass rebuilt every bucket
+from that point forward by deleting it and re-reading the raw records.
+Where the records for a bucket had already been trimmed — anything
+older than the hour or two the row cap keeps on a busy store — the
+rebuild found nothing and left the bucket empty, for every dimension
+and every scope, up to the point records still reached. One exporter
+with a clock between two hours and thirty days behind did this on every
+flush, hollowing out the minute and hourly history behind it, and it
+would have erased the totals this release reconstructs. Reviewed on
+this release and reproduced on the previous one: six hours of flows
+summarised, records trimmed to the last hour, one record six hours old,
+one compaction pass — 11,440 minute-tier rows became 11. A bucket whose
+records are now fewer than the total it was built from is kept exactly
+as built, keys, totals and flags alike; a bucket the records still
+cover rebuilds as before, so a genuinely late flow is still folded in.
+`tests/test_netflow_scoped.py` test 12 pins the scenario above with
+every row identical before and after, on both tiers, and the positive
+case beside it.
 
 **Sequence-gap diagnostics, so "1050 missed" is no longer a dead end.**
 The decoder now keeps, per exporter, a count of gap *events* and of
@@ -353,8 +383,9 @@ cell's two formats, and the `ago()` clamp.
 
 Files: `netpath/flowdb.py`, `netpath/nfdecode.py`, `netpath/collector.py`,
 `netpath/web/api/netflow.py`, `netpath/web/static/netflow.js`,
-`netpath/web/static/app.js`, `tests/test_netflow_scoped.py`,
-`tests/test_netflow_exporters_api.py`, `tests/test_frontend_contracts.py`,
+`netpath/web/static/app.js`, `demo/flows.py`, `tests/test_netflow_scoped.py`,
+`tests/test_netflow_rollup.py`, `tests/test_netflow_exporters_api.py`,
+`tests/test_flows_simulator.py`, `tests/test_frontend_contracts.py`,
 plus docs.
 
 ### 5.67.0 — NetFlow: filtered charts now read the summaries per exporter and interface, the page says what records-only views can reach, exporters are named, and EXPORTERS/INTERFACES views arrive

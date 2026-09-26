@@ -839,16 +839,38 @@ def test_11_upgraded_history_gets_scoped_totals() -> None:
           "or added")
 
     exporter = {**NO_FILTERS, "exporter": EXPORTER}
-    db.insert_flows([flow(i, floors[3600] - 3000 + i * 400, exporter=EXPORTER)
-                     for i in range(20)])
+    # Raw holds the last hour at the density the spans counted (3 an hour),
+    # then one flush from a clock six hours behind.
+    db.insert_flows([flow(i, hour - 3600 + i * 1200, exporter=EXPORTER)
+                     for i in range(3)])
+    db.insert_flows([flow(3, floors[3600], exporter=EXPORTER)])
+    for tier in flowdb.ROLLUP_TIERS:
+        info = {}
+        totals = db.overview(floors[tier], hour, "Application", exporter,
+                             tier, info=info)[4]
+        check(not info["records_only"] and info["tier"] == tier
+              and totals == summed(want, tier, EXPORTER),
+              f"tier {tier}: one stray flow six hours behind leaves the "
+              f"pre-upgrade window summary-served ({info})")
+    info = {}
+    got = db.overview(floors[3600], hour, "Application",
+                      {**exporter, "iface": 2, "direction": "both"}, 300,
+                      info=info)
+    check(got[2] == 3600 and info["widened"] and not info["records_only"]
+          and info["tier"] == 3600
+          and got[4] == summed(want, 3600, EXPORTER, 2, ("in", "out")),
+          f"and an interface-filtered 300s window still widens to the hour "
+          f"and stays summary-served ({info})")
+    db.insert_flows([flow(i, floors[3600] - 3000 + i * 300, exporter=EXPORTER)
+                     for i in range(84)])
     info = {}
     got = db.overview(floors[3600], hour, "Application", exporter, 3600,
                       info=info)
     check(info["records_only"] and len(got[1]) > 1
           and got == raw(db, "overview", floors[3600], hour, "Application",
                          exporter, 3600),
-          f"with raw reaching t0 below the breakdown floor, raw draws the "
-          f"breakdown as it did before ({info})")
+          f"with raw holding every flow the pre-upgrade spans counted, raw "
+          f"draws the breakdown as it did before ({info})")
     for tier in flowdb.ROLLUP_TIERS:
         db.backfill_rollup(tier, max_buckets=1)
         floor = db.rollup_bounds(tier)[0]
@@ -899,6 +921,74 @@ def test_11_upgraded_history_gets_scoped_totals() -> None:
     db.close()
 
 
+# ------------------------------------------------------------------------ 12
+
+COUNTED = {"global rows": f"flow_rollup WHERE {flowdb._GLOBAL_SQL}",
+           "global spans": f"flow_rollup_span WHERE {flowdb._GLOBAL_SQL}",
+           "exporter spans": "flow_rollup_span WHERE exporter != ''"
+                             " AND iface = -1"}
+
+
+def built(db: FlowDatabase, tier: int, below: int) -> tuple[dict, list]:
+    """({what: rows}, every row, span and flag) of a tier below `below`."""
+    counts = {name: count(db, f"SELECT COUNT(*) FROM {sql} AND tier = ?"
+                          f" AND bucket < ?", (tier, below))
+              for name, sql in COUNTED.items()}
+    rows = [sorted(tuple(row) for row in db._conn.execute(
+        f"SELECT * FROM {table} WHERE tier = ? AND bucket < ?", (tier, below)))
+        for table in ("flow_rollup", "flow_rollup_span", "flow_rollup_trunc")]
+    return counts, rows
+
+
+def span(db: FlowDatabase, tier: int, exporter: str, ts: float) -> tuple:
+    row = db._conn.execute(
+        "SELECT bytes, packets, flows FROM flow_rollup_span WHERE tier = ?"
+        " AND exporter = ? AND iface = -1 AND dir = '' AND bucket = ?",
+        (tier, exporter, flowdb._align_down(ts, tier))).fetchone()
+    return (0, 0, 0) if row is None else tuple(row)
+
+
+def test_12_redo_keeps_what_raw_no_longer_holds() -> None:
+    print("12: a flush from a lagging clock leaves the summaries raw no longer "
+          "holds as built")
+    end = flowdb._align_down(time.time() - 300, 3600)
+    start = end - 6 * 3600
+    kept = end - 3600
+    for name, minutes in (("minute tier built", True),
+                          ("hourly tier from raw", False)):
+        db = store(f"redo_{int(minutes)}.db")
+        db.insert_flows([flow(i, start + i * 10.0) for i in range(6 * 360)])
+        cover(db, minutes=minutes)
+        with db._lock:
+            db._conn.execute("DELETE FROM flows WHERE ts_end < ?", (kept,))
+            db._conn.commit()
+        tiers = flowdb.ROLLUP_TIERS if minutes else (3600,)
+        before = {tier: built(db, tier, kept) for tier in tiers}
+        db.insert_flows([flow(0, time.time() - 6 * 3600, exporter=EXPORTER)])
+        for tier in tiers:
+            db.compact_rollup(tier, max_buckets=10_000, budget_s=120)
+            after = built(db, tier, kept)
+            check(after == before[tier] and before[tier][0]["global spans"]
+                  and db._private_setting(flowdb._DIRTY % tier) is None,
+                  f"{name}, tier {tier}: the redo walked the old hours and "
+                  f"kept them as built ({before[tier][0]} -> {after[0]})")
+
+        late = kept + 1805
+        added = flow(1, late, exporter=EXPORTER)
+        grew = (added.bytes * added.sampling, added.packets * added.sampling, 1)
+        was = {(tier, scope): span(db, tier, scope, late)
+               for tier in tiers for scope in ("", EXPORTER)}
+        db.insert_flows([added])
+        for tier in tiers:
+            db.compact_rollup(tier, max_buckets=10_000, budget_s=120)
+        now = {key: span(db, *key, late) for key in was}
+        check(all(now[key] == tuple(a + b for a, b in zip(was[key], grew))
+                  and was[key][2] for key in was),
+              f"{name}: a late flow into a bucket raw still holds is folded "
+              f"into its global and exporter spans ({was} -> {now})")
+        db.close()
+
+
 TESTS = [
     test_1_scopes_agree_with_raw,
     test_2_caps_flags_and_repair,
@@ -911,6 +1001,7 @@ TESTS = [
     test_9_oldest_ts_stays_a_probe,
     test_10_totals_reads,
     test_11_upgraded_history_gets_scoped_totals,
+    test_12_redo_keeps_what_raw_no_longer_holds,
 ]
 
 
