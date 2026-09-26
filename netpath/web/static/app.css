@@ -113,10 +113,7 @@ body {
 .tile-chart { height: 200px; }
 .tile.tall .tile-chart { height: 280px; }
 .tile-chart svg { width: 100%; height: 100%; cursor: crosshair; }
-/* A graph tile's h3 (options.legend in App.tile) carries the series legend
-   beside the title instead of it sitting over the plot's top-left corner.
-   Wrapping lets a narrow tile drop the legend to its own row rather than
-   truncating it. */
+/* A graph tile's h3 (options.legend) carries the series legend beside the title instead of over the plot. */
 .tile h3 { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; }
 .tile-legend {
   margin-left: auto;
@@ -677,9 +674,7 @@ p.hint, .help-body p { max-width: 68ch; }
 .ip-line { color: var(--muted); font-size: var(--fs-xs); font-family: var(--mono); }
 .ip-line .muted-tag { font-family: var(--ui); }
 .hint.pad { padding: 2px var(--space-md) 6px; margin: 0; }
-/* App.loadingMark(): the same .hint loading line, with the header's brand
-   mark animated in place of plain text. Fills/strokes repeat .brand's
-   .mark-* rules since those are scoped to .brand. */
+/* App.loadingMark(): the same .hint loading line; fills/strokes repeat .brand's .mark-* rules (scoped to .brand). */
 .loading-mark { display: flex; align-items: center; justify-content: center; gap: var(--space-sm); }
 .loading-mark .mark { width: 22px; height: 22px; flex: none; }
 .loading-mark .mark-route {
@@ -1002,11 +997,7 @@ body.compact .canvas.small, body.tiny .canvas.small { min-height: 120px; }
 
 /* -------------------------------------------------------------- netflow */
 #page-netflow .canvas.chart { flex: 1; min-height: 120px; margin: 0 var(--space-md); }
-/* A view being replaced (not the periodic poll of one already on screen):
-   the chart overlays its own canvas, since #canvas is already the
-   containing block (position: relative); the two tables show theirs in a
-   sibling placeholder above the (hidden) table instead, since a <p> cannot
-   live inside a <table>. */
+/* A view being replaced overlays the chart's own canvas; the tables show theirs in a sibling placeholder instead. */
 .pane-loading { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: var(--canvas); }
 .pane-loading-block { padding: var(--space-md) 0; }
 .split { display: flex; gap: var(--space-md); padding: 0 var(--space-md) var(--space-md); flex: 1; min-height: 0; }

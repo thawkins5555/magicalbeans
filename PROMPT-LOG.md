@@ -49,12 +49,15 @@ fast index probes with a last-answer fallback when that lock is busy; a
 wherever they can; and the Dashboard's access grants now load on their own
 if the status poll is stuck behind a slow module. Plus the three items
 above: the tile legend moved beside the title, the loading mark, and
-sortable INTERFACES. Left for later, named plainly in `CHANGELOG.md`: the
-hourly interface breakdown's own write-lock cost, and the size-cap trim
-every store shares, which still runs the scanning oldest/newest query.
-Released as 5.68.0; the benchmark's before-figures are in
-`CHANGELOG.md`, with the after-figures marked `AFTER-PENDING` for a
-follow-up.
+sortable INTERFACES. Left for later, named plainly in `CHANGELOG.md`:
+the benchmark's own ~20-second write-lock hold inside its summary build
+and prune, not yet pinned to a step; the size-cap trim every store
+shares, still running the same combined oldest/newest query; an
+interface-filtered chart's unsealed tail, still read from raw records;
+and a chart (the totals reports no longer do this) whose window starts
+before the summaries' own oldest bucket, still answered from records.
+Released as 5.68.0; the before and after figures are both in
+`CHANGELOG.md`'s 5.68.0 table.
 
 ## 5.67.1 — NetFlow follow-up: pre-upgrade history restored, sequence-gap diagnostics
 

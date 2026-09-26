@@ -95,9 +95,12 @@ class Spy:
     def __init__(self, conn):
         self.conn = conn
         self.sql: list[str] = []
+        self.hook = None
 
     def execute(self, sql, *args):
         self.sql.append(sql)
+        if self.hook:
+            self.hook()
         return self.conn.execute(sql, *args)
 
     def __getattr__(self, name):
@@ -174,7 +177,7 @@ def test_b_no_waiting() -> None:
 # ------------------------------------------------------------------------- c
 
 def test_c_raw_holds_memo() -> None:
-    print("c: _raw_holds is memoised for a minute, and prune() clears it")
+    print("c: _raw_holds is memoised for a minute, until a prune or trim")
     db = store("memo.db")
     base = flowdb._align_down(time.time(), 3600) - 4 * 3600
     db.insert_flows([flow(i, base + i * 20.0) for i in range(3 * 180)])
@@ -192,12 +195,20 @@ def test_c_raw_holds_memo() -> None:
               and len(spy.sql) == walked,
               f"the second call, and one a poll later in the same hour, do "
               f"not query ({walked} statement(s), then {len(spy.sql) - walked})")
-        key = (3600, base, upper)
+        check(list(db._raw_holds_memo) == [(3600, base + 3600, upper)],
+              "keyed on the first whole bucket, which both queries bind")
+        key = (3600, base + 3600, upper)
         db._raw_holds_memo[key] = (time.monotonic() - 61, True)
         db._raw_holds(3600, base + 100.0, upper)
         check(len(spy.sql) == walked + 2, "a stale answer is recomputed")
+
+        def queries() -> int:
+            before = len(spy.sql)
+            db._raw_holds(3600, base + 100.0, upper)
+            return len(spy.sql) - before
+
         db.prune(365, 0, budget_s=10)
-        check(not db._raw_holds_memo, "prune() clears the memo")
+        check(queries() == 2, "after prune() the next call queries again")
         real_stage = db._prune_interfaces
 
         def mid_prune(*args, **kwargs):
@@ -207,14 +218,21 @@ def test_c_raw_holds_memo() -> None:
         db._prune_interfaces = mid_prune
         db.prune(365, 0, budget_s=10)
         del db._prune_interfaces
-        check(not db._raw_holds_memo,
-              "and an answer computed during a prune does not outlive it")
-        db._raw_holds(3600, base + 100.0, upper)
+        check(queries() == 2,
+              "an answer computed during a prune does not outlive it")
         db.trim_to_size(10 ** 12)
-        check(not db._raw_holds_memo, "the size cap's trim clears it too")
-        before = len(spy.sql)
+        check(queries() == 2, "nor one from before the size cap's trim")
+        check(queries() == 0, "and a fresh answer is reused again")
+
+        def stamp():
+            db._raw_holds_cleared = time.monotonic()
+
+        db._raw_holds_memo.clear()
+        spy.hook = stamp
         db._raw_holds(3600, base + 100.0, upper)
-        check(len(spy.sql) == before + 2, "and the next call queries again")
+        spy.hook = None
+        check(queries() == 2,
+              "an answer computed across a prune's end is discarded")
         stale = time.monotonic() - 120
         for n in range(250):
             db._raw_holds_memo[(3600, n, n)] = (stale, False)
@@ -234,6 +252,16 @@ def test_c_raw_holds_memo() -> None:
         check(first_poll >= 1 and raw_walks(spy) == 0,
               f"an interface chart's next poll does not re-walk raw "
               f"({first_poll} walk(s), then {raw_walks(spy)})")
+
+        with db._lock:
+            db._conn.execute("DELETE FROM flows WHERE id IN (SELECT id FROM"
+                             " flows WHERE ts_end >= ? ORDER BY ts_end"
+                             " LIMIT 5)", (base + 3600,))
+            db._conn.commit()
+        db.prune(365, 0, budget_s=10)
+        check(not db._raw_holds(3600, base + 100.0, upper),
+              "five flows gone from the whole buckets are missed, however "
+              "many the partial hour before them holds")
     finally:
         db._read_conn = spy.conn
     db.close()

@@ -235,13 +235,21 @@ does history reach" probe behind the status strip runs every ten seconds
 and was walking all five million raw rows on every call — `SELECT
 MIN(ts_end), MAX(ts_end) FROM flows` is written as one query, but SQLite
 plans a combined min-and-max like that as a full table scan rather than
-two index lookups, costing 1.2 seconds a call at this scale. And the
-7-day INTERFACES report was reading ten thousand *minute*-level rows per
-interface to build an hour-by-hour utilisation picture, when the hourly
-summary already had the answer. Separately, on the browser side, the
-EXPORTERS and INTERFACES polls had slipped past the page's own
-one-request-at-a-time guard, so a slow server let their queries pile up
-rather than being held back like every other tab's poll.
+two index lookups, costing 1.2 seconds a call at this scale. The 7-day
+INTERFACES report's 18.5-second read was a routing gap in
+`interface_totals`/`exporter_totals` themselves: the window-splitting plan
+skipped a summary tier outright whenever that tier's own oldest bucket was
+newer than the window's start, and fell back to raw for the *entire*
+window rather than only the stretch the tier genuinely couldn't cover —
+on the two-day fixture behind this benchmark, where the summaries don't
+yet reach back seven days, that meant scanning all five million raw rows
+for the whole week. (Ten thousand *minute*-level rows read per interface
+is what actually explains the 24-hour figure below — the hourly summary
+already had that answer, just paid for one row at a time rather than one
+summed figure.) Separately, on the browser side, the EXPORTERS and
+INTERFACES polls had slipped past the page's own one-request-at-a-time
+guard, so a slow server let their queries pile up rather than being held
+back like every other tab's poll.
 
 **What changed — the flow store.** Chart, record-list and totals reads
 (`flows`, `exporter_totals`, `interface_totals`, `coverage`, `exporters`,
@@ -260,7 +268,12 @@ each edge from the minute-level rows, instead of the minute-level table
 for the whole window; and a 7- or 30-day chart's unsealed tail — the last
 stretch the hourly summary hasn't caught up to yet — is now served from
 the minute-level rows instead of falling back to up to an hour of raw
-records.
+records. And `interface_totals`/`exporter_totals`'s own window-splitting
+plan now serves each summary tier from its own oldest bucket forward —
+raw covering only the stretch genuinely older than that — instead of
+abandoning a tier for the whole window the moment any part of it predated
+that tier's history; that alone is what took the 7-day interface-totals
+figure below from 18.5 seconds to 5.5 milliseconds.
 
 **What changed — the browser.** NetFlow's poll tick now fetches only the
 subtab actually on screen (TRAFFIC, EXPORTERS or INTERFACES), awaited
@@ -288,10 +301,10 @@ module.
   it now opens sorted by inbound rate, highest first, remembered per
   browser like the record table's own sort.
 
-**Measured on the released code, before this release's fixes, at the
-operator's reported scale** (`tests/bench_flow_scale.py`'s defaults: five
-million raw records over 1.7 hours from six exporters, behind two days of
-minute/hourly summaries) — before → after:
+**Measured at the operator's reported scale, before and after**
+(`tests/bench_flow_scale.py`'s defaults: five million raw records over
+1.7 hours from six exporters, behind two days of minute/hourly
+summaries):
 
 | Query | Before | After |
 | --- | --- | --- |
@@ -323,11 +336,13 @@ was not running in the benchmark, so whether it drops flows during
 such a hold on a live box is unmeasured. The size-cap trim every store
 shares still runs the same combined oldest/newest query this release
 rewrote for `coverage()` and `prune()`'s row-cap bound alone. An
-interface-filtered
-chart's unsealed tail still comes from raw records, because interfaces
-have no minute-level summary to fall back to. And a chart whose window
-starts before the summaries' own oldest bucket is still answered entirely
-from records, as it always has been.
+interface-filtered chart's unsealed tail still comes from raw records,
+because interfaces have no minute-level summary to fall back to. And a
+*chart* whose window starts before the summaries' own oldest bucket is
+still answered entirely from records, as it always has been — the totals
+reports (`interface_totals`, `exporter_totals`) no longer are: the fix
+above means they now split at that same oldest bucket, records below it
+and summary above, rather than giving up on the summary altogether.
 
 Files: `netpath/flowdb.py`, `netpath/sqlitebase.py`,
 `netpath/web/api/debug.py`, `netpath/web/static/app.css`,

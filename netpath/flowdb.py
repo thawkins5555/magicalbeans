@@ -274,26 +274,25 @@ _IF_COLUMN = {"in": "in_if", "out": "out_if"}
 # in the rollup arm's `AND NOT (bucket >= ? AND bucket < ?)` exclusion and
 # four in the run's own UNION ALL raw arm (two for the slot expression, two
 # for the ts_end range). The rest of the statement binds at most twenty-two
-# (nine in each rollup arm — an hourly chart has two, the second its minute
-# tail, sharing one bucket budget — and four in the raw tail; a filtered
-# query is never repaired, so no filter terms). The worst case — no two
-# flagged buckets adjacent — is one run per bucket, so 120 buckets is
-# 120 * 6 + 22 = 742 parameters against the 999 an older SQLite allows
-# (sqlitebase.id_chunks explains why 999, not 32766, is the number to plan
-# for), a quarter of the limit spare; it is also 123 arms against the
-# default compound-select ceiling of 500. 200 was over: 200 * 6 + 10 is
-# about 1,200, and the query raised "too many SQL variables" on exactly the
-# chart the bound was meant to keep whole. Past it a chart's holes stay
-# exactly as they did before the flag existed, which is the answer the bound
-# has always given.
+# (nine in each rollup arm, of which an hourly chart's minute tail is a
+# second, and four in the raw tail; a filtered query is never repaired, so
+# no filter terms). The worst case — no two flagged buckets adjacent — is
+# one run per bucket, so 120 buckets is 120 * 6 + 22 = 742 parameters
+# against the 999 an older SQLite allows (sqlitebase.id_chunks explains why
+# 999, not 32766, is the number to plan for), a quarter of the limit
+# spare; it is also 123 arms against the default compound-select ceiling
+# of 500. 200 was over: 200 * 6 + 10 is about 1,200, and the query raised
+# "too many SQL variables" on exactly the chart the bound was meant to keep
+# whole. Past it a chart's holes stay exactly as they did before the flag
+# existed, which is the answer the bound has always given.
 #
 # _REPAIR_MAX_FLOWS bounds the work: the raw rows one rollup arm's repairs
 # will scan, known in advance from the span rows' own flow counts. The
-# overview holds the read lock for the whole query, shared only with the
-# other web reads, so a repair that took seconds would stall every other
-# chart and the record list behind it; a hundred thousand rows is a few
-# hundred milliseconds. A quiet store never reaches it; a store busy enough
-# to does not get its holes repaired, which is where it stood before.
+# overview holds the read lock for the whole query, so a repair taking
+# seconds would stall every other chart and the record list behind it;
+# a hundred thousand rows is a few hundred milliseconds. A quiet store never
+# reaches it; a store busy enough to does not get its holes repaired, which
+# is where it stood before.
 _REPAIR_MAX_BUCKETS = 120
 _REPAIR_MAX_FLOWS = 100_000
 
@@ -321,8 +320,7 @@ _ROLLUP_LAG_S = 120
 _ROLLUP_MAX_BUCKETS = {60: 240, 3600: 48}
 _ROLLUP_BUDGET_S = 5.0
 
-# How long a _raw_holds answer is reused: every interface-filtered chart poll
-# asks it, and prune() clears the memo.
+# How long a _raw_holds answer is reused, unless a prune or trim ends first.
 _RAW_HOLDS_TTL_S = 60.0
 _RAW_HOLDS_MEMO_MAX = 200
 
@@ -472,11 +470,11 @@ class FlowDatabase(SqliteStore):
         self.cap_held_back = 0   # rows prune()'s row-cap stage spared, not yet summarised
         self._compact_hit_limit: dict[int, bool] = {}   # tier -> whether compact_rollup's last call used its full bucket limit
         self._iface_built: int | None = None   # the last hourly bucket whose interface breakdown _compact_bucket rebuilt
-        self._raw_holds_memo: dict = {}   # (tier, aligned t0, upper) -> (monotonic, answer)
+        self._raw_holds_memo: dict = {}   # (tier, start, upper) -> (monotonic, answer)
+        self._raw_holds_cleared = float("-inf")
         self._coverage_last: dict | None = None
         super().__init__(path)
-        # Request-path reads, so a chart or the record list never holds the
-        # lock the collector's writer and the summariser need.
+        # Request-path reads, off the lock the writer and summariser need.
         if path and path != ":memory:":
             self._read_conn = connect(path)
             self._read_conn.row_factory = sqlite3.Row
@@ -489,20 +487,24 @@ class FlowDatabase(SqliteStore):
     def close(self, timeout_s: float | None = None) -> None:
         if self._closed:
             return
-        if self._read_conn is not self._conn:
-            wait = (self.CLOSE_LOCK_WAIT_S if timeout_s is None
-                    else max(0.0, timeout_s))
-            held = (self._read_lock.acquire(timeout=wait) if wait
-                    else self._read_lock.acquire(blocking=False))
-            try:
-                self._read_conn.close()
-            finally:
-                if held:
-                    self._read_lock.release()
-        super().close(timeout_s)
+        try:
+            if self._read_conn is not self._conn:
+                wait = (self.CLOSE_LOCK_WAIT_S if timeout_s is None
+                        else max(0.0, timeout_s))
+                held = (self._read_lock.acquire(timeout=wait) if wait
+                        else self._read_lock.acquire(blocking=False))
+                try:
+                    self._read_conn.close()
+                finally:
+                    if held:
+                        self._read_lock.release()
+        finally:
+            super().close(timeout_s)
 
     def read_lock_stats(self) -> dict:
         """lock_stats() for the read connection's lock."""
+        if self._read_lock is self._lock:
+            return {}
         stats = getattr(self._read_lock, "stats", None)
         return stats() if callable(stats) else {}
 
@@ -828,24 +830,27 @@ class FlowDatabase(SqliteStore):
         [t0, upper) counted. Counted as _repair_ranges does, not read off
         MIN(ts_end), which one flow from a lagging clock drags back."""
         memo = self._raw_holds_memo
-        key = (tier, _align_down(t0, tier), int(upper))
+        start = _align_up(t0, tier)
+        key = (tier, start, int(upper))
         now = time.monotonic()
         hit = memo.get(key)
-        if hit is not None and now - hit[0] < _RAW_HOLDS_TTL_S:
+        if (hit is not None and hit[0] > self._raw_holds_cleared
+                and now - hit[0] < _RAW_HOLDS_TTL_S):
             return hit[1]
         with self._read_lock:
             wanted = self._read_conn.execute(
                 f"SELECT COALESCE(SUM(flows), 0) AS n FROM flow_rollup_span"
                 f" WHERE tier = ? AND {_GLOBAL_SQL} AND bucket >= ?"
-                f" AND bucket < ?", (tier, t0, upper)).fetchone()["n"]
+                f" AND bucket < ?", (tier, start, upper)).fetchone()["n"]
             held = self._read_conn.execute(
                 "SELECT COUNT(*) AS n FROM (SELECT 1 FROM flows"
                 " WHERE ts_end >= ? AND ts_end < ? LIMIT ?)",
-                (t0, upper, wanted)).fetchone()["n"] if wanted else 0
+                (start, upper, wanted)).fetchone()["n"] if wanted else 0
         answer = bool(wanted) and held >= wanted
         if len(memo) > _RAW_HOLDS_MEMO_MAX:
             for stale in [k for k, (when, _a) in list(memo.items())
-                          if now - when >= _RAW_HOLDS_TTL_S]:
+                          if when <= self._raw_holds_cleared
+                          or now - when >= _RAW_HOLDS_TTL_S]:
                 memo.pop(stale, None)
         memo[key] = (now, answer)
         return answer
@@ -1401,7 +1406,7 @@ class FlowDatabase(SqliteStore):
         for the first four (the Settings page's maintenance button) matches
         every existing row.
         """
-        self._raw_holds_memo.clear()
+        self._raw_holds_cleared = time.monotonic()
         now = time.time()
         cutoff = now - retention_days * 86400
         deadline = time.monotonic() + budget_s
@@ -1491,7 +1496,7 @@ class FlowDatabase(SqliteStore):
                         "maintenance pass", retention_days)
         if removed:
             self._reclaim_until(time.monotonic() + PRUNE_RECLAIM_BUDGET_S)
-        self._raw_holds_memo.clear()
+        self._raw_holds_cleared = time.monotonic()
         return removed
 
     def _trim_more(self, max_bytes: int, budget_s: float | None = None) -> int:
@@ -1504,8 +1509,8 @@ class FlowDatabase(SqliteStore):
         a compaction pass rewrites. A hook rather than an override, so the
         base emits its over-cap warning after this rather than before it.
         """
-        # Called after the base trim's raw deletes, so this also covers those.
-        self._raw_holds_memo.clear()
+        # Called after the base trim's raw deletes, so this covers those too.
+        self._raw_holds_cleared = time.monotonic()
         removed = 0
         if max_bytes <= 0 or self._trim_size() <= max_bytes:
             return removed
@@ -1533,7 +1538,7 @@ class FlowDatabase(SqliteStore):
             removed += batch_removed
             self._raise_floors(tier, reached)
             self._reclaim_until(deadline)
-        self._raw_holds_memo.clear()
+        self._raw_holds_cleared = time.monotonic()
         return removed
 
     def _trim_id_ceiling(self, cut: int) -> int | None:
@@ -1606,9 +1611,8 @@ class FlowDatabase(SqliteStore):
         return max(0.0, sealed - watermark)
 
     def coverage(self) -> dict:
-        """What each tier still covers, for the NetFlow status strip (A5).
-        The last answer when a chart or record query holds the read lock, so
-        /api/state never waits behind one."""
+        """What each tier still covers, for the NetFlow status strip (A5);
+        the last answer rather than wait behind a chart or record query."""
         if self._coverage_last is None:
             self._read_lock.acquire()
         elif not self._read_lock.acquire(timeout=0.25):
@@ -1733,8 +1737,7 @@ class FlowDatabase(SqliteStore):
     def _minute_tail(self, kind: str, dimension: str | None, seal: int,
                      t1: float) -> int | None:
         """Where the minute tier stops serving an hourly plan's tail from
-        `seal`, raw taking the rest; None leaves the whole tail to raw.
-        Interface scopes have no minute keys."""
+        `seal`, or None for raw; interface scopes have no minute keys."""
         if kind not in ("global", "exporter"):
             return None
         floor = self._scope_floor(60, kind)
@@ -1889,8 +1892,6 @@ class FlowDatabase(SqliteStore):
         if plan is not None:
             tier, dim, raw_from, scopes = plan
             arms = [(tier, t0, raw_from)]
-            # An hourly plan's tail up to the minute watermark comes from the
-            # minute tier rather than up to an hour of raw rows.
             tail = (self._minute_tail(kind, dimension, raw_from, t1)
                     if tier == 3600 else None)
             if tail is not None:
@@ -1912,12 +1913,8 @@ class FlowDatabase(SqliteStore):
                         key_params.extend([scope[0], *expr_params, arm_tier,
                                            *scope, low, upper])
                     elif dim is not None:
-                        # The buckets the cap cut short leave the rollup arm
-                        # here and join the raw arms below, so each is counted
-                        # by exactly one of them. The spans are untouched
-                        # either way: they were never capped, and the residual
-                        # is measured against them. The arms share one scope's
-                        # bucket budget, which is what bounds the statement.
+                        # The arms share one scope's bucket budget, which is
+                        # what bounds the statement.
                         repair = self._repair_ranges(arm_tier, scope, dim, low,
                                                      upper, max_buckets - used,
                                                      max_flows)
@@ -2006,11 +2003,9 @@ class FlowDatabase(SqliteStore):
         return t0, bucket_s, n_buckets, rows, spans
 
     def _span_plan(self, t0: float, t1: float, kind: str):
-        """(arms, edges): arms (tier, start, seal) serve whole buckets
-        [start, seal), coarsest tier first, each finer tier filling what the
-        coarser left, none below its floor; edges (low, upper, closed) are
-        the raw ts_end ranges between them, closed only at t1. Together they
-        tile [t0, t1]."""
+        """(arms, edges): arms (tier, start, seal) serve whole buckets,
+        coarsest tier first, none below its floor; edges (low, upper, closed)
+        are the raw ts_end ranges left over, closed only at t1."""
         arms = []
         gaps = [(t0, t1)]
         for tier in sorted(ROLLUP_TIERS, reverse=True):

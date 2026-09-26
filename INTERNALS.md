@@ -12510,7 +12510,7 @@ splitting it). `close()` closes both.
 floor/watermark lookup are unchanged), compaction (`compact_rollup`),
 backfill (`backfill_rollup`), `prune`, `_reconstruct_scoped_spans`, and
 `insert_flows` — nothing that reads or writes the rollup or setting
-tables moved, only the four request-path reads above.
+tables moved, only the request-path reads listed above.
 
 **`coverage()` no longer waits behind a chart.** It tries the read lock
 with a 0.25 s timeout; on the first call ever (`self._coverage_last is
@@ -12523,8 +12523,8 @@ a little stale in the worst case, never blocked.
 **`_raw_holds` is memoised for 60 seconds** (`_raw_holds_memo`, keyed on
 `(tier, aligned t0, upper)`, capped at `_RAW_HOLDS_MEMO_MAX` entries):
 every interface-filtered chart's poll tick asks it, and without the memo
-that is one more raw-table probe every two seconds a screen is left open
-on such a view. `prune()` and the size-cap trim (`_trim_more`) both clear
+that is one more raw-table probe on every NetFlow poll a screen is left
+open on such a view. `prune()` and the size-cap trim (`_trim_more`) both clear
 it, since either can move the raw table out from under a cached answer.
 
 **`_span_plan(t0, t1, kind)` tiles a window coarsest tier first.** It
@@ -12572,10 +12572,11 @@ it is deliberately not a `test_*.py` (informational, not part of the
 suite `run_all.py` collects).
 
 **One line for Debug.** `/api/debug`'s `store_locks` dict gains a
-`flows_reads` row from `FlowDatabase.read_lock_stats()`, labelled "…
-(chart and record reads)" — it rides in the payload next to the existing
-per-store rows the same way they do, unrendered, since `debug.js` does
-not draw a store-locks table on the page today.
+`flow_reads` row (the flow store is registered as `"flow"` in
+`STORES`, `web/service.py`) from `FlowDatabase.read_lock_stats()`,
+labelled "… (chart and record reads)" — it rides in the payload next to
+the existing per-store rows the same way they do, unrendered, since
+`debug.js` does not draw a store-locks table on the page today.
 
 ---
 

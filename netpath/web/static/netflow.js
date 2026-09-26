@@ -173,11 +173,11 @@
   const REFETCH_MS = 250;
 
   /* The window an operator has just left is not worth finishing. Its
-     queries run on a connection of their own now, but still queue on the
-     flow store's read lock ahead of the answer the operator actually
-     wants, and the token check in refresh() only hides a stale answer in
-     the browser — the server had already computed it. The token is bumped
-     here as well as aborted, for the pair that answered a moment before. */
+     queries still queue on the flow store's read lock ahead of the answer
+     the operator actually wants, and the token check in refresh() only
+     hides a stale answer in the browser — the server had already computed
+     it. The token is bumped here as well as aborted, for the pair that
+     answered a moment before. */
   function dropInFlight() {
     view.request += 1;
     if (view.abort) { view.abort.abort(); view.abort = null; }
@@ -913,18 +913,14 @@
 
   /* ------------------------------------------------------- exporters / interfaces
 
-     The two Plixer-style report views: only the subtab on screen fetches,
-     on selectSub and on the module's own poll (drawStatus alone still runs
-     every tick, off /api/state). Whichever one that is shows the loading
-     mark and hides its pane while its own first answer for this view is
-     in flight; the poll tick that follows leaves both alone. */
+     The two Plixer-style report views: only the subtab on screen fetches, on selectSub and on the module's own poll. */
 
   function selectSub(name) {
     view.sub = name;
     App.selectSub('netflow', name);
     if (name === 'exporters') { view.subLoading = 'exporters'; refreshExporters(); }
     else if (name === 'interfaces') { view.subLoading = 'interfaces'; refreshInterfaces(); }
-    else if (name === 'traffic') requestFetch(true);
+    else if (name === 'traffic' && App.state.tab === 'netflow') requestFetch(true);
   }
 
   // A device on TRAFFIC's own exporter and iface pickers, set from a report
@@ -1056,9 +1052,7 @@
     App.wireRowKeyboard(body);
   }
 
-  // The mark in the sibling placeholder, table hidden behind it, while
-  // view.subLoading names the pane being replaced (first open, subtab
-  // switch, a filter changing) — never set for the poll tick alone.
+  // The mark in the sibling placeholder, table hidden behind it, while view.subLoading names the pane being replaced.
   function showPaneLoading(loadingId, tableId) {
     const el = App.el(loadingId);
     el.innerHTML = App.loadingMark();
@@ -1076,8 +1070,7 @@
     try {
       data = await App.get('/api/netflow/exporters', {});
     } catch (error) {
-      // A failed fetch still retracts the loading claim; the table left
-      // behind is whatever it last showed, same as the TRAFFIC rule.
+      // A failed fetch still retracts the loading claim, same as the TRAFFIC rule.
       if (view.sub === 'exporters') { view.subLoading = null; hidePaneLoading('nf-exporters-loading', 'nf-exporters'); }
       return;
     }
@@ -1552,13 +1545,10 @@
   async function refresh() {
     if (App.state.tab !== 'netflow') return;
     drawStatus();
-    // Only the subtab on screen fetches this tick, and page.refreshing
-    // (app.js runRefresh) covers it end to end, so a slow server gets one
-    // set of requests per tick rather than three piling up behind it.
+    // Only the subtab on screen fetches this tick; page.refreshing (app.js runRefresh) covers it end to end.
     if (view.sub === 'exporters') { await refreshExporters(); return; }
     if (view.sub === 'interfaces') { await refreshInterfaces(); return; }
-    // From here down, view.sub === 'traffic': the window-change debounce
-    // and the overview+records pair TRAFFIC has always fetched.
+    // From here down, view.sub === 'traffic': TRAFFIC's own window-change debounce and overview+records pair.
     /* A window change is still settling. The poll tick can see the window
        half way through the burst — the dropdown is on 6h on its way to 30d —
        and fetching that one is exactly the waste requestFetch() exists to
