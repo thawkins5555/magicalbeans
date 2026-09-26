@@ -3465,6 +3465,7 @@ const App = (() => {
     const geo = { plot, width, t0, t1 };
     if (!allValues.length) {
       emptyText(svg, width, height, opts.emptyText || 'No data in this window');
+      if (opts.legendHost) opts.legendHost.innerHTML = '';
       return geo;
     }
     // opts.peak pins the axis for a metric with a known full scale (a
@@ -3526,9 +3527,7 @@ const App = (() => {
       }
     }
 
-    // Legend beside the tile title (opts.legendHost) when a caller has one,
-    // else inside the plot's top-left, when the lines need telling apart —
-    // same "more than one labelled series" rule either way.
+    // Legend beside the tile title (opts.legendHost) or, absent that, inside the plot's top-left.
     const labelled = seriesList.filter((s) => s.label);
     if (opts.legendHost) {
       opts.legendHost.innerHTML = labelled.length > 1 ? labelled.map((s) =>
@@ -3794,9 +3793,7 @@ const App = (() => {
     if (options.h === 2) cls.push('tall');
     if (options.tone) cls.push(`tone-${options.tone}`);
     const idAttr = options.id ? ` data-tile="${escapeHtml(options.id)}"` : '';
-    // options.legend: the title shares its <h3> with a .tile-legend span
-    // that drawSeriesChart fills in-place (see opts.legendHost) — used by
-    // the graph tiles, whose in-plot legend used to cover the top lines.
+    // options.legend: an h3 with a .tile-legend span drawSeriesChart fills via opts.legendHost.
     const h3 = options.legend
       ? `<h3><span class="tile-title">${escapeHtml(title)}</span><span class="tile-legend"></span></h3>`
       : `<h3>${escapeHtml(title)}</h3>`;
@@ -5521,10 +5518,7 @@ const App = (() => {
   function emptyState(message) { return `<p class="hint">${escapeHtml(message)}</p>`; }
   function loading() { return '<p class="hint">Loading…</p>'; }
 
-  /* Same loading state, with the brand mark animated in place of plain text
-     — used where a whole view/pane is being replaced (see loadingMark's
-     callers), never on the periodic poll of a view already on screen. The
-     svg markup is copied verbatim from the header's brand mark. */
+  // Same as loading(), but the brand mark (copied from the header) animates in place of plain text.
   function loadingMark(text = 'Loading…') {
     return '<p class="hint loading-mark" role="status">'
       + '<svg class="mark" viewBox="0 0 32 32" aria-hidden="true" focusable="false">'
@@ -6521,10 +6515,7 @@ const App = (() => {
     } catch (error) {
       if (error && error.superseded) return;
       connected(false, String(error.message || error));
-      // /api/state is down, but /api/config is a separate endpoint and does
-      // not touch the flow store; fetch it on its own so state.permissions
-      // lands and the Dashboard tiles and tabs render with the account's
-      // real access while the state poll keeps retrying.
+      // /api/config doesn't touch the flow store; fetch it on its own so state.permissions lands while /api/state retries.
       if (!state.config) loadConfig().catch(() => {});
       // /api/state failing says nothing about the current tab's own endpoint; try it once.
       const first = pages[state.tab];

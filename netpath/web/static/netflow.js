@@ -115,9 +115,7 @@
     // EXPORTERS/INTERFACES read this, to fetch on the poll while they are
     // the one showing rather than on every tick regardless.
     sub: 'traffic',
-    // Set to 'exporters'/'interfaces' only while that pane is being
-    // replaced (entering it, or a range/exporter change on INTERFACES),
-    // never for the poll tick alone; cleared once that fetch lands.
+    // 'exporters'/'interfaces' while that pane is being replaced, not on a plain poll tick; cleared once its fetch lands.
     subLoading: null,
     // The exporter nf-iface's options were last built for, so a poll tick
     // that sees the same choice again does not refetch the interface list.
