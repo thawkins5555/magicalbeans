@@ -267,8 +267,8 @@ def test_3_scoped_repair_fits_999_variables() -> None:
         check(plan is not None and runs == [bound] * len(scopes),
               f"{name}: {runs} non-adjacent runs, the scoped bound of {bound} "
               f"per scope")
-        if limit is not None and hasattr(db._conn, "setlimit"):
-            db._conn.setlimit(limit, 999)
+        if limit is not None and hasattr(db._read_conn, "setlimit"):
+            db._read_conn.setlimit(limit, 999)
         try:
             got, error = db.overview(start, end, "Conversation", filters,
                                      bucket), None

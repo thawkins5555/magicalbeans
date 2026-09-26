@@ -376,12 +376,14 @@ class InstrumentedLock:
     """An RLock that records how long callers wait for it and hold it.
 
     Every read in this application takes its store's single write lock, not
-    just every write — so although all thirteen files are in WAL mode, and
-    WAL would let readers run alongside a writer, that concurrency is not
-    reachable through one connection behind one Python lock. Whether that
-    costs anything at a given fleet size is an empirical question, and this
-    is the measurement that answers it: `wait_s` per store per minute is the
-    time the web tier spent queued behind the poller and the collectors.
+    just every write (flows.db's chart, record and totals reads excepted:
+    they have had a query-only connection of their own since 5.68.0) — so
+    although all thirteen files are in WAL mode, and WAL would let readers
+    run alongside a writer, that concurrency is not reachable through one
+    connection behind one Python lock. Whether that costs anything at a
+    given fleet size is an empirical question, and this is the measurement
+    that answers it: `wait_s` per store per minute is the time the web tier
+    spent queued behind the poller and the collectors.
 
     Measured cost is 0.8 us per acquisition on top of a plain RLock's 0.1 us
     -- two perf_counter calls and a thread-local lookup. Stated as a share

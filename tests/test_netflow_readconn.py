@@ -3,8 +3,9 @@
 Charts, the record list and the totals read through a second, query-only
 connection behind its own lock, so the collector's writer and the summariser
 never queue behind them; coverage() answers from its last result rather than
-wait; _raw_holds is memoised; and _span_plan tiles a window coarsest tier
-first.
+wait; _raw_holds is memoised; _span_plan tiles a window coarsest tier first;
+an hourly chart's tail comes from the minute tier; and the MIN/MAX bounds
+coverage() and prune() read are index probes.
 
 Plain script, no pytest: run it, read the PASS lines, non-zero exit on failure.
 """
@@ -41,8 +42,8 @@ def store(name: str) -> FlowDatabase:
     return FlowDatabase(f"{TMPDIR}/{name}")
 
 
-def flow(index: int, ts: float):
-    return types.SimpleNamespace(
+def flow(index: int, ts: float, **overrides):
+    fields = dict(
         exporter=f"10.0.0.{index % 3}", version=9, ts_start=ts - 1, ts_end=ts,
         src_ip=f"192.168.0.{index % 4}", dst_ip=f"8.8.8.{index % 5}",
         src_port=1000 + index % 11, dst_port=(80, 443, 53, 22)[index % 4],
@@ -50,6 +51,17 @@ def flow(index: int, ts: float):
         in_if=index % 6, out_if=index % 8, src_as=0, dst_as=0, next_hop=None,
         packets=1 + index % 9, bytes=100 + index * 7,
         sampling=(1, 2, 10)[index % 3], domain=0, sampler_id=0)
+    fields.update(overrides)
+    return types.SimpleNamespace(**fields)
+
+
+def raw(db: FlowDatabase, method: str, *args, **kwargs):
+    real = FlowDatabase._rollup_plan
+    FlowDatabase._rollup_plan = lambda *a, **k: None
+    try:
+        return getattr(db, method)(*args, **kwargs)
+    finally:
+        FlowDatabase._rollup_plan = real
 
 
 def cover(db: FlowDatabase) -> None:
@@ -186,6 +198,20 @@ def test_c_raw_holds_memo() -> None:
         check(len(spy.sql) == walked + 2, "a stale answer is recomputed")
         db.prune(365, 0, budget_s=10)
         check(not db._raw_holds_memo, "prune() clears the memo")
+        real_stage = db._prune_interfaces
+
+        def mid_prune(*args, **kwargs):
+            db._raw_holds(3600, base + 100.0, upper)
+            return real_stage(*args, **kwargs)
+
+        db._prune_interfaces = mid_prune
+        db.prune(365, 0, budget_s=10)
+        del db._prune_interfaces
+        check(not db._raw_holds_memo,
+              "and an answer computed during a prune does not outlive it")
+        db._raw_holds(3600, base + 100.0, upper)
+        db.trim_to_size(10 ** 12)
+        check(not db._raw_holds_memo, "the size cap's trim clears it too")
         before = len(spy.sql)
         db._raw_holds(3600, base + 100.0, upper)
         check(len(spy.sql) == before + 2, "and the next call queries again")
@@ -272,6 +298,16 @@ def test_d_span_plan() -> None:
           "interface_totals over all three arms equals raw, all exporters "
           "and one")
 
+    early = base - 3 * 86400
+    arms, raw_edges = db._span_plan(early, t1, "interface")
+    check(arms == [(3600, base, base + 4 * 3600),
+                   (60, base + 4 * 3600, minute_seal)]
+          and raw_edges == [(early, base, False), (minute_seal, t1, True)]
+          and db.interface_totals(early, t1) == want_interfaces(early, t1)
+          and db.exporter_totals(early, t1) == want_exporters(early, t1),
+          "a window starting below the floors is served from the floor up, "
+          "raw only below it, and still totals as raw")
+
     rng = random.Random(5)
     bad = []
     for _ in range(40):
@@ -341,8 +377,112 @@ def test_f_memory() -> None:
     check(True, "close() twice is fine")
 
 
+# ------------------------------------------------------------------------- g
+
+def test_g_minute_tail() -> None:
+    print("g: an hourly chart's tail comes from the minute tier, not raw")
+    db = store("tail.db")
+    now = time.time()
+    base = flowdb._align_down(now, 3600) - 5 * 3600
+    rows = [flow(i, base + i * 6.0) for i in range(int((now - 5 - base) / 6))]
+    # Ten minutes over the minute cap, inside the hour the tail will cover.
+    burst = flowdb._align_down(now - flowdb._ROLLUP_LAG_S, 3600) - 3600
+    rows += [flow(k, burst + minute * 60 + 30, src_ip=f"172.16.0.{k}",
+                  bytes=50, sampling=1)
+             for minute in range(10) for k in range(60)]
+    db.insert_flows(rows)
+    cover(db)
+    hourly = db.rollup_bounds(3600)[1] - 3600
+    db._set_private_setting(flowdb._WATERMARK % 3600, hourly)
+    week = flowdb._align_down(now - 8 * 86400, 86400)
+    for key in (flowdb._FLOOR % 3600, flowdb._SCOPED_FLOOR % 3600,
+                flowdb._IFACE_FLOOR):
+        db._set_private_setting(key, week)
+    t0, t1 = now - 7 * 86400, now
+    tail = db._minute_tail("global", "Source", hourly, t1)
+    check(tail is not None and tail >= hourly + 3600 and tail < t1,
+          f"the hourly watermark sits an hour behind the minute tier's "
+          f"({(tail or 0) - hourly} s of tail from minutes, raw after)")
+
+    exporter = {**NO_FILTERS, "exporter": EXPORTER}
+    iface = {**exporter, "iface": 4}
+    cases = [("Source", NO_FILTERS, 3600), ("Conversation", NO_FILTERS, 21600),
+             ("Source", exporter, 3600), ("Conversation", exporter, 3600),
+             ("Application", iface, 3600)]
+    for dimension, filters, bucket in cases:
+        info: dict = {}
+        got = db.overview(t0, t1, dimension, filters, bucket, info=info)
+        want = raw(db, "overview", t0, t1, dimension, filters, bucket)
+        check(info["tier"] == 3600 and got == want,
+              f"7 days of {dimension} by {bucket}s, filters "
+              f"{ {k: v for k, v in filters.items() if v and k != 'direction'} }"
+              f": equal to raw, capped minutes repaired")
+    check(db.totals(flowdb._align_down(t0, 3600), t1, exporter)
+          == raw(db, "totals", flowdb._align_down(t0, 3600), t1, exporter),
+          "and one-slot totals()")
+
+    saved = flowdb._REPAIR_MAX_FLOWS
+    flowdb._REPAIR_MAX_FLOWS = 0
+    try:
+        got = db.overview(t0, t1, "Source", NO_FILTERS, 3600, top_limit=500)
+    finally:
+        flowdb._REPAIR_MAX_FLOWS = saved
+    want = raw(db, "overview", t0, t1, "Source", NO_FILTERS, 3600,
+               top_limit=500)
+    keys = {row["key"]: row["bytes"] for row in got[3]}
+    raw_keys = {row["key"]: row["bytes"] for row in want[3]}
+    check(got[4] == want[4]
+          and all(keys.get(k, 0) <= v for k, v in raw_keys.items())
+          and all(keys[f"192.168.0.{n}"] == raw_keys[f"192.168.0.{n}"]
+                  for n in range(4))
+          and len(keys) < len(raw_keys),
+          f"with the repair stood down the totals stay exact and only keys "
+          f"under the minute cap come up short ({len(keys)} of "
+          f"{len(raw_keys)} keys)")
+
+    with db._lock:
+        poisoned = db._conn.execute(
+            f"UPDATE flow_rollup_span SET bytes = bytes + 1000000 WHERE"
+            f" tier = 60 AND {flowdb._GLOBAL_SQL} AND bucket >= ?"
+            f" AND bucket < ?", (hourly, tail)).rowcount
+        db._conn.commit()
+    after = db.overview(t0, t1, "Source", NO_FILTERS, 3600)[4]
+    check(after["bytes"] - want[4]["bytes"] == poisoned * 1_000_000,
+          f"the tail's totals are read from the {poisoned} minute span rows")
+    db.close()
+
+
+# ------------------------------------------------------------------------- h
+
+def test_h_index_probes() -> None:
+    print("h: coverage() and prune()'s row cap read their bounds by probe")
+    db = store("probes.db")
+    now = time.time()
+    db.insert_flows([flow(i, now - 100 + i) for i in range(50)])
+    seen: list[str] = []
+    for conn in (db._conn, db._read_conn):
+        conn.set_trace_callback(seen.append)
+    try:
+        db.coverage()
+        db.prune(365, 10 ** 9, budget_s=10)
+    finally:
+        for conn in (db._conn, db._read_conn):
+            conn.set_trace_callback(None)
+    bounds = [sql for sql in seen
+              if ("MIN(ts_end)" in sql and "MAX(ts_end)" in sql)
+              or ("MIN(id)" in sql and "MAX(id)" in sql)]
+    plans = [[row["detail"] for row in db._conn.execute(
+        "EXPLAIN QUERY PLAN " + sql)] for sql in bounds]
+    check(len(bounds) == 2
+          and not any(line.startswith("SCAN flows")
+                      for plan in plans for line in plan),
+          f"no scan of flows in either ({plans})")
+    db.close()
+
+
 TESTS = [test_a_visibility, test_b_no_waiting, test_c_raw_holds_memo,
-         test_d_span_plan, test_e_close, test_f_memory]
+         test_d_span_plan, test_e_close, test_f_memory, test_g_minute_tail,
+         test_h_index_probes]
 
 
 def main() -> int:

@@ -97,18 +97,21 @@ def plan_of(store, call):
     module built — no second, hand-copied version of the query to drift.
     """
     seen = []
-    conn = store._conn
-    conn.set_trace_callback(seen.append)
+    # flows.db reads through a second, query-only connection as well.
+    conns = {store._conn, getattr(store, "_read_conn", store._conn)}
+    for conn in conns:
+        conn.set_trace_callback(seen.append)
     try:
         call()
     finally:
-        conn.set_trace_callback(None)
+        for conn in conns:
+            conn.set_trace_callback(None)
     selects = [sql for sql in seen if sql.lstrip()[:6].upper() == "SELECT"]
     if not selects:
         return "-"
     with store._lock:
         try:
-            rows = conn.execute(
+            rows = store._conn.execute(
                 "EXPLAIN QUERY PLAN " + max(selects, key=len)).fetchall()
         except Exception as exc:            # a plan is never worth a crash
             return "explain failed: %s" % exc

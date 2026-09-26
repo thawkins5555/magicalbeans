@@ -760,12 +760,13 @@ def test_15_the_repair_statement_fits_an_old_sqlite() -> None:
         print("  (Connection.setlimit unavailable here; the live check is skipped)")
     bound = flowdb._REPAIR_MAX_BUCKETS
     # The comment on _REPAIR_MAX_BUCKETS is the arithmetic being pinned:
-    # six parameters a run, ten for the rest, a quarter of 999 to spare.
-    check(bound * 6 + 10 <= 999 * 3 // 4,
+    # six parameters a run, twenty-two for the rest (two rollup arms with an
+    # hourly chart's minute tail), a quarter of 999 to spare.
+    check(bound * 6 + 22 <= 999 * 3 // 4,
           f"the bound leaves headroom under 999 variables "
-          f"({bound} runs * 6 + 10 = {bound * 6 + 10})")
-    check(bound + 2 <= 500,
-          f"...and under the default 500-arm compound select ({bound + 2} arms)")
+          f"({bound} runs * 6 + 22 = {bound * 6 + 22})")
+    check(bound + 3 <= 500,
+          f"...and under the default 500-arm compound select ({bound + 3} arms)")
 
     db = store("variables.db")
     end = flowdb._align_down(time.time() - 300, 60)
@@ -794,10 +795,11 @@ def test_15_the_repair_statement_fits_an_old_sqlite() -> None:
     check(plan is not None and len(runs) == bound,
           f"the fixture is the worst case: {len(runs)} non-adjacent runs "
           f"at the bound of {bound}")
-    if limit is not None and hasattr(db._conn, "setlimit"):
-        db._conn.setlimit(limit, 999)
-        check(db._conn.getlimit(limit) == 999,
-              "the connection is held to the older SQLite's 999 variables")
+    if limit is not None and hasattr(db._read_conn, "setlimit"):
+        db._read_conn.setlimit(limit, 999)
+        check(db._read_conn.getlimit(limit) == 999,
+              "the read connection, which runs the chart, is held to the "
+              "older SQLite's 999 variables")
     try:
         got = db.overview(start, end, "Conversation", NO_FILTERS, 60,
                           series_limit=8, top_limit=10)

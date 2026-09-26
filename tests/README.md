@@ -198,8 +198,12 @@ times web-shaped reads with a paced writer alongside, and **the pacing is the
 whole point**. Unpaced, a writer commits about eleven thousand transactions a
 second and reports a p95 two orders of magnitude worse than the truth; a
 2,000-device fleet on the shipped interval commits about 17. Deciding from
-the first would buy a risky change to fix a problem no install has. Run it
-before proposing read-only connections again.
+the first would buy a risky change to fix a problem no install has. It
+measures nodes.db, and the answer there is still no. flows.db is the
+exception: since 5.68.0 its chart, record and totals reads have a query-only
+connection of their own, because those reads each ran for seconds on the
+lock the NetFlow collector writes through, which is not the contention this
+bench models. Run it before proposing a read connection for another store.
 
 `bench_prune.py` is the one whose last column matters most. Every store here
 guards one sqlite connection with one RLock, and each shipped prune holds it

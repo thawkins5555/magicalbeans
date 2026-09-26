@@ -273,25 +273,27 @@ _IF_COLUMN = {"in": "in_if", "out": "out_if"}
 # buckets costs the key statement _agg_rows builds SIX bound parameters: two
 # in the rollup arm's `AND NOT (bucket >= ? AND bucket < ?)` exclusion and
 # four in the run's own UNION ALL raw arm (two for the slot expression, two
-# for the ts_end range). The rest of the statement binds ten (six in the
-# rollup arm, four in the raw tail; a filtered query is never repaired, so
-# no filter terms). The worst case — no two flagged buckets adjacent — is
-# one run per bucket, so 120 buckets is 120 * 6 + 10 = 730 parameters
-# against the 999 an older SQLite allows (sqlitebase.id_chunks explains why
-# 999, not 32766, is the number to plan for), a quarter of the limit
-# spare; it is also 122 arms against the default compound-select ceiling
-# of 500. 200 was over: 200 * 6 + 10 is about 1,200, and the query raised
-# "too many SQL variables" on exactly the chart the bound was meant to keep
-# whole. Past it a chart's holes stay exactly as they did before the flag
-# existed, which is the answer the bound has always given.
+# for the ts_end range). The rest of the statement binds at most twenty-two
+# (nine in each rollup arm — an hourly chart has two, the second its minute
+# tail, sharing one bucket budget — and four in the raw tail; a filtered
+# query is never repaired, so no filter terms). The worst case — no two
+# flagged buckets adjacent — is one run per bucket, so 120 buckets is
+# 120 * 6 + 22 = 742 parameters against the 999 an older SQLite allows
+# (sqlitebase.id_chunks explains why 999, not 32766, is the number to plan
+# for), a quarter of the limit spare; it is also 123 arms against the
+# default compound-select ceiling of 500. 200 was over: 200 * 6 + 10 is
+# about 1,200, and the query raised "too many SQL variables" on exactly the
+# chart the bound was meant to keep whole. Past it a chart's holes stay
+# exactly as they did before the flag existed, which is the answer the bound
+# has always given.
 #
-# _REPAIR_MAX_FLOWS bounds the work: the raw rows the repair arms will scan,
-# known in advance from the span rows' own flow counts. The overview holds
-# the read lock for the whole query, shared only with the other web reads,
-# so a repair that took seconds would stall every other chart and the record
-# list behind it; a hundred thousand rows is a few hundred milliseconds. A
-# quiet store never reaches it; a store busy enough to does not get its holes
-# repaired, which is where it stood before.
+# _REPAIR_MAX_FLOWS bounds the work: the raw rows one rollup arm's repairs
+# will scan, known in advance from the span rows' own flow counts. The
+# overview holds the read lock for the whole query, shared only with the
+# other web reads, so a repair that took seconds would stall every other
+# chart and the record list behind it; a hundred thousand rows is a few
+# hundred milliseconds. A quiet store never reaches it; a store busy enough
+# to does not get its holes repaired, which is where it stood before.
 _REPAIR_MAX_BUCKETS = 120
 _REPAIR_MAX_FLOWS = 100_000
 
@@ -1442,7 +1444,8 @@ class FlowDatabase(SqliteStore):
             # a good enough proxy for the row count.
             with self._lock:
                 bounds = self._conn.execute(
-                    "SELECT MIN(id) AS lo, MAX(id) AS hi FROM flows").fetchone()
+                    "SELECT (SELECT MIN(id) FROM flows) AS lo,"
+                    " (SELECT MAX(id) FROM flows) AS hi").fetchone()
             low, high = bounds["lo"], bounds["hi"]
             over = 0 if low is None else (high - low + 1) - max_flows
             if over > 0:
@@ -1488,6 +1491,7 @@ class FlowDatabase(SqliteStore):
                         "maintenance pass", retention_days)
         if removed:
             self._reclaim_until(time.monotonic() + PRUNE_RECLAIM_BUDGET_S)
+        self._raw_holds_memo.clear()
         return removed
 
     def _trim_more(self, max_bytes: int, budget_s: float | None = None) -> int:
@@ -1500,6 +1504,8 @@ class FlowDatabase(SqliteStore):
         a compaction pass rewrites. A hook rather than an override, so the
         base emits its over-cap warning after this rather than before it.
         """
+        # Called after the base trim's raw deletes, so this also covers those.
+        self._raw_holds_memo.clear()
         removed = 0
         if max_bytes <= 0 or self._trim_size() <= max_bytes:
             return removed
@@ -1527,6 +1533,7 @@ class FlowDatabase(SqliteStore):
             removed += batch_removed
             self._raise_floors(tier, reached)
             self._reclaim_until(deadline)
+        self._raw_holds_memo.clear()
         return removed
 
     def _trim_id_ceiling(self, cut: int) -> int | None:
@@ -1607,9 +1614,10 @@ class FlowDatabase(SqliteStore):
         elif not self._read_lock.acquire(timeout=0.25):
             return dict(self._coverage_last)
         try:
+            # Two subqueries: SQLite probes the index only for a lone MIN or MAX.
             row = self._read_conn.execute(
-                "SELECT MIN(ts_end) AS oldest, MAX(ts_end) AS newest"
-                " FROM flows").fetchone()
+                "SELECT (SELECT MIN(ts_end) FROM flows) AS oldest,"
+                " (SELECT MAX(ts_end) FROM flows) AS newest").fetchone()
         finally:
             self._read_lock.release()
         minute_floor, minute_watermark = self.rollup_bounds(60)
@@ -1721,6 +1729,23 @@ class FlowDatabase(SqliteStore):
             dim = None if dimension is None else DIMENSION_IDS[dimension]
             return tier, dim, seal, scopes
         return None
+
+    def _minute_tail(self, kind: str, dimension: str | None, seal: int,
+                     t1: float) -> int | None:
+        """Where the minute tier stops serving an hourly plan's tail from
+        `seal`, raw taking the rest; None leaves the whole tail to raw.
+        Interface scopes have no minute keys."""
+        if kind not in ("global", "exporter"):
+            return None
+        floor = self._scope_floor(60, kind)
+        _floor, watermark = self.rollup_bounds(60)
+        if floor is None or watermark is None or seal < floor:
+            return None
+        breakdown = self._breakdown_floor(60, kind)
+        if dimension is not None and breakdown is not None and seal < breakdown:
+            return None
+        tail = min(watermark, _align_down(t1, 60))
+        return tail if tail > seal else None
 
     def _widens(self, t0: float, t1: float, kind: str) -> bool:
         """A4: widen a sub-hour bucket when only the hourly tier reaches t0;
@@ -1863,41 +1888,57 @@ class FlowDatabase(SqliteStore):
         repairs: list = []
         if plan is not None:
             tier, dim, raw_from, scopes = plan
+            arms = [(tier, t0, raw_from)]
+            # An hourly plan's tail up to the minute watermark comes from the
+            # minute tier rather than up to an hour of raw rows.
+            tail = (self._minute_tail(kind, dimension, raw_from, t1)
+                    if tier == 3600 else None)
+            if tail is not None:
+                arms.append((60, raw_from, tail))
+                raw_from = tail
             expr, expr_params = slot("bucket")
             max_buckets, max_flows = _repair_budget(scopes)
             scope_sql = "tier = ? AND exporter = ? AND iface = ? AND dir = ?"
             for scope in scopes:
-                if dim == DIMENSION_IDS["Exporter"] and tuple(scope) != GLOBAL_SCOPE:
-                    # A scope holds one exporter, so its span is the only key.
-                    key_sql.append(
-                        f"SELECT ? AS key, {expr} AS slot, bytes, packets,"
-                        f" flows FROM flow_rollup_span WHERE {scope_sql}"
+                used = 0
+                for arm_tier, low, upper in arms:
+                    if (dim == DIMENSION_IDS["Exporter"]
+                            and tuple(scope) != GLOBAL_SCOPE):
+                        # A scope holds one exporter, so its span is the only key.
+                        key_sql.append(
+                            f"SELECT ? AS key, {expr} AS slot, bytes, packets,"
+                            f" flows FROM flow_rollup_span WHERE {scope_sql}"
+                            f" AND bucket >= ? AND bucket < ?")
+                        key_params.extend([scope[0], *expr_params, arm_tier,
+                                           *scope, low, upper])
+                    elif dim is not None:
+                        # The buckets the cap cut short leave the rollup arm
+                        # here and join the raw arms below, so each is counted
+                        # by exactly one of them. The spans are untouched
+                        # either way: they were never capped, and the residual
+                        # is measured against them. The arms share one scope's
+                        # bucket budget, which is what bounds the statement.
+                        repair = self._repair_ranges(arm_tier, scope, dim, low,
+                                                     upper, max_buckets - used,
+                                                     max_flows)
+                        used += len(repair)
+                        repairs.append((scope, repair))
+                        excluded = "".join(" AND NOT (bucket >= ? AND bucket < ?)"
+                                           for _ in repair)
+                        key_sql.append(
+                            f"SELECT key, {expr} AS slot, bytes, packets, flows"
+                            f" FROM flow_rollup WHERE {scope_sql} AND dim = ?"
+                            f" AND bucket >= ? AND bucket < ?{excluded}")
+                        key_params.extend([*expr_params, arm_tier, *scope, dim,
+                                           low, upper,
+                                           *(edge for run in repair
+                                             for edge in run)])
+                    span_sql.append(
+                        f"SELECT {expr} AS slot, bytes, packets, flows"
+                        f" FROM flow_rollup_span WHERE {scope_sql}"
                         f" AND bucket >= ? AND bucket < ?")
-                    key_params.extend([scope[0], *expr_params, tier, *scope,
-                                       t0, raw_from])
-                elif dim is not None:
-                    # The buckets the cap cut short leave the rollup arm here
-                    # and join the raw arms below, so each is counted by
-                    # exactly one of them. The spans are untouched either
-                    # way: they were never capped, and the residual is
-                    # measured against them.
-                    repair = self._repair_ranges(tier, scope, dim, t0, raw_from,
-                                                 max_buckets, max_flows)
-                    repairs.append((scope, repair))
-                    excluded = "".join(" AND NOT (bucket >= ? AND bucket < ?)"
-                                       for _ in repair)
-                    key_sql.append(
-                        f"SELECT key, {expr} AS slot, bytes, packets, flows"
-                        f" FROM flow_rollup WHERE {scope_sql} AND dim = ?"
-                        f" AND bucket >= ? AND bucket < ?{excluded}")
-                    key_params.extend([*expr_params, tier, *scope, dim, t0,
-                                       raw_from,
-                                       *(edge for run in repair for edge in run)])
-                span_sql.append(
-                    f"SELECT {expr} AS slot, bytes, packets, flows"
-                    f" FROM flow_rollup_span WHERE {scope_sql}"
-                    f" AND bucket >= ? AND bucket < ?")
-                span_params.extend([*expr_params, tier, *scope, t0, raw_from])
+                    span_params.extend([*expr_params, arm_tier, *scope, low,
+                                        upper])
 
         expr, expr_params = slot("ts_end")
         wheres = [self._where(raw_from, t1, filters, side)
@@ -1967,8 +2008,9 @@ class FlowDatabase(SqliteStore):
     def _span_plan(self, t0: float, t1: float, kind: str):
         """(arms, edges): arms (tier, start, seal) serve whole buckets
         [start, seal), coarsest tier first, each finer tier filling what the
-        coarser left; edges (low, upper, closed) are the raw ts_end ranges
-        between them, closed only at t1. Together they tile [t0, t1]."""
+        coarser left, none below its floor; edges (low, upper, closed) are
+        the raw ts_end ranges between them, closed only at t1. Together they
+        tile [t0, t1]."""
         arms = []
         gaps = [(t0, t1)]
         for tier in sorted(ROLLUP_TIERS, reverse=True):
@@ -1978,9 +2020,9 @@ class FlowDatabase(SqliteStore):
                 continue
             left = []
             for low, upper in gaps:
-                start = _align_up(low, tier)
+                start = max(_align_up(low, tier), _align_up(floor, tier))
                 seal = min(watermark, _align_down(upper, tier))
-                if start < floor or seal <= start:
+                if seal <= start:
                     left.append((low, upper))
                     continue
                 arms.append((tier, start, seal))
