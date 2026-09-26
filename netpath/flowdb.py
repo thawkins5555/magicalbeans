@@ -766,6 +766,23 @@ class FlowDatabase(SqliteStore):
             return None
         return max(int(mark) for mark in marks)
 
+    def _breakdown_floor(self, tier: int, kind: str) -> int | None:
+        """Where a scope kind's keys start at this tier on an upgraded store."""
+        if kind == "global":
+            return None
+        mark = self._private_setting(_IFACE_BREAKDOWN_FLOOR if kind == "interface"
+                                     else _BREAKDOWN_FLOOR % tier)
+        return None if mark is None else int(mark)
+
+    def _raw_breaks_down(self, tier: int, kind: str, t0: float) -> bool:
+        """Whether raw still reaches a t0 this tier holds only totals for:
+        raw then draws the breakdown, as it did before the reconstruction."""
+        floor = self._breakdown_floor(tier, kind)
+        if floor is None or t0 >= floor:
+            return False
+        oldest = self._oldest_raw()
+        return oldest is not None and oldest <= t0
+
     def _seed_scoped(self, tier: int, at: int) -> None:
         keys = [_SCOPED_FLOOR % tier]
         if tier in SCOPED_KEYS["interface"]:
@@ -1570,6 +1587,8 @@ class FlowDatabase(SqliteStore):
 
         An address, port or protocol filter is never rollup-served: no scope
         holds those columns. An interface filter reads the hourly tier only.
+        A breakdown starting below its scope's breakdown floor reads raw
+        while raw still reaches t0.
         """
         kind, scopes = _scopes(filters)
         if kind is None:
@@ -1596,6 +1615,8 @@ class FlowDatabase(SqliteStore):
             _floor, watermark = self.rollup_bounds(tier)
             if floor is None or watermark is None or t0 < floor:
                 continue
+            if dimension is not None and self._raw_breaks_down(tier, kind, t0):
+                continue
             # Never past t1: a bucket straddling the end of the window holds
             # flows the raw path would not have counted.
             seal = min(watermark, _align_down(t1, tier))
@@ -1618,7 +1639,8 @@ class FlowDatabase(SqliteStore):
             oldest = self._oldest_raw()
             return oldest is None or oldest > t0
         minute_floor = self._scope_floor(60, kind)
-        return minute_floor is not None and t0 < minute_floor
+        return (minute_floor is not None and t0 < minute_floor
+                and not self._raw_breaks_down(3600, kind, t0))
 
     def _repair_ranges(self, tier: int, scope, dim: int, t0: float,
                        seal: float, max_buckets: int = _REPAIR_MAX_BUCKETS,
@@ -1721,17 +1743,15 @@ class FlowDatabase(SqliteStore):
             n_buckets = max(1, int((t1 - t0) / bucket_s) + 1)
         plan = self._rollup_plan(t0, t1, dimension, filters, bucket_s)
         if info is not None:
-            floor = None if plan is None else self._scope_floor(plan[0], kind)
-            breakdown = None
-            if floor is not None and kind != "global":
-                breakdown = self._private_setting(
-                    _IFACE_BREAKDOWN_FLOOR if kind == "interface"
-                    else _BREAKDOWN_FLOOR % plan[0])
+            floor = breakdown = None
+            if plan is not None:
+                floor = self._scope_floor(plan[0], kind)
+                breakdown = self._breakdown_floor(plan[0], kind)
             info.update(records_only=plan is None,
                         tier=None if plan is None else plan[0],
                         summaries_from=floor,
-                        breakdown_from=(int(breakdown) if breakdown is not None
-                                        and int(breakdown) > floor else None),
+                        breakdown_from=(breakdown if breakdown is not None
+                                        and breakdown > floor else None),
                         widened=widened)
 
         def slot(column: str) -> tuple[str, list]:
